@@ -151,7 +151,9 @@ GitNexus supports indexing multiple repositories. Each `gitnexus analyze` regist
 
 ## Supported Languages
 
-TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust
+TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP
+
+> Note: Blade templates (`.blade.php`) are indexed as `Template` nodes (excluded from PHP AST parsing), with template-to-template edges (`EXTENDS`/`IMPORTS`) and Laravel wiring edges (`view(...)`, `Mail::send(...)`, `Mailable->view(...)`) when resolvable.
 
 ## Agent Skills
 

@@ -1,0 +1,4 @@
+<button>
+  {{ $slot ?? 'OK' }}
+</button>
+

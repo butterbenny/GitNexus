@@ -6,7 +6,7 @@ import Parser from 'tree-sitter';
 import { loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
+import { getLanguageFromFilename, getParseableContent, yieldToEventLoop } from './utils.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 
@@ -34,6 +34,189 @@ interface TsconfigPaths {
 interface GoModuleConfig {
   /** Module path (e.g., "github.com/user/repo") */
   modulePath: string;
+}
+
+/** Composer PSR-4 config parsed from composer.json */
+interface ComposerPsr4Config {
+  /** Relative path to composer.json within the repo */
+  composerJsonPath: string;
+  /** Directory containing composer.json (relative to repo root; '' for root) */
+  composerDir: string;
+  /** Sorted longest-prefix-first namespace mappings */
+  mappings: {
+    /** Normalized namespace prefix, using '/' separators and trailing '/' (e.g. 'App/') */
+    namespacePrefix: string;
+    /** One or more target directories (relative to composerDir), normalized with trailing '/' */
+    targetDirs: string[];
+  }[];
+}
+
+const normalizePosixPath = (p: string): string => p.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+
+const normalizeComposerNamespacePrefix = (ns: string): string => {
+  const normalized = normalizePosixPath(ns);
+  return normalized.endsWith('/') ? normalized : normalized + '/';
+};
+
+const normalizeComposerTargetDir = (dir: string): string => {
+  const normalized = normalizePosixPath(dir).replace(/^\.\//, '').replace(/^\/+/, '');
+  if (normalized.length === 0) return '';
+  return normalized.endsWith('/') ? normalized : normalized + '/';
+};
+
+async function loadComposerPsr4Config(
+  repoRoot: string,
+  composerJsonPath: string,
+  cache: Map<string, ComposerPsr4Config | null>,
+): Promise<ComposerPsr4Config | null> {
+  if (cache.has(composerJsonPath)) return cache.get(composerJsonPath) ?? null;
+
+  if (!repoRoot) {
+    cache.set(composerJsonPath, null);
+    return null;
+  }
+
+  try {
+    const absPath = path.join(repoRoot, composerJsonPath);
+    const raw = await fs.readFile(absPath, 'utf-8');
+    const json = JSON.parse(raw);
+
+    const psr4 = {
+      ...(json?.autoload?.['psr-4'] || {}),
+      ...(json?.['autoload-dev']?.['psr-4'] || {}),
+    } as Record<string, string | string[]>;
+
+    const mappings: ComposerPsr4Config['mappings'] = [];
+    for (const [nsRaw, dirRaw] of Object.entries(psr4)) {
+      const namespacePrefix = normalizeComposerNamespacePrefix(nsRaw);
+      const targetDirs = (Array.isArray(dirRaw) ? dirRaw : [dirRaw])
+        .filter(Boolean)
+        .map(normalizeComposerTargetDir);
+      if (targetDirs.length === 0) continue;
+      mappings.push({ namespacePrefix, targetDirs });
+    }
+
+    // Longest prefix wins
+    mappings.sort((a, b) => b.namespacePrefix.length - a.namespacePrefix.length);
+
+    const composerDir = normalizePosixPath(path.posix.dirname(composerJsonPath));
+    const cfg: ComposerPsr4Config = {
+      composerJsonPath,
+      composerDir: composerDir === '.' ? '' : composerDir,
+      mappings,
+    };
+
+    cache.set(composerJsonPath, cfg);
+    return cfg;
+  } catch {
+    cache.set(composerJsonPath, null);
+    return null;
+  }
+}
+
+function findNearestComposerJson(filePath: string, composerJsonFiles: Set<string>): string | null {
+  const parts = normalizePosixPath(filePath).split('/').slice(0, -1);
+  for (let i = parts.length; i >= 0; i--) {
+    const dir = parts.slice(0, i).join('/');
+    const candidate = dir ? `${dir}/composer.json` : 'composer.json';
+    if (composerJsonFiles.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+function splitTopLevelByComma(value: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === '{') {
+      depth++;
+      current += ch;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+      current += ch;
+      continue;
+    }
+    if (ch === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+
+  parts.push(current);
+  return parts;
+}
+
+function stripPhpAlias(value: string): string {
+  return value.replace(/\s+as\s+[\w\x80-\xff]+/i, '').trim();
+}
+
+/**
+ * Expand a PHP `use ...;` declaration into one-or-more imported fully-qualified names.
+ * Handles:
+ * - `use Foo\\Bar;`
+ * - `use Foo\\Bar as Baz;`
+ * - `use Foo\\Bar\\{Baz,Qux as Quux};`
+ * - `use Foo\\Bar, Foo\\Baz;`
+ */
+function expandPhpUseDeclaration(raw: string): string[] {
+  let body = raw.trim();
+  if (body.length === 0) return [];
+
+  body = body.replace(/^use\s+/i, '').replace(/;+\s*$/, '').trim();
+  if (body.length === 0) return [];
+
+  // Ignore `use function ...` / `use const ...` (file-level imports only for now)
+  if (/^(function|const)\s+/i.test(body)) return [];
+
+  const results: string[] = [];
+  const topLevel = splitTopLevelByComma(body);
+  for (const partRaw of topLevel) {
+    let part = partRaw.trim();
+    if (part.length === 0) continue;
+
+    // Strip leading global namespace prefix `\`
+    part = part.replace(/^\\+/, '');
+
+    const braceStart = part.indexOf('{');
+    if (braceStart >= 0) {
+      const braceEnd = part.lastIndexOf('}');
+      if (braceEnd < braceStart) continue;
+
+      const prefixRaw = part.slice(0, braceStart).trim();
+      const innerRaw = part.slice(braceStart + 1, braceEnd).trim();
+
+      const prefix = prefixRaw.length === 0
+        ? ''
+        : prefixRaw.endsWith('\\') ? prefixRaw : prefixRaw + '\\';
+
+      const innerParts = splitTopLevelByComma(innerRaw);
+      for (const innerPartRaw of innerParts) {
+        let innerPart = innerPartRaw.trim();
+        if (innerPart.length === 0) continue;
+
+        if (/^(function|const)\s+/i.test(innerPart)) continue;
+
+        innerPart = stripPhpAlias(innerPart).replace(/^\\+/, '');
+        if (innerPart.length === 0) continue;
+
+        results.push(prefix + innerPart);
+      }
+      continue;
+    }
+
+    part = stripPhpAlias(part);
+    if (part.length === 0) continue;
+    results.push(part);
+  }
+
+  return Array.from(new Set(results));
 }
 
 /**
@@ -110,8 +293,12 @@ const EXTENSIONS = [
   '',
   // TypeScript/JavaScript
   '.tsx', '.ts', '.jsx', '.js', '/index.tsx', '/index.ts', '/index.jsx', '/index.js',
+  // Svelte
+  '.svelte', '/index.svelte',
   // Python
   '.py', '/__init__.py',
+  // PHP
+  '.php',
   // Java
   '.java',
   // C/C++
@@ -270,6 +457,7 @@ const resolveImportPath = (
   resolveCache: Map<string, string | null>,
   language: SupportedLanguages,
   tsconfigPaths: TsconfigPaths | null,
+  composerPsr4: ComposerPsr4Config | null,
   index?: SuffixIndex,
 ): string | null => {
   const cacheKey = `${currentFile}::${importPath}`;
@@ -279,6 +467,10 @@ const resolveImportPath = (
     resolveCache.set(cacheKey, result);
     return result;
   };
+
+  const importPathForResolution = language === SupportedLanguages.PHP
+    ? importPath.replace(/\\/g, '/').replace(/^\/+/, '')
+    : importPath;
 
   // ---- TypeScript/JavaScript: rewrite path aliases ----
   if (
@@ -313,9 +505,45 @@ const resolveImportPath = (
     // Fall through to generic resolution if Rust-specific didn't match
   }
 
+  // ---- PHP: namespace import resolution (use Foo\\Bar\\Baz) ----
+  if (language === SupportedLanguages.PHP) {
+    // Prefer deterministic resolution via Composer PSR-4 (nearest composer.json)
+    if (composerPsr4) {
+      for (const { namespacePrefix, targetDirs } of composerPsr4.mappings) {
+        if (!importPathForResolution.startsWith(namespacePrefix)) continue;
+        const remainder = importPathForResolution.slice(namespacePrefix.length);
+        for (const targetDir of targetDirs) {
+          const basePath = normalizePosixPath([composerPsr4.composerDir, targetDir, remainder].filter(Boolean).join('/'))
+            .replace(/^\/+/, '');
+          const direct = tryResolveWithExtensions(basePath, allFiles);
+          if (direct) return cache(direct);
+        }
+      }
+    }
+
+    const candidates = new Set<string>();
+    candidates.add(importPathForResolution);
+
+    // Laravel convention: `App\\...` namespace maps to `app/...` directory
+    if (importPathForResolution.startsWith('App/')) {
+      const remainder = importPathForResolution.slice('App/'.length);
+      candidates.add(`app/${remainder}`);
+      candidates.add(remainder);
+    }
+
+    for (const candidate of candidates) {
+      const direct = tryResolveWithExtensions(candidate, allFiles);
+      if (direct) return cache(direct);
+
+      const parts = candidate.split('/').filter(Boolean);
+      const suffixResult = suffixResolve(parts, normalizedFileList, allFileList, index);
+      if (suffixResult) return cache(suffixResult);
+    }
+  }
+
   // ---- Generic relative import resolution (./ and ../) ----
   const currentDir = currentFile.split('/').slice(0, -1);
-  const parts = importPath.split('/');
+  const parts = importPathForResolution.split('/');
 
   for (const part of parts) {
     if (part === '.') continue;
@@ -328,20 +556,20 @@ const resolveImportPath = (
 
   const basePath = currentDir.join('/');
 
-  if (importPath.startsWith('.')) {
+  if (importPathForResolution.startsWith('.')) {
     const resolved = tryResolveWithExtensions(basePath, allFiles);
     return cache(resolved);
   }
 
   // ---- Generic package/absolute import resolution (suffix matching) ----
   // Java wildcards are handled in processImports, not here
-  if (importPath.endsWith('.*')) {
+  if (importPathForResolution.endsWith('.*')) {
     return cache(null);
   }
 
-  const pathLike = importPath.includes('/')
-    ? importPath
-    : importPath.replace(/\./g, '/');
+  const pathLike = importPathForResolution.includes('/')
+    ? importPathForResolution
+    : importPathForResolution.replace(/\./g, '/');
   const pathParts = pathLike.split('/').filter(Boolean);
 
   const resolved = suffixResolve(pathParts, normalizedFileList, allFileList, index);
@@ -581,6 +809,9 @@ export const processImports = async (
   const effectiveRoot = repoRoot || '';
   const tsconfigPaths = await loadTsconfigPaths(effectiveRoot);
   const goModule = await loadGoModulePath(effectiveRoot);
+  const composerJsonFiles = new Set(allFileList.filter(p => p.endsWith('composer.json')));
+  const composerPsr4Cache = new Map<string, ComposerPsr4Config | null>();
+  const composerJsonForFileCache = new Map<string, string | null>();
 
   // Helper: add an IMPORTS edge + update import map
   const addImportEdge = (filePath: string, resolvedPath: string) => {
@@ -617,6 +848,20 @@ export const processImports = async (
     const queryStr = LANGUAGE_QUERIES[language];
     if (!queryStr) continue;
 
+    // PHP: Load nearest Composer PSR-4 config (package-level composer.json supported)
+    let composerPsr4: ComposerPsr4Config | null = null;
+    if (language === SupportedLanguages.PHP && composerJsonFiles.size > 0) {
+      let composerJsonPath = composerJsonForFileCache.get(file.path);
+      if (composerJsonPath === undefined) {
+        composerJsonPath = findNearestComposerJson(file.path, composerJsonFiles);
+        composerJsonForFileCache.set(file.path, composerJsonPath);
+      }
+
+      if (composerJsonPath) {
+        composerPsr4 = await loadComposerPsr4Config(effectiveRoot, composerJsonPath, composerPsr4Cache);
+      }
+    }
+
     // 2. ALWAYS load the language before querying (parser is stateful)
     await loadLanguage(language, file.path);
 
@@ -626,7 +871,8 @@ export const processImports = async (
 
     if (!tree) {
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+        const content = getParseableContent(file.path, file.content);
+        tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
       } catch (parseError) {
         continue;
       }
@@ -672,54 +918,61 @@ export const processImports = async (
 
         // Clean path (remove quotes and angle brackets for C/C++ includes)
         const rawImportPath = sourceNode.text.replace(/['"<>]/g, '');
-        totalImportsFound++;
+        const importPaths = language === SupportedLanguages.PHP
+          ? expandPhpUseDeclaration(rawImportPath)
+          : [rawImportPath];
 
-        // ---- Java: handle wildcards and static imports specially ----
-        if (language === SupportedLanguages.Java) {
-          if (rawImportPath.endsWith('.*')) {
-            const matchedFiles = resolveJavaWildcard(rawImportPath, normalizedFileList, allFileList, index);
-            for (const matchedFile of matchedFiles) {
-              addImportEdge(file.path, matchedFile);
+        for (const importPath of importPaths) {
+          totalImportsFound++;
+
+          // ---- Java: handle wildcards and static imports specially ----
+          if (language === SupportedLanguages.Java) {
+            if (importPath.endsWith('.*')) {
+              const matchedFiles = resolveJavaWildcard(importPath, normalizedFileList, allFileList, index);
+              for (const matchedFile of matchedFiles) {
+                addImportEdge(file.path, matchedFile);
+              }
+              continue; // skip single-file resolution
             }
-            return; // skip single-file resolution
-          }
 
-          // Try static import resolution (strip member name)
-          const staticResolved = resolveJavaStaticImport(rawImportPath, normalizedFileList, allFileList, index);
-          if (staticResolved) {
-            addImportEdge(file.path, staticResolved);
-            return;
-          }
-          // Fall through to normal resolution for regular Java imports
-        }
-
-        // ---- Go: handle package-level imports ----
-        if (language === SupportedLanguages.Go && goModule && rawImportPath.startsWith(goModule.modulePath)) {
-          const pkgFiles = resolveGoPackage(rawImportPath, goModule, normalizedFileList, allFileList);
-          if (pkgFiles.length > 0) {
-            for (const pkgFile of pkgFiles) {
-              addImportEdge(file.path, pkgFile);
+            // Try static import resolution (strip member name)
+            const staticResolved = resolveJavaStaticImport(importPath, normalizedFileList, allFileList, index);
+            if (staticResolved) {
+              addImportEdge(file.path, staticResolved);
+              continue;
             }
-            return; // skip single-file resolution
+            // Fall through to normal resolution for regular Java imports
           }
-          // Fall through if no files found (package might be external)
-        }
 
-        // ---- Standard single-file resolution ----
-        const resolvedPath = resolveImportPath(
-          file.path,
-          rawImportPath,
-          allFilePaths,
-          allFileList,
-          normalizedFileList,
-          resolveCache,
-          language,
-          tsconfigPaths,
-          index,
-        );
+          // ---- Go: handle package-level imports ----
+          if (language === SupportedLanguages.Go && goModule && importPath.startsWith(goModule.modulePath)) {
+            const pkgFiles = resolveGoPackage(importPath, goModule, normalizedFileList, allFileList);
+            if (pkgFiles.length > 0) {
+              for (const pkgFile of pkgFiles) {
+                addImportEdge(file.path, pkgFile);
+              }
+              continue; // skip single-file resolution
+            }
+            // Fall through if no files found (package might be external)
+          }
 
-        if (resolvedPath) {
-          addImportEdge(file.path, resolvedPath);
+          // ---- Standard single-file resolution ----
+          const resolvedPath = resolveImportPath(
+            file.path,
+            importPath,
+            allFilePaths,
+            allFileList,
+            normalizedFileList,
+            resolveCache,
+            language,
+            tsconfigPaths,
+            composerPsr4,
+            index,
+          );
+
+          if (resolvedPath) {
+            addImportEdge(file.path, resolvedPath);
+          }
         }
       }
     });
@@ -757,6 +1010,9 @@ export const processImportsFromExtracted = async (
   const effectiveRoot = repoRoot || '';
   const tsconfigPaths = await loadTsconfigPaths(effectiveRoot);
   const goModule = await loadGoModulePath(effectiveRoot);
+  const composerJsonFiles = new Set(allFileList.filter(p => p.endsWith('composer.json')));
+  const composerPsr4Cache = new Map<string, ComposerPsr4Config | null>();
+  const composerJsonForFileCache = new Map<string, string | null>();
 
   const addImportEdge = (filePath: string, resolvedPath: string) => {
     const sourceId = generateId('File', filePath);
@@ -816,61 +1072,82 @@ export const processImportsFromExtracted = async (
       await yieldToEventLoop();
     }
 
+    // PHP: Load nearest Composer PSR-4 config once per file
+    let composerPsr4: ComposerPsr4Config | null = null;
+    if (composerJsonFiles.size > 0 && fileImports.some(imp => imp.language === SupportedLanguages.PHP)) {
+      let composerJsonPath = composerJsonForFileCache.get(filePath);
+      if (composerJsonPath === undefined) {
+        composerJsonPath = findNearestComposerJson(filePath, composerJsonFiles);
+        composerJsonForFileCache.set(filePath, composerJsonPath);
+      }
+
+      if (composerJsonPath) {
+        composerPsr4 = await loadComposerPsr4Config(effectiveRoot, composerJsonPath, composerPsr4Cache);
+      }
+    }
+
     for (const { rawImportPath, language } of fileImports) {
-      totalImportsFound++;
+      const importPaths = language === SupportedLanguages.PHP
+        ? expandPhpUseDeclaration(rawImportPath)
+        : [rawImportPath];
 
-      // Check resolve cache first
-      const cacheKey = `${filePath}::${rawImportPath}`;
-      if (resolveCache.has(cacheKey)) {
-        const cached = resolveCache.get(cacheKey);
-        if (cached) addImportEdge(filePath, cached);
-        continue;
-      }
+      for (const importPath of importPaths) {
+        totalImportsFound++;
 
-      // Java: handle wildcards and static imports
-      if (language === SupportedLanguages.Java) {
-        if (rawImportPath.endsWith('.*')) {
-          const matchedFiles = resolveJavaWildcard(rawImportPath, normalizedFileList, allFileList, index);
-          for (const matchedFile of matchedFiles) {
-            addImportEdge(filePath, matchedFile);
+        // Check resolve cache first
+        const cacheKey = `${filePath}::${importPath}`;
+        if (resolveCache.has(cacheKey)) {
+          const cached = resolveCache.get(cacheKey);
+          if (cached) addImportEdge(filePath, cached);
+          continue;
+        }
+
+        // Java: handle wildcards and static imports
+        if (language === SupportedLanguages.Java) {
+          if (importPath.endsWith('.*')) {
+            const matchedFiles = resolveJavaWildcard(importPath, normalizedFileList, allFileList, index);
+            for (const matchedFile of matchedFiles) {
+              addImportEdge(filePath, matchedFile);
+            }
+            continue;
           }
-          continue;
-        }
 
-        const staticResolved = resolveJavaStaticImport(rawImportPath, normalizedFileList, allFileList, index);
-        if (staticResolved) {
-          resolveCache.set(cacheKey, staticResolved);
-          addImportEdge(filePath, staticResolved);
-          continue;
-        }
-      }
-
-      // Go: handle package-level imports
-      if (language === SupportedLanguages.Go && goModule && rawImportPath.startsWith(goModule.modulePath)) {
-        const pkgFiles = resolveGoPackage(rawImportPath, goModule, normalizedFileList, allFileList);
-        if (pkgFiles.length > 0) {
-          for (const pkgFile of pkgFiles) {
-            addImportEdge(filePath, pkgFile);
+          const staticResolved = resolveJavaStaticImport(importPath, normalizedFileList, allFileList, index);
+          if (staticResolved) {
+            resolveCache.set(cacheKey, staticResolved);
+            addImportEdge(filePath, staticResolved);
+            continue;
           }
-          continue;
         }
-      }
 
-      // Standard resolution (has its own internal cache)
-      const resolvedPath = resolveImportPath(
-        filePath,
-        rawImportPath,
-        allFilePaths,
-        allFileList,
-        normalizedFileList,
-        resolveCache,
-        language as SupportedLanguages,
-        tsconfigPaths,
-        index,
-      );
+        // Go: handle package-level imports
+        if (language === SupportedLanguages.Go && goModule && importPath.startsWith(goModule.modulePath)) {
+          const pkgFiles = resolveGoPackage(importPath, goModule, normalizedFileList, allFileList);
+          if (pkgFiles.length > 0) {
+            for (const pkgFile of pkgFiles) {
+              addImportEdge(filePath, pkgFile);
+            }
+            continue;
+          }
+        }
 
-      if (resolvedPath) {
-        addImportEdge(filePath, resolvedPath);
+        // Standard resolution (has its own internal cache)
+        const resolvedPath = resolveImportPath(
+          filePath,
+          importPath,
+          allFilePaths,
+          allFileList,
+          normalizedFileList,
+          resolveCache,
+          language as SupportedLanguages,
+          tsconfigPaths,
+          composerPsr4,
+          index,
+        );
+
+        if (resolvedPath) {
+          addImportEdge(filePath, resolvedPath);
+        }
       }
     }
   }

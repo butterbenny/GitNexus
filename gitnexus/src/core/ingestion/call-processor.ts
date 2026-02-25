@@ -6,7 +6,7 @@ import Parser from 'tree-sitter';
 import { loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
+import { getLanguageFromFilename, getParseableContent, yieldToEventLoop } from './utils.js';
 import type { ExtractedCall } from './workers/parse-worker.js';
 
 /**
@@ -161,7 +161,8 @@ export const processCalls = async (
       // Cache Miss: Re-parse
       // Use larger bufferSize for files > 32KB
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+        const content = getParseableContent(file.path, file.content);
+        tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
       } catch (parseError) {
         // Skip files that can't be parsed
         continue;

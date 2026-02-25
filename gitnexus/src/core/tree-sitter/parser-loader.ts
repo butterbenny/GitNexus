@@ -8,15 +8,21 @@ import CPP from 'tree-sitter-cpp';
 import CSharp from 'tree-sitter-c-sharp';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
+import PHP from 'tree-sitter-php';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
 let parser: Parser | null = null;
+
+const phpLanguage = (PHP as unknown as { php?: unknown; php_only?: unknown }).php
+  ?? (PHP as unknown as { php?: unknown; php_only?: unknown }).php_only
+  ?? PHP;
 
 const languageMap: Record<string, any> = {
   [SupportedLanguages.JavaScript]: JavaScript,
   [SupportedLanguages.TypeScript]: TypeScript.typescript,
   [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
   [SupportedLanguages.Python]: Python,
+  [SupportedLanguages.PHP]: phpLanguage,
   [SupportedLanguages.Java]: Java,
   [SupportedLanguages.C]: C,
   [SupportedLanguages.CPlusPlus]: CPP,

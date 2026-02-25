@@ -5,7 +5,7 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
+import { getLanguageFromFilename, getParseableContent, yieldToEventLoop } from './utils.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage } from './workers/parse-worker.js';
 
@@ -114,6 +114,27 @@ const isNodeExported = (node: any, name: string, language: string): boolean => {
     case 'cpp':
       return false;
 
+    // PHP: treat symbols as public unless explicitly private/protected
+    case 'php':
+      while (current) {
+        if (current.parent) {
+          const parent = current.parent;
+          for (let i = 0; i < parent.childCount; i++) {
+            const child = parent.child(i);
+            if (child?.type === 'visibility_modifier') {
+              if (child.text?.includes('private') || child.text?.includes('protected')) {
+                return false;
+              }
+              if (child.text?.includes('public')) {
+                return true;
+              }
+            }
+          }
+        }
+        current = current.parent;
+      }
+      return true;
+
     default:
       return false;
   }
@@ -213,7 +234,8 @@ const processParsingSequential = async (
 
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+      const content = getParseableContent(file.path, file.content);
+      tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
       continue;

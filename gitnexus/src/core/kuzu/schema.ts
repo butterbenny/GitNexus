@@ -258,6 +258,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Method TO Interface,
   FROM Method TO \`Constructor\`,
   FROM \`Template\` TO \`Template\`,
+  FROM \`Template\` TO File,
   FROM \`Template\` TO Function,
   FROM \`Template\` TO Method,
   FROM \`Template\` TO Class,

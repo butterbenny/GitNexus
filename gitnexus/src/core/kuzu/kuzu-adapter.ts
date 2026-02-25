@@ -221,6 +221,14 @@ export const loadGraphToKuzu = async (
 // KuzuDB from overriding our settings based on sample rows.
 const COPY_CSV_OPTS = `(HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
+const EXPORTED_CODE_TABLES = new Set<NodeTableName>([
+  'Function',
+  'Class',
+  'Interface',
+  'Method',
+  'CodeElement',
+]);
+
 // Multi-language table names that were created with backticks in CODE_ELEMENT_BASE
 // and must always be referenced with backticks in queries
 const BACKTICK_TABLES = new Set([
@@ -282,8 +290,11 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   if (table === 'Process') {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
-  // Code element tables (Function, Class, Interface, Method, CodeElement, and multi-language)
-  return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  if (EXPORTED_CODE_TABLES.has(table)) {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  // Multi-language + Template/Module tables (no isExported column)
+  return `COPY ${t}(id, name, filePath, startLine, endLine, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
 };
 
 /**

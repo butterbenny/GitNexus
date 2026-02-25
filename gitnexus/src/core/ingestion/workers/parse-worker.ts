@@ -9,9 +9,10 @@ import CPP from 'tree-sitter-cpp';
 import CSharp from 'tree-sitter-c-sharp';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
+import PHP from 'tree-sitter-php';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
-import { getLanguageFromFilename } from '../utils.js';
+import { getLanguageFromFilename, getParseableContent } from '../utils.js';
 import { generateId } from '../../../lib/utils.js';
 
 // ============================================================================
@@ -89,11 +90,16 @@ export interface ParseWorkerInput {
 
 const parser = new Parser();
 
+const phpLanguage = (PHP as unknown as { php?: unknown; php_only?: unknown }).php
+  ?? (PHP as unknown as { php?: unknown; php_only?: unknown }).php_only
+  ?? PHP;
+
 const languageMap: Record<string, any> = {
   [SupportedLanguages.JavaScript]: JavaScript,
   [SupportedLanguages.TypeScript]: TypeScript.typescript,
   [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
   [SupportedLanguages.Python]: Python,
+  [SupportedLanguages.PHP]: phpLanguage,
   [SupportedLanguages.Java]: Java,
   [SupportedLanguages.C]: C,
   [SupportedLanguages.CPlusPlus]: CPP,
@@ -184,6 +190,26 @@ const isNodeExported = (node: any, name: string, language: string): boolean => {
     case 'c':
     case 'cpp':
       return false;
+
+    case 'php':
+      while (current) {
+        if (current.parent) {
+          const parent = current.parent;
+          for (let i = 0; i < parent.childCount; i++) {
+            const child = parent.child(i);
+            if (child?.type === 'visibility_modifier') {
+              if (child.text?.includes('private') || child.text?.includes('protected')) {
+                return false;
+              }
+              if (child.text?.includes('public')) {
+                return true;
+              }
+            }
+          }
+        }
+        current = current.parent;
+      }
+      return true;
 
     default:
       return false;
@@ -403,8 +429,9 @@ const processFileGroup = (
 
   for (const file of files) {
     let tree;
+    const content = getParseableContent(file.path, file.content);
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+      tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
     } catch {
       continue;
     }

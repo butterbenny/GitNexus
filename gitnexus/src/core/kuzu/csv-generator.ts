@@ -10,7 +10,7 @@
  * - All fields are consistently quoted for safety with code content
  */
 
-import { KnowledgeGraph, GraphNode, NodeLabel } from '../graph/types.js';
+import { KnowledgeGraph, GraphNode } from '../graph/types.js';
 import { NODE_TABLES, NodeTableName } from './schema.js';
 
 // ============================================================================
@@ -178,13 +178,21 @@ const generateFolderCSV = (nodes: GraphNode[]): string => {
   return rows.join('\n');
 };
 
+const EXPORTED_CODE_TABLES = new Set<NodeTableName>([
+  'Function',
+  'Class',
+  'Interface',
+  'Method',
+  'CodeElement',
+]);
+
 /**
- * Generate CSV for code element nodes (Function, Class, Interface, Method, CodeElement)
+ * Generate CSV for code element nodes with export semantics
  * Headers: id,name,filePath,startLine,endLine,isExported,content
  */
-const generateCodeElementCSV = (
+const generateExportedCodeElementCSV = (
   nodes: GraphNode[],
-  label: NodeLabel,
+  label: NodeTableName,
   fileContents: Map<string, string>
 ): string => {
   const headers = ['id', 'name', 'filePath', 'startLine', 'endLine', 'isExported', 'content'];
@@ -204,6 +212,34 @@ const generateCodeElementCSV = (
     ].join(','));
   }
   
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for generic code element nodes (multi-language and template nodes)
+ * Headers: id,name,filePath,startLine,endLine,content
+ */
+const generateCodeElementBaseCSV = (
+  nodes: GraphNode[],
+  label: NodeTableName,
+  fileContents: Map<string, string>
+): string => {
+  const headers = ['id', 'name', 'filePath', 'startLine', 'endLine', 'content'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== label) continue;
+    const content = extractContent(node, fileContents);
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField(node.properties.filePath || ''),
+      escapeCSVNumber(node.properties.startLine, -1),
+      escapeCSVNumber(node.properties.endLine, -1),
+      escapeCSVField(content),
+    ].join(','));
+  }
+
   return rows.join('\n');
 };
 
@@ -308,19 +344,34 @@ export const generateAllCSVs = (
   
   // Generate node CSVs
   const nodeCSVs = new Map<NodeTableName, string>();
-  nodeCSVs.set('File', generateFileCSV(nodes, fileContents));
-  nodeCSVs.set('Folder', generateFolderCSV(nodes));
-  nodeCSVs.set('Function', generateCodeElementCSV(nodes, 'Function', fileContents));
-  nodeCSVs.set('Class', generateCodeElementCSV(nodes, 'Class', fileContents));
-  nodeCSVs.set('Interface', generateCodeElementCSV(nodes, 'Interface', fileContents));
-  nodeCSVs.set('Method', generateCodeElementCSV(nodes, 'Method', fileContents));
-  nodeCSVs.set('CodeElement', generateCodeElementCSV(nodes, 'CodeElement', fileContents));
-  nodeCSVs.set('Community', generateCommunityCSV(nodes));
-  nodeCSVs.set('Process', generateProcessCSV(nodes));
+  for (const tableName of NODE_TABLES) {
+    if (tableName === 'File') {
+      nodeCSVs.set(tableName, generateFileCSV(nodes, fileContents));
+      continue;
+    }
+    if (tableName === 'Folder') {
+      nodeCSVs.set(tableName, generateFolderCSV(nodes));
+      continue;
+    }
+    if (tableName === 'Community') {
+      nodeCSVs.set(tableName, generateCommunityCSV(nodes));
+      continue;
+    }
+    if (tableName === 'Process') {
+      nodeCSVs.set(tableName, generateProcessCSV(nodes));
+      continue;
+    }
+
+    if (EXPORTED_CODE_TABLES.has(tableName)) {
+      nodeCSVs.set(tableName, generateExportedCodeElementCSV(nodes, tableName, fileContents));
+      continue;
+    }
+
+    nodeCSVs.set(tableName, generateCodeElementBaseCSV(nodes, tableName, fileContents));
+  }
   
   // Generate single relation CSV
   const relCSV = generateRelationCSV(graph);
   
   return { nodes: nodeCSVs, relCSV };
 };
-

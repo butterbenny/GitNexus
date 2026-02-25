@@ -1,0 +1,4 @@
+<footer>
+  Thanks for reading.
+</footer>
+

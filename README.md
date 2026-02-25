@@ -326,7 +326,9 @@ flowchart TD
 
 ### Supported Languages
 
-TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust
+TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP
+
+> PHP is symbol-indexed (classes / methods / functions) and import-indexed (`use ...` → `IMPORTS`). Blade templates (`.blade.php`) are indexed as `Template` nodes with template-to-template edges (`EXTENDS`/`IMPORTS`) and Laravel wiring edges (`view(...)`, `Mail::send(...)`, `Mailable->view(...)`) to connect PHP → Blade; see `ARCHITECTURE.md` → “North Star: Closed-Loop Full-Stack Graphs (TypeScript + Laravel PHP + Blade + Svelte)” for the staged plan and acceptance queries.
 
 ### Language-Aware Import Resolution
 
@@ -606,6 +608,8 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [ ] **LLM Cluster Enrichment** — Semantic cluster names via LLM API
 - [ ] **AST Decorator Detection** — Parse @Controller, @Get, etc.
 - [ ] **Incremental Indexing** — Only re-index changed files
+- [ ] **PHP (Laravel) Symbol Indexing** — PHP AST + Composer imports + Laravel wiring edges (routes/events/schedule/views)
+- [ ] **Templates (Blade + Svelte)** — Template nodes + template-to-template edges + `.svelte` import awareness
 
 ### Recently Completed
 
@@ -622,7 +626,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [X] **Language-Aware Imports** — TS path aliases, Rust modules, Java wildcards, Go packages
 - [X] **Community Detection** — Leiden algorithm for functional clustering
 - [X] **Process Detection** — Entry point tracing with framework awareness
-- [X] **9 Language Support** — TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust
+- [X] **10 Language Support** — TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP
 - [X] **Confidence Scoring** — Trust levels on CALLS edges (0.3-0.9)
 - [X] **Blast Radius Tool** — `impact` with minConfidence, relationTypes, includeTests
 - [X] **Hybrid Search** — BM25 + semantic + Reciprocal Rank Fusion

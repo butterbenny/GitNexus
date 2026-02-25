@@ -3,6 +3,15 @@ import { processStructure } from './structure-processor.js';
 import { processParsing } from './parsing-processor.js';
 import { processImports, processImportsFromExtracted, createImportMap } from './import-processor.js';
 import { processCalls, processCallsFromExtracted } from './call-processor.js';
+import { processLaravelRoutes } from './laravel-route-processor.js';
+import { processLaravelHttpWiring } from './laravel-http-processor.js';
+import { processLaravelRouteNameWiring } from './laravel-route-name-processor.js';
+import { processLaravelViewsAndMail } from './laravel-view-mail-processor.js';
+import { processLaravelEvents } from './laravel-event-processor.js';
+import { processLaravelEventDispatch } from './laravel-event-dispatch-processor.js';
+import { processLaravelSchedule } from './laravel-schedule-processor.js';
+import { processLaravelJobDispatch } from './laravel-job-dispatch-processor.js';
+import { processBladeTemplates } from './blade-template-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
@@ -69,6 +78,8 @@ export const runPipelineFromRepo = async (
 
     const filePaths = files.map(f => f.path);
     processStructure(graph, filePaths);
+
+    processBladeTemplates(graph, files);
 
     onProgress({
       phase: 'structure',
@@ -175,6 +186,22 @@ export const runPipelineFromRepo = async (
         });
       });
     }
+
+    onProgress({
+      phase: 'calls',
+      percent: 92,
+      message: 'Detecting Laravel framework wiring...',
+      stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    await processLaravelViewsAndMail(graph, files, astCache, symbolTable, importMap);
+    await processLaravelEvents(graph, files, astCache, symbolTable, importMap);
+    await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap);
+    await processLaravelSchedule(graph, files, astCache, symbolTable, importMap);
+    await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap);
+    processLaravelRoutes(graph, files, symbolTable, importMap);
+    await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap);
+    await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap);
 
     onProgress({
       phase: 'heritage',
@@ -331,4 +358,3 @@ export const runPipelineFromRepo = async (
     throw error;
   }
 };
-

@@ -1,0 +1,9 @@
+{
+  "name": "acme/pkg",
+  "autoload": {
+    "psr-4": {
+      "Acme\\\\": "src/"
+    }
+  }
+}
+

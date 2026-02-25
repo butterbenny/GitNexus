@@ -317,10 +317,31 @@ export const RUST_QUERIES = `
 (impl_item trait: (generic_type type: (type_identifier) @heritage.trait) type: (type_identifier) @heritage.class) @heritage
 `;
 
+// PHP queries - works with tree-sitter-php
+export const PHP_QUERIES = `
+; Types
+(class_declaration name: (name) @name) @definition.class
+(interface_declaration name: (name) @name) @definition.interface
+(trait_declaration name: (name) @name) @definition.trait
+
+; Functions & methods
+(function_definition name: (name) @name) @definition.function
+(method_declaration name: (name) @name) @definition.method
+
+; Imports (use statements)
+(namespace_use_declaration) @import @import.source
+
+; Calls
+(function_call_expression function: (name) @call.name) @call
+(member_call_expression name: (name) @call.name) @call
+(scoped_call_expression name: (name) @call.name) @call
+`;
+
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.TypeScript]: TYPESCRIPT_QUERIES,
   [SupportedLanguages.JavaScript]: JAVASCRIPT_QUERIES,
   [SupportedLanguages.Python]: PYTHON_QUERIES,
+  [SupportedLanguages.PHP]: PHP_QUERIES,
   [SupportedLanguages.Java]: JAVA_QUERIES,
   [SupportedLanguages.C]: C_QUERIES,
   [SupportedLanguages.Go]: GO_QUERIES,

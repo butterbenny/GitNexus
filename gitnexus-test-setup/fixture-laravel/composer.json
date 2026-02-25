@@ -1,0 +1,9 @@
+{
+  "name": "gitnexus/fixture-laravel",
+  "autoload": {
+    "psr-4": {
+      "App\\\\": "app/",
+      "MyVendor\\\\": "lib/"
+    }
+  }
+}
