@@ -2,7 +2,7 @@ import { KnowledgeGraph } from '../graph/types.js';
 import Parser from 'tree-sitter';
 import { ASTCache } from './ast-cache.js';
 import { SymbolTable, SymbolDefinition } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import { ImportMap, PhpUseAliasMap, expandPhpClassRefFromUseAliases } from './import-processor.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
 import { loadLanguage, loadParser } from '../tree-sitter/parser-loader.js';
@@ -14,7 +14,16 @@ type ResolvedClass = {
   reason: string;
 };
 
-type DispatchKind = 'helper' | 'helper-sync' | 'static' | 'bus';
+type DispatchKind =
+  | 'helper'
+  | 'helper-sync'
+  | 'static'
+  | 'bus'
+  | 'bus-chain'
+  | 'bus-batch'
+  | 'with-chain-root'
+  | 'with-chain-item'
+  | 'dispatch-chain-item';
 
 type ExtractedDispatchCall = {
   callNode: any;
@@ -38,9 +47,11 @@ const resolvePhpClassToFile = (
   currentFilePath: string,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): ResolvedClass | null => {
   const normalizedRef = stripPhpClassConstant(classRef);
-  const { baseName, parts } = normalizePhpClassRef(normalizedRef);
+  const expandedRef = expandPhpClassRefFromUseAliases(normalizedRef, currentFilePath, phpUseAliases);
+  const { baseName, parts } = normalizePhpClassRef(expandedRef);
   if (!looksLikePhpIdentifier(baseName)) return null;
 
   const classDefs = symbolTable
@@ -126,6 +137,11 @@ const DISPATCH_STATIC_METHODS = new Set([
   'dispatchUnless',
 ]);
 
+type BusBuilderKind = 'chain' | 'batch';
+
+const BUS_BUILDER_METHODS = new Set<BusBuilderKind>(['chain', 'batch']);
+const PENDING_DISPATCH_METHODS = new Set(['dispatch', 'dispatchAfterResponse']);
+
 const getCallArgumentExpressions = (argsNode: any): any[] => {
   if (!argsNode) return [];
   const named = argsNode.namedChildren || [];
@@ -141,6 +157,99 @@ const getCallArgumentExpressions = (argsNode: any): any[] => {
   }
 
   return exprs;
+};
+
+const extractClassRefsFromArrayExpression = (arrayNode: any): string[] => {
+  if (!arrayNode || arrayNode.type !== 'array_creation_expression') return [];
+  const entries = arrayNode.namedChildren?.filter((c: any) => c.type === 'array_element_initializer') || [];
+  const classRefs: string[] = [];
+
+  for (const entry of entries) {
+    const expr = entry.namedChildren?.at(-1);
+    const classRef = parseClassRefFromDispatchArg(expr);
+    if (classRef) classRefs.push(classRef);
+  }
+
+  return classRefs;
+};
+
+const unwrapChainedCallObject = (node: any): any | null => {
+  let current = node;
+
+  while (current) {
+    if (current.type === 'member_call_expression') {
+      current = current.childForFieldName?.('object') || null;
+      continue;
+    }
+    if (current.type === 'parenthesized_expression') {
+      current = current.namedChildren?.at(0) || null;
+      continue;
+    }
+    return current;
+  }
+
+  return null;
+};
+
+const findBusBuilderCall = (
+  node: any,
+): { kind: BusBuilderKind; callNode: any; argsNode: any } | null => {
+  const base = unwrapChainedCallObject(node);
+  if (!base || base.type !== 'scoped_call_expression') return null;
+
+  const scopeNode = base.childForFieldName?.('scope');
+  const methodNode = base.childForFieldName?.('name');
+  const methodName = methodNode?.text?.trim();
+  const scopeText = scopeNode?.text?.trim();
+
+  if (!methodName || !scopeText) return null;
+  if (!BUS_BUILDER_METHODS.has(methodName as BusBuilderKind)) return null;
+
+  const baseScope = getScopeBaseName(scopeText);
+  if (baseScope !== 'Bus') return null;
+
+  const argsNode = base.childForFieldName?.('arguments');
+  return { kind: methodName as BusBuilderKind, callNode: base, argsNode };
+};
+
+const findJobWithChainCall = (
+  node: any,
+): { jobClassRef: string; argsNode: any } | null => {
+  const base = unwrapChainedCallObject(node);
+  if (!base || base.type !== 'scoped_call_expression') return null;
+
+  const scopeNode = base.childForFieldName?.('scope');
+  const methodNode = base.childForFieldName?.('name');
+  const methodName = methodNode?.text?.trim();
+  const scopeText = scopeNode?.text?.trim();
+
+  if (!methodName || !scopeText) return null;
+  if (methodName !== 'withChain') return null;
+
+  const baseScope = getScopeBaseName(scopeText);
+  if (baseScope === 'Bus') return null;
+
+  const argsNode = base.childForFieldName?.('arguments');
+  return { jobClassRef: stripPhpClassConstant(scopeText), argsNode };
+};
+
+const findStaticJobDispatchCall = (
+  node: any,
+): { jobClassRef: string; callNode: any } | null => {
+  const base = unwrapChainedCallObject(node);
+  if (!base || base.type !== 'scoped_call_expression') return null;
+
+  const scopeNode = base.childForFieldName?.('scope');
+  const methodNode = base.childForFieldName?.('name');
+  const methodName = methodNode?.text?.trim();
+  const scopeText = scopeNode?.text?.trim();
+  if (!methodName || !scopeText) return null;
+  if (!DISPATCH_STATIC_METHODS.has(methodName)) return null;
+
+  const baseScope = getScopeBaseName(scopeText);
+  if (baseScope === 'Bus') return null;
+
+  return { jobClassRef: stripPhpClassConstant(scopeText), callNode: base };
 };
 
 const extractDispatchCallsFromTree = (tree: Parser.Tree): ExtractedDispatchCall[] => {
@@ -187,6 +296,65 @@ const extractDispatchCallsFromTree = (tree: Parser.Tree): ExtractedDispatchCall[
       }
     }
 
+    if (node.type === 'member_call_expression') {
+      const methodNode = node.childForFieldName?.('name');
+      const methodName = methodNode?.text?.trim();
+      const objectNode = node.childForFieldName?.('object');
+
+      if (methodName && PENDING_DISPATCH_METHODS.has(methodName)) {
+        const busCall = findBusBuilderCall(objectNode);
+        if (busCall?.argsNode) {
+          const args = getCallArgumentExpressions(busCall.argsNode);
+          const jobExpr = args[0];
+          const classRefs = extractClassRefsFromArrayExpression(jobExpr);
+          for (const classRef of classRefs) {
+            calls.push({
+              callNode: node,
+              kind: busCall.kind === 'chain' ? 'bus-chain' : 'bus-batch',
+              classRef,
+            });
+          }
+        }
+
+        const withChainCall = findJobWithChainCall(objectNode);
+        if (withChainCall) {
+          calls.push({
+            callNode: node,
+            kind: 'with-chain-root',
+            classRef: withChainCall.jobClassRef,
+          });
+
+          const args = getCallArgumentExpressions(withChainCall.argsNode);
+          const chainExpr = args[0];
+          const classRefs = extractClassRefsFromArrayExpression(chainExpr);
+          for (const classRef of classRefs) {
+            calls.push({
+              callNode: node,
+              kind: 'with-chain-item',
+              classRef,
+            });
+          }
+        }
+      }
+
+      if (methodName === 'chain') {
+        const staticDispatch = findStaticJobDispatchCall(objectNode);
+        if (staticDispatch) {
+          const argsNode = node.childForFieldName?.('arguments');
+          const args = getCallArgumentExpressions(argsNode);
+          const chainExpr = args[0];
+          const classRefs = extractClassRefsFromArrayExpression(chainExpr);
+          for (const classRef of classRefs) {
+            calls.push({
+              callNode: node,
+              kind: 'dispatch-chain-item',
+              classRef,
+            });
+          }
+        }
+      }
+    }
+
     for (const child of node.namedChildren || []) {
       visit(child);
     }
@@ -228,7 +396,7 @@ const isJobDispatchRelevantFile = (filePath: string, content: string): boolean =
   const lang = getLanguageFromFilename(filePath);
   if (lang !== SupportedLanguages.PHP) return false;
   // Cheap prefilter before parsing.
-  return /\bdispatch(?:_sync)?\s*\(|::\s*dispatch(?:Sync|Now|AfterResponse|If|Unless)?\s*\(|\bBus\s*::\s*dispatch\b/.test(content);
+  return /\bdispatch(?:_sync)?\s*\(|::\s*dispatch(?:Sync|Now|AfterResponse|If|Unless)?\s*\(|::\s*withChain\s*\(|->\s*chain\s*\(|\bBus\s*::\s*(?:dispatch|chain|batch)\b/.test(content);
 };
 
 export const processLaravelJobDispatch = async (
@@ -237,6 +405,7 @@ export const processLaravelJobDispatch = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Promise<{ edgesAdded: number }> => {
   const parser = await loadParser();
   await loadLanguage(SupportedLanguages.PHP);
@@ -263,7 +432,7 @@ export const processLaravelJobDispatch = async (
     if (dispatchCalls.length === 0) continue;
 
     for (const call of dispatchCalls) {
-      const resolved = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap);
+      const resolved = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap, phpUseAliases);
       if (!resolved) continue;
 
       const handlerMethodId = symbolTable.lookupExact(resolved.filePath, 'handle')
@@ -287,4 +456,3 @@ export const processLaravelJobDispatch = async (
 
   return { edgesAdded };
 };
-

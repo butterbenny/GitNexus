@@ -2,7 +2,7 @@ import Parser from 'tree-sitter';
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import { SymbolTable, SymbolDefinition } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import { ImportMap, PhpUseAliasMap, expandPhpClassRefFromUseAliases } from './import-processor.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename } from './utils.js';
 import { loadLanguage, loadParser } from '../tree-sitter/parser-loader.js';
@@ -34,10 +34,12 @@ const resolvePhpClassToFile = (
   currentFilePath: string,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
   kind: ScheduleCallKind,
 ): ResolvedClass | null => {
   const normalizedRef = stripPhpClassConstant(classRef);
-  const { baseName, parts } = normalizePhpClassRef(normalizedRef);
+  const expandedRef = expandPhpClassRefFromUseAliases(normalizedRef, currentFilePath, phpUseAliases);
+  const { baseName, parts } = normalizePhpClassRef(expandedRef);
   if (!looksLikePhpIdentifier(baseName)) return null;
 
   const classDefs = symbolTable
@@ -153,6 +155,7 @@ export const processLaravelSchedule = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Promise<{ filesProcessed: number; relationshipsAdded: number }> => {
   const kernelFiles = files.filter(f => KERNEL_FILE_PATH_RE.test(f.path));
   if (kernelFiles.length === 0) return { filesProcessed: 0, relationshipsAdded: 0 };
@@ -209,7 +212,7 @@ export const processLaravelSchedule = async (
       const classRef = parseClassRefFromScheduleArg(argNode);
       if (!classRef) continue;
 
-      const resolved = resolvePhpClassToFile(classRef, file.path, symbolTable, importMap, kind);
+      const resolved = resolvePhpClassToFile(classRef, file.path, symbolTable, importMap, phpUseAliases, kind);
       if (!resolved) continue;
 
       const handlerMethodId = symbolTable.lookupExact(resolved.filePath, 'handle')
@@ -231,4 +234,3 @@ export const processLaravelSchedule = async (
 
   return { filesProcessed, relationshipsAdded };
 };
-

@@ -28,6 +28,8 @@ program
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--skip-embeddings', 'Skip embedding generation (faster)')
+  .option('--write-context', 'Write GitNexus context into AGENTS.md/CLAUDE.md (and install .claude skills)')
+  .option('--update-gitignore', 'Add .gitnexus to the repo .gitignore')
   .action(analyzeCommand);
 
 program

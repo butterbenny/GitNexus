@@ -2,7 +2,7 @@ import Parser from 'tree-sitter';
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import { SymbolTable } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import { ImportMap, PhpUseAliasMap } from './import-processor.js';
 import { loadLanguage, loadParser } from '../tree-sitter/parser-loader.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { generateId } from '../../lib/utils.js';
@@ -82,6 +82,7 @@ const buildLaravelNamedRouteIndex = (
   files: { path: string; content: string }[],
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Map<string, ResolvedNamedRouteTarget[]> => {
   const index = new Map<string, ResolvedNamedRouteTarget[]>();
 
@@ -102,7 +103,7 @@ const buildLaravelNamedRouteIndex = (
       if (targets.length !== 1) continue;
 
       const target = targets[0];
-      const resolvedController = resolveController(target.controllerClass, file.path, symbolTable, importMap);
+      const resolvedController = resolveController(target.controllerClass, file.path, symbolTable, importMap, phpUseAliases);
       if (!resolvedController) continue;
 
       const methodNodeId = symbolTable.lookupExact(resolvedController.filePath, target.controllerMethod);
@@ -338,8 +339,9 @@ export const processLaravelRouteNameWiring = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Promise<{ edgesAdded: number }> => {
-  const routeNameIndex = buildLaravelNamedRouteIndex(files, symbolTable, importMap);
+  const routeNameIndex = buildLaravelNamedRouteIndex(files, symbolTable, importMap, phpUseAliases);
   if (routeNameIndex.size === 0) return { edgesAdded: 0 };
 
   let edgesAdded = 0;
@@ -479,4 +481,3 @@ export const processLaravelRouteNameWiring = async (
 
   return { edgesAdded };
 };
-

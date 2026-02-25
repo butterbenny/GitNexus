@@ -18,6 +18,12 @@ export type ImportMap = Map<string, Set<string>>;
 
 export const createImportMap = (): ImportMap => new Map();
 
+// PHP: Map<FilePath, Map<AliasName, FullyQualifiedName>>
+// Example: "use App\\Services\\EmailService as Mailer;" -> { Mailer: "App\\Services\\EmailService" }
+export type PhpUseAliasMap = Map<string, Map<string, string>>;
+
+export const createPhpUseAliasMap = (): PhpUseAliasMap => new Map();
+
 // ============================================================================
 // LANGUAGE-SPECIFIC CONFIG
 // ============================================================================
@@ -156,6 +162,99 @@ function splitTopLevelByComma(value: string): string[] {
 function stripPhpAlias(value: string): string {
   return value.replace(/\s+as\s+[\w\x80-\xff]+/i, '').trim();
 }
+
+function parsePhpAliasClause(value: string): { imported: string; alias: string | null } {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return { imported: '', alias: null };
+
+  const match = /\s+as\s+([\w\x80-\xff]+)\s*$/i.exec(trimmed);
+  if (!match || match.index === undefined) return { imported: trimmed, alias: null };
+
+  const alias = match[1]?.trim();
+  const imported = trimmed.slice(0, match.index).trim();
+  return { imported, alias: alias || null };
+}
+
+function extractPhpUseAliases(raw: string): Map<string, string> {
+  let body = raw.trim();
+  if (body.length === 0) return new Map();
+
+  body = body.replace(/^use\s+/i, '').replace(/;+\s*$/, '').trim();
+  if (body.length === 0) return new Map();
+
+  // Ignore `use function ...` / `use const ...`
+  if (/^(function|const)\s+/i.test(body)) return new Map();
+
+  const aliases = new Map<string, string>();
+  const topLevel = splitTopLevelByComma(body);
+
+  for (const partRaw of topLevel) {
+    let part = partRaw.trim();
+    if (part.length === 0) continue;
+
+    part = part.replace(/^\\+/, '');
+
+    const braceStart = part.indexOf('{');
+    if (braceStart >= 0) {
+      const braceEnd = part.lastIndexOf('}');
+      if (braceEnd < braceStart) continue;
+
+      const prefixRaw = part.slice(0, braceStart).trim().replace(/^\\+/, '');
+      const innerRaw = part.slice(braceStart + 1, braceEnd).trim();
+
+      const prefix = prefixRaw.length === 0
+        ? ''
+        : prefixRaw.endsWith('\\') ? prefixRaw : prefixRaw + '\\';
+
+      const innerParts = splitTopLevelByComma(innerRaw);
+      for (const innerPartRaw of innerParts) {
+        const innerPart = innerPartRaw.trim();
+        if (innerPart.length === 0) continue;
+        if (/^(function|const)\s+/i.test(innerPart)) continue;
+
+        const parsed = parsePhpAliasClause(innerPart);
+        if (!parsed.alias) continue;
+
+        const imported = parsed.imported.replace(/^\\+/, '').trim();
+        if (imported.length === 0) continue;
+
+        aliases.set(parsed.alias, prefix + imported);
+      }
+      continue;
+    }
+
+    const parsed = parsePhpAliasClause(part);
+    if (!parsed.alias) continue;
+
+    const imported = parsed.imported.replace(/^\\+/, '').trim();
+    if (imported.length === 0) continue;
+
+    aliases.set(parsed.alias, imported);
+  }
+
+  return aliases;
+}
+
+export const expandPhpClassRefFromUseAliases = (
+  classRef: string,
+  currentFilePath: string,
+  phpUseAliases: PhpUseAliasMap,
+): string => {
+  const aliasMap = phpUseAliases.get(currentFilePath);
+  if (!aliasMap || aliasMap.size === 0) return classRef;
+
+  const trimmed = classRef.trim().replace(/^\\+/, '');
+  if (trimmed.length === 0) return classRef;
+
+  const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+  if (parts.length === 0) return classRef;
+
+  const aliasTarget = aliasMap.get(parts[0]);
+  if (!aliasTarget) return classRef;
+
+  if (parts.length === 1) return aliasTarget;
+  return `${aliasTarget}\\${parts.slice(1).join('\\')}`;
+};
 
 /**
  * Expand a PHP `use ...;` declaration into one-or-more imported fully-qualified names.
@@ -788,6 +887,7 @@ export const processImports = async (
   files: { path: string; content: string }[],
   astCache: ASTCache,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
   onProgress?: (current: number, total: number) => void,
   repoRoot?: string,
 ) => {
@@ -922,6 +1022,20 @@ export const processImports = async (
           ? expandPhpUseDeclaration(rawImportPath)
           : [rawImportPath];
 
+        if (language === SupportedLanguages.PHP) {
+          const aliases = extractPhpUseAliases(rawImportPath);
+          if (aliases.size > 0) {
+            let fileAliases = phpUseAliases.get(file.path);
+            if (!fileAliases) {
+              fileAliases = new Map<string, string>();
+              phpUseAliases.set(file.path, fileAliases);
+            }
+            for (const [alias, imported] of aliases) {
+              fileAliases.set(alias, imported);
+            }
+          }
+        }
+
         for (const importPath of importPaths) {
           totalImportsFound++;
 
@@ -994,6 +1108,7 @@ export const processImportsFromExtracted = async (
   files: { path: string; content: string }[],
   extractedImports: ExtractedImport[],
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
   onProgress?: (current: number, total: number) => void,
   repoRoot?: string,
 ) => {
@@ -1087,6 +1202,20 @@ export const processImportsFromExtracted = async (
     }
 
     for (const { rawImportPath, language } of fileImports) {
+      if (language === SupportedLanguages.PHP) {
+        const aliases = extractPhpUseAliases(rawImportPath);
+        if (aliases.size > 0) {
+          let fileAliases = phpUseAliases.get(filePath);
+          if (!fileAliases) {
+            fileAliases = new Map<string, string>();
+            phpUseAliases.set(filePath, fileAliases);
+          }
+          for (const [alias, imported] of aliases) {
+            fileAliases.set(alias, imported);
+          }
+        }
+      }
+
       const importPaths = language === SupportedLanguages.PHP
         ? expandPhpUseDeclaration(rawImportPath)
         : [rawImportPath];

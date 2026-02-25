@@ -37,6 +37,15 @@ test('PHP: indexes classes and methods', async () => {
     .filter(n => n.properties?.name === 'index');
   assert.equal(controllerMethods.length, 1);
 
+  const controllerMemberEdges = graph.relationships.filter(r => {
+    return r.type === 'MEMBER_OF'
+      && r.sourceId === controllerMethods[0].id
+      && r.targetId === controllerClasses[0].id;
+  });
+  assert.equal(controllerMemberEdges.length, 1);
+  assert.equal(controllerMemberEdges[0].reason, 'php-enclosing-type');
+  assert.equal(controllerMemberEdges[0].confidence, 1.0);
+
   const serviceClasses = getNodes(graph, 'Class', 'app/Services/TicketService.php')
     .filter(n => n.properties?.name === 'TicketService');
   assert.equal(serviceClasses.length, 1);
@@ -50,6 +59,191 @@ test('PHP: indexes classes and methods', async () => {
     return n.label !== 'File' && n.label !== 'Template';
   });
   assert.equal(bladeSymbols.length, 0);
+});
+
+test('PHP: captures extends and implements heritage edges', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const ticketService = getNodes(graph, 'Class', 'app/Services/TicketService.php')
+    .find(n => n.properties?.name === 'TicketService');
+  assert.ok(ticketService);
+
+  const baseService = getNodes(graph, 'Class', 'app/Services/BaseService.php')
+    .find(n => n.properties?.name === 'BaseService');
+  assert.ok(baseService);
+
+  const ticketHandler = getNodes(graph, 'Interface', 'app/Services/Contracts/TicketHandler.php')
+    .find(n => n.properties?.name === 'TicketHandler');
+  assert.ok(ticketHandler);
+
+  const extendsEdges = graph.relationships.filter(r => {
+    return r.type === 'EXTENDS'
+      && r.sourceId === ticketService.id
+      && r.targetId === baseService.id;
+  });
+  assert.equal(extendsEdges.length, 1);
+  assert.equal(extendsEdges[0].confidence, 1.0);
+  assert.equal(extendsEdges[0].reason, '');
+
+  const implementsEdges = graph.relationships.filter(r => {
+    return r.type === 'IMPLEMENTS'
+      && r.sourceId === ticketService.id
+      && r.targetId === ticketHandler.id;
+  });
+  assert.equal(implementsEdges.length, 1);
+  assert.equal(implementsEdges[0].confidence, 1.0);
+  assert.equal(implementsEdges[0].reason, '');
+});
+
+test('PHP: resolves member calls using inferred $this property types', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerIndex = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(controllerIndex);
+
+  const serviceHandle = getNodes(graph, 'Method', 'app/Services/TicketService.php')
+    .find(n => n.properties?.name === 'handle');
+  assert.ok(serviceHandle);
+
+  const callEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerIndex.id
+      && r.targetId === serviceHandle.id;
+  });
+  assert.equal(callEdges.length, 1);
+  assert.equal(callEdges[0].reason, 'import-resolved');
+  assert.ok(callEdges[0].confidence >= 0.9);
+});
+
+test('PHP: infers container-resolved property types via app()', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerIndex = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(controllerIndex);
+
+  const emailServiceSend = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'send');
+  assert.ok(emailServiceSend);
+
+  const callEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerIndex.id
+      && r.targetId === emailServiceSend.id;
+  });
+  assert.equal(callEdges.length, 1);
+  assert.equal(callEdges[0].reason, 'import-resolved');
+  assert.ok(callEdges[0].confidence >= 0.9);
+});
+
+test('PHP: resolves inline receivers (app/resolve/new) for member calls', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerIndex = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(controllerIndex);
+
+  const emailSendViaApp = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'sendViaApp');
+  assert.ok(emailSendViaApp);
+
+  const emailSendViaResolve = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'sendViaResolve');
+  assert.ok(emailSendViaResolve);
+
+  const ticketHandleViaNew = getNodes(graph, 'Method', 'app/Services/TicketService.php')
+    .find(n => n.properties?.name === 'handleViaNew');
+  assert.ok(ticketHandleViaNew);
+
+  const assertCallEdge = (target) => {
+    const edges = graph.relationships.filter(r => {
+      return r.type === 'CALLS'
+        && r.sourceId === controllerIndex.id
+        && r.targetId === target.id;
+    });
+    assert.equal(edges.length, 1);
+    assert.equal(edges[0].reason, 'import-resolved');
+    assert.ok(edges[0].confidence >= 0.9);
+  };
+
+  assertCallEdge(emailSendViaApp);
+  assertCallEdge(emailSendViaResolve);
+  assertCallEdge(ticketHandleViaNew);
+});
+
+test('PHP: resolves container make receivers (app()->make / App::make) for member calls', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerIndex = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(controllerIndex);
+
+  const emailSendViaMake = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'sendViaMake');
+  assert.ok(emailSendViaMake);
+
+  const emailSendViaFacadeMake = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'sendViaFacadeMake');
+  assert.ok(emailSendViaFacadeMake);
+
+  const emailSendViaMakeAssigned = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'sendViaMakeAssigned');
+  assert.ok(emailSendViaMakeAssigned);
+
+  const emailSendViaFacadeMakeAssigned = getNodes(graph, 'Method', 'app/Services/EmailService.php')
+    .find(n => n.properties?.name === 'sendViaFacadeMakeAssigned');
+  assert.ok(emailSendViaFacadeMakeAssigned);
+
+  const assertCallEdge = (target) => {
+    const edges = graph.relationships.filter(r => {
+      return r.type === 'CALLS'
+        && r.sourceId === controllerIndex.id
+        && r.targetId === target.id;
+    });
+    assert.equal(edges.length, 1);
+    assert.equal(edges[0].reason, 'import-resolved');
+    assert.ok(edges[0].confidence >= 0.9);
+  };
+
+  assertCallEdge(emailSendViaMake);
+  assertCallEdge(emailSendViaFacadeMake);
+  assertCallEdge(emailSendViaMakeAssigned);
+  assertCallEdge(emailSendViaFacadeMakeAssigned);
+});
+
+test('PHP: resolves $this calls to trait methods', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const serviceHandle = getNodes(graph, 'Method', 'app/Services/TraitUserService.php')
+    .find(n => n.properties?.name === 'handle');
+  assert.ok(serviceHandle);
+
+  const traitNode = getNodes(graph, 'Trait', 'app/Traits/DoesThing.php')
+    .find(n => n.properties?.name === 'DoesThing');
+  assert.ok(traitNode);
+
+  const traitDoThing = getNodes(graph, 'Method', 'app/Traits/DoesThing.php')
+    .find(n => n.properties?.name === 'doThing');
+  assert.ok(traitDoThing);
+
+  const traitMemberEdges = graph.relationships.filter(r => {
+    return r.type === 'MEMBER_OF'
+      && r.sourceId === traitDoThing.id
+      && r.targetId === traitNode.id;
+  });
+  assert.equal(traitMemberEdges.length, 1);
+  assert.equal(traitMemberEdges[0].reason, 'php-enclosing-type');
+  assert.equal(traitMemberEdges[0].confidence, 1.0);
+
+  const callEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === serviceHandle.id
+      && r.targetId === traitDoThing.id;
+  });
+  assert.equal(callEdges.length, 1);
+  assert.equal(callEdges[0].reason, 'import-resolved');
+  assert.ok(callEdges[0].confidence >= 0.9);
 });
 
 test('PHP: resolves imports from use statements', async () => {
@@ -539,4 +733,142 @@ test('Full-stack: frontend HTTP calls wire to Laravel controller methods', async
   });
   assert.equal(httpEdges.length, 1);
   assert.ok(httpEdges[0].confidence >= 0.9);
+
+  const fetchUsersViaClient = getNodes(graph, 'Function', 'apps/dashboard/src/api/instanceClient.ts')
+    .find(n => n.properties?.name === 'fetchUsersViaClient');
+  assert.ok(fetchUsersViaClient);
+
+  const instanceEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchUsersViaClient.id
+      && r.targetId === controllerIndex.id
+      && r.reason === 'http-get:/api/users';
+  });
+  assert.equal(instanceEdges.length, 1);
+  assert.ok(instanceEdges[0].confidence >= 0.95);
+
+  const revokeTicket = getNodes(graph, 'Function', 'apps/dashboard/src/api/tickets.ts')
+    .find(n => n.properties?.name === 'revokeTicket');
+  assert.ok(revokeTicket);
+
+  const revokeTicketController = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Tickets/RevokeTicketController.php')
+    .find(n => n.properties?.name === '__invoke');
+  assert.ok(revokeTicketController);
+
+  const revokeEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === revokeTicket.id
+      && r.targetId === revokeTicketController.id
+      && r.reason === 'http-post:/api/tickets/*/revoke';
+  });
+  assert.equal(revokeEdges.length, 1);
+  assert.ok(revokeEdges[0].confidence >= 0.9);
+
+  const fetchFinancialAccountSummary = getNodes(graph, 'Function', 'apps/dashboard/src/api/finance.ts')
+    .find(n => n.properties?.name === 'fetchFinancialAccountSummary');
+  assert.ok(fetchFinancialAccountSummary);
+
+  const financialSummaryController = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Finance/FinancialAccountController.php')
+    .find(n => n.properties?.name === 'summary');
+  assert.ok(financialSummaryController);
+
+  const financialSummaryEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchFinancialAccountSummary.id
+      && r.targetId === financialSummaryController.id
+      && r.reason === 'http-get:/api/accounts/*/financial_accounts/*/summary';
+  });
+  assert.equal(financialSummaryEdges.length, 1);
+  assert.ok(financialSummaryEdges[0].confidence >= 0.9);
+
+  const fetchPayoutAccount = getNodes(graph, 'Function', 'apps/dashboard/src/api/payoutAccount.ts')
+    .find(n => n.properties?.name === 'fetchPayoutAccount');
+  assert.ok(fetchPayoutAccount);
+
+  const payoutAccountIndex = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Payouts/PayoutAccountController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(payoutAccountIndex);
+
+  const payoutAccountEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchPayoutAccount.id
+      && r.targetId === payoutAccountIndex.id
+      && r.reason === 'http-get:/api/accounts/*/payout_account';
+  });
+  assert.equal(payoutAccountEdges.length, 1);
+  assert.ok(payoutAccountEdges[0].confidence >= 0.9);
+
+  const fetchHealth = getNodes(graph, 'Function', 'apps/dashboard/src/api/health.ts')
+    .find(n => n.properties?.name === 'fetchHealth');
+  assert.ok(fetchHealth);
+
+  const healthControllerIndex = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/HealthController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(healthControllerIndex);
+
+  const healthEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchHealth.id
+      && r.targetId === healthControllerIndex.id
+      && r.reason === 'http-get:/health';
+  });
+  assert.equal(healthEdges.length, 1);
+  assert.ok(healthEdges[0].confidence >= 0.95);
+
+  const getAuthToken = getNodes(graph, 'Function', 'apps/dashboard/src/api/auth.ts')
+    .find(n => n.properties?.name === 'getAuthToken');
+  assert.ok(getAuthToken);
+
+  const loginController = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Mobile/Auth/LoginController.php')
+    .find(n => n.properties?.name === '__invoke');
+  assert.ok(loginController);
+
+  const loginEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === getAuthToken.id
+      && r.targetId === loginController.id
+      && r.reason === 'http-post:/api-mobile/login';
+  });
+  assert.equal(loginEdges.length, 1);
+  assert.ok(loginEdges[0].confidence >= 0.95);
+});
+
+test('Full-stack: does not emit cross-language fuzzy-global edges', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const callPhpOnlySymbol = getNodes(graph, 'Function', 'apps/dashboard/src/api/fuzzyGlobal.ts')
+    .find(n => n.properties?.name === 'callPhpOnlySymbol');
+  assert.ok(callPhpOnlySymbol);
+
+  const phpTarget = getNodes(graph, 'Method', 'apps/backend/app/Support/FuzzyGlobalOnlyTarget.php')
+    .find(n => n.properties?.name === 'gitNexusFuzzyGlobalOnlyTarget');
+  assert.ok(phpTarget);
+
+  const fuzzyEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === callPhpOnlySymbol.id
+      && r.targetId === phpTarget.id
+      && r.reason === 'fuzzy-global';
+  });
+  assert.equal(fuzzyEdges.length, 0);
+});
+
+test('Full-stack: does not emit cross-app fuzzy-global edges', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const callPhpOnlySymbol = getNodes(graph, 'Function', 'apps/dashboard/src/api/fuzzyGlobal.ts')
+    .find(n => n.properties?.name === 'callPhpOnlySymbol');
+  assert.ok(callPhpOnlySymbol);
+
+  const backendTarget = getNodes(graph, 'Function', 'apps/backend/resources/js/fuzzyGlobalTarget.ts')
+    .find(n => n.properties?.name === 'gitNexusBackendOnlySymbol');
+  assert.ok(backendTarget);
+
+  const fuzzyEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === callPhpOnlySymbol.id
+      && r.targetId === backendTarget.id
+      && r.reason === 'fuzzy-global';
+  });
+  assert.equal(fuzzyEdges.length, 0);
 });

@@ -213,7 +213,7 @@ type AdjacencyList = Map<string, string[]>;
 
 /**
  * Minimum edge confidence for process tracing.
- * Filters out ambiguous fuzzy-global matches (0.3) that cause
+ * Filters out low-confidence edges that tend to inject noise and cause
  * traces to jump across unrelated code areas.
  */
 const MIN_TRACE_CONFIDENCE = 0.5;

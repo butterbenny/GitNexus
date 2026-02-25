@@ -15,6 +15,16 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, getParseableContent, yieldToEventLoop } from './utils.js';
 import type { ExtractedHeritage } from './workers/parse-worker.js';
+import type { SymbolDefinition } from './symbol-table.js';
+
+const resolveUniqueDefinition = (
+  defs: SymbolDefinition[],
+  allowedTypes: Set<string>,
+): SymbolDefinition | null => {
+  const filtered = defs.filter(d => allowedTypes.has(d.type));
+  if (filtered.length === 1) return filtered[0];
+  return null;
+};
 
 export const processHeritage = async (
   graph: KnowledgeGraph,
@@ -82,12 +92,12 @@ export const processHeritage = async (
         const parentClassName = captureMap['heritage.extends'].text;
 
         // Resolve both class IDs
-        const childId = symbolTable.lookupExact(file.path, className) ||
-                        symbolTable.lookupFuzzy(className)[0]?.nodeId ||
-                        generateId('Class', `${file.path}:${className}`);
-        
-        const parentId = symbolTable.lookupFuzzy(parentClassName)[0]?.nodeId ||
-                         generateId('Class', `${parentClassName}`);
+        const childId = symbolTable.lookupExact(file.path, className)
+          ?? resolveUniqueDefinition(symbolTable.lookupFuzzy(className), new Set(['Class', 'Interface']))?.nodeId
+          ?? null;
+
+        const parentId = resolveUniqueDefinition(symbolTable.lookupFuzzy(parentClassName), new Set(['Class', 'Interface']))?.nodeId
+          ?? null;
 
         if (childId && parentId && childId !== parentId) {
           const relId = generateId('EXTENDS', `${childId}->${parentId}`);
@@ -109,12 +119,12 @@ export const processHeritage = async (
         const interfaceName = captureMap['heritage.implements'].text;
 
         // Resolve class and interface IDs
-        const classId = symbolTable.lookupExact(file.path, className) ||
-                        symbolTable.lookupFuzzy(className)[0]?.nodeId ||
-                        generateId('Class', `${file.path}:${className}`);
-        
-        const interfaceId = symbolTable.lookupFuzzy(interfaceName)[0]?.nodeId ||
-                            generateId('Interface', `${interfaceName}`);
+        const classId = symbolTable.lookupExact(file.path, className)
+          ?? resolveUniqueDefinition(symbolTable.lookupFuzzy(className), new Set(['Class']))?.nodeId
+          ?? null;
+
+        const interfaceId = resolveUniqueDefinition(symbolTable.lookupFuzzy(interfaceName), new Set(['Interface']))?.nodeId
+          ?? null;
 
         if (classId && interfaceId) {
           const relId = generateId('IMPLEMENTS', `${classId}->${interfaceId}`);
@@ -136,12 +146,12 @@ export const processHeritage = async (
         const traitName = captureMap['heritage.trait'].text;
 
         // Resolve struct and trait IDs
-        const structId = symbolTable.lookupExact(file.path, structName) ||
-                         symbolTable.lookupFuzzy(structName)[0]?.nodeId ||
-                         generateId('Struct', `${file.path}:${structName}`);
-        
-        const traitId = symbolTable.lookupFuzzy(traitName)[0]?.nodeId ||
-                        generateId('Trait', `${traitName}`);
+        const structId = symbolTable.lookupExact(file.path, structName)
+          ?? resolveUniqueDefinition(symbolTable.lookupFuzzy(structName), new Set(['Struct']))?.nodeId
+          ?? null;
+
+        const traitId = resolveUniqueDefinition(symbolTable.lookupFuzzy(traitName), new Set(['Trait']))?.nodeId
+          ?? null;
 
         if (structId && traitId) {
           const relId = generateId('IMPLEMENTS', `${structId}->${traitId}`);
@@ -183,12 +193,12 @@ export const processHeritageFromExtracted = async (
     const h = extractedHeritage[i];
 
     if (h.kind === 'extends') {
-      const childId = symbolTable.lookupExact(h.filePath, h.className) ||
-                      symbolTable.lookupFuzzy(h.className)[0]?.nodeId ||
-                      generateId('Class', `${h.filePath}:${h.className}`);
+      const childId = symbolTable.lookupExact(h.filePath, h.className)
+        ?? resolveUniqueDefinition(symbolTable.lookupFuzzy(h.className), new Set(['Class', 'Interface']))?.nodeId
+        ?? null;
 
-      const parentId = symbolTable.lookupFuzzy(h.parentName)[0]?.nodeId ||
-                       generateId('Class', `${h.parentName}`);
+      const parentId = resolveUniqueDefinition(symbolTable.lookupFuzzy(h.parentName), new Set(['Class', 'Interface']))?.nodeId
+        ?? null;
 
       if (childId && parentId && childId !== parentId) {
         graph.addRelationship({
@@ -201,12 +211,12 @@ export const processHeritageFromExtracted = async (
         });
       }
     } else if (h.kind === 'implements') {
-      const classId = symbolTable.lookupExact(h.filePath, h.className) ||
-                      symbolTable.lookupFuzzy(h.className)[0]?.nodeId ||
-                      generateId('Class', `${h.filePath}:${h.className}`);
+      const classId = symbolTable.lookupExact(h.filePath, h.className)
+        ?? resolveUniqueDefinition(symbolTable.lookupFuzzy(h.className), new Set(['Class']))?.nodeId
+        ?? null;
 
-      const interfaceId = symbolTable.lookupFuzzy(h.parentName)[0]?.nodeId ||
-                          generateId('Interface', `${h.parentName}`);
+      const interfaceId = resolveUniqueDefinition(symbolTable.lookupFuzzy(h.parentName), new Set(['Interface']))?.nodeId
+        ?? null;
 
       if (classId && interfaceId) {
         graph.addRelationship({
@@ -219,12 +229,12 @@ export const processHeritageFromExtracted = async (
         });
       }
     } else if (h.kind === 'trait-impl') {
-      const structId = symbolTable.lookupExact(h.filePath, h.className) ||
-                       symbolTable.lookupFuzzy(h.className)[0]?.nodeId ||
-                       generateId('Struct', `${h.filePath}:${h.className}`);
+      const structId = symbolTable.lookupExact(h.filePath, h.className)
+        ?? resolveUniqueDefinition(symbolTable.lookupFuzzy(h.className), new Set(['Struct']))?.nodeId
+        ?? null;
 
-      const traitId = symbolTable.lookupFuzzy(h.parentName)[0]?.nodeId ||
-                      generateId('Trait', `${h.parentName}`);
+      const traitId = resolveUniqueDefinition(symbolTable.lookupFuzzy(h.parentName), new Set(['Trait']))?.nodeId
+        ?? null;
 
       if (structId && traitId) {
         graph.addRelationship({

@@ -2,11 +2,17 @@
 
 namespace App\Services;
 
-class TicketService
+use App\Services\Contracts\TicketHandler;
+
+class TicketService extends BaseService implements TicketHandler
 {
     public function handle(): string
     {
         return $this->format('ok');
+    }
+
+    public function handleViaNew(): void
+    {
     }
 
     private function format(string $value): string
@@ -14,4 +20,3 @@ class TicketService
         return strtoupper($value);
     }
 }
-

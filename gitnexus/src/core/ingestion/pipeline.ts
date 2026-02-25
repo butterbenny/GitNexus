@@ -1,7 +1,7 @@
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { processStructure } from './structure-processor.js';
 import { processParsing } from './parsing-processor.js';
-import { processImports, processImportsFromExtracted, createImportMap } from './import-processor.js';
+import { processImports, processImportsFromExtracted, createImportMap, createPhpUseAliasMap } from './import-processor.js';
 import { processCalls, processCallsFromExtracted } from './call-processor.js';
 import { processLaravelRoutes } from './laravel-route-processor.js';
 import { processLaravelHttpWiring } from './laravel-http-processor.js';
@@ -11,6 +11,7 @@ import { processLaravelEvents } from './laravel-event-processor.js';
 import { processLaravelEventDispatch } from './laravel-event-dispatch-processor.js';
 import { processLaravelSchedule } from './laravel-schedule-processor.js';
 import { processLaravelJobDispatch } from './laravel-job-dispatch-processor.js';
+import { processLaravelNotifications } from './laravel-notification-processor.js';
 import { processBladeTemplates } from './blade-template-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -33,6 +34,7 @@ export const runPipelineFromRepo = async (
   // AST cache sized after file scan — start with a placeholder, resize after we know file count
   let astCache = createASTCache(50);
   const importMap = createImportMap();
+  const phpUseAliases = createPhpUseAliasMap();
 
   const cleanup = () => {
     astCache.clear();
@@ -129,7 +131,7 @@ export const runPipelineFromRepo = async (
 
     if (workerData) {
       // Fast path: imports already extracted by workers, just resolve paths
-      await processImportsFromExtracted(graph, files, workerData.imports, importMap, (current, total) => {
+      await processImportsFromExtracted(graph, files, workerData.imports, importMap, phpUseAliases, (current, total) => {
         const importProgress = 70 + ((current / total) * 12);
         onProgress({
           phase: 'imports',
@@ -140,7 +142,7 @@ export const runPipelineFromRepo = async (
       }, repoPath);
     } else {
       // Fallback: full parse + resolve (sequential path)
-      await processImports(graph, files, astCache, importMap, (current, total) => {
+      await processImports(graph, files, astCache, importMap, phpUseAliases, (current, total) => {
         const importProgress = 70 + ((current / total) * 12);
         onProgress({
           phase: 'imports',
@@ -165,7 +167,7 @@ export const runPipelineFromRepo = async (
 
     if (workerData) {
       // Fast path: calls already extracted by workers, just resolve targets
-      await processCallsFromExtracted(graph, workerData.calls, symbolTable, importMap, (current, total) => {
+      await processCallsFromExtracted(graph, workerData.calls, symbolTable, importMap, phpUseAliases, workerData.phpAssignments, workerData.phpTraitUses, (current, total) => {
         const callProgress = 82 + ((current / total) * 10);
         onProgress({
           phase: 'calls',
@@ -176,7 +178,7 @@ export const runPipelineFromRepo = async (
       });
     } else {
       // Fallback: full parse + resolve (sequential path)
-      await processCalls(graph, files, astCache, symbolTable, importMap, (current, total) => {
+      await processCalls(graph, files, astCache, symbolTable, importMap, phpUseAliases, (current, total) => {
         const callProgress = 82 + ((current / total) * 10);
         onProgress({
           phase: 'calls',
@@ -194,14 +196,15 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    await processLaravelViewsAndMail(graph, files, astCache, symbolTable, importMap);
-    await processLaravelEvents(graph, files, astCache, symbolTable, importMap);
-    await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap);
-    await processLaravelSchedule(graph, files, astCache, symbolTable, importMap);
-    await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap);
-    processLaravelRoutes(graph, files, symbolTable, importMap);
-    await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap);
-    await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap);
+    await processLaravelViewsAndMail(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelEvents(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelSchedule(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelNotifications(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    processLaravelRoutes(graph, files, symbolTable, importMap, phpUseAliases);
+    await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
 
     onProgress({
       phase: 'heritage',

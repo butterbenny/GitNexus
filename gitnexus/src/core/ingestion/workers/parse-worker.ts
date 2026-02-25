@@ -36,7 +36,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES';
+  type: 'DEFINES' | 'MEMBER_OF';
   confidence: number;
   reason: string;
 }
@@ -59,6 +59,16 @@ export interface ExtractedCall {
   calledName: string;
   /** generateId of enclosing function, or generateId('File', filePath) for top-level */
   sourceId: string;
+  /** 0-based tree-sitter row of the call expression (PHP only for now) */
+  startLine?: number;
+  /** PHP-only call kind for better resolution */
+  kind?: 'simple' | 'member' | 'scoped';
+  /** PHP-only: receiver expression for member calls (e.g. "$this", "$service") */
+  receiver?: string;
+  /** PHP-only: inferred class ref for inline receivers (e.g. app(Foo::class)->bar(), (new Foo())->bar()) */
+  receiverClassRef?: string;
+  /** PHP-only: scope expression for scoped calls (e.g. "Foo\\Bar", "self") */
+  scope?: string;
 }
 
 export interface ExtractedHeritage {
@@ -69,6 +79,24 @@ export interface ExtractedHeritage {
   kind: string;
 }
 
+export interface ExtractedPhpAssignment {
+  filePath: string;
+  /** generateId of enclosing function/method */
+  sourceId: string;
+  /** Variable name including `$` */
+  variableName: string;
+  /** Raw class ref from `new <classRef>(...)` (name or qualified_name text) */
+  classRef: string;
+  /** 0-based tree-sitter row of the assignment */
+  startLine: number;
+}
+
+export interface ExtractedPhpTraitUse {
+  filePath: string;
+  className: string;
+  traitRef: string;
+}
+
 export interface ParseWorkerResult {
   nodes: ParsedNode[];
   relationships: ParsedRelationship[];
@@ -76,6 +104,8 @@ export interface ParseWorkerResult {
   imports: ExtractedImport[];
   calls: ExtractedCall[];
   heritage: ExtractedHeritage[];
+  phpAssignments: ExtractedPhpAssignment[];
+  phpTraitUses: ExtractedPhpTraitUse[];
   fileCount: number;
 }
 
@@ -336,6 +366,664 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
   return 'CodeElement';
 };
 
+type PhpEnclosingType = { label: 'Class' | 'Interface' | 'Trait'; name: string };
+
+const findEnclosingPhpType = (node: any): PhpEnclosingType | null => {
+  let current = node?.parent;
+
+  while (current) {
+    if (current.type === 'class_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        || current.namedChildren?.find((c: any) => c.type === 'name');
+      const name = nameNode?.text;
+      return name ? { label: 'Class', name } : null;
+    }
+
+    if (current.type === 'interface_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        || current.namedChildren?.find((c: any) => c.type === 'name');
+      const name = nameNode?.text;
+      return name ? { label: 'Interface', name } : null;
+    }
+
+    if (current.type === 'trait_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        || current.namedChildren?.find((c: any) => c.type === 'name');
+      const name = nameNode?.text;
+      return name ? { label: 'Trait', name } : null;
+    }
+
+    current = current.parent;
+  }
+
+  return null;
+};
+
+const stripPhpClassConstantText = (value: string): string => value.trim().replace(/::class$/i, '').trim();
+
+const getPhpBaseCallableName = (value: string): string => {
+  const trimmed = value.trim().replace(/^\\+/, '');
+  const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+  return parts.at(-1) ?? trimmed;
+};
+
+const unwrapPhpParens = (expr: any): any => {
+  let current = expr;
+  while (current?.type === 'parenthesized_expression') {
+    const inner = current.namedChildren?.[0];
+    if (!inner) break;
+    current = inner;
+  }
+  return current;
+};
+
+const getPhpCallArgumentExpressions = (argsNode: any): any[] => {
+  if (!argsNode) return [];
+  const named = argsNode.namedChildren || [];
+  const exprs: any[] = [];
+
+  for (const n of named) {
+    if (n.type === 'argument') {
+      const expr = n.namedChildren?.at(-1);
+      if (expr) exprs.push(expr);
+      continue;
+    }
+    exprs.push(n);
+  }
+
+  return exprs;
+};
+
+const inferPhpClassRefFromExpression = (expr: any): string | null => {
+  const e = unwrapPhpParens(expr);
+  if (!e) return null;
+
+  const inferFromTypeArg = (arg: any): string | null => {
+    if (!arg) return null;
+
+    if (arg.type === 'class_constant_access_expression') {
+      const raw = stripPhpClassConstantText(String(arg.text || '')).trim();
+      return raw ? raw.replace(/^\\+/, '') : null;
+    }
+
+    if (arg.type === 'qualified_name' || arg.type === 'name') {
+      const raw = stripPhpClassConstantText(String(arg.text || '')).trim();
+      return raw ? raw.replace(/^\\+/, '') : null;
+    }
+
+    return null;
+  };
+
+  if (e.type === 'object_creation_expression') {
+    const classNode = (e.namedChildren || []).find((c: any) => c.type === 'name' || c.type === 'qualified_name');
+    const raw = String(classNode?.text || '').trim();
+    if (!raw) return null;
+    return raw.replace(/^\\+/, '');
+  }
+
+  if (e.type === 'function_call_expression') {
+    const fnNode = e.childForFieldName?.('function') || e.childForFieldName?.('name');
+    const fnText = String(fnNode?.text || '').trim();
+    const fnName = getPhpBaseCallableName(fnText).toLowerCase();
+    if (fnName !== 'app' && fnName !== 'resolve') return null;
+
+    const argsNode = e.childForFieldName?.('arguments');
+    const args = getPhpCallArgumentExpressions(argsNode);
+    return inferFromTypeArg(args[0]);
+  }
+
+  if (e.type === 'member_call_expression') {
+    const nameNode = e.childForFieldName?.('name');
+    const methodName = String(nameNode?.text || '').trim().toLowerCase();
+    if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+    const objectNode = unwrapPhpParens(e.childForFieldName?.('object'));
+    if (!objectNode || objectNode.type !== 'function_call_expression') return null;
+
+    const fnNode = objectNode.childForFieldName?.('function') || objectNode.childForFieldName?.('name');
+    const fnText = String(fnNode?.text || '').trim();
+    const fnName = getPhpBaseCallableName(fnText).toLowerCase();
+    if (fnName !== 'app') return null;
+
+    const appArgsNode = objectNode.childForFieldName?.('arguments');
+    const appArgs = getPhpCallArgumentExpressions(appArgsNode);
+    if (appArgs.length !== 0) return null;
+
+    const argsNode = e.childForFieldName?.('arguments');
+    const args = getPhpCallArgumentExpressions(argsNode);
+    return inferFromTypeArg(args[0]);
+  }
+
+  if (e.type === 'scoped_call_expression') {
+    const nameNode = e.childForFieldName?.('name');
+    const methodName = String(nameNode?.text || '').trim().toLowerCase();
+    if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+    const scopeNode = e.childForFieldName?.('scope');
+    const scopeText = String(scopeNode?.text || '').trim();
+    const scopeName = getPhpBaseCallableName(scopeText).toLowerCase();
+    if (scopeName !== 'app') return null;
+
+    const argsNode = e.childForFieldName?.('arguments');
+    const args = getPhpCallArgumentExpressions(argsNode);
+    return inferFromTypeArg(args[0]);
+  }
+
+  return null;
+};
+
+const PHP_SCALAR_TYPES = new Set([
+  'int',
+  'float',
+  'string',
+  'bool',
+  'boolean',
+  'array',
+  'callable',
+  'iterable',
+  'mixed',
+  'object',
+  'void',
+  'never',
+  'false',
+  'true',
+  'null',
+  'self',
+  'static',
+  'parent',
+]);
+
+const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssignment[] => {
+  const assignments: ExtractedPhpAssignment[] = [];
+
+  const visit = (node: any) => {
+    if (!node) return;
+
+    if (node.type === 'class_declaration') {
+      const bodyNode = node.childForFieldName?.('body')
+        || node.namedChildren?.find((c: any) => c.type === 'declaration_list');
+      const decls = bodyNode?.namedChildren || [];
+
+      const propertyTypes = new Map<string, string>();
+
+      const normalizeType = (raw: string): string | null => {
+        const cleaned = raw.trim().replace(/^\?+/, '').replace(/^\\+/, '');
+        if (!cleaned) return null;
+        if (PHP_SCALAR_TYPES.has(cleaned.toLowerCase())) return null;
+        return cleaned;
+      };
+
+      const stripPhpClassConstant = (value: string): string => value.trim().replace(/::class$/i, '').trim();
+
+      const getCallArgumentExpressions = (argsNode: any): any[] => {
+        if (!argsNode) return [];
+        const named = argsNode.namedChildren || [];
+        const exprs: any[] = [];
+
+        for (const n of named) {
+          if (n.type === 'argument') {
+            const expr = n.namedChildren?.at(-1);
+            if (expr) exprs.push(expr);
+            continue;
+          }
+          exprs.push(n);
+        }
+
+        return exprs;
+      };
+
+      const getBaseCallableName = (value: string): string => {
+        const trimmed = value.trim().replace(/^\\+/, '');
+        const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+        return parts.at(-1) ?? trimmed;
+      };
+
+      for (const decl of decls) {
+        if (decl.type === 'property_declaration') {
+          const typeNode = decl.childForFieldName?.('type');
+          if (!typeNode) continue;
+
+          const innerType = typeNode.namedChildren?.[0];
+          const classRef = normalizeType(String((innerType?.text ?? typeNode.text) || ''));
+          if (!classRef) continue;
+
+          for (const child of decl.namedChildren || []) {
+            if (child.type !== 'property_element') continue;
+            const varNode = child.namedChildren?.find((c: any) => c.type === 'variable_name');
+            const varText = varNode?.text;
+            if (!varText) continue;
+            const propName = varText.replace(/^\$/, '');
+            if (!propName) continue;
+            propertyTypes.set(`$this->${propName}`, classRef);
+          }
+        }
+
+        if (decl.type === 'method_declaration') {
+          const nameNode = decl.childForFieldName?.('name');
+          if (nameNode?.text !== '__construct') continue;
+
+          const constructorParamTypes = new Map<string, string>();
+
+          const paramsNode = decl.childForFieldName?.('parameters');
+          const params = paramsNode?.namedChildren || [];
+
+          for (const param of params) {
+            const varNode = param.childForFieldName?.('name');
+            const varText = varNode?.type === 'variable_name' ? varNode.text : null;
+            if (!varText) continue;
+
+            const typeNode = param.childForFieldName?.('type');
+            if (!typeNode) continue;
+
+            const innerType = typeNode.namedChildren?.[0];
+            const classRef = normalizeType(String((innerType?.text ?? typeNode.text) || ''));
+            if (!classRef) continue;
+
+            constructorParamTypes.set(varText, classRef);
+
+            if (param.type === 'property_promotion_parameter') {
+              const propName = varText.replace(/^\$/, '');
+              if (!propName) continue;
+              propertyTypes.set(`$this->${propName}`, classRef);
+            }
+          }
+
+          const inferClassRefFromExpression = (expr: any): string | null => {
+            if (!expr) return null;
+
+            if (expr.type === 'parenthesized_expression') {
+              return inferClassRefFromExpression(expr.namedChildren?.[0]);
+            }
+
+            if (expr.type === 'variable_name') {
+              return constructorParamTypes.get(expr.text) || null;
+            }
+
+            if (expr.type === 'object_creation_expression') {
+              const classNode = (expr.namedChildren || []).find((c: any) => c.type === 'name' || c.type === 'qualified_name');
+              const classRef = normalizeType(String(classNode?.text || ''));
+              return classRef;
+            }
+
+            if (expr.type === 'function_call_expression') {
+              const fnNode = expr.childForFieldName?.('function') || expr.childForFieldName?.('name');
+              const fnText = String(fnNode?.text || '').trim();
+              const fnName = getBaseCallableName(fnText).toLowerCase();
+              if (fnName !== 'app' && fnName !== 'resolve') return null;
+
+              const argsNode = expr.childForFieldName?.('arguments');
+              const args = getCallArgumentExpressions(argsNode);
+              const first = args[0];
+              if (!first) return null;
+
+              if (first.type === 'class_constant_access_expression') {
+                return normalizeType(stripPhpClassConstant(String(first.text || '')));
+              }
+              if (first.type === 'qualified_name' || first.type === 'name') {
+                return normalizeType(stripPhpClassConstant(String(first.text || '')));
+              }
+              return null;
+            }
+
+            if (expr.type === 'member_call_expression') {
+              const nameNode = expr.childForFieldName?.('name');
+              const methodName = String(nameNode?.text || '').trim().toLowerCase();
+              if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+              const objectNode = expr.childForFieldName?.('object');
+              if (objectNode?.type !== 'function_call_expression') return null;
+
+              const fnNode = objectNode.childForFieldName?.('function') || objectNode.childForFieldName?.('name');
+              const fnText = String(fnNode?.text || '').trim();
+              const fnName = getBaseCallableName(fnText).toLowerCase();
+              if (fnName !== 'app') return null;
+
+              const appArgsNode = objectNode.childForFieldName?.('arguments');
+              const appArgs = getCallArgumentExpressions(appArgsNode);
+              if (appArgs.length !== 0) return null;
+
+              const argsNode = expr.childForFieldName?.('arguments');
+              const args = getCallArgumentExpressions(argsNode);
+              const first = args[0];
+              if (!first) return null;
+
+              if (first.type === 'class_constant_access_expression') {
+                return normalizeType(stripPhpClassConstant(String(first.text || '')));
+              }
+              if (first.type === 'qualified_name' || first.type === 'name') {
+                return normalizeType(stripPhpClassConstant(String(first.text || '')));
+              }
+              return null;
+            }
+
+            if (expr.type === 'scoped_call_expression') {
+              const nameNode = expr.childForFieldName?.('name');
+              const methodName = String(nameNode?.text || '').trim().toLowerCase();
+              if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+              const scopeNode = expr.childForFieldName?.('scope');
+              const scopeText = String(scopeNode?.text || '').trim();
+              const scopeName = getBaseCallableName(scopeText).toLowerCase();
+              if (scopeName !== 'app') return null;
+
+              const argsNode = expr.childForFieldName?.('arguments');
+              const args = getCallArgumentExpressions(argsNode);
+              const first = args[0];
+              if (!first) return null;
+
+              if (first.type === 'class_constant_access_expression') {
+                return normalizeType(stripPhpClassConstant(String(first.text || '')));
+              }
+              if (first.type === 'qualified_name' || first.type === 'name') {
+                return normalizeType(stripPhpClassConstant(String(first.text || '')));
+              }
+              return null;
+            }
+
+            return null;
+          };
+
+          const bodyNode = decl.childForFieldName?.('body')
+            || decl.namedChildren?.find((c: any) => c.type === 'compound_statement');
+
+          const visitConstructorBody = (node: any) => {
+            if (!node) return;
+
+            if (node.type === 'assignment_expression') {
+              const left = node.childForFieldName?.('left');
+              const right = node.childForFieldName?.('right');
+
+              if (left?.type === 'member_access_expression') {
+                const baseNode = left.childForFieldName?.('object');
+                if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
+                  const variableName = left.text;
+                  const classRef = inferClassRefFromExpression(right);
+                  if (variableName && classRef) {
+                    const existing = propertyTypes.get(variableName);
+                    if (!existing) propertyTypes.set(variableName, classRef);
+                  }
+                }
+              }
+            }
+
+            for (const child of node.namedChildren || []) {
+              visitConstructorBody(child);
+            }
+          };
+
+          visitConstructorBody(bodyNode);
+        }
+      }
+
+      if (propertyTypes.size > 0) {
+        for (const decl of decls) {
+          if (decl.type !== 'method_declaration') continue;
+
+          const nameNode = decl.childForFieldName?.('name');
+          const methodName = nameNode?.text;
+          if (!methodName) continue;
+
+          const sourceId = generateId('Method', `${filePath}:${methodName}`);
+
+          for (const [variableName, classRef] of propertyTypes) {
+            assignments.push({
+              filePath,
+              sourceId,
+              variableName,
+              classRef,
+              startLine: decl.startPosition.row,
+            });
+          }
+        }
+      }
+    }
+
+    if (node.type === 'method_declaration' || node.type === 'function_definition') {
+      const nameNode = node.childForFieldName?.('name');
+      const callableName = nameNode?.text;
+      const label = node.type === 'method_declaration' ? 'Method' : 'Function';
+      const sourceId = callableName ? generateId(label, `${filePath}:${callableName}`) : null;
+
+      if (sourceId) {
+        const paramsNode = node.childForFieldName?.('parameters');
+        const params = paramsNode?.namedChildren || [];
+
+        for (const param of params) {
+          if (param.type !== 'simple_parameter') continue;
+
+          const varNode = param.childForFieldName?.('name');
+          const variableName = varNode?.type === 'variable_name' ? varNode.text : null;
+          if (!variableName) continue;
+
+          const typeNode = param.childForFieldName?.('type');
+          if (!typeNode) continue;
+
+          // named_type wraps (name|qualified_name)
+          const innerType = typeNode.namedChildren?.[0];
+          const classRefRaw = String((innerType?.text ?? typeNode.text) || '').trim();
+          const classRef = classRefRaw.replace(/^\?+/, '').replace(/^\\+/, '');
+          if (!classRef) continue;
+          if (PHP_SCALAR_TYPES.has(classRef.toLowerCase())) continue;
+
+          assignments.push({
+            filePath,
+            sourceId,
+            variableName,
+            classRef,
+            startLine: node.startPosition.row,
+          });
+        }
+      }
+    }
+
+    if (node.type === 'assignment_expression') {
+      const left = node.childForFieldName?.('left');
+      const right = node.childForFieldName?.('right');
+
+      const sourceId = findEnclosingFunctionId(node, filePath);
+      if (sourceId) {
+        const normalizeType = (raw: string): string | null => {
+          const cleaned = raw.trim().replace(/^\?+/, '').replace(/^\\+/, '');
+          if (!cleaned) return null;
+          if (PHP_SCALAR_TYPES.has(cleaned.toLowerCase())) return null;
+          return cleaned;
+        };
+
+        const stripPhpClassConstant = (value: string): string => value.trim().replace(/::class$/i, '').trim();
+
+        const getBaseCallableName = (value: string): string => {
+          const trimmed = value.trim().replace(/^\\+/, '');
+          const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+          return parts.at(-1) ?? trimmed;
+        };
+
+        const getCallArgumentExpressions = (argsNode: any): any[] => {
+          if (!argsNode) return [];
+          const named = argsNode.namedChildren || [];
+          const exprs: any[] = [];
+
+          for (const n of named) {
+            if (n.type === 'argument') {
+              const expr = n.namedChildren?.at(-1);
+              if (expr) exprs.push(expr);
+              continue;
+            }
+            exprs.push(n);
+          }
+
+          return exprs;
+        };
+
+        const inferClassRefFromExpression = (expr: any): string | null => {
+          if (!expr) return null;
+
+          if (expr.type === 'parenthesized_expression') {
+            return inferClassRefFromExpression(expr.namedChildren?.[0]);
+          }
+
+          if (expr.type === 'object_creation_expression') {
+            const classNode = (expr.namedChildren || []).find((c: any) => c.type === 'name' || c.type === 'qualified_name');
+            return classNode?.text ? normalizeType(String(classNode.text)) : null;
+          }
+
+          if (expr.type === 'function_call_expression') {
+            const fnNode = expr.childForFieldName?.('function') || expr.childForFieldName?.('name');
+            const fnText = String(fnNode?.text || '').trim();
+            const fnName = getBaseCallableName(fnText).toLowerCase();
+            if (fnName !== 'app' && fnName !== 'resolve') return null;
+
+            const argsNode = expr.childForFieldName?.('arguments');
+            const args = getCallArgumentExpressions(argsNode);
+            const first = args[0];
+            if (!first) return null;
+
+            if (first.type === 'class_constant_access_expression') {
+              return normalizeType(stripPhpClassConstant(String(first.text || '')));
+            }
+            if (first.type === 'qualified_name' || first.type === 'name') {
+              return normalizeType(stripPhpClassConstant(String(first.text || '')));
+            }
+            return null;
+          }
+
+          if (expr.type === 'member_call_expression') {
+            const nameNode = expr.childForFieldName?.('name');
+            const methodName = String(nameNode?.text || '').trim().toLowerCase();
+            if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+            const objectNode = expr.childForFieldName?.('object');
+            if (objectNode?.type !== 'function_call_expression') return null;
+
+            const fnNode = objectNode.childForFieldName?.('function') || objectNode.childForFieldName?.('name');
+            const fnText = String(fnNode?.text || '').trim();
+            const fnName = getBaseCallableName(fnText).toLowerCase();
+            if (fnName !== 'app') return null;
+
+            const appArgsNode = objectNode.childForFieldName?.('arguments');
+            const appArgs = getCallArgumentExpressions(appArgsNode);
+            if (appArgs.length !== 0) return null;
+
+            const argsNode = expr.childForFieldName?.('arguments');
+            const args = getCallArgumentExpressions(argsNode);
+            const first = args[0];
+            if (!first) return null;
+
+            if (first.type === 'class_constant_access_expression') {
+              return normalizeType(stripPhpClassConstant(String(first.text || '')));
+            }
+            if (first.type === 'qualified_name' || first.type === 'name') {
+              return normalizeType(stripPhpClassConstant(String(first.text || '')));
+            }
+            return null;
+          }
+
+          if (expr.type === 'scoped_call_expression') {
+            const nameNode = expr.childForFieldName?.('name');
+            const methodName = String(nameNode?.text || '').trim().toLowerCase();
+            if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+            const scopeNode = expr.childForFieldName?.('scope');
+            const scopeText = String(scopeNode?.text || '').trim();
+            const scopeName = getBaseCallableName(scopeText).toLowerCase();
+            if (scopeName !== 'app') return null;
+
+            const argsNode = expr.childForFieldName?.('arguments');
+            const args = getCallArgumentExpressions(argsNode);
+            const first = args[0];
+            if (!first) return null;
+
+            if (first.type === 'class_constant_access_expression') {
+              return normalizeType(stripPhpClassConstant(String(first.text || '')));
+            }
+            if (first.type === 'qualified_name' || first.type === 'name') {
+              return normalizeType(stripPhpClassConstant(String(first.text || '')));
+            }
+            return null;
+          }
+
+          return null;
+        };
+
+        if (left?.type === 'variable_name') {
+          const variableName = left.text;
+          const classRef = inferClassRefFromExpression(right);
+          if (variableName && classRef) {
+            assignments.push({
+              filePath,
+              sourceId,
+              variableName,
+              classRef,
+              startLine: node.startPosition.row,
+            });
+          }
+        }
+
+        if (left?.type === 'member_access_expression') {
+          const baseNode = left.childForFieldName?.('object');
+          if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
+            const variableName = left.text;
+            const classRef = inferClassRefFromExpression(right);
+            if (variableName && classRef) {
+              assignments.push({
+                filePath,
+                sourceId,
+                variableName,
+                classRef,
+                startLine: node.startPosition.row,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    for (const child of node.namedChildren || []) {
+      visit(child);
+    }
+  };
+
+  visit(rootNode);
+  return assignments;
+};
+
+const extractPhpTraitUses = (rootNode: any, filePath: string): ExtractedPhpTraitUse[] => {
+  const traitUses: ExtractedPhpTraitUse[] = [];
+
+  const visit = (node: any) => {
+    if (!node) return;
+
+    if (node.type === 'class_declaration') {
+      const classNameNode = node.childForFieldName?.('name')
+        || node.namedChildren?.find((c: any) => c.type === 'name');
+      const className = classNameNode?.text;
+
+      const bodyNode = node.childForFieldName?.('body')
+        || node.namedChildren?.find((c: any) => c.type === 'declaration_list');
+      const decls = bodyNode?.namedChildren || [];
+
+      if (className) {
+        for (const decl of decls) {
+          if (decl.type !== 'use_declaration') continue;
+
+          for (const child of decl.namedChildren || []) {
+            if (child.type !== 'name' && child.type !== 'qualified_name') continue;
+            const traitRef = String(child.text || '').trim();
+            if (!traitRef) continue;
+            traitUses.push({ filePath, className, traitRef });
+          }
+        }
+      }
+    }
+
+    for (const child of node.namedChildren || []) {
+      visit(child);
+    }
+  };
+
+  visit(rootNode);
+  return traitUses;
+};
+
 // ============================================================================
 // Process a batch of files
 // ============================================================================
@@ -348,6 +1036,8 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     imports: [],
     calls: [],
     heritage: [],
+    phpAssignments: [],
+    phpTraitUses: [],
     fileCount: 0,
   };
 
@@ -472,7 +1162,34 @@ const processFileGroup = (
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path)
               || generateId('File', file.path);
-            result.calls.push({ filePath: file.path, calledName, sourceId });
+            const extracted: ExtractedCall = { filePath: file.path, calledName, sourceId };
+
+            if (language === SupportedLanguages.PHP) {
+              extracted.startLine = callNode.startPosition.row;
+              if (callNode.type === 'member_call_expression') {
+                extracted.kind = 'member';
+                const objectNode = callNode.childForFieldName?.('object');
+                if (objectNode?.type === 'variable_name') {
+                  extracted.receiver = objectNode.text;
+                } else if (objectNode?.type === 'member_access_expression') {
+                  const baseNode = objectNode.childForFieldName?.('object');
+                  if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
+                    extracted.receiver = objectNode.text;
+                  }
+                } else {
+                  const classRef = inferPhpClassRefFromExpression(objectNode);
+                  if (classRef) extracted.receiverClassRef = classRef;
+                }
+              } else if (callNode.type === 'scoped_call_expression') {
+                extracted.kind = 'scoped';
+                const scopeNode = callNode.childForFieldName?.('scope');
+                extracted.scope = scopeNode?.text;
+              } else if (callNode.type === 'function_call_expression') {
+                extracted.kind = 'simple';
+              }
+            }
+
+            result.calls.push(extracted);
           }
         }
         continue;
@@ -546,6 +1263,28 @@ const processFileGroup = (
         confidence: 1.0,
         reason: '',
       });
+
+      if (language === SupportedLanguages.PHP && nodeLabel === 'Method') {
+        const methodNode = captureMap['definition.method'];
+        const enclosing = methodNode ? findEnclosingPhpType(methodNode) : null;
+        if (enclosing) {
+          const containerId = generateId(enclosing.label, `${file.path}:${enclosing.name}`);
+          const memberRelId = generateId('MEMBER_OF', `${nodeId}->${containerId}`);
+          result.relationships.push({
+            id: memberRelId,
+            sourceId: nodeId,
+            targetId: containerId,
+            type: 'MEMBER_OF',
+            confidence: 1.0,
+            reason: 'php-enclosing-type',
+          });
+        }
+      }
+    }
+
+    if (language === SupportedLanguages.PHP) {
+      result.phpAssignments.push(...extractPhpVarTypes(tree.rootNode, file.path));
+      result.phpTraitUses.push(...extractPhpTraitUses(tree.rootNode, file.path));
     }
   }
 };

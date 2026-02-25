@@ -335,6 +335,24 @@ export const PHP_QUERIES = `
 (function_call_expression function: (name) @call.name) @call
 (member_call_expression name: (name) @call.name) @call
 (scoped_call_expression name: (name) @call.name) @call
+
+; Heritage queries - class extends
+(class_declaration
+  name: (name) @heritage.class
+  (base_clause
+    (name) @heritage.extends)) @heritage
+
+; Heritage queries - interface extends interface
+(interface_declaration
+  name: (name) @heritage.class
+  (base_clause
+    (name) @heritage.extends)) @heritage
+
+; Heritage queries - class implements interfaces
+(class_declaration
+  name: (name) @heritage.class
+  (class_interface_clause
+    (name) @heritage.implements)) @heritage.impl
 `;
 
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {

@@ -7,7 +7,8 @@ import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, getParseableContent, yieldToEventLoop } from './utils.js';
 import { WorkerPool } from './workers/worker-pool.js';
-import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage } from './workers/parse-worker.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
+import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedPhpAssignment, ExtractedPhpTraitUse } from './workers/parse-worker.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
 
@@ -15,7 +16,42 @@ export interface WorkerExtractedData {
   imports: ExtractedImport[];
   calls: ExtractedCall[];
   heritage: ExtractedHeritage[];
+  phpAssignments: ExtractedPhpAssignment[];
+  phpTraitUses: ExtractedPhpTraitUse[];
 }
+
+type PhpEnclosingType = { label: 'Class' | 'Interface' | 'Trait'; name: string };
+
+const findEnclosingPhpType = (node: any): PhpEnclosingType | null => {
+  let current = node?.parent;
+
+  while (current) {
+    if (current.type === 'class_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        || current.namedChildren?.find((c: any) => c.type === 'name');
+      const name = nameNode?.text;
+      return name ? { label: 'Class', name } : null;
+    }
+
+    if (current.type === 'interface_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        || current.namedChildren?.find((c: any) => c.type === 'name');
+      const name = nameNode?.text;
+      return name ? { label: 'Interface', name } : null;
+    }
+
+    if (current.type === 'trait_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        || current.namedChildren?.find((c: any) => c.type === 'name');
+      const name = nameNode?.text;
+      return name ? { label: 'Trait', name } : null;
+    }
+
+    current = current.parent;
+  }
+
+  return null;
+};
 
 // ============================================================================
 // EXPORT DETECTION - Language-specific visibility detection
@@ -161,7 +197,7 @@ const processParsingWithWorkers = async (
     }
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], heritage: [] };
+  if (parseableFiles.length === 0) return { imports: [], calls: [], heritage: [], phpAssignments: [], phpTraitUses: [] };
 
   const total = files.length;
 
@@ -178,6 +214,8 @@ const processParsingWithWorkers = async (
   const allImports: ExtractedImport[] = [];
   const allCalls: ExtractedCall[] = [];
   const allHeritage: ExtractedHeritage[] = [];
+  const allPhpAssignments: ExtractedPhpAssignment[] = [];
+  const allPhpTraitUses: ExtractedPhpTraitUse[] = [];
   for (const result of chunkResults) {
     for (const node of result.nodes) {
       graph.addNode({
@@ -198,11 +236,13 @@ const processParsingWithWorkers = async (
     allImports.push(...result.imports);
     allCalls.push(...result.calls);
     allHeritage.push(...result.heritage);
+    allPhpAssignments.push(...result.phpAssignments);
+    allPhpTraitUses.push(...result.phpTraitUses);
   }
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, heritage: allHeritage };
+  return { imports: allImports, calls: allCalls, heritage: allHeritage, phpAssignments: allPhpAssignments, phpTraitUses: allPhpTraitUses };
 };
 
 // ============================================================================
@@ -337,6 +377,23 @@ const processParsingSequential = async (
       };
 
       graph.addRelationship(relationship);
+
+      if (language === SupportedLanguages.PHP && nodeLabel === 'Method') {
+        const methodNode = captureMap['definition.method'];
+        const enclosing = methodNode ? findEnclosingPhpType(methodNode) : null;
+        if (enclosing) {
+          const containerId = generateId(enclosing.label, `${file.path}:${enclosing.name}`);
+          const memberRelId = generateId('MEMBER_OF', `${nodeId}->${containerId}`);
+          graph.addRelationship({
+            id: memberRelId,
+            sourceId: nodeId,
+            targetId: containerId,
+            type: 'MEMBER_OF',
+            confidence: 1.0,
+            reason: 'php-enclosing-type',
+          });
+        }
+      }
     });
   }
 };

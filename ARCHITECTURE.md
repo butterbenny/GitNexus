@@ -258,8 +258,11 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 
 - **PHP is symbol-indexed**: `.php` files produce `Class` / `Method` / `Function` nodes plus `DEFINES`/`MEMBER_OF` edges (call-graph + blast radius works).
 - **Laravel is framework-aware**: high-confidence edges connect `routes/*` → `Controller@method` and other “wiring” constructs (events, scheduler, view rendering).
+- **Cross-stack HTTP is deterministic (monorepo-optimized)**: TS/TSX HTTP calls (fetch/Axios) connect directly to the exact Laravel controller `Method` via explicit `CALLS` edges with `reason` starting `http-...` (not `fuzzy-global`).
 - **Templates participate in the graph**: Blade and Svelte are not “dead ends”; they are at least connected as `Template`/`File` nodes with meaningful relationships.
 - **Confidence-first invariant**: prefer skipping uncertain dynamic edges over injecting noisy guesses (keeps `impact` and `processes` useful).
+
+> Scope note (monorepo-optimized): for cross-stack tracing, we optimize for **one-hop deterministic** “HTTP request → route → controller method” edges, rather than a single continuous call chain across languages.
 
 ### Implementation Plan (staged, plug’n’play with current pipeline)
 
@@ -329,6 +332,19 @@ Milestone 4 — **Laravel-aware “wiring” edges (routes, events, schedule, vi
   - **Events**: subscriber `$subscribe` and listeners `$listen` → handler methods
   - **Scheduler**: `$schedule->job(Foo::class)` / `->command(...)` → job/command handlers
   - **Views/Mail**: `view('a.b')`, `Mail::to(...)->send(new Mailable)` → blade template(s)
+  - **HTTP (TS/TSX) → Laravel routes (monorepo)**:
+    - Frontend extraction must handle dashboard conventions:
+      - Axios instances named `Axios` (not just `axios`) and member calls like `Axios.get(...)`.
+      - Template-literal URLs with params (`/x/${id}/y`) by converting interpolations into wildcards (e.g. `/x/*/y`) for conservative matching.
+      - Base URL prefixes like `Axios.defaults.baseURL = \`${apiUrl}/api\`` so relative request paths are matched under `/api/...` by default.
+    - Backend route indexing must match runtime prefixes + resource expansion:
+      - Apply correct route file prefixes (e.g. `routes/dashboard.php` under `/api`, `routes/mobile.php` under `/api-mobile`) as defined in `RouteServiceProvider`.
+      - Apply in-file group prefixes (`Route::prefix(...)->group(...)`, `Route::group(['prefix' => ...], ...)`) so relative URIs index correctly.
+      - Expand `Route::apiResource(...)` into concrete verb+path patterns (index/store/show/update/destroy) so HTTP matching can succeed.
+    - Confidence policy:
+      - Exact string match: `confidence >= 0.95`
+      - Wildcard match (templated/param): `confidence >= 0.90`
+      - Anything ambiguous (multiple matches): skip
 - Keep this as an additive pass after `calls` (so communities/processes benefit) without changing core edge shapes.
 
 Milestone 5 — **Blade templates as first-class `Template` nodes**
@@ -378,5 +394,24 @@ Laravel wiring should show nonzero route/controller and scheduler/event edges on
 ```cypher
 MATCH (a)-[:CodeRelation {type:'CALLS'}]->(b)
 WHERE a.filePath CONTAINS 'routes/' AND b.filePath CONTAINS 'app/Http/Controllers/'
+RETURN count(*);
+```
+
+Cross-stack HTTP wiring (dashboard → backend) should show nonzero explicit edges (not `fuzzy-global`):
+
+```cypher
+MATCH (a)-[r:CodeRelation {type:'CALLS'}]->(b)
+WHERE a.filePath STARTS WITH 'apps/dashboard/' AND r.reason STARTS WITH 'http-'
+RETURN count(*);
+```
+
+For “trustworthy one-hop”, require high-confidence edges into backend PHP handlers:
+
+```cypher
+MATCH (a)-[r:CodeRelation {type:'CALLS'}]->(b)
+WHERE a.filePath STARTS WITH 'apps/dashboard/'
+  AND b.filePath STARTS WITH 'apps/backend/'
+  AND r.reason STARTS WITH 'http-'
+  AND r.confidence >= 0.9
 RETURN count(*);
 ```

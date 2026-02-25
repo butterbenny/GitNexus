@@ -1,7 +1,7 @@
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import { SymbolTable, SymbolDefinition } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import { ImportMap, PhpUseAliasMap, expandPhpClassRefFromUseAliases } from './import-processor.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename } from './utils.js';
 import { loadLanguage, loadParser } from '../tree-sitter/parser-loader.js';
@@ -38,9 +38,11 @@ const resolvePhpClassToFile = (
   currentFilePath: string,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): ResolvedClass | null => {
   const normalizedRef = stripPhpClassConstant(classRef);
-  const { baseName, parts } = normalizePhpClassRef(normalizedRef);
+  const expandedRef = expandPhpClassRefFromUseAliases(normalizedRef, currentFilePath, phpUseAliases);
+  const { baseName, parts } = normalizePhpClassRef(expandedRef);
   if (!looksLikePhpIdentifier(baseName)) return null;
 
   const classDefs = symbolTable
@@ -214,6 +216,7 @@ export const processLaravelEvents = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Promise<{ filesProcessed: number; relationshipsAdded: number }> => {
   const eventProviderFiles = files.filter(f => EVENT_PROVIDER_FILE_PATH_RE.test(f.path));
   if (eventProviderFiles.length === 0) return { filesProcessed: 0, relationshipsAdded: 0 };
@@ -246,7 +249,7 @@ export const processLaravelEvents = async (
     const sourceId = generateId('File', file.path);
 
     for (const handler of targets.listen) {
-      const resolved = resolvePhpClassToFile(handler.classRef, file.path, symbolTable, importMap);
+      const resolved = resolvePhpClassToFile(handler.classRef, file.path, symbolTable, importMap, phpUseAliases);
       if (!resolved) continue;
 
       const methodNodeId = symbolTable.lookupExact(resolved.filePath, handler.methodName);
@@ -265,7 +268,7 @@ export const processLaravelEvents = async (
     }
 
     for (const subscriberClassRef of targets.subscribe) {
-      const resolved = resolvePhpClassToFile(subscriberClassRef, file.path, symbolTable, importMap);
+      const resolved = resolvePhpClassToFile(subscriberClassRef, file.path, symbolTable, importMap, phpUseAliases);
       if (!resolved) continue;
 
       const methodNodeId = symbolTable.lookupExact(resolved.filePath, 'subscribe');

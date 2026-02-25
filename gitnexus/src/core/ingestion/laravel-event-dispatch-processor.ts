@@ -2,7 +2,7 @@ import Parser from 'tree-sitter';
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import { SymbolTable, SymbolDefinition } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import { ImportMap, PhpUseAliasMap, expandPhpClassRefFromUseAliases } from './import-processor.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
 import { loadLanguage, loadParser } from '../tree-sitter/parser-loader.js';
@@ -52,10 +52,12 @@ const resolvePhpClassToFile = (
   currentFilePath: string,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
   kind: ResolveKind,
 ): ResolvedClass | null => {
   const normalizedRef = stripPhpClassConstant(classRef);
-  const { baseName, parts } = normalizePhpClassRef(normalizedRef);
+  const expandedRef = expandPhpClassRefFromUseAliases(normalizedRef, currentFilePath, phpUseAliases);
+  const { baseName, parts } = normalizePhpClassRef(expandedRef);
   if (!looksLikePhpIdentifier(baseName)) return null;
 
   const classDefs = symbolTable
@@ -474,6 +476,7 @@ const buildLaravelEventListenerIndex = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
   parser: Parser,
 ): Promise<{ listenersByEventFile: Map<string, IndexedListenerTarget[]>; eventBaseNames: Set<string> }> => {
   const listenersByEventFile = new Map<string, IndexedListenerTarget[]>();
@@ -503,10 +506,10 @@ const buildLaravelEventListenerIndex = async (
     const subscriberClassRefs = extractEventSubscriberClassRefs(tree.rootNode);
 
     for (const mapping of mappings) {
-      const resolvedEvent = resolvePhpClassToFile(mapping.eventClassRef, file.path, symbolTable, importMap, 'event');
+      const resolvedEvent = resolvePhpClassToFile(mapping.eventClassRef, file.path, symbolTable, importMap, phpUseAliases, 'event');
       if (!resolvedEvent) continue;
 
-      const resolvedListener = resolvePhpClassToFile(mapping.handler.classRef, file.path, symbolTable, importMap, 'listener');
+      const resolvedListener = resolvePhpClassToFile(mapping.handler.classRef, file.path, symbolTable, importMap, phpUseAliases, 'listener');
       if (!resolvedListener) continue;
 
       const methodNodeId = symbolTable.lookupExact(resolvedListener.filePath, mapping.handler.methodName);
@@ -514,7 +517,12 @@ const buildLaravelEventListenerIndex = async (
 
       const confidence = Math.min(resolvedEvent.confidence, resolvedListener.confidence);
 
-      eventBaseNames.add(normalizePhpClassRef(mapping.eventClassRef).baseName);
+      const expandedEventRef = expandPhpClassRefFromUseAliases(
+        stripPhpClassConstant(mapping.eventClassRef),
+        file.path,
+        phpUseAliases,
+      );
+      eventBaseNames.add(normalizePhpClassRef(expandedEventRef).baseName);
 
       let list = listenersByEventFile.get(resolvedEvent.filePath);
       if (!list) {
@@ -528,7 +536,7 @@ const buildLaravelEventListenerIndex = async (
     }
 
     for (const subscriberClassRef of subscriberClassRefs) {
-      const resolvedSubscriber = resolvePhpClassToFile(subscriberClassRef, file.path, symbolTable, importMap, 'listener');
+      const resolvedSubscriber = resolvePhpClassToFile(subscriberClassRef, file.path, symbolTable, importMap, phpUseAliases, 'listener');
       if (!resolvedSubscriber) continue;
 
       const subscriberFile = fileByPath.get(resolvedSubscriber.filePath);
@@ -549,13 +557,13 @@ const buildLaravelEventListenerIndex = async (
       if (subscriberMappings.length === 0) continue;
 
       for (const mapping of subscriberMappings) {
-        const resolvedEvent = resolvePhpClassToFile(mapping.eventClassRef, subscriberFile.path, symbolTable, importMap, 'event');
+        const resolvedEvent = resolvePhpClassToFile(mapping.eventClassRef, subscriberFile.path, symbolTable, importMap, phpUseAliases, 'event');
         if (!resolvedEvent) continue;
 
         const handlerClassRef = mapping.handler.classRef;
         const resolvedListener = handlerClassRef === 'self' || handlerClassRef === 'static' || handlerClassRef === 'parent'
           ? { filePath: subscriberFile.path, confidence: 0.95, reason: 'self-file' }
-          : resolvePhpClassToFile(handlerClassRef, subscriberFile.path, symbolTable, importMap, 'listener');
+          : resolvePhpClassToFile(handlerClassRef, subscriberFile.path, symbolTable, importMap, phpUseAliases, 'listener');
         if (!resolvedListener) continue;
 
         const methodNodeId = symbolTable.lookupExact(resolvedListener.filePath, mapping.handler.methodName);
@@ -563,7 +571,12 @@ const buildLaravelEventListenerIndex = async (
 
         const confidence = Math.min(resolvedEvent.confidence, resolvedListener.confidence);
 
-        eventBaseNames.add(normalizePhpClassRef(mapping.eventClassRef).baseName);
+        const expandedEventRef = expandPhpClassRefFromUseAliases(
+          stripPhpClassConstant(mapping.eventClassRef),
+          subscriberFile.path,
+          phpUseAliases,
+        );
+        eventBaseNames.add(normalizePhpClassRef(expandedEventRef).baseName);
 
         let list = listenersByEventFile.get(resolvedEvent.filePath);
         if (!list) {
@@ -587,6 +600,7 @@ export const processLaravelEventDispatch = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Promise<{ edgesAdded: number }> => {
   const parser = await loadParser();
   await loadLanguage(SupportedLanguages.PHP);
@@ -596,6 +610,7 @@ export const processLaravelEventDispatch = async (
     astCache,
     symbolTable,
     importMap,
+    phpUseAliases,
     parser
   );
   if (listenersByEventFile.size === 0) return { edgesAdded: 0 };
@@ -622,10 +637,15 @@ export const processLaravelEventDispatch = async (
     if (dispatchCalls.length === 0) continue;
 
     for (const call of dispatchCalls) {
-      const { baseName } = normalizePhpClassRef(call.classRef);
+      const expandedCallRef = expandPhpClassRefFromUseAliases(
+        stripPhpClassConstant(call.classRef),
+        file.path,
+        phpUseAliases,
+      );
+      const { baseName } = normalizePhpClassRef(expandedCallRef);
       if (!eventBaseNames.has(baseName)) continue;
 
-      const resolvedEvent = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap, 'event');
+      const resolvedEvent = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap, phpUseAliases, 'event');
       if (!resolvedEvent) continue;
 
       const listenerTargets = listenersByEventFile.get(resolvedEvent.filePath);

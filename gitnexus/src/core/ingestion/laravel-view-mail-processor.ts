@@ -2,7 +2,7 @@ import Parser from 'tree-sitter';
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import { SymbolTable, SymbolDefinition } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import { ImportMap, PhpUseAliasMap, expandPhpClassRefFromUseAliases } from './import-processor.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
 import { loadLanguage, loadParser } from '../tree-sitter/parser-loader.js';
@@ -138,8 +138,10 @@ const resolvePhpClassToFile = (
   currentFilePath: string,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): ResolvedClass | null => {
-  const { baseName, parts } = normalizePhpClassRef(classRef);
+  const expandedClassRef = expandPhpClassRefFromUseAliases(classRef, currentFilePath, phpUseAliases);
+  const { baseName, parts } = normalizePhpClassRef(expandedClassRef);
   if (!looksLikePhpIdentifier(baseName)) return null;
 
   const classDefs = symbolTable
@@ -275,6 +277,7 @@ export const processLaravelViewsAndMail = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  phpUseAliases: PhpUseAliasMap,
 ): Promise<{ viewEdgesAdded: number; mailEdgesAdded: number }> => {
   const bladePaths = new Set(files.filter(f => f.path.endsWith(BLADE_SUFFIX)).map(f => f.path));
   if (bladePaths.size === 0) return { viewEdgesAdded: 0, mailEdgesAdded: 0 };
@@ -378,7 +381,7 @@ export const processLaravelViewsAndMail = async (
   }
 
   for (const pending of pendingMailSends) {
-    const resolved = resolvePhpClassToFile(pending.mailableClassRef, pending.senderFilePath, symbolTable, importMap);
+    const resolved = resolvePhpClassToFile(pending.mailableClassRef, pending.senderFilePath, symbolTable, importMap, phpUseAliases);
     if (!resolved) continue;
 
     const templateTargets = templatesUsedByPhpFile.get(resolved.filePath);

@@ -19,6 +19,8 @@ import { registerClaudeHook } from './claude-hooks.js';
 export interface AnalyzeOptions {
   force?: boolean;
   skipEmbeddings?: boolean;
+  writeContext?: boolean;
+  updateGitignore?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -213,7 +215,6 @@ export const analyzeCommand = async (
   };
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
-  await addToGitignore(repoPath);
 
   const hookResult = await registerClaudeHook();
 
@@ -228,14 +229,20 @@ export const analyzeCommand = async (
     aggregatedClusterCount = Array.from(groups.values()).filter(count => count >= 5).length;
   }
 
-  const aiContext = await generateAIContextFiles(repoPath, storagePath, projectName, {
-    files: pipelineResult.fileContents.size,
-    nodes: stats.nodes,
-    edges: stats.edges,
-    communities: pipelineResult.communityResult?.stats.totalCommunities,
-    clusters: aggregatedClusterCount,
-    processes: pipelineResult.processResult?.stats.totalProcesses,
-  });
+  if (options?.updateGitignore) {
+    await addToGitignore(repoPath);
+  }
+
+  const aiContext = options?.writeContext
+    ? await generateAIContextFiles(repoPath, storagePath, projectName, {
+      files: pipelineResult.fileContents.size,
+      nodes: stats.nodes,
+      edges: stats.edges,
+      communities: pipelineResult.communityResult?.stats.totalCommunities,
+      clusters: aggregatedClusterCount,
+      processes: pipelineResult.processResult?.stats.totalProcesses,
+    })
+    : { files: [] as string[] };
 
   await closeKuzu();
   await disposeEmbedder();

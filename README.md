@@ -351,7 +351,8 @@ Every function call edge includes a trust score:
 | 0.90       | `import-resolved`          | Target found in imported file  |
 | 0.85       | `same-file`                | Target defined in same file    |
 | 0.50       | `fuzzy-global` (1 match)   | Single global match by name    |
-| 0.30       | `fuzzy-global` (N matches) | Multiple matches, first picked |
+
+If there are **multiple** global matches for the same call name, GitNexus skips the edge (ambiguous) rather than guessing.
 
 The `impact` tool uses `minConfidence` to filter out guesses and return only reliable results.
 
@@ -365,10 +366,10 @@ flowchart TD
     CHECK2 -->|Yes| FOUND2["Same-file (85%)"]
     CHECK2 -->|No| CHECK3{"Global Search"}
     CHECK3 -->|1 match| FOUND3["Fuzzy single (50%)"]
-    CHECK3 -->|N matches| FOUND4["Fuzzy multiple (30%)"]
+    CHECK3 -->|N matches| SKIP2["Skip - ambiguous"]
     CHECK3 -->|Not Found| SKIP["Skip - unresolved"]
 
-    FOUND1 & FOUND2 & FOUND3 & FOUND4 --> EDGE["Create CALLS edge with confidence"]
+    FOUND1 & FOUND2 & FOUND3 --> EDGE["Create CALLS edge with confidence"]
 ```
 
 ### Community Detection (Leiden Algorithm)
@@ -627,7 +628,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [X] **Community Detection** — Leiden algorithm for functional clustering
 - [X] **Process Detection** — Entry point tracing with framework awareness
 - [X] **10 Language Support** — TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP
-- [X] **Confidence Scoring** — Trust levels on CALLS edges (0.3-0.9)
+- [X] **Confidence Scoring** — Trust levels on CALLS edges
 - [X] **Blast Radius Tool** — `impact` with minConfidence, relationTypes, includeTests
 - [X] **Hybrid Search** — BM25 + semantic + Reciprocal Rank Fusion
 - [X] **Vector Index** — HNSW in KuzuDB for semantic search
