@@ -12,3 +12,8 @@ test('Kuzu schema: CodeRelation allows Function/Method -> Trait/Typedef/Union', 
   assert.match(RELATION_SCHEMA, /FROM Method TO `Union`/);
 });
 
+test('Kuzu schema: CodeRelation allows edges -> Const', () => {
+  assert.match(RELATION_SCHEMA, /FROM Function TO `Const`/);
+  assert.match(RELATION_SCHEMA, /FROM Method TO `Const`/);
+  assert.match(RELATION_SCHEMA, /FROM CodeElement TO `Const`/);
+});

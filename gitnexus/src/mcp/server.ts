@@ -25,6 +25,7 @@ import {
 import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
+import { safeStringify } from '../lib/safe-json.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -156,11 +157,11 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
 
   // Handle tool calls — append next-step hints to guide agent workflow
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+      const { name, arguments: args } = request.params;
 
     try {
       const result = await backend.callTool(name, args);
-      const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      const resultText = typeof result === 'string' ? result : safeStringify(result, 2);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
       return {

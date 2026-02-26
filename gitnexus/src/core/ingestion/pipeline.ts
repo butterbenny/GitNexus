@@ -6,6 +6,12 @@ import { processCalls, processCallsFromExtracted } from './call-processor.js';
 import { processLaravelRoutes } from './laravel-route-processor.js';
 import { processLaravelHttpWiring } from './laravel-http-processor.js';
 import { processLaravelRouteNameWiring } from './laravel-route-name-processor.js';
+import { processLaravelSemanticEdges } from './laravel-semantic-processor.js';
+import { processLaravelAuthorization } from './laravel-auth-processor.js';
+import { processLaravelPermissionsConfig } from './laravel-permissions-config-processor.js';
+import { processPhpMatchReturnEdges } from './php-match-return-processor.js';
+import { processLaravelEloquentRelationships } from './laravel-eloquent-relationship-processor.js';
+import { processReactQueryKeyWiring } from './react-query-processor.js';
 import { processLaravelViewsAndMail } from './laravel-view-mail-processor.js';
 import { processLaravelEvents } from './laravel-event-processor.js';
 import { processLaravelEventDispatch } from './laravel-event-dispatch-processor.js';
@@ -205,6 +211,12 @@ export const runPipelineFromRepo = async (
     processLaravelRoutes(graph, files, symbolTable, importMap, phpUseAliases);
     await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelSemanticEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelEloquentRelationships(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelAuthorization(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelPermissionsConfig(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processPhpMatchReturnEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processReactQueryKeyWiring(graph, files, astCache, symbolTable, importMap);
 
     onProgress({
       phase: 'heritage',

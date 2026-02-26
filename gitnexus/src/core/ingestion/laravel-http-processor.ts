@@ -55,6 +55,11 @@ const normalizeHttpPath = (rawUrlOrPath: string): string | null => {
   value = value.trim();
   if (value.length === 0) return null;
 
+  if (value.startsWith('*')) {
+    const slashIndex = value.indexOf('/');
+    if (slashIndex !== -1) value = value.slice(slashIndex);
+  }
+
   if (!value.startsWith('/')) value = '/' + value;
   value = value.replace(/\/{2,}/g, '/');
   if (value.length > 1) value = value.replace(/\/+$/g, '');
@@ -83,6 +88,11 @@ const stripQuotes = (value: string): string => {
   return value;
 };
 
+const stripBackticks = (value: string): string => {
+  if (value.length < 2) return value;
+  return value.startsWith('`') && value.endsWith('`') ? value.slice(1, -1) : value;
+};
+
 const parseStringLikeLiteral = (node: any): string | null => {
   if (!node) return null;
   const text = String(node.text || '');
@@ -93,6 +103,131 @@ const parseStringLikeLiteral = (node: any): string | null => {
   if (node.type === 'template_string') {
     const inner = text.startsWith('`') && text.endsWith('`') ? text.slice(1, -1) : text;
     return inner.replace(/\$\{[^}]*\}/g, '*');
+  }
+
+  return null;
+};
+
+type TemplateStringToken = { type: 'text'; value: string } | { type: 'expr'; value: string };
+
+const findTemplateSubstitutionEndIndex = (inner: string, exprStartIndex: number): number | null => {
+  let i = exprStartIndex;
+  let depth = 1;
+
+  const skipQuoted = (startIndex: number, quote: string): number => {
+    let j = startIndex + 1;
+    while (j < inner.length) {
+      const ch = inner[j];
+      if (ch === '\\') {
+        j += 2;
+        continue;
+      }
+      if (ch === quote) return j + 1;
+      j++;
+    }
+    return inner.length;
+  };
+
+  while (i < inner.length) {
+    const ch = inner[i];
+    if (ch === '\'' || ch === '"' || ch === '`') {
+      i = skipQuoted(i, ch);
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) return i;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  return null;
+};
+
+const splitTemplateString = (inner: string): TemplateStringToken[] => {
+  const tokens: TemplateStringToken[] = [];
+  let i = 0;
+
+  while (i < inner.length) {
+    const start = inner.indexOf('${', i);
+    if (start === -1) {
+      if (i < inner.length) tokens.push({ type: 'text', value: inner.slice(i) });
+      break;
+    }
+
+    if (start > i) tokens.push({ type: 'text', value: inner.slice(i, start) });
+
+    const exprStart = start + 2;
+    const exprEnd = findTemplateSubstitutionEndIndex(inner, exprStart);
+    if (exprEnd === null) {
+      tokens.push({ type: 'text', value: inner.slice(start) });
+      break;
+    }
+
+    const expr = inner.slice(exprStart, exprEnd);
+    tokens.push({ type: 'expr', value: expr });
+    i = exprEnd + 1;
+  }
+
+  return tokens;
+};
+
+const parseTernaryStringLiteralBranches = (expr: string): string[] | null => {
+  const trimmed = expr.trim();
+  if (!trimmed.includes('?') || !trimmed.includes(':')) return null;
+
+  const m = trimmed.match(
+    /^.+?\?\s*(['"])([^'"]+)\1\s*:\s*(['"])([^'"]+)\3\s*$/s
+  );
+  if (!m) return null;
+
+  const a = m[2];
+  const b = m[4];
+  if (!a || !b) return null;
+  return [a, b];
+};
+
+const parseHttpUrlLikeLiteralCandidates = (node: any): string[] | null => {
+  if (!node) return null;
+  const text = String(node.text || '');
+  if (text.length === 0) return null;
+
+  if (node.type === 'string') return [stripQuotes(text)];
+
+  if (node.type === 'template_string') {
+    const inner = stripBackticks(text);
+    const tokens = splitTemplateString(inner);
+
+    let candidates: string[] = [''];
+    for (const token of tokens) {
+      if (token.type === 'text') {
+        candidates = candidates.map(c => c + token.value);
+        continue;
+      }
+
+      const branches = parseTernaryStringLiteralBranches(token.value);
+      if (branches) {
+        const next: string[] = [];
+        for (const c of candidates) {
+          for (const b of branches) next.push(c + b);
+        }
+        // Keep this conservative — if we’re generating too many candidates, fall back to a wildcard.
+        if (next.length > 4) return [inner.replace(/\$\{[^}]*\}/g, '*')];
+        candidates = next;
+        continue;
+      }
+
+      candidates = candidates.map(c => c + '*');
+    }
+
+    return Array.from(new Set(candidates));
   }
 
   return null;
@@ -377,21 +512,25 @@ const extractHttpCallsFromTree = (filePath: string, tree: Parser.Tree): HttpCall
 
         // fetch('/path', { method: 'POST' })
         if (fnName === 'fetch' && args.length >= 1) {
-          const url = parseStringLikeLiteral(args[0]);
-          if (url) {
+          const urls = parseHttpUrlLikeLiteralCandidates(args[0]);
+          if (urls && urls.length > 0) {
             const method = args.length >= 2 && args[1]?.type === 'object'
               ? (getObjectStringProperty(args[1], 'method') || 'GET')
               : 'GET';
-            const path = normalizeHttpPath(url);
-            if (path) calls.push({
-              filePath,
-              callNode: node,
-              httpMethod: String(method).toUpperCase(),
-              path,
-              client: null,
-              basePrefixOverride: null,
-              clientBasePrefix: null,
-            });
+
+            for (const url of urls) {
+              const path = normalizeHttpPath(url);
+              if (!path) continue;
+              calls.push({
+                filePath,
+                callNode: node,
+                httpMethod: String(method).toUpperCase(),
+                path,
+                client: null,
+                basePrefixOverride: null,
+                clientBasePrefix: null,
+              });
+            }
           }
         }
 
@@ -451,18 +590,21 @@ const extractHttpCallsFromTree = (filePath: string, tree: Parser.Tree): HttpCall
             return;
           }
 
-          const url = parseStringLikeLiteral(args[0]);
-          if (url) {
-            const path = normalizeHttpPath(url);
-            if (path) calls.push({
-              filePath,
-              callNode: node,
-              httpMethod: methodName.toUpperCase(),
-              path,
-              client: objectName,
-              basePrefixOverride,
-              clientBasePrefix: objectName ? (localAxiosBasePrefixes.get(objectName) || null) : null,
-            });
+          const urls = parseHttpUrlLikeLiteralCandidates(args[0]);
+          if (urls && urls.length > 0) {
+            for (const url of urls) {
+              const path = normalizeHttpPath(url);
+              if (!path) continue;
+              calls.push({
+                filePath,
+                callNode: node,
+                httpMethod: methodName.toUpperCase(),
+                path,
+                client: objectName,
+                basePrefixOverride,
+                clientBasePrefix: objectName ? (localAxiosBasePrefixes.get(objectName) || null) : null,
+              });
+            }
           }
         }
       }
@@ -542,6 +684,63 @@ const isHttpConfigFile = (filePath: string, content: string): boolean => {
   const lang = getLanguageFromFilename(filePath);
   if (lang !== SupportedLanguages.TypeScript && lang !== SupportedLanguages.JavaScript) return false;
   return /\bdefaults\s*\.\s*baseURL\s*=/.test(content);
+};
+
+const isHttpLiteralRouteRelevantFile = (filePath: string, content: string): boolean => {
+  const lang = getLanguageFromFilename(filePath);
+  if (lang !== SupportedLanguages.TypeScript && lang !== SupportedLanguages.JavaScript) return false;
+  // Heuristic prefilter: only parse files that likely contain backend path literals.
+  return /\/(?:api|dashboard)\//.test(content);
+};
+
+type HttpPathLiteral = {
+  filePath: string;
+  node: any;
+  path: string;
+};
+
+const extractHttpPathLiteralsFromTree = (filePath: string, tree: Parser.Tree): HttpPathLiteral[] => {
+  const literals: HttpPathLiteral[] = [];
+
+  const visit = (node: any) => {
+    if (!node) return;
+
+    if (node.type === 'string' || node.type === 'template_string') {
+      const urls = parseHttpUrlLikeLiteralCandidates(node);
+      if (urls && urls.length > 0) {
+        for (const url of urls) {
+          const path = normalizeHttpPath(url);
+          if (!path) continue;
+          if (!path.startsWith('/api') && !path.startsWith('/dashboard')) continue;
+          literals.push({ filePath, node, path });
+        }
+      }
+    }
+
+    for (const child of node.namedChildren || []) {
+      visit(child);
+    }
+  };
+
+  visit(tree.rootNode);
+  return literals;
+};
+
+const resolveUniqueRouteTargetForPath = (
+  routeIndex: Map<string, ResolvedRouteTarget[]>,
+  path: string
+): ResolvedRouteTarget | null => {
+  const verbs = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'ANY'];
+  const matches: ResolvedRouteTarget[] = [];
+
+  for (const verb of verbs) {
+    const list = routeIndex.get(`${verb} ${path}`);
+    if (!list || list.length === 0) continue;
+    matches.push(...list);
+  }
+
+  if (matches.length !== 1) return null;
+  return matches[0];
 };
 
 export const processLaravelHttpWiring = async (
@@ -625,6 +824,56 @@ export const processLaravelHttpWiring = async (
       if (confidence < matchConfidence) continue;
       const sourceId = findEnclosingCallableId(call.callNode, call.filePath, symbolTable)
         || generateId('File', call.filePath);
+
+      const relId = generateId('CALLS', `${sourceId}:${reason}->${target.methodNodeId}`);
+      graph.addRelationship({
+        id: relId,
+        type: 'CALLS',
+        sourceId,
+        targetId: target.methodNodeId,
+        confidence,
+        reason,
+      });
+      edgesAdded++;
+    }
+  }
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    if (i % 200 === 0) await yieldToEventLoop();
+
+    if (!isHttpLiteralRouteRelevantFile(file.path, file.content)) continue;
+    // Avoid double-wiring in files that already have explicit fetch/axios calls.
+    if (isHttpRelevantFile(file.path, file.content)) continue;
+
+    const language = getLanguageFromFilename(file.path);
+    if (!language) continue;
+
+    await loadLanguage(language, file.path);
+
+    let tree = astCache.get(file.path);
+    if (!tree) {
+      try {
+        const content = getParseableContent(file.path, file.content);
+        tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
+        astCache.set(file.path, tree);
+      } catch {
+        continue;
+      }
+    }
+
+    const literals = extractHttpPathLiteralsFromTree(file.path, tree);
+    if (literals.length === 0) continue;
+
+    for (const literal of literals) {
+      const target = resolveUniqueRouteTargetForPath(routeIndex, literal.path);
+      if (!target) continue;
+
+      const reason = `http-literal-${target.httpMethod.toLowerCase()}:${literal.path}`;
+      const matchConfidence = literal.path.includes('*') ? 0.75 : 0.8;
+      const confidence = Math.min(target.confidence, matchConfidence);
+      const sourceId = findEnclosingCallableId(literal.node, literal.filePath, symbolTable)
+        || generateId('File', literal.filePath);
 
       const relId = generateId('CALLS', `${sourceId}:${reason}->${target.methodNodeId}`);
       graph.addRelationship({

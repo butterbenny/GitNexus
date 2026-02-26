@@ -9,6 +9,7 @@ import { cleanCommand } from './clean.js';
 import { setupCommand } from './setup.js';
 import { augmentCommand } from './augment.js';
 import { wikiCommand } from './wiki.js';
+import { archetypesCommand } from './archetypes.js';
 import { queryCommand, contextCommand, impactCommand, cypherCommand } from './tool.js';
 import { evalServerCommand } from './eval-server.js';
 const program = new Command();
@@ -76,6 +77,15 @@ program
   .description('Augment a search pattern with knowledge graph context (used by hooks)')
   .action(augmentCommand);
 
+program
+  .command('archetypes')
+  .description('Derive flow signatures + exemplar processes (archetype heat map)')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('-l, --limit <n>', 'Max signatures to return (default: 25)', '25')
+  .option('-e, --examples <n>', 'Examples per signature (default: 3)', '3')
+  .option('--min-http-confidence <n>', 'Minimum confidence for HTTP wiring edges (default: 0.9)', '0.9')
+  .action(archetypesCommand);
+
 // ─── Direct Tool Commands (no MCP overhead) ────────────────────────
 // These invoke LocalBackend directly for use in eval, scripts, and CI.
 
@@ -99,10 +109,12 @@ program
   .action(contextCommand);
 
 program
-  .command('impact <target>')
+  .command('impact [target]')
   .description('Blast radius analysis: what breaks if you change a symbol')
   .option('-d, --direction <dir>', 'upstream (dependants) or downstream (dependencies)', 'upstream')
   .option('-r, --repo <name>', 'Target repository')
+  .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
+  .option('-f, --file <path>', 'File path to disambiguate common names')
   .option('--depth <n>', 'Max relationship depth (default: 3)')
   .option('--include-tests', 'Include test files in results')
   .action(impactCommand);

@@ -580,6 +580,12 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     const classConst = trimmed.match(/^(\\?[A-Za-z0-9_\\]+)\s*::\s*class\b/);
     if (classConst?.[1]) return classConst[1];
 
+    // Common Laravel pattern for a fully-qualified class string:
+    //   '\\' . FooController::class
+    // We only support a pure backslash prefix to avoid mis-parsing arbitrary string concatenations.
+    const leadingSlashConcat = trimmed.match(/^(['"])(\\+)\1\s*\.\s*(\\?[A-Za-z0-9_\\]+)\s*::\s*class\b/);
+    if (leadingSlashConcat?.[2] && leadingSlashConcat?.[3]) return leadingSlashConcat[3];
+
     const stringLiteral = trimmed.match(/^(['"])([^'"]+)\1$/);
     if (stringLiteral?.[2]) return stringLiteral[2];
 

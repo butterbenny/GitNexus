@@ -188,6 +188,13 @@ function extractPhpUseAliases(raw: string): Map<string, string> {
   const aliases = new Map<string, string>();
   const topLevel = splitTopLevelByComma(body);
 
+  const getDefaultAlias = (imported: string): string | null => {
+    const trimmed = imported.replace(/^\\+/, '').trim();
+    if (!trimmed) return null;
+    const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+    return parts.at(-1) ?? null;
+  };
+
   for (const partRaw of topLevel) {
     let part = partRaw.trim();
     if (part.length === 0) continue;
@@ -213,23 +220,27 @@ function extractPhpUseAliases(raw: string): Map<string, string> {
         if (/^(function|const)\s+/i.test(innerPart)) continue;
 
         const parsed = parsePhpAliasClause(innerPart);
-        if (!parsed.alias) continue;
-
         const imported = parsed.imported.replace(/^\\+/, '').trim();
         if (imported.length === 0) continue;
 
-        aliases.set(parsed.alias, prefix + imported);
+        const alias = parsed.alias || getDefaultAlias(imported);
+        if (!alias) continue;
+        if (!parsed.alias && aliases.has(alias)) continue;
+
+        aliases.set(alias, prefix + imported);
       }
       continue;
     }
 
     const parsed = parsePhpAliasClause(part);
-    if (!parsed.alias) continue;
-
     const imported = parsed.imported.replace(/^\\+/, '').trim();
     if (imported.length === 0) continue;
 
-    aliases.set(parsed.alias, imported);
+    const alias = parsed.alias || getDefaultAlias(imported);
+    if (!alias) continue;
+    if (!parsed.alias && aliases.has(alias)) continue;
+
+    aliases.set(alias, imported);
   }
 
   return aliases;

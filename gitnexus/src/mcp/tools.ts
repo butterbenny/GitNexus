@@ -68,6 +68,28 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
     },
   },
   {
+    name: 'archetypes',
+    description: `Derive "flow signatures" (archetypes) from execution flows, and return exemplar processes.
+
+WHEN TO USE: When architecting or implementing and you want to mirror existing patterns ("more than a map").
+Also useful in review to verify new code fits an existing archetype rather than inventing a new shape.
+
+This is a derived view (no schema changes). It groups Process traces into common signatures using
+path-based layer tags plus explicit high-confidence http-* edges.
+
+AFTER THIS: Use query/context on exemplar entry/terminal symbols, then impact on the planned change point.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max signatures to return (default: 25)', default: 25 },
+        examples: { type: 'number', description: 'Examples per signature (default: 3)', default: 3 },
+        min_http_confidence: { type: 'number', description: 'Minimum confidence for HTTP wiring edges (default: 0.9)', default: 0.9 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'cypher',
     description: `Execute Cypher query against the code knowledge graph.
 
@@ -187,7 +209,10 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
     inputSchema: {
       type: 'object',
       properties: {
-        target: { type: 'string', description: 'Name of function, class, or file to analyze' },
+        target: { type: 'string', description: 'Name of function, class, or file to analyze (legacy name param)' },
+        name: { type: 'string', description: 'Symbol name (preferred; same as target)' },
+        uid: { type: 'string', description: 'Direct symbol UID from prior tool results (zero-ambiguity lookup)' },
+        file_path: { type: 'string', description: 'File path to disambiguate common names' },
         direction: { type: 'string', description: 'upstream (what depends on this) or downstream (what this depends on)' },
         maxDepth: { type: 'number', description: 'Max relationship depth (default: 3)', default: 3 },
         relationTypes: { type: 'array', items: { type: 'string' }, description: 'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS (default: usage-based)' },
@@ -195,7 +220,7 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
         minConfidence: { type: 'number', description: 'Minimum confidence 0-1 (default: 0.7)' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
-      required: ['target', 'direction'],
+      required: ['direction'],
     },
   },
 ];

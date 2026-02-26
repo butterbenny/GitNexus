@@ -235,7 +235,7 @@ Source Code
 
 ## Supported Languages
 
-Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python**, **Java**, **C**, **C++**, **C#**, **Go**, **Rust**.
+Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python**, **Java**, **C**, **C++**, **C#**, **Go**, **Rust**, **PHP**.
 
 ## Key Design Decisions
 
@@ -260,11 +260,25 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 - **Laravel is framework-aware**: high-confidence edges connect `routes/*` → `Controller@method` and other “wiring” constructs (events, scheduler, view rendering).
 - **Cross-stack HTTP is deterministic (monorepo-optimized)**: TS/TSX HTTP calls (fetch/Axios) connect directly to the exact Laravel controller `Method` via explicit `CALLS` edges with `reason` starting `http-...` (not `fuzzy-global`).
 - **Templates participate in the graph**: Blade and Svelte are not “dead ends”; they are at least connected as `Template`/`File` nodes with meaningful relationships.
+- **Archetypes are discoverable (“more than a map”)**: derived views group execution flows into common “flow signatures” and surface exemplars/hotspots, so agents can copy proven anatomy instead of inventing mini-architectures.
 - **Confidence-first invariant**: prefer skipping uncertain dynamic edges over injecting noisy guesses (keeps `impact` and `processes` useful).
 
 > Scope note (monorepo-optimized): for cross-stack tracing, we optimize for **one-hop deterministic** “HTTP request → route → controller method” edges, rather than a single continuous call chain across languages.
 
 ### Implementation Plan (staged, plug’n’play with current pipeline)
+
+### Current Status (as of 2026-02-26)
+
+- ✅ **M0–M1**: PHP parsing + symbol extraction (classes / methods / functions) is live.
+- ✅ **M2**: PHP imports — Composer PSR-4 + `use` (including alias + grouped imports) are live.
+- ✅ **M3**: PHP calls — high-confidence `CALLS` edges are live (with conservative resolution tiers + DI/container receiver support); harden only as needed (keep confidence-first).
+- ✅ **M4 (monorepo-optimized)**: deterministic dashboard HTTP wiring (`http-*` edges with `confidence >= 0.9`) is live.
+- ✅ **M5**: Blade templates are indexed as `Template` nodes with template-to-template edges + PHP→Blade wiring edges.
+- ✅ **M6**: Svelte `.svelte` files participate via `<script>` extraction + TS parsing/import resolution.
+- ✅ **M7**: acceptance queries are in regular use on a large TS + Laravel monorepo.
+- 🟡 **M8**: MCP ergonomics — stale DB refresh + disambiguation are live; query ranking now returns full process traces and bridges test hits → app symbols (remaining: polish + optional MCP exposure for derived views).
+- ✅ **M9**: semantic enrichment — FormRequest/Resource, auth/permission, Eloquent relationship, and React Query key wiring are live.
+- ✅ **M10**: derived views — flow signatures + archetype report are shipped via `gitnexus archetypes` (remaining: wire into agent workflows).
 
 ### Canonical Build Order (so we don’t “jump”)
 
@@ -301,6 +315,16 @@ The milestones below are written as capability buckets, but the **development or
 7) **M7 (acceptance on real monorepos)**
    - Re-run the Cypher acceptance queries on the target repo(s) and ensure the counts/edges move in the expected direction.
 
+8) **M8 (MCP ergonomics)**
+   - Improve agent UX (disambiguation, fewer “which symbol?” dead ends) without changing graph shapes.
+
+9) **M9 (semantic enrichment edges)**
+   - Add high-confidence “meaning links” (FormRequests/Resources/permissions/query-keys) once core call graphs are reliable.
+
+10) **M10 (derived views: archetypes + heat maps)**
+   - Derive “flow signatures” and hotspots from `Process` + `Community` without introducing new graph shapes.
+   - Optional: use an LLM only to name/describe clusters (never to create edges).
+
 If you hit a milestone and it’s forcing you into “stringly guesswork”, that’s a signal to go **back to M2** and harden resolution rather than pushing forward with low-confidence edges.
 
 Milestone 0 — **Enable PHP parsing (plumbing)**
@@ -325,6 +349,10 @@ Milestone 3 — **PHP call edges (high-confidence only)**
   - static calls `Foo::bar()`
   - method calls `$obj->bar()` when `$obj` type is resolvable (same-file / constructor assignment / obvious container resolution)
 - Reuse existing confidence scoring tiers (`import-resolved`, `same-file`, `fuzzy-global`) and keep fuzzy-global conservative.
+- Laravel focus (monorepo-optimized):
+  - Ensure Laravel controller → service edges are reliable for DI-backed patterns (typed properties, constructor promotion/assignment) and common action methods (`index`/`show`/`store`/`update`/`destroy`).
+  - Treat common Laravel helpers (`response()`, `auth()`, `abort()`, `config()`, …) as builtins (no fuzzy resolution) to prevent spurious call edges.
+  - Suppress low-confidence `fuzzy-global` edges into `tests/` (noise reduction; keeps review flows high-signal).
 
 Milestone 4 — **Laravel-aware “wiring” edges (routes, events, schedule, views)**
 - Add a framework pass that produces *explicit* runtime edges as `CALLS` with high confidence + clear `reason`:
@@ -341,6 +369,7 @@ Milestone 4 — **Laravel-aware “wiring” edges (routes, events, schedule, vi
       - Apply correct route file prefixes (e.g. `routes/dashboard.php` under `/api`, `routes/mobile.php` under `/api-mobile`) as defined in `RouteServiceProvider`.
       - Apply in-file group prefixes (`Route::prefix(...)->group(...)`, `Route::group(['prefix' => ...], ...)`) so relative URIs index correctly.
       - Expand `Route::apiResource(...)` into concrete verb+path patterns (index/store/show/update/destroy) so HTTP matching can succeed.
+      - Support controller expressions like `'\\' . FooController::class` (leading-slash string concat) when extracting `Route::resource/apiResource` targets.
     - Confidence policy:
       - Exact string match: `confidence >= 0.95`
       - Wildcard match (templated/param): `confidence >= 0.90`
@@ -348,14 +377,16 @@ Milestone 4 — **Laravel-aware “wiring” edges (routes, events, schedule, vi
 - Keep this as an additive pass after `calls` (so communities/processes benefit) without changing core edge shapes.
 
 Milestone 5 — **Blade templates as first-class `Template` nodes**
-- Treat `resources/views/**/*.blade.php` as `Template` nodes (not PHP AST).
-- Connect template relationships using existing edge types:
-  - `@extends`, `@include`, `@component`, `<x-*>` → `IMPORTS`/`EXTENDS`-shaped edges between templates.
-- Fix Kuzu persistence gaps so `Template` nodes actually land in CSV/COPY (schema + CSV generation alignment).
+- Implemented:
+  - Treat `resources/views/**/*.blade.php` as `Template` nodes (not PHP AST).
+  - Connect template relationships using existing edge types:
+    - `@extends`, `@include`, `@component`, `<x-*>` → `IMPORTS`/`EXTENDS`-shaped edges between templates.
+  - Add Laravel wiring edges from PHP to Blade via view/mail constructs (`view(...)`, `Mail::send(...)`, `Mailable->view(...)`).
 
 Milestone 6 — **Svelte awareness (minimal, useful, non-invasive)**
-- Minimum viable: `.svelte` files are linkable targets of `IMPORTS` from TS/JS.
-- Stretch: extract `<script>` blocks and run existing TS/JS parsing on that content (symbols + calls) while keeping the owning filePath as the `.svelte` file.
+- Implemented:
+  - `.svelte` files are linkable targets of `IMPORTS` from TS/JS.
+  - `<script>` blocks are extracted and parsed with the existing TS/JS grammars, while keeping the owning `filePath` as the `.svelte` file.
 
 Milestone 7 — **TDD + acceptance verification**
 - Add fixture repos under `gitnexus-test-setup/` (tiny Laravel-ish app + blade + svelte + TS client).
@@ -364,6 +395,25 @@ Milestone 7 — **TDD + acceptance verification**
   - `routes` → `Controller` edges exist with expected confidence/reason
   - blade `Template` nodes are present and connected
 - Add “real world” acceptance queries (Kuzu Cypher) to validate on large monorepos.
+
+Milestone 8 — **MCP ergonomics (agent-facing)**
+- Improve disambiguation for graph tools in agent workflows:
+  - Allow `impact` to accept either a symbol `uid` or `{ filePath, name }` (in addition to the current `target: string`) to avoid name-collision failures.
+  - Keep backwards compatibility: `target: string` should continue to work unchanged.
+
+Milestone 9 — **Semantic enrichment edges (high-confidence only)**
+- Add domain-aware “meaning” links (still confidence-first; avoid inventing behavior):
+  - Laravel: controller methods ↔ FormRequest classes (param types) and ↔ Resource classes (return types).
+  - Laravel: authorization calls ↔ permission constants/classes (useful for review blast radius).
+  - Laravel: Eloquent relationship methods ↔ related model classes (e.g. `hasMany`, `belongsToMany`) so model/data wiring isn’t a dead end.
+  - Dashboard: React Query key factories ↔ the API wrapper functions they key (so “find key” → “find endpoint” is one hop).
+
+Milestone 10 — **Derived Views: Flow Signatures + Archetype Heat Maps (no schema changes)**
+- Derive a “flow signature” for each `Process` (layered steps inferred from file paths + node labels + edge reasons like `http-*`).
+- Cluster signatures and surface:
+  - the most common archetypes (with exemplar processes to copy)
+  - cross-stack hotspots (high coupling between `apps/dashboard` and backend PHP handlers)
+- Gate: reports are confidence-filtered (e.g. only `http-*` edges with `confidence >= 0.9`) so they remain trustworthy.
 
 ### Nexus-Driven Workflow (use GitNexus to extend GitNexus)
 
@@ -415,3 +465,14 @@ WHERE a.filePath STARTS WITH 'apps/dashboard/'
   AND r.confidence >= 0.9
 RETURN count(*);
 ```
+
+Cross-stack **Process** flows are a derived signal (they should become nonzero once `http-*` edges exist):
+
+```cypher
+MATCH (s1)-[:CodeRelation {type:'STEP_IN_PROCESS'}]->(p:Process)<-[:CodeRelation {type:'STEP_IN_PROCESS'}]-(s2)
+WHERE s1.filePath STARTS WITH 'apps/dashboard/'
+  AND s2.filePath STARTS WITH 'apps/backend/app/'
+RETURN count(DISTINCT p);
+```
+
+> Kuzu gotcha: avoid `=~` regex inside `any(...)` / list predicates — it can return 0 even when matches exist. Prefer `STARTS WITH` / `CONTAINS`, or use the 2-symbol join pattern above.

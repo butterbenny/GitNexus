@@ -26,6 +26,7 @@
 
 import http from 'http';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { safeStringify } from '../lib/safe-json.js';
 
 export interface EvalServerOptions {
   port?: string;
@@ -199,7 +200,7 @@ function formatCypherResult(result: any): string {
     return lines.join('\n');
   }
 
-  return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  return typeof result === 'string' ? result : safeStringify(result, 2);
 }
 
 function formatDetectChangesResult(result: any): string {
@@ -264,7 +265,7 @@ function formatToolResult(toolName: string, result: any): string {
     case 'cypher': return formatCypherResult(result);
     case 'detect_changes': return formatDetectChangesResult(result);
     case 'list_repos': return formatListReposResult(result);
-    default: return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    default: return typeof result === 'string' ? result : safeStringify(result, 2);
   }
 }
 

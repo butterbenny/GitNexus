@@ -202,8 +202,8 @@ export const processCalls = async (
 
       const calledName = nameNode.text;
 
-      // Skip common built-ins and noise
-      if (isBuiltInOrNoise(calledName)) return;
+      // Skip common built-ins and noise (language-aware)
+      if (isBuiltInOrNoise(calledName, language)) return;
 
       const callNode = captureMap['call'];
 
@@ -299,6 +299,21 @@ const isFuzzyGlobalScopeCompatible = (fromFilePath: string, toFilePath: string):
   return fromApp === toApp;
 };
 
+const isTestFilePath = (filePath: string): boolean => {
+  const p = filePath.toLowerCase().replace(/\\/g, '/');
+  return (
+    p.includes('.test.') || p.includes('.spec.') ||
+    p.startsWith('__tests__/') || p.includes('/__tests__/') ||
+    p.startsWith('__mocks__/') || p.includes('/__mocks__/') ||
+    p.startsWith('test/') || p.includes('/test/') ||
+    p.startsWith('tests/') || p.includes('/tests/') ||
+    p.startsWith('testing/') || p.includes('/testing/') ||
+    p.startsWith('fixtures/') || p.includes('/fixtures/') ||
+    p.endsWith('_test.go') || p.endsWith('_test.py') ||
+    p.includes('/test_') || p.includes('/conftest.')
+  );
+};
+
 /**
  * Resolve a function call to its target node ID using priority strategy:
  * A. Check imported files first (highest confidence)
@@ -337,6 +352,7 @@ const resolveCallTarget = (
     // Confidence-first: only emit a fuzzy edge if there's exactly one global match.
     // Multiple matches is ambiguous and tends to inject noisy CALLS edges.
     if (allDefs.length === 1) {
+      if (isTestFilePath(currentFile) || isTestFilePath(allDefs[0].filePath)) return null;
       const currentLanguage = getLanguageFromFilename(currentFile);
       const targetLanguage = getLanguageFromFilename(allDefs[0].filePath);
       if (!isFuzzyGlobalLanguageCompatible(currentLanguage, targetLanguage)) return null;
@@ -459,6 +475,8 @@ const resolvePhpClassOrInterfaceByName = (
   }
 
   if (candidates.length === 1) {
+    if (isTestFilePath(currentFile) || isTestFilePath(candidates[0].filePath)) return null;
+    if (!isFuzzyGlobalScopeCompatible(currentFile, candidates[0].filePath)) return null;
     return { filePath: candidates[0].filePath, confidence: 0.6, reason: 'fuzzy-global' };
   }
 
@@ -487,6 +505,8 @@ const resolvePhpTraitByName = (
   }
 
   if (candidates.length === 1) {
+    if (isTestFilePath(currentFile) || isTestFilePath(candidates[0].filePath)) return null;
+    if (!isFuzzyGlobalScopeCompatible(currentFile, candidates[0].filePath)) return null;
     return { filePath: candidates[0].filePath, confidence: 0.6, reason: 'fuzzy-global' };
   }
 
@@ -1362,8 +1382,7 @@ const resolvePhpCallTargetFromAst = (
  * Filter out common built-in functions and noise
  * that shouldn't be tracked as calls
  */
-const isBuiltInOrNoise = (name: string): boolean => {
-  const builtIns = new Set([
+const BUILT_INS = new Set([
     // JavaScript/TypeScript built-ins
     'console', 'log', 'warn', 'error', 'info', 'debug',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
@@ -1391,9 +1410,45 @@ const isBuiltInOrNoise = (name: string): boolean => {
     'open', 'read', 'write', 'close', 'append', 'extend', 'update',
     'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
     'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
-  ]);
+]);
 
-  return builtIns.has(name);
+// PHP/Laravel: treat framework helpers as built-ins (avoid noisy/incorrect fuzzy call edges)
+// and allow-list common domain verbs that are meaningful in backend call graphs.
+const PHP_BUILT_IN_ALLOWLIST = new Set([
+  // Common Laravel controller/service verbs
+  'update',
+]);
+
+const PHP_FRAMEWORK_HELPERS = new Set([
+  'abort',
+  'abort_if',
+  'abort_unless',
+  'app',
+  'auth',
+  'back',
+  'config',
+  'dispatch',
+  'dispatch_sync',
+  'event',
+  'redirect',
+  'report',
+  'request',
+  'response',
+  'resolve',
+  'route',
+  'to_route',
+  'throw_if',
+  'throw_unless',
+  'view',
+]);
+
+const isBuiltInOrNoise = (name: string, language: SupportedLanguages | null): boolean => {
+  if (language === SupportedLanguages.PHP) {
+    if (PHP_FRAMEWORK_HELPERS.has(name)) return true;
+    return BUILT_INS.has(name) && !PHP_BUILT_IN_ALLOWLIST.has(name);
+  }
+
+  return BUILT_INS.has(name);
 };
 
 /**
@@ -1447,6 +1502,7 @@ export const processCallsFromExtracted = async (
     for (const call of calls) {
       const language = getLanguageFromFilename(call.filePath);
       if (!language) continue;
+      if (isBuiltInOrNoise(call.calledName, language)) continue;
 
       const resolved = language === SupportedLanguages.PHP
         ? resolvePhpCallTargetFromExtracted(

@@ -66,6 +66,12 @@ export function getResourceTemplates(): ResourceTemplate[] {
       mimeType: 'text/yaml',
     },
     {
+      uriTemplate: 'gitnexus://repo/{name}/archetypes',
+      name: 'Repo Archetypes',
+      description: 'Derived flow signatures + exemplar processes (no schema changes)',
+      mimeType: 'text/yaml',
+    },
+    {
       uriTemplate: 'gitnexus://repo/{name}/schema',
       name: 'Graph Schema',
       description: 'Node/edge schema for Cypher queries',
@@ -116,6 +122,7 @@ function parseUri(uri: string): { repoName?: string; resourceType: string; param
  * Read a resource and return its content
  */
 export async function readResource(uri: string, backend: LocalBackend): Promise<string> {
+  await backend.refreshFromRegistryIfNeeded();
   const parsed = parseUri(uri);
 
   // Global repos list — no repo context needed
@@ -137,6 +144,8 @@ export async function readResource(uri: string, backend: LocalBackend): Promise<
       return getClustersResource(backend, repoName);
     case 'processes':
       return getProcessesResource(backend, repoName);
+    case 'archetypes':
+      return getArchetypesResource(backend, repoName);
     case 'schema':
       return getSchemaResource();
     case 'cluster':
@@ -188,8 +197,7 @@ function getReposResource(backend: LocalBackend): string {
 async function getContextResource(backend: LocalBackend, repoName?: string): Promise<string> {
   // Resolve repo
   const repo = backend.resolveRepo(repoName);
-  const repoId = repo.name.toLowerCase();
-  const context = backend.getContext(repoId) || backend.getContext();
+  const context = backend.getContext(repo.id) || backend.getContext();
 
   if (!context) {
     return 'error: No codebase loaded. Run: gitnexus analyze';
@@ -230,6 +238,7 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('  - gitnexus://repos: All indexed repositories');
   lines.push(`  - gitnexus://repo/${context.projectName}/clusters: All functional areas`);
   lines.push(`  - gitnexus://repo/${context.projectName}/processes: All execution flows`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/archetypes: Derived flow signatures + exemplars`);
   lines.push(`  - gitnexus://repo/${context.projectName}/cluster/{name}: Module details`);
   lines.push(`  - gitnexus://repo/${context.projectName}/process/{name}: Process trace`);
   
@@ -300,6 +309,59 @@ async function getProcessesResource(backend: LocalBackend, repoName?: string): P
   } catch (err: any) {
     return `error: ${err.message}`;
   }
+}
+
+/**
+ * Archetypes resource — derived overview of common flow signatures.
+ */
+async function getArchetypesResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  const { report } = await backend.queryArchetypes(repoName, { limit: 20, examplesPerSignature: 1 });
+
+  const lines: string[] = [
+    `generatedAt: "${report.generatedAt}"`,
+    `totalProcesses: ${report.totalProcesses}`,
+    `uniqueSignatures: ${report.uniqueSignatures}`,
+    'signatures:',
+  ];
+
+  for (const sig of report.signatures) {
+    lines.push(`  - signature: "${sig.signature.replace(/"/g, '\\"')}"`);
+    lines.push(`    count: ${sig.count}`);
+    lines.push(`    crossStack: ${sig.crossStack}`);
+
+    if (sig.topHttpRoutes.length > 0) {
+      lines.push('    topHttpRoutes:');
+      for (const route of sig.topHttpRoutes.slice(0, 5)) {
+        lines.push(`      - route: "${String(route.route).replace(/"/g, '\\"')}"`);
+        lines.push(`        count: ${route.count}`);
+      }
+    }
+
+    const ex = sig.exampleProcesses[0];
+    if (ex) {
+      lines.push('    example:');
+      lines.push(`      processId: "${String(ex.processId).replace(/"/g, '\\"')}"`);
+      lines.push(`      label: "${String(ex.label).replace(/"/g, '\\"')}"`);
+      lines.push(`      stepCount: ${ex.stepCount}`);
+      lines.push('      entry:');
+      lines.push(`        name: "${String(ex.entry.name).replace(/"/g, '\\"')}"`);
+      lines.push(`        filePath: "${String(ex.entry.filePath).replace(/"/g, '\\"')}"`);
+      lines.push(`        type: "${String(ex.entry.type).replace(/"/g, '\\"')}"`);
+      lines.push('      terminal:');
+      lines.push(`        name: "${String(ex.terminal.name).replace(/"/g, '\\"')}"`);
+      lines.push(`        filePath: "${String(ex.terminal.filePath).replace(/"/g, '\\"')}"`);
+      lines.push(`        type: "${String(ex.terminal.type).replace(/"/g, '\\"')}"`);
+
+      if (ex.httpRoutes.length > 0) {
+        lines.push('      httpRoutes:');
+        for (const route of ex.httpRoutes.slice(0, 5)) {
+          lines.push(`        - "${String(route).replace(/"/g, '\\"')}"`);
+        }
+      }
+    }
+  }
+
+  return lines.join('\n');
 }
 
 /**

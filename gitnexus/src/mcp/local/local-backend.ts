@@ -13,9 +13,11 @@ import { embedQuery, getEmbeddingDims, disposeEmbedder } from '../core/embedder.
 // git utilities available if needed
 // import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
 import {
+  getGlobalRegistryPath,
   listRegisteredRepos,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { buildArchetypeReport, type ArchetypeReport, type HttpEdgeInfo, type ProcessTraceInfo } from '../../core/derived/archetypes.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -27,9 +29,12 @@ function isTestFilePath(filePath: string): boolean {
   const p = filePath.toLowerCase().replace(/\\/g, '/');
   return (
     p.includes('.test.') || p.includes('.spec.') ||
-    p.includes('__tests__/') || p.includes('__mocks__/') ||
-    p.includes('/test/') || p.includes('/tests/') ||
-    p.includes('/testing/') || p.includes('/fixtures/') ||
+    p.startsWith('__tests__/') || p.includes('/__tests__/') ||
+    p.startsWith('__mocks__/') || p.includes('/__mocks__/') ||
+    p.startsWith('test/') || p.includes('/test/') ||
+    p.startsWith('tests/') || p.includes('/tests/') ||
+    p.startsWith('testing/') || p.includes('/testing/') ||
+    p.startsWith('fixtures/') || p.includes('/fixtures/') ||
     p.endsWith('_test.go') || p.endsWith('_test.py') ||
     p.includes('/test_') || p.includes('/conftest.')
   );
@@ -68,6 +73,7 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
+  private registryMtimeMs: number | null = null;
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -78,8 +84,46 @@ export class LocalBackend {
   async init(): Promise<boolean> {
     const entries = await listRegisteredRepos({ validate: true });
 
+    this.syncFromRegistryEntries(entries);
+    this.registryMtimeMs = await this.getRegistryMtimeMs();
+    return this.repos.size > 0;
+  }
+
+  private async getRegistryMtimeMs(): Promise<number | null> {
+    try {
+      const stat = await fs.stat(getGlobalRegistryPath());
+      return stat.mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Reload repo handles + lightweight context from the global registry.
+   * Used to keep MCP tool/resources metadata consistent after `gitnexus analyze`
+   * runs in a separate process.
+   */
+  async refreshFromRegistryIfNeeded(): Promise<void> {
+    const mtimeMs = await this.getRegistryMtimeMs();
+    if (mtimeMs === null) return;
+    if (this.registryMtimeMs === mtimeMs) return;
+
+    // Index was rebuilt in another process. Close Kuzu pools so subsequent
+    // queries reopen against the refreshed on-disk database.
+    await closeKuzu();
+    this.initializedRepos.clear();
+
+    const entries = await listRegisteredRepos({ validate: true });
+    this.syncFromRegistryEntries(entries);
+    this.registryMtimeMs = mtimeMs;
+  }
+
+  private syncFromRegistryEntries(entries: RegistryEntry[]): void {
+    this.repos.clear();
+    this.contextCache.clear();
+
     for (const entry of entries) {
-      const id = this.repoId(entry.name, entry.path);
+      const id = this.repoId(entry.name, entry.path, this.repos);
       const storagePath = entry.storagePath;
       const kuzuPath = path.join(storagePath, 'kuzu');
 
@@ -108,18 +152,17 @@ export class LocalBackend {
         },
       });
     }
-
-    return this.repos.size > 0;
   }
 
   /**
    * Generate a stable repo ID from name + path.
    * If names collide, append a hash of the path.
    */
-  private repoId(name: string, repoPath: string): string {
+  private repoId(name: string, repoPath: string, existing?: Map<string, RepoHandle>): string {
     const base = name.toLowerCase();
+    const repos = existing ?? this.repos;
     // Check for name collision with a different path
-    for (const [id, handle] of this.repos) {
+    for (const [id, handle] of repos) {
       if (id === base && handle.repoPath !== path.resolve(repoPath)) {
         // Collision — use path hash
         const hash = Buffer.from(repoPath).toString('base64url').slice(0, 6);
@@ -224,6 +267,8 @@ export class LocalBackend {
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
+    await this.refreshFromRegistryIfNeeded();
+
     if (method === 'list_repos') {
       return this.listRepos();
     }
@@ -234,6 +279,8 @@ export class LocalBackend {
     switch (method) {
       case 'query':
         return this.query(repo, params);
+      case 'archetypes':
+        return this.archetypes(repo, params);
       case 'cypher':
         return this.cypher(repo, params);
       case 'context':
@@ -254,6 +301,19 @@ export class LocalBackend {
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
+  }
+
+  private async archetypes(repo: RepoHandle, params: {
+    limit?: number;
+    examples?: number;
+    min_http_confidence?: number;
+    repo?: string;
+  }): Promise<{ report: ArchetypeReport }> {
+    return this.queryArchetypes(repo.id, {
+      limit: params.limit,
+      examplesPerSignature: params.examples,
+      minHttpConfidence: params.min_http_confidence,
+    });
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
@@ -292,13 +352,13 @@ export class LocalBackend {
       this.semanticSearch(repo, searchQuery, searchLimit),
     ]);
     
-    // Merge via reciprocal rank fusion
+    // Merge via reciprocal rank fusion (RRF)
     const scoreMap = new Map<string, { score: number; data: any }>();
-    
+
     for (let i = 0; i < bm25Results.length; i++) {
       const result = bm25Results[i];
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      const rrfScore = 1 / (60 + i + 1); // rank starts at 1
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -306,11 +366,11 @@ export class LocalBackend {
         scoreMap.set(key, { score: rrfScore, data: result });
       }
     }
-    
+
     for (let i = 0; i < semanticResults.length; i++) {
       const result = semanticResults[i];
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      const rrfScore = 1 / (60 + i + 1); // rank starts at 1
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -318,19 +378,58 @@ export class LocalBackend {
         scoreMap.set(key, { score: rrfScore, data: result });
       }
     }
-    
-    const merged = Array.from(scoreMap.entries())
-      .sort((a, b) => b[1].score - a[1].score)
-      .slice(0, searchLimit);
+
+    const merged = Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, searchLimit)
+      .map((item, idx) => ({ ...item, mergedRank: idx + 1 }));
+
+    const hitMeta = new Map<string, { score: number; rank: number }>();
+    for (const item of merged) {
+      if (item.data?.nodeId) {
+        hitMeta.set(item.data.nodeId, { score: item.score, rank: item.mergedRank });
+      }
+    }
     
     // Step 2: For each match with a nodeId, trace to process(es)
-    const processMap = new Map<string, { id: string; label: string; heuristicLabel: string; processType: string; stepCount: number; totalScore: number; cohesionBoost: number; symbols: any[] }>();
+    type ProcessAgg = {
+      id: string;
+      label: string;
+      heuristicLabel: string;
+      processType: string;
+      stepCount: number;
+      totalScore: number;
+      cohesionBoost: number;
+      bestHitRank: number;
+      hitCount: number;
+      anchored: boolean;
+    };
+
+    const processMap = new Map<string, ProcessAgg>();
     const definitions: any[] = []; // standalone symbols not in any process
-    
-    for (const [_, item] of merged) {
+
+    const ensureProcess = (row: any, defaultPid: string): ProcessAgg => {
+      const pid = row.pid ?? row[0] ?? defaultPid;
+      if (!processMap.has(pid)) {
+        processMap.set(pid, {
+          id: pid,
+          label: row.label ?? row[1] ?? '',
+          heuristicLabel: row.heuristicLabel ?? row[2] ?? '',
+          processType: row.processType ?? row[3] ?? '',
+          stepCount: row.stepCount ?? row[4] ?? 0,
+          totalScore: 0,
+          cohesionBoost: 0,
+          bestHitRank: Number.POSITIVE_INFINITY,
+          hitCount: 0,
+          anchored: false,
+        });
+      }
+      return processMap.get(pid)!;
+    };
+
+    for (const item of merged) {
       const sym = item.data;
       if (!sym.nodeId) {
-        // File-level results go to definitions
         definitions.push({
           name: sym.name,
           type: sym.type || 'File',
@@ -338,9 +437,11 @@ export class LocalBackend {
         });
         continue;
       }
-      
+
       const escaped = sym.nodeId.replace(/'/g, "''");
-      
+      const hitRank = item.mergedRank;
+      const hitScore = item.score;
+
       // Find processes this symbol participates in
       let processRows: any[] = [];
       try {
@@ -349,7 +450,7 @@ export class LocalBackend {
           RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
         `);
       } catch { /* symbol might not be in any process */ }
-      
+
       // Get cluster cohesion as internal ranking signal (never exposed)
       let cohesion = 0;
       try {
@@ -362,7 +463,7 @@ export class LocalBackend {
           cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
         }
       } catch { /* no cluster info */ }
-      
+
       // Optionally fetch content
       let content: string | undefined;
       if (includeContent) {
@@ -376,7 +477,7 @@ export class LocalBackend {
           }
         } catch { /* skip */ }
       }
-      
+
       const symbolEntry = {
         id: sym.nodeId,
         name: sym.name,
@@ -386,83 +487,217 @@ export class LocalBackend {
         endLine: sym.endLine,
         ...(includeContent && content ? { content } : {}),
       };
-      
+
       if (processRows.length === 0) {
-        // Symbol not in any process — goes to definitions
         definitions.push(symbolEntry);
-      } else {
-        // Add to each process it belongs to
-        for (const row of processRows) {
-          const pid = row.pid ?? row[0];
-          const label = row.label ?? row[1];
-          const hLabel = row.heuristicLabel ?? row[2];
-          const pType = row.processType ?? row[3];
-          const stepCount = row.stepCount ?? row[4];
-          const step = row.step ?? row[5];
-          
-          if (!processMap.has(pid)) {
-            processMap.set(pid, {
-              id: pid,
-              label,
-              heuristicLabel: hLabel,
-              processType: pType,
-              stepCount,
-              totalScore: 0,
-              cohesionBoost: 0,
-              symbols: [],
-            });
-          }
-          
-          const proc = processMap.get(pid)!;
-          proc.totalScore += item.score;
-          proc.cohesionBoost = Math.max(proc.cohesionBoost, cohesion);
-          proc.symbols.push({
-            ...symbolEntry,
-            process_id: pid,
-            step_index: step,
-          });
-        }
+        continue;
+      }
+
+      for (const row of processRows) {
+        const pid = row.pid ?? row[0];
+        const proc = ensureProcess(row, pid);
+        proc.totalScore += hitScore;
+        proc.cohesionBoost = Math.max(proc.cohesionBoost, cohesion);
+        proc.bestHitRank = Math.min(proc.bestHitRank, hitRank);
+        proc.hitCount += 1;
+        if (hitRank <= 10) proc.anchored = true;
+      }
+    }
+
+    // Step 2b: If top results are tests, try to bridge to likely-under-test symbols
+    // via high-confidence CALLS edges (tests are excluded as process entry points).
+    const testSeedHits = merged
+      .filter(item => item.data?.nodeId && item.data?.filePath && isTestFilePath(item.data.filePath))
+      .filter(item => {
+        const type = item.data?.type || '';
+        return type !== 'File';
+      })
+      .slice(0, 3);
+
+    const BRIDGE_MIN_CONFIDENCE = 0.8;
+    const MAX_BRIDGE_TARGETS = 8;
+    const bridgeTargets = new Map<string, { score: number; data: any; seedRank: number }>();
+
+    for (const seed of testSeedHits) {
+      const seedId = seed.data.nodeId;
+      const escapedSeed = seedId.replace(/'/g, "''");
+
+      let callRows: any[] = [];
+      try {
+        callRows = await executeQuery(repo.id, `
+          MATCH (n {id: '${escapedSeed}'})-[r:CodeRelation {type: 'CALLS'}]->(m)
+          RETURN m.id AS id, m.name AS name, m.filePath AS filePath, m.startLine AS startLine, m.endLine AS endLine,
+                 r.confidence AS confidence, r.reason AS reason
+          ORDER BY r.confidence DESC
+          LIMIT ${MAX_BRIDGE_TARGETS}
+        `);
+      } catch { /* skip */ }
+
+      for (const row of callRows) {
+        const targetId = row.id ?? row[0];
+        if (!targetId || typeof targetId !== 'string') continue;
+        if (hitMeta.has(targetId)) continue;
+
+        const filePath = row.filePath ?? row[2] ?? '';
+        if (!filePath || typeof filePath !== 'string') continue;
+        if (isTestFilePath(filePath)) continue;
+
+        const confidenceRaw = row.confidence ?? row[5] ?? 0;
+        const confidence = typeof confidenceRaw === 'number' ? confidenceRaw : parseFloat(confidenceRaw) || 0;
+        if (confidence < BRIDGE_MIN_CONFIDENCE) continue;
+
+        const reason = row.reason ?? row[6] ?? '';
+        if (typeof reason === 'string' && reason === 'fuzzy-global') continue;
+
+        const bridgeScore = seed.score * 0.5 * confidence;
+
+        const existing = bridgeTargets.get(targetId);
+        if (existing && existing.score >= bridgeScore) continue;
+
+        const labelEndIdx = targetId.indexOf(':');
+        const type = labelEndIdx > 0 ? targetId.substring(0, labelEndIdx) : 'Unknown';
+
+        bridgeTargets.set(targetId, {
+          score: bridgeScore,
+          seedRank: seed.mergedRank,
+          data: {
+            nodeId: targetId,
+            name: row.name ?? row[1] ?? '',
+            type,
+            filePath,
+            startLine: row.startLine ?? row[3],
+            endLine: row.endLine ?? row[4],
+          },
+        });
+      }
+    }
+
+    for (const target of bridgeTargets.values()) {
+      const sym = target.data;
+      const escaped = sym.nodeId.replace(/'/g, "''");
+
+      let processRows: any[] = [];
+      try {
+        processRows = await executeQuery(repo.id, `
+          MATCH (n {id: '${escaped}'})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `);
+      } catch { /* skip */ }
+
+      if (processRows.length === 0) {
+        definitions.push({
+          id: sym.nodeId,
+          name: sym.name,
+          type: sym.type,
+          filePath: sym.filePath,
+          startLine: sym.startLine,
+          endLine: sym.endLine,
+        });
+        continue;
+      }
+
+      for (const row of processRows) {
+        const pid = row.pid ?? row[0];
+        const proc = ensureProcess(row, pid);
+        proc.totalScore += target.score;
+        proc.bestHitRank = Math.min(proc.bestHitRank, target.seedRank);
+        proc.hitCount += 1;
+        proc.anchored = true;
       }
     }
     
     // Step 3: Rank processes by aggregate score + internal cohesion boost
-    const rankedProcesses = Array.from(processMap.values())
+    const allProcesses = Array.from(processMap.values());
+    const anchored = allProcesses.filter(p => p.anchored);
+
+    // If we have anchored processes, suppress unanchored ones to avoid noisy "process hits"
+    // when the query is really about a standalone symbol (tests are a common case).
+    const candidates = anchored.length > 0
+      ? anchored
+      : allProcesses.filter(p => p.bestHitRank <= 20 || p.hitCount >= 2);
+
+    const rankedProcesses = candidates
       .map(p => ({
         ...p,
-        priority: p.totalScore + (p.cohesionBoost * 0.1), // cohesion as subtle ranking signal
+        priority: p.totalScore +
+          (p.cohesionBoost * 0.1) +
+          (Number.isFinite(p.bestHitRank) ? (1 / (30 + p.bestHitRank)) : 0),
       }))
       .sort((a, b) => b.priority - a.priority)
       .slice(0, processLimit);
     
-    // Step 4: Build response
+    // Step 4: Fetch full process-step symbols (not only the direct search hits)
+    const processSymbols: any[] = [];
+    const symbolCountByProcess = new Map<string, number>();
+
+    for (const proc of rankedProcesses) {
+      const escapedPid = proc.id.replace(/'/g, "''");
+      const contentProjection = includeContent ? ', n.content AS content' : '';
+
+      let stepRows: any[] = [];
+      try {
+        stepRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escapedPid}'})
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${contentProjection},
+                 r.step AS step
+          ORDER BY r.step
+        `);
+      } catch { /* skip */ }
+
+      const stepSymbols: any[] = [];
+      for (const row of stepRows) {
+        const nodeId = row.id ?? row[0];
+        if (!nodeId || typeof nodeId !== 'string') continue;
+
+        const labelEndIdx = nodeId.indexOf(':');
+        const type = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
+
+        const step = row.step ?? row[includeContent ? 6 : 5];
+        const stepIndex = typeof step === 'number' ? step : parseInt(step, 10);
+
+        stepSymbols.push({
+          id: nodeId,
+          name: row.name ?? row[1] ?? '',
+          type,
+          filePath: row.filePath ?? row[2] ?? '',
+          startLine: row.startLine ?? row[3],
+          endLine: row.endLine ?? row[4],
+          ...(includeContent ? { content: row.content ?? row[5] } : {}),
+          process_id: proc.id,
+          step_index: stepIndex,
+          ...(hitMeta.has(nodeId) ? { hit_rank: hitMeta.get(nodeId)!.rank } : {}),
+        });
+      }
+
+      const limitedSteps = stepSymbols.slice(0, maxSymbolsPerProcess);
+      symbolCountByProcess.set(proc.id, limitedSteps.length);
+      processSymbols.push(...limitedSteps);
+    }
+
     const processes = rankedProcesses.map(p => ({
       id: p.id,
       summary: p.heuristicLabel || p.label,
       priority: Math.round(p.priority * 1000) / 1000,
-      symbol_count: p.symbols.length,
+      symbol_count: symbolCountByProcess.get(p.id) ?? 0,
       process_type: p.processType,
       step_count: p.stepCount,
     }));
-    
-    const processSymbols = rankedProcesses.flatMap(p =>
-      p.symbols.slice(0, maxSymbolsPerProcess).map(s => ({
-        ...s,
-        // remove internal fields
-      }))
-    );
-    
-    // Deduplicate process_symbols by id
-    const seen = new Set<string>();
-    const dedupedSymbols = processSymbols.filter(s => {
-      if (seen.has(s.id)) return false;
-      seen.add(s.id);
-      return true;
-    });
+
+    // Deduplicate definitions by id/filePath (keep highest-ranked)
+    const dedupedDefinitions: any[] = [];
+    const seenDef = new Set<string>();
+    for (const d of definitions) {
+      const key = d.id || d.filePath;
+      if (!key) continue;
+      if (seenDef.has(key)) continue;
+      seenDef.add(key);
+      dedupedDefinitions.push(d);
+    }
     
     return {
       processes,
-      process_symbols: dedupedSymbols,
-      definitions: definitions.slice(0, 20), // cap standalone definitions
+      process_symbols: processSymbols,
+      definitions: dedupedDefinitions.slice(0, 20), // cap standalone definitions
     };
   }
 
@@ -470,61 +705,64 @@ export class LocalBackend {
    * BM25 keyword search helper - uses KuzuDB FTS for always-fresh results
    */
   private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
-    const { searchFTSFromKuzu } = await import('../../core/search/bm25-index.js');
-    let bm25Results;
     try {
-      bm25Results = await searchFTSFromKuzu(query, limit, repo.id);
+      const escapedQuery = query.replace(/'/g, "''");
+      const scoreMap = new Map<string, { score: number; bm25Score: number; data: any }>();
+      const tables: Array<{ table: string; index: string }> = [
+        { table: 'Method', index: 'method_fts' },
+        { table: 'Function', index: 'function_fts' },
+        { table: 'Class', index: 'class_fts' },
+        { table: 'Interface', index: 'interface_fts' },
+        { table: 'File', index: 'file_fts' },
+      ];
+
+      for (const { table, index } of tables) {
+        const rows = await executeQuery(repo.id, `
+          CALL QUERY_FTS_INDEX('${table}', '${index}', '${escapedQuery}', conjunctive := false)
+          RETURN node, score
+          ORDER BY score DESC
+          LIMIT ${limit}
+        `);
+
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          const node = row.node || row[0] || {};
+          const nodeId = node.id || node.nodeId || '';
+          if (!nodeId) continue;
+
+          const rrfScore = 1 / (60 + i + 1); // rank starts at 1
+          const bm25ScoreRaw = row.score ?? row[1] ?? 0;
+          const bm25Score = typeof bm25ScoreRaw === 'number' ? bm25ScoreRaw : parseFloat(bm25ScoreRaw) || 0;
+
+          const existing = scoreMap.get(nodeId);
+          if (existing) {
+            existing.score += rrfScore;
+            existing.bm25Score = Math.max(existing.bm25Score, bm25Score);
+          } else {
+            scoreMap.set(nodeId, {
+              score: rrfScore,
+              bm25Score,
+              data: {
+                nodeId,
+                name: node.name || '',
+                type: table,
+                filePath: node.filePath || '',
+                startLine: typeof node.startLine === 'number' ? node.startLine : undefined,
+                endLine: typeof node.endLine === 'number' ? node.endLine : undefined,
+              }
+            });
+          }
+        }
+      }
+
+      return Array.from(scoreMap.values())
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit)
+        .map(item => ({ ...item.data, bm25Score: item.bm25Score }));
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
       return [];
     }
-    
-    const results: any[] = [];
-    
-    for (const bm25Result of bm25Results) {
-      const fullPath = bm25Result.filePath;
-      try {
-        const symbolQuery = `
-          MATCH (n) 
-          WHERE n.filePath = '${fullPath.replace(/'/g, "''")}'
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
-          LIMIT 3
-        `;
-        const symbols = await executeQuery(repo.id, symbolQuery);
-        
-        if (symbols.length > 0) {
-          for (const sym of symbols) {
-            results.push({
-              nodeId: sym.id || sym[0],
-              name: sym.name || sym[1],
-              type: sym.type || sym[2],
-              filePath: sym.filePath || sym[3],
-              startLine: sym.startLine || sym[4],
-              endLine: sym.endLine || sym[5],
-              bm25Score: bm25Result.score,
-            });
-          }
-        } else {
-          const fileName = fullPath.split('/').pop() || fullPath;
-          results.push({
-            name: fileName,
-            type: 'File',
-            filePath: bm25Result.filePath,
-            bm25Score: bm25Result.score,
-          });
-        }
-      } catch {
-        const fileName = fullPath.split('/').pop() || fullPath;
-        results.push({
-          name: fileName,
-          type: 'File',
-          filePath: bm25Result.filePath,
-          bm25Score: bm25Result.score,
-        });
-      }
-    }
-    
-    return results;
   }
 
   /**
@@ -1190,7 +1428,10 @@ export class LocalBackend {
   }
 
   private async impact(repo: RepoHandle, params: {
-    target: string;
+    target?: string;
+    name?: string;
+    uid?: string;
+    file_path?: string;
     direction: 'upstream' | 'downstream';
     maxDepth?: number;
     relationTypes?: string[];
@@ -1199,7 +1440,7 @@ export class LocalBackend {
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
-    const { target, direction } = params;
+    const { direction } = params;
     const maxDepth = params.maxDepth || 3;
     const relationTypes = params.relationTypes && params.relationTypes.length > 0
       ? params.relationTypes
@@ -1210,16 +1451,59 @@ export class LocalBackend {
     const relTypeFilter = relationTypes.map(t => `'${t}'`).join(', ');
     const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
     
-    const targetQuery = `
-      MATCH (n)
-      WHERE n.name = '${target.replace(/'/g, "''")}'
-      RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-      LIMIT 1
-    `;
-    const targets = await executeQuery(repo.id, targetQuery);
-    if (targets.length === 0) return { error: `Target '${target}' not found` };
-    
-    const sym = targets[0];
+    const uid = params.uid?.trim();
+    const name = (params.name || params.target || '').trim();
+    const filePathHint = params.file_path?.trim();
+
+    if (!uid && !name) {
+      return { error: 'Either "name" (or legacy "target") or "uid" parameter is required.' };
+    }
+
+    let symbols: any[] = [];
+    if (uid) {
+      const escaped = uid.replace(/'/g, "''");
+      symbols = await executeQuery(repo.id, `
+        MATCH (n {id: '${escaped}'})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        LIMIT 1
+      `);
+    } else {
+      const escaped = name.replace(/'/g, "''");
+      const isQualified = name.includes('/') || name.includes(':');
+
+      let whereClause: string;
+      if (filePathHint) {
+        const fpEscaped = filePathHint.replace(/'/g, "''");
+        whereClause = `WHERE n.name = '${escaped}' AND n.filePath CONTAINS '${fpEscaped}'`;
+      } else if (isQualified) {
+        whereClause = `WHERE n.id = '${escaped}' OR n.name = '${escaped}'`;
+      } else {
+        whereClause = `WHERE n.name = '${escaped}'`;
+      }
+
+      symbols = await executeQuery(repo.id, `
+        MATCH (n) ${whereClause}
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        LIMIT 10
+      `);
+    }
+
+    if (symbols.length === 0) return { error: `Target '${name || uid}' not found` };
+
+    if (symbols.length > 1 && !uid) {
+      return {
+        status: 'ambiguous',
+        message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
+        candidates: symbols.map((s: any) => ({
+          uid: s.id || s[0],
+          name: s.name || s[1],
+          kind: s.type || s[2],
+          filePath: s.filePath || s[3],
+        })),
+      };
+    }
+
+    const sym = symbols[0];
     const symId = sym.id || sym[0];
     
     const impacted: any[] = [];
@@ -1340,6 +1624,89 @@ export class LocalBackend {
     } catch {
       return { processes: [] };
     }
+  }
+
+  /**
+   * Query derived archetype clusters (flow signatures) from Process traces.
+   * Used for “more than a map” architecture overview without changing graph schema.
+   */
+  async queryArchetypes(repoName?: string, options?: {
+    limit?: number;
+    examplesPerSignature?: number;
+    minHttpConfidence?: number;
+  }): Promise<{ report: ArchetypeReport }> {
+    const repo = this.resolveRepo(repoName);
+    await this.ensureInitialized(repo.id);
+
+    const limit = options?.limit ?? 25;
+    const examplesPerSignature = options?.examplesPerSignature ?? 3;
+    const minHttpConfidence = options?.minHttpConfidence ?? 0.9;
+
+    const stepRows = await executeQuery(repo.id, `
+      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+      RETURN p.id AS processId,
+             p.label AS label,
+             p.heuristicLabel AS heuristicLabel,
+             p.processType AS processType,
+             p.stepCount AS stepCount,
+             s.id AS nodeId,
+             s.name AS name,
+             s.filePath AS filePath,
+             labels(s)[0] AS type,
+             r.step AS step
+      ORDER BY processId, step
+    `);
+
+    const processesById = new Map<string, ProcessTraceInfo>();
+    for (const row of stepRows) {
+      const processId = row.processId || row[0];
+      let proc = processesById.get(processId);
+      if (!proc) {
+        proc = {
+          id: processId,
+          label: row.label || row[1] || processId,
+          heuristicLabel: row.heuristicLabel || row[2] || row.label || row[1] || processId,
+          processType: row.processType || row[3] || '',
+          stepCount: row.stepCount || row[4] || 0,
+          steps: [],
+        };
+        processesById.set(processId, proc);
+      }
+
+      proc.steps.push({
+        step: row.step || row[9] || 0,
+        nodeId: row.nodeId || row[5],
+        name: row.name || row[6] || '',
+        filePath: row.filePath || row[7] || '',
+        type: row.type || row[8] || '',
+      });
+    }
+
+    for (const proc of processesById.values()) {
+      proc.steps.sort((a, b) => a.step - b.step);
+      if (!proc.stepCount) proc.stepCount = proc.steps.length;
+    }
+
+    const httpRows = await executeQuery(repo.id, `
+      MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
+      WHERE r.reason STARTS WITH 'http-' AND r.confidence >= ${minHttpConfidence}
+      RETURN a.id AS sourceId, b.id AS targetId, r.reason AS reason, r.confidence AS confidence
+    `);
+
+    const httpEdges: HttpEdgeInfo[] = httpRows.map((r: any) => ({
+      sourceId: r.sourceId || r[0],
+      targetId: r.targetId || r[1],
+      reason: r.reason || r[2],
+      confidence: r.confidence || r[3] || 1.0,
+    }));
+
+    const report = buildArchetypeReport(Array.from(processesById.values()), httpEdges, {
+      limit,
+      examplesPerSignature,
+      minHttpConfidence,
+    });
+
+    return { report };
   }
 
   /**

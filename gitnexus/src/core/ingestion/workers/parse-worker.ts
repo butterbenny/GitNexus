@@ -332,6 +332,45 @@ const BUILT_INS = new Set([
   'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
 ]);
 
+// PHP/Laravel: treat framework helpers as built-ins (avoid noisy/incorrect fuzzy call edges)
+// and allow-list common domain verbs that are meaningful in backend call graphs.
+const PHP_BUILT_IN_ALLOWLIST = new Set([
+  // Common Laravel controller/service verbs
+  'update',
+]);
+
+const PHP_FRAMEWORK_HELPERS = new Set([
+  'abort',
+  'abort_if',
+  'abort_unless',
+  'app',
+  'auth',
+  'back',
+  'config',
+  'dispatch',
+  'dispatch_sync',
+  'event',
+  'redirect',
+  'report',
+  'request',
+  'response',
+  'resolve',
+  'route',
+  'to_route',
+  'throw_if',
+  'throw_unless',
+  'view',
+]);
+
+const isBuiltInCall = (calledName: string, language: SupportedLanguages): boolean => {
+  if (language === SupportedLanguages.PHP) {
+    if (PHP_FRAMEWORK_HELPERS.has(calledName)) return true;
+    return BUILT_INS.has(calledName) && !PHP_BUILT_IN_ALLOWLIST.has(calledName);
+  }
+
+  return BUILT_INS.has(calledName);
+};
+
 // ============================================================================
 // Label detection from capture map
 // ============================================================================
@@ -1158,7 +1197,7 @@ const processFileGroup = (
         const callNameNode = captureMap['call.name'];
         if (callNameNode) {
           const calledName = callNameNode.text;
-          if (!BUILT_INS.has(calledName)) {
+          if (!isBuiltInCall(calledName, language)) {
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path)
               || generateId('File', file.path);

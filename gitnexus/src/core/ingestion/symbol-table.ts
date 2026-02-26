@@ -53,7 +53,9 @@ export const createSymbolTable = (): SymbolTable => {
     if (!globalIndex.has(name)) {
       globalIndex.set(name, []);
     }
-    globalIndex.get(name)!.push({ nodeId, filePath, type });
+    const defs = globalIndex.get(name)!;
+    if (defs.some(d => d.nodeId === nodeId)) return;
+    defs.push({ nodeId, filePath, type });
   };
 
   const lookupExact = (filePath: string, name: string): string | undefined => {

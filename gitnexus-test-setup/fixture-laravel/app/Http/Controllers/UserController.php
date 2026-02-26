@@ -4,10 +4,14 @@ namespace App\Http\Controllers;
 
 use App\Events\UserRegistered;
 use App\Jobs\{CleanupJob as Clean, SendDigestJob};
+use App\Http\Requests\UpdateUserRequest;
+use App\Http\Resources\UserResource;
 use App\Mail\WelcomeMail;
+use App\Models\User;
 use App\Notifications\SmsNotification;
 use App\Notifications\WelcomeNotification;
 use App\Services\{EmailService as Mailer, TicketService};
+use App\Domains\AccessControl\Permissions\AccountPermission;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Event;
@@ -65,6 +69,23 @@ class UserController
         $viaFacadeMake = App::make(Mailer::class);
         $viaFacadeMake->sendViaFacadeMakeAssigned();
         (new TicketService())->handleViaNew();
+        $this->service->update();
         return $this->service->handle();
+    }
+
+    public function update(UpdateUserRequest $request, User $user): UserResource
+    {
+        $this->authorize('update', $user);
+        $this->authorize(AccountPermission::EDIT, $user);
+        $this->authorize('manage-member', [$user, $user]);
+
+        return new UserResource();
+    }
+
+    public function canTest(?User $user): bool
+    {
+        return (bool) $user?->can('update', $user)
+            && (bool) $user?->can(AccountPermission::EDIT, $user)
+            && (bool) $user?->can('manage-member', [$user, $user]);
     }
 }

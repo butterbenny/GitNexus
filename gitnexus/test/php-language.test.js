@@ -106,6 +106,10 @@ test('PHP: resolves member calls using inferred $this property types', async () 
     .find(n => n.properties?.name === 'handle');
   assert.ok(serviceHandle);
 
+  const serviceUpdate = getNodes(graph, 'Method', 'app/Services/TicketService.php')
+    .find(n => n.properties?.name === 'update');
+  assert.ok(serviceUpdate);
+
   const callEdges = graph.relationships.filter(r => {
     return r.type === 'CALLS'
       && r.sourceId === controllerIndex.id
@@ -114,6 +118,15 @@ test('PHP: resolves member calls using inferred $this property types', async () 
   assert.equal(callEdges.length, 1);
   assert.equal(callEdges[0].reason, 'import-resolved');
   assert.ok(callEdges[0].confidence >= 0.9);
+
+  const updateEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerIndex.id
+      && r.targetId === serviceUpdate.id;
+  });
+  assert.equal(updateEdges.length, 1);
+  assert.equal(updateEdges[0].reason, 'import-resolved');
+  assert.ok(updateEdges[0].confidence >= 0.9);
 });
 
 test('PHP: infers container-resolved property types via app()', async () => {
@@ -244,6 +257,289 @@ test('PHP: resolves $this calls to trait methods', async () => {
   assert.equal(callEdges.length, 1);
   assert.equal(callEdges[0].reason, 'import-resolved');
   assert.ok(callEdges[0].confidence >= 0.9);
+});
+
+test('Laravel semantic: controller method wires to FormRequest + Resource types', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerUpdate = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'update');
+  assert.ok(controllerUpdate);
+
+  const requestClass = getNodes(graph, 'Class', 'app/Http/Requests/UpdateUserRequest.php')
+    .find(n => n.properties?.name === 'UpdateUserRequest');
+  assert.ok(requestClass);
+
+  const resourceClass = getNodes(graph, 'Class', 'app/Http/Resources/UserResource.php')
+    .find(n => n.properties?.name === 'UserResource');
+  assert.ok(resourceClass);
+
+  const formRequestEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerUpdate.id
+      && r.targetId === requestClass.id;
+  });
+  assert.equal(formRequestEdges.length, 1);
+  assert.equal(formRequestEdges[0].reason, 'laravel-form-request:param');
+  assert.ok(formRequestEdges[0].confidence >= 0.9);
+
+  const resourceEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerUpdate.id
+      && r.targetId === resourceClass.id;
+  });
+  assert.equal(resourceEdges.length, 1);
+  assert.equal(resourceEdges[0].reason, 'laravel-resource:return');
+  assert.ok(resourceEdges[0].confidence >= 0.9);
+});
+
+test('Laravel auth: controller methods wire to Policy methods + Permission enums', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerUpdate = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'update');
+  assert.ok(controllerUpdate);
+
+  const controllerCanTest = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'canTest');
+  assert.ok(controllerCanTest);
+
+  const policyUpdate = getNodes(graph, 'Method', 'app/Policies/UserPolicy.php')
+    .find(n => n.properties?.name === 'update');
+  assert.ok(policyUpdate);
+
+  const policyManageMember = getNodes(graph, 'Method', 'app/Policies/UserPolicy.php')
+    .find(n => n.properties?.name === 'manageMember');
+  assert.ok(policyManageMember);
+
+  const accountPermissionEnum = getNodes(graph, 'Enum', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'AccountPermission');
+  assert.ok(accountPermissionEnum);
+
+  const accountPermissionEdit = getNodes(graph, 'Const', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'EDIT');
+  assert.ok(accountPermissionEdit);
+
+  const policyEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerUpdate.id
+      && r.targetId === policyUpdate.id
+      && r.reason === 'laravel-authorize:update';
+  });
+  assert.equal(policyEdges.length, 1);
+  assert.ok(policyEdges[0].confidence >= 0.9);
+
+  const permissionEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerUpdate.id
+      && r.targetId === accountPermissionEdit.id
+      && r.reason === 'laravel-authorize:AccountPermission::EDIT';
+  });
+  assert.equal(permissionEdges.length, 1);
+  assert.ok(permissionEdges[0].confidence >= 0.9);
+
+  const manageMemberEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerUpdate.id
+      && r.targetId === policyManageMember.id
+      && r.reason === 'laravel-authorize:manage-member';
+  });
+  assert.equal(manageMemberEdges.length, 1);
+  assert.ok(manageMemberEdges[0].confidence >= 0.9);
+
+  const canPolicyEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerCanTest.id
+      && r.targetId === policyUpdate.id
+      && r.reason === 'laravel-can:update';
+  });
+  assert.equal(canPolicyEdges.length, 1);
+  assert.ok(canPolicyEdges[0].confidence >= 0.9);
+
+  const canPermissionEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerCanTest.id
+      && r.targetId === accountPermissionEdit.id
+      && r.reason === 'laravel-can:AccountPermission::EDIT';
+  });
+  assert.equal(canPermissionEdges.length, 1);
+  assert.ok(canPermissionEdges[0].confidence >= 0.9);
+
+  const canManageMemberEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerCanTest.id
+      && r.targetId === policyManageMember.id
+      && r.reason === 'laravel-can:manage-member';
+  });
+  assert.equal(canManageMemberEdges.length, 1);
+  assert.ok(canManageMemberEdges[0].confidence >= 0.9);
+});
+
+test('Laravel permissions config: wires roles to permission enum cases', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const financeRole = getNodes(graph, 'CodeElement', 'config/permissions.php')
+    .find(n => n.properties?.name === 'role:finance');
+  assert.ok(financeRole);
+
+  const adminRole = getNodes(graph, 'CodeElement', 'config/permissions.php')
+    .find(n => n.properties?.name === 'role:administrator');
+  assert.ok(adminRole);
+
+  const editorRole = getNodes(graph, 'CodeElement', 'config/permissions.php')
+    .find(n => n.properties?.name === 'role:editor');
+  assert.ok(editorRole);
+
+  const accountView = getNodes(graph, 'Const', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'VIEW');
+  assert.ok(accountView);
+
+  const accountEdit = getNodes(graph, 'Const', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'EDIT');
+  assert.ok(accountEdit);
+
+  const accountViewSlug = getNodes(graph, 'CodeElement', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'account.view');
+  assert.ok(accountViewSlug);
+
+  const accountEditSlug = getNodes(graph, 'CodeElement', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'account.edit');
+  assert.ok(accountEditSlug);
+
+  const assertRolePermissionEdge = (source, target, reason) => {
+    const edges = graph.relationships.filter(r => {
+      return r.type === 'CALLS'
+        && r.sourceId === source.id
+        && r.targetId === target.id
+        && r.reason === reason;
+    });
+    assert.equal(edges.length, 1);
+    assert.ok(edges[0].confidence >= 0.9);
+  };
+
+  assertRolePermissionEdge(financeRole, accountView, 'laravel-role-permission:AccountPermission::VIEW');
+  assertRolePermissionEdge(financeRole, accountEdit, 'laravel-role-permission:AccountPermission::EDIT');
+  assertRolePermissionEdge(financeRole, accountViewSlug, 'laravel-role-permission-slug:account.view');
+  assertRolePermissionEdge(financeRole, accountEditSlug, 'laravel-role-permission-slug:account.edit');
+
+  // AccountPermission::ALL expands to VIEW + EDIT
+  assertRolePermissionEdge(adminRole, accountView, 'laravel-role-permission:AccountPermission::VIEW');
+  assertRolePermissionEdge(adminRole, accountEdit, 'laravel-role-permission:AccountPermission::EDIT');
+  assertRolePermissionEdge(adminRole, accountViewSlug, 'laravel-role-permission-slug:account.view');
+  assertRolePermissionEdge(adminRole, accountEditSlug, 'laravel-role-permission-slug:account.edit');
+
+  // ...AccountPermission::allExcept([EDIT]) yields VIEW only
+  assertRolePermissionEdge(editorRole, accountView, 'laravel-role-permission:AccountPermission::VIEW');
+  assertRolePermissionEdge(editorRole, accountViewSlug, 'laravel-role-permission-slug:account.view');
+  const editorEditEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === editorRole.id
+      && r.targetId === accountEdit.id;
+  });
+  assert.equal(editorEditEdges.length, 0);
+
+  const editorEditSlugEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === editorRole.id
+      && r.targetId === accountEditSlug.id;
+  });
+  assert.equal(editorEditSlugEdges.length, 0);
+
+  const enumSlugEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === accountView.id
+      && r.targetId === accountViewSlug.id
+      && r.reason === 'laravel-permission-slug:account.view';
+  });
+  assert.equal(enumSlugEdges.length, 1);
+  assert.equal(enumSlugEdges[0].confidence, 1.0);
+});
+
+test('PHP: match return expressions wire to enum cases', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const permissionFor = getNodes(graph, 'Method', 'app/Services/TicketService.php')
+    .find(n => n.properties?.name === 'permissionFor');
+  assert.ok(permissionFor);
+
+  const accountView = getNodes(graph, 'Const', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'VIEW');
+  assert.ok(accountView);
+
+  const accountEdit = getNodes(graph, 'Const', 'app/Domains/AccessControl/Permissions/AccountPermission.php')
+    .find(n => n.properties?.name === 'EDIT');
+  assert.ok(accountEdit);
+
+  const viewEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === permissionFor.id
+      && r.targetId === accountView.id
+      && r.reason === 'php-match-return:AccountPermission::VIEW';
+  });
+  assert.equal(viewEdges.length, 1);
+  assert.ok(viewEdges[0].confidence >= 0.9);
+
+  const editEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === permissionFor.id
+      && r.targetId === accountEdit.id
+      && r.reason === 'php-match-return:AccountPermission::EDIT';
+  });
+  assert.equal(editEdges.length, 1);
+  assert.ok(editEdges[0].confidence >= 0.9);
+});
+
+test('Laravel Eloquent: relationship methods wire to related model classes', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const campaignMembers = getNodes(graph, 'Method', 'app/Models/Campaign/Campaign.php')
+    .find(n => n.properties?.name === 'members');
+  assert.ok(campaignMembers);
+
+  const campaignMembersWithScope = getNodes(graph, 'Method', 'app/Models/Campaign/Campaign.php')
+    .find(n => n.properties?.name === 'membersWithScope');
+  assert.ok(campaignMembersWithScope);
+
+  const campaignOwner = getNodes(graph, 'Method', 'app/Models/Campaign/Campaign.php')
+    .find(n => n.properties?.name === 'owner');
+  assert.ok(campaignOwner);
+
+  const campaignItems = getNodes(graph, 'Method', 'app/Models/Campaign/Campaign.php')
+    .find(n => n.properties?.name === 'items');
+  assert.ok(campaignItems);
+
+  const campaignMemberClass = getNodes(graph, 'Class', 'app/Models/Campaign/CampaignMember.php')
+    .find(n => n.properties?.name === 'CampaignMember');
+  assert.ok(campaignMemberClass);
+
+  const userClass = getNodes(graph, 'Class', 'app/Models/User.php')
+    .find(n => n.properties?.name === 'User');
+  assert.ok(userClass);
+
+  const campaignItemClass = getNodes(graph, 'Class', 'app/Models/Campaign/CampaignItem.php')
+    .find(n => n.properties?.name === 'CampaignItem');
+  assert.ok(campaignItemClass);
+
+  const campaignItemPivotClass = getNodes(graph, 'Class', 'app/Models/Campaign/CampaignItemPivot.php')
+    .find(n => n.properties?.name === 'CampaignItemPivot');
+  assert.ok(campaignItemPivotClass);
+
+  const assertEloquentEdge = (source, target, reason) => {
+    const edges = graph.relationships.filter(r => {
+      return r.type === 'CALLS'
+        && r.sourceId === source.id
+        && r.targetId === target.id
+        && r.reason === reason;
+    });
+    assert.equal(edges.length, 1);
+    assert.ok(edges[0].confidence >= 0.9);
+  };
+
+  assertEloquentEdge(campaignMembers, campaignMemberClass, 'laravel-eloquent:hasMany');
+  assertEloquentEdge(campaignMembersWithScope, campaignMemberClass, 'laravel-eloquent:hasMany');
+  assertEloquentEdge(campaignOwner, userClass, 'laravel-eloquent:belongsTo');
+  assertEloquentEdge(campaignItems, campaignItemClass, 'laravel-eloquent:hasManyThrough');
+  assertEloquentEdge(campaignItems, campaignItemPivotClass, 'laravel-eloquent:hasManyThrough:through');
 });
 
 test('PHP: resolves imports from use statements', async () => {
@@ -831,6 +1127,91 @@ test('Full-stack: frontend HTTP calls wire to Laravel controller methods', async
   });
   assert.equal(loginEdges.length, 1);
   assert.ok(loginEdges[0].confidence >= 0.95);
+
+  const toggleAcknowledgeTransaction = getNodes(graph, 'Function', 'apps/dashboard/src/api/transactions.ts')
+    .find(n => n.properties?.name === 'toggleAcknowledgeTransaction');
+  assert.ok(toggleAcknowledgeTransaction);
+
+  const acknowledgeController = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Transactions/AcknowledgeTransactionController.php')
+    .find(n => n.properties?.name === '__invoke');
+  assert.ok(acknowledgeController);
+
+  const disacknowledgeController = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Transactions/DisacknowledgeTransactionController.php')
+    .find(n => n.properties?.name === '__invoke');
+  assert.ok(disacknowledgeController);
+
+  const acknowledgeEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === toggleAcknowledgeTransaction.id
+      && r.targetId === acknowledgeController.id
+      && r.reason === 'http-post:/api/transactions/*/acknowledge';
+  });
+  assert.equal(acknowledgeEdges.length, 1);
+  assert.ok(acknowledgeEdges[0].confidence >= 0.9);
+
+  const disacknowledgeEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === toggleAcknowledgeTransaction.id
+      && r.targetId === disacknowledgeController.id
+      && r.reason === 'http-post:/api/transactions/*/unacknowledge';
+  });
+  assert.equal(disacknowledgeEdges.length, 1);
+  assert.ok(disacknowledgeEdges[0].confidence >= 0.9);
+});
+
+test('Full-stack: frontend literal route strings wire to Laravel controller methods', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const useDownloadAccessUrl = getNodes(graph, 'Function', 'apps/dashboard/src/customHooks/useDownloadAccessUrl.ts')
+    .find(n => n.properties?.name === 'useDownloadAccessUrl');
+  assert.ok(useDownloadAccessUrl);
+
+  const downloadAccessController = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/DownloadAccessController.php')
+    .find(n => n.properties?.name === '__invoke');
+  assert.ok(downloadAccessController);
+
+  const literalEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === useDownloadAccessUrl.id
+      && r.targetId === downloadAccessController.id
+      && r.reason === 'http-literal-get:/dashboard/downloads/*/access-file';
+  });
+  assert.equal(literalEdges.length, 1);
+  assert.ok(literalEdges[0].confidence >= 0.75);
+});
+
+test('Dashboard: React Query key factories wire to API wrapper functions', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const usersQueryKeyFactory = getNodes(graph, 'Function', 'apps/dashboard/src/queries/usersQueryKeys.ts')
+    .find(n => n.properties?.name === 'usersQueryKeys.all');
+  assert.ok(usersQueryKeyFactory);
+
+  const fetchUsersViaClient = getNodes(graph, 'Function', 'apps/dashboard/src/api/instanceClient.ts')
+    .find(n => n.properties?.name === 'fetchUsersViaClient');
+  assert.ok(fetchUsersViaClient);
+
+  const controllerIndex = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(controllerIndex);
+
+  const edges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === usersQueryKeyFactory.id
+      && r.targetId === fetchUsersViaClient.id
+      && r.reason === 'react-query:key-to-query-fn';
+  });
+  assert.equal(edges.length, 1);
+  assert.ok(edges[0].confidence >= 0.9);
+
+  const hopEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === usersQueryKeyFactory.id
+      && r.targetId === controllerIndex.id
+      && r.reason === 'react-query:key-to-http-get:/api/users';
+  });
+  assert.equal(hopEdges.length, 1);
+  assert.ok(hopEdges[0].confidence >= 0.9);
 });
 
 test('Full-stack: does not emit cross-language fuzzy-global edges', async () => {
@@ -868,6 +1249,26 @@ test('Full-stack: does not emit cross-app fuzzy-global edges', async () => {
     return r.type === 'CALLS'
       && r.sourceId === callPhpOnlySymbol.id
       && r.targetId === backendTarget.id
+      && r.reason === 'fuzzy-global';
+  });
+  assert.equal(fuzzyEdges.length, 0);
+});
+
+test('Calls: suppresses fuzzy-global edges into tests/', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const testMethod = getNodes(graph, 'Method', 'tests/FuzzyGlobalTest.php')
+    .find(n => n.properties?.name === 'testFuzzyGlobalSuppressed');
+  assert.ok(testMethod);
+
+  const helperFn = getNodes(graph, 'Function', 'app/Support/FuzzyGlobalHelper.php')
+    .find(n => n.properties?.name === 'gitNexusFixtureUniqueHelper');
+  assert.ok(helperFn);
+
+  const fuzzyEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === testMethod.id
+      && r.targetId === helperFn.id
       && r.reason === 'fuzzy-global';
   });
   assert.equal(fuzzyEdges.length, 0);

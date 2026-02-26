@@ -15,6 +15,7 @@
  */
 
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { safeStringify } from '../lib/safe-json.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -30,7 +31,7 @@ async function getBackend(): Promise<LocalBackend> {
 }
 
 function output(data: any): void {
-  const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+  const text = typeof data === 'string' ? data : safeStringify(data, 2);
   // stderr because KuzuDB captures stdout at OS level
   process.stderr.write(text + '\n');
 }
@@ -81,20 +82,26 @@ export async function contextCommand(name: string, options?: {
   output(result);
 }
 
-export async function impactCommand(target: string, options?: {
+export async function impactCommand(target: string | undefined, options?: {
   direction?: string;
   repo?: string;
+  uid?: string;
+  file?: string;
   depth?: string;
   includeTests?: boolean;
 }): Promise<void> {
-  if (!target?.trim()) {
-    console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
+  const name = target?.trim() || '';
+  if (!name && !options?.uid) {
+    console.error('Usage: gitnexus impact [symbol_name] [--uid <uid>] [--file <path>] [--direction upstream|downstream]');
     process.exit(1);
   }
 
   const backend = await getBackend();
   const result = await backend.callTool('impact', {
-    target,
+    target: name || undefined,
+    name: name || undefined,
+    uid: options?.uid,
+    file_path: options?.file,
     direction: options?.direction || 'upstream',
     maxDepth: options?.depth ? parseInt(options.depth) : undefined,
     includeTests: options?.includeTests ?? false,

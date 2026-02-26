@@ -609,8 +609,6 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [ ] **LLM Cluster Enrichment** — Semantic cluster names via LLM API
 - [ ] **AST Decorator Detection** — Parse @Controller, @Get, etc.
 - [ ] **Incremental Indexing** — Only re-index changed files
-- [ ] **PHP (Laravel) Symbol Indexing** — PHP AST + Composer imports + Laravel wiring edges (routes/events/schedule/views)
-- [ ] **Templates (Blade + Svelte)** — Template nodes + template-to-template edges + `.svelte` import awareness
 
 ### Recently Completed
 
@@ -628,6 +626,8 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [X] **Community Detection** — Leiden algorithm for functional clustering
 - [X] **Process Detection** — Entry point tracing with framework awareness
 - [X] **10 Language Support** — TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP
+- [X] **PHP (Laravel) Symbol Indexing** — PHP AST + Composer imports + Laravel wiring edges (routes/events/schedule/views)
+- [X] **Templates (Blade + Svelte)** — Template nodes + template-to-template edges + `.svelte` import awareness
 - [X] **Confidence Scoring** — Trust levels on CALLS edges
 - [X] **Blast Radius Tool** — `impact` with minConfidence, relationTypes, includeTests
 - [X] **Hybrid Search** — BM25 + semantic + Reciprocal Rank Fusion
