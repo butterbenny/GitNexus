@@ -10,7 +10,7 @@ import { setupCommand } from './setup.js';
 import { augmentCommand } from './augment.js';
 import { wikiCommand } from './wiki.js';
 import { archetypesCommand } from './archetypes.js';
-import { queryCommand, contextCommand, impactCommand, cypherCommand } from './tool.js';
+import { queryCommand, contextCommand, impactCommand, cypherCommand, precedentsCommand } from './tool.js';
 import { evalServerCommand } from './eval-server.js';
 const program = new Command();
 
@@ -29,6 +29,8 @@ program
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--skip-embeddings', 'Skip embedding generation (faster)')
+  .option('--no-registry', 'Do not update global registry (~/.gitnexus/registry.json)')
+  .option('--no-hooks', 'Do not register Claude Code hooks')
   .option('--write-context', 'Write GitNexus context into AGENTS.md/CLAUDE.md (and install .claude skills)')
   .option('--update-gitignore', 'Add .gitnexus to the repo .gitignore')
   .action(analyzeCommand);
@@ -98,6 +100,22 @@ program
   .option('-l, --limit <n>', 'Max processes to return (default: 5)')
   .option('--content', 'Include full symbol source code')
   .action(queryCommand);
+
+program
+  .command('precedents <search_query>')
+  .description('Precedent/template finder: exemplars with similar anatomy')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('-u, --uid <uid>', 'Explicit anchor symbol UID (optional)')
+  .option('-l, --limit <n>', 'Max anchor processes to consider (default: 2)', '2')
+  .option('-e, --examples <n>', 'Examples per anchor signature (default: 3)', '3')
+  .option('--min-http-confidence <n>', 'Minimum confidence for HTTP wiring edges (default: 0.9)', '0.9')
+  .action((searchQuery, options) => precedentsCommand(searchQuery, {
+    repo: options.repo,
+    uid: options.uid,
+    limit: options.limit,
+    examples: options.examples,
+    minHttpConfidence: options.minHttpConfidence,
+  }));
 
 program
   .command('context [name]')

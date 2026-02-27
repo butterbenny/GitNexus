@@ -10,17 +10,26 @@ export interface FileEntry {
 
 const READ_CONCURRENCY = 32;
 
-export const walkRepository = async (
-  repoPath: string,
-  onProgress?: (current: number, total: number, filePath: string) => void
-): Promise<FileEntry[]> => {
+export const listRepositoryFiles = async (repoPath: string): Promise<string[]> => {
   const files = await glob('**/*', {
     cwd: repoPath,
     nodir: true,
     dot: false,
   });
 
-  const filtered = files.filter(file => !shouldIgnorePath(file));
+  return files
+    .map(file => file.replace(/\\/g, '/'))
+    .filter(file => !shouldIgnorePath(file));
+};
+
+export const readRepositoryFiles = async (
+  repoPath: string,
+  relativePaths: string[],
+  onProgress?: (current: number, total: number, filePath: string) => void,
+): Promise<FileEntry[]> => {
+  const unique = Array.from(new Set(relativePaths.map(p => p.replace(/\\/g, '/').trim()).filter(Boolean)));
+  const filtered = unique.filter(file => !shouldIgnorePath(file));
+
   const entries: FileEntry[] = [];
   let processed = 0;
 
@@ -45,4 +54,12 @@ export const walkRepository = async (
   }
 
   return entries;
+};
+
+export const walkRepository = async (
+  repoPath: string,
+  onProgress?: (current: number, total: number, filePath: string) => void
+): Promise<FileEntry[]> => {
+  const filtered = await listRepositoryFiles(repoPath);
+  return await readRepositoryFiles(repoPath, filtered, onProgress);
 };

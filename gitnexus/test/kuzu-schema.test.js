@@ -17,3 +17,18 @@ test('Kuzu schema: CodeRelation allows edges -> Const', () => {
   assert.match(RELATION_SCHEMA, /FROM Method TO `Const`/);
   assert.match(RELATION_SCHEMA, /FROM CodeElement TO `Const`/);
 });
+
+test('Kuzu schema: CodeRelation allows permission slug wiring', () => {
+  // laravel-permissions-config-processor emits:
+  // - Role (CodeElement) -> permission slug (CodeElement)
+  // - Enum case (Const) -> permission slug (CodeElement)
+  assert.match(RELATION_SCHEMA, /FROM CodeElement TO CodeElement/);
+  assert.match(RELATION_SCHEMA, /FROM `Const` TO CodeElement/);
+});
+
+test('Kuzu schema: CodeRelation allows endpoint wiring', () => {
+  // Endpoint nodes are CodeElement, wired from frontend callables and to backend handlers.
+  assert.match(RELATION_SCHEMA, /FROM Function TO CodeElement/);
+  assert.match(RELATION_SCHEMA, /FROM Method TO CodeElement/);
+  assert.match(RELATION_SCHEMA, /FROM CodeElement TO Method/);
+});

@@ -608,10 +608,14 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 
 - [ ] **LLM Cluster Enrichment** — Semantic cluster names via LLM API
 - [ ] **AST Decorator Detection** — Parse @Controller, @Get, etc.
-- [ ] **Incremental Indexing** — Only re-index changed files
 
 ### Recently Completed
 
+- [X] **Incremental Indexing** — Only re-index changed files (note: communities/processes still require `analyze --force`)
+- [X] **Staleness-Aware Tool Responses** — Compare indexed commit vs repo HEAD and show a one-command refresh hint before returning results
+- [X] **Sandbox-Friendly Refresh** — `gitnexus analyze --no-registry --no-hooks` + `GITNEXUS_HOME` support so indexing works in sandboxed environments without escalations
+- [X] **Contract Graph: Endpoint Nodes** — Model HTTP endpoints as first-class nodes linking frontend callers ↔ routes ↔ controller methods ↔ permissions/tests/resources
+- [X] **Eloquent Load/Resource Awareness** — Relate `with/loadMissing/...` + Resource fields to relationship names to reduce runtime guesswork (confidence-first)
 - [X] **Wiki Generation** — LLM-powered docs from knowledge graph (`gitnexus wiki`)
 - [X] **Multi-File Rename** — Graph-aware rename with confidence tags (`rename` tool)
 - [X] **Git-Diff Impact** — Pre-commit change analysis (`detect_changes` tool)
@@ -627,6 +631,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [X] **Process Detection** — Entry point tracing with framework awareness
 - [X] **10 Language Support** — TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP
 - [X] **PHP (Laravel) Symbol Indexing** — PHP AST + Composer imports + Laravel wiring edges (routes/events/schedule/views)
+- [X] **Laravel Tactician Command Bus** — `dispatch(...)` wires to handler + middleware methods (confidence-first, `laravel-tactician-*` reasons)
 - [X] **Templates (Blade + Svelte)** — Template nodes + template-to-template edges + `.svelte` import awareness
 - [X] **Confidence Scoring** — Trust levels on CALLS edges
 - [X] **Blast Radius Tool** — `impact` with minConfidence, relationTypes, includeTests
@@ -637,7 +642,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 
 ## Security & Privacy
 
-- **CLI**: Everything runs locally on your machine. No network calls. Index stored in `.gitnexus/` (gitignored). Global registry at `~/.gitnexus/` stores only paths and metadata.
+- **CLI**: Everything runs locally on your machine. No network calls. Index stored in `.gitnexus/` (gitignored). Global registry at `~/.gitnexus/` (override with `GITNEXUS_HOME`) stores only paths and metadata.
 - **Web**: Everything runs in your browser. No code uploaded to any server. API keys stored in localStorage only.
 - Open source — audit the code yourself.
 

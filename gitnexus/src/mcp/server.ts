@@ -26,6 +26,7 @@ import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { safeStringify } from '../lib/safe-json.js';
+import { checkStaleness } from './staleness.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -73,6 +74,31 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
 
     default:
       return '';
+  }
+}
+
+function getStalenessBanner(backend: LocalBackend, toolName: string, args: Record<string, any> | undefined): string {
+  if (toolName === 'list_repos') return '';
+
+  const repoParam = args?.repo as string | undefined;
+  try {
+    const repo = backend.resolveRepo(repoParam);
+    const lastCommit = repo.lastCommit || 'HEAD';
+    const staleness = repo.repoPath ? checkStaleness(repo.repoPath, lastCommit) : { isStale: false, commitsBehind: 0 };
+    if (!staleness.isStale) return '';
+
+    const repoPath = repo.repoPath;
+    const refreshCmd = `gitnexus analyze "${repoPath}" --skip-embeddings`;
+    const forceCmd = `gitnexus analyze "${repoPath}" --force --skip-embeddings`;
+
+    const hint = staleness.hint
+      ? staleness.hint
+      : '⚠️ Index appears to be stale vs HEAD. Run analyze tool to update.';
+
+    return `${hint}\nRefresh: ${refreshCmd}\nFull refresh (recompute communities/processes): ${forceCmd}\n\n`;
+  } catch {
+    // If repo resolution fails (e.g. multiple repos without repo param), let the tool error handle it.
+    return '';
   }
 }
 
@@ -161,6 +187,7 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
 
     try {
       const result = await backend.callTool(name, args);
+      const banner = getStalenessBanner(backend, name, args as Record<string, any> | undefined);
       const resultText = typeof result === 'string' ? result : safeStringify(result, 2);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
@@ -168,7 +195,7 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
         content: [
           {
             type: 'text',
-            text: resultText + hint,
+            text: banner + resultText + hint,
           },
         ],
       };

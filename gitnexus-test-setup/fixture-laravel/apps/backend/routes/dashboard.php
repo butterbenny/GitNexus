@@ -12,3 +12,5 @@ Route::post('tickets/{ticket}/revoke', 'API\\Tickets\\RevokeTicketController');
 
 Route::post('transactions/{transaction}/acknowledge', 'API\\Transactions\\AcknowledgeTransactionController');
 Route::post('transactions/{transaction}/unacknowledge', 'API\\Transactions\\DisacknowledgeTransactionController');
+
+Route::apiResource('accounts.notifications', 'API\\Notifications\\NotificationController');

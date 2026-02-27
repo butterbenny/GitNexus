@@ -11,6 +11,9 @@ export type LaravelRouteTarget = {
 export type LaravelRouteDefinition = LaravelRouteTarget & {
   verb: string;
   path: string;
+  /** 0-based line number for the defining Route::* statement (best-effort). */
+  sourceStartLine?: number;
+  sourceEndLine?: number;
 };
 
 type ResolvedController = {
@@ -453,6 +456,33 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
   const targets: LaravelRouteDefinition[] = [];
   const groupSpans = buildLaravelRouteGroupPrefixSpans(content);
 
+  const buildLineLookup = (text: string) => {
+    const newlines: number[] = [];
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10) newlines.push(i);
+    }
+
+    const lineAt = (index: number): number => {
+      if (index <= 0) return 0;
+      let lo = 0;
+      let hi = newlines.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (newlines[mid] < index) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    };
+
+    return { lineAt };
+  };
+
+  const lineLookup = buildLineLookup(content);
+  const getSourceLine = (index: number | undefined): number => {
+    if (index === undefined) return -1;
+    return lineLookup.lineAt(index);
+  };
+
   const getGroupPrefixForIndex = (index: number): string => {
     if (groupSpans.length === 0) return '';
 
@@ -479,7 +509,8 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     if (!looksLikePhpIdentifier(controllerMethod)) continue;
     const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
     const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
-    targets.push({ verb, path: fullPath, controllerClass, controllerMethod });
+    const sourceLine = getSourceLine(match.index);
+    targets.push({ verb, path: fullPath, controllerClass, controllerMethod, sourceStartLine: sourceLine, sourceEndLine: sourceLine });
   }
 
   for (const match of content.matchAll(STRING_ACTION_RE)) {
@@ -498,7 +529,8 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
       if (!looksLikePhpIdentifier(controllerMethod)) continue;
       const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
       const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
-      targets.push({ verb, path: fullPath, controllerClass, controllerMethod });
+      const sourceLine = getSourceLine(match.index);
+      targets.push({ verb, path: fullPath, controllerClass, controllerMethod, sourceStartLine: sourceLine, sourceEndLine: sourceLine });
       continue;
     }
 
@@ -506,7 +538,8 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     {
       const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
       const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
-      targets.push({ verb, path: fullPath, controllerClass: action, controllerMethod: '__invoke' });
+      const sourceLine = getSourceLine(match.index);
+      targets.push({ verb, path: fullPath, controllerClass: action, controllerMethod: '__invoke', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
     }
   }
 
@@ -519,7 +552,8 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     if (!verb || !path || !controllerClass) continue;
     const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
     const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
-    targets.push({ verb, path: fullPath, controllerClass, controllerMethod: '__invoke' });
+    const sourceLine = getSourceLine(match.index);
+    targets.push({ verb, path: fullPath, controllerClass, controllerMethod: '__invoke', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
   }
 
   const extractStringArgs = (value: string): string[] => {
@@ -625,15 +659,16 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
 
     const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
     const withGroupPrefix = (p: string): string => groupPrefix ? joinLaravelRoutePrefix(groupPrefix, p) : p;
+    const sourceLine = getSourceLine(match.index);
 
-    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index' });
-    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store' });
-    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show' });
+    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
     if (allow('update')) {
-      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update' });
-      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update' });
+      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
     }
-    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy' });
+    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
   }
 
   for (const match of content.matchAll(RESOURCE_RE)) {
@@ -672,17 +707,18 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
 
     const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
     const withGroupPrefix = (p: string): string => groupPrefix ? joinLaravelRoutePrefix(groupPrefix, p) : p;
+    const sourceLine = getSourceLine(match.index);
 
-    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index' });
-    if (allow('create')) targets.push({ verb: 'get', path: withGroupPrefix(createPath), controllerClass, controllerMethod: 'create' });
-    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store' });
-    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show' });
-    if (allow('edit')) targets.push({ verb: 'get', path: withGroupPrefix(editPath), controllerClass, controllerMethod: 'edit' });
+    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('create')) targets.push({ verb: 'get', path: withGroupPrefix(createPath), controllerClass, controllerMethod: 'create', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('edit')) targets.push({ verb: 'get', path: withGroupPrefix(editPath), controllerClass, controllerMethod: 'edit', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
     if (allow('update')) {
-      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update' });
-      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update' });
+      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
     }
-    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy' });
+    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
   }
 
   return targets;

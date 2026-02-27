@@ -68,6 +68,62 @@ const parseHttpVerb = (reason: string): string | null => {
   return verb.length > 0 ? verb : null;
 };
 
+export const computeProcessArchetype = (
+  proc: ProcessTraceInfo,
+  httpEdges: HttpEdgeInfo[],
+  options: { minHttpConfidence?: number } = {}
+): { signature: string; tokens: string[]; httpRoutes: string[]; crossStack: boolean } | null => {
+  const minHttpConfidence = options.minHttpConfidence ?? 0.9;
+
+  const httpEdgeMap = new Map<string, HttpEdgeInfo>();
+  for (const edge of httpEdges) {
+    if ((edge.confidence ?? 0) < minHttpConfidence) continue;
+    httpEdgeMap.set(`${edge.sourceId}::${edge.targetId}`, edge);
+  }
+
+  const steps = proc.steps.filter(s => looksLikeFilePath(s.filePath));
+  if (steps.length === 0) return null;
+
+  const tokens: string[] = [];
+  const httpRoutes: string[] = [];
+
+  const pushToken = (token: string) => {
+    if (!token) return;
+    if (tokens.length > 0 && tokens[tokens.length - 1] === token) return;
+    tokens.push(token);
+  };
+
+  for (let i = 0; i < steps.length; i++) {
+    const curr = steps[i];
+    pushToken(deriveLayerTag(curr.filePath));
+
+    if (i + 1 < steps.length) {
+      const next = steps[i + 1];
+      const httpEdge = httpEdgeMap.get(`${curr.nodeId}::${next.nodeId}`);
+      if (httpEdge) {
+        const verb = parseHttpVerb(httpEdge.reason);
+        pushToken(verb ? `HTTP:${verb.toUpperCase()}` : 'HTTP');
+        httpRoutes.push(httpEdge.reason);
+      }
+    }
+  }
+
+  const signature = tokens.join(' → ');
+  if (!signature) return null;
+
+  const crossStack = tokens.some(t => t.startsWith('HTTP:') || t.startsWith('HTTP'))
+    || (tokens.some(t => t.startsWith('FE:')) && tokens.some(t => t.startsWith('BE:')))
+    || (tokens.some(t => t.startsWith('FE:')) && tokens.some(t => t.startsWith('Template:')))
+    || (tokens.some(t => t.startsWith('BE:')) && tokens.some(t => t.startsWith('Template:')));
+
+  return {
+    signature,
+    tokens,
+    httpRoutes: Array.from(new Set(httpRoutes)),
+    crossStack,
+  };
+};
+
 export const deriveLayerTag = (filePath: string): string => {
   const fp = normalizeFilePath(filePath);
   const lower = fp.toLowerCase();
@@ -300,4 +356,3 @@ export const buildArchetypeReport = (
     signatures,
   };
 };
-

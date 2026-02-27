@@ -2,7 +2,7 @@
  * Repository Manager
  * 
  * Manages GitNexus index storage in .gitnexus/ at repo root.
- * Also maintains a global registry at ~/.gitnexus/registry.json
+ * Also maintains a global registry at ~/.gitnexus/registry.json (or $GITNEXUS_HOME/registry.json)
  * so the MCP server can discover indexed repos from any cwd.
  */
 
@@ -14,6 +14,7 @@ export interface RepoMeta {
   repoPath: string;
   lastCommit: string;
   indexedAt: string;
+  kuzuSchemaVersion?: number;
   stats?: {
     files?: number;
     nodes?: number;
@@ -159,6 +160,9 @@ export const addToGitignore = async (repoPath: string): Promise<void> => {
  * Get the path to the global GitNexus directory
  */
 export const getGlobalDir = (): string => {
+  const envHome = process.env.GITNEXUS_HOME?.trim();
+  if (envHome) return path.resolve(envHome);
+
   return path.join(os.homedir(), '.gitnexus');
 };
 

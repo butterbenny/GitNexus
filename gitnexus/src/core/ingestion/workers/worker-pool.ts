@@ -26,15 +26,22 @@ export interface WorkerPool {
  * @param poolSize - Number of workers (defaults to cpus - 1, minimum 1)
  */
 export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool => {
-  const size = poolSize ?? Math.max(1, os.cpus().length - 1);
+  const maxSize = poolSize ?? Math.max(1, os.cpus().length - 1);
   const workers: Worker[] = [];
 
-  for (let i = 0; i < size; i++) {
-    workers.push(new Worker(workerUrl));
-  }
+  const ensureWorkers = (count: number): void => {
+    while (workers.length < count) {
+      workers.push(new Worker(workerUrl));
+    }
+  };
 
   const dispatch = <TInput, TResult>(items: TInput[], onProgress?: (filesProcessed: number) => void): Promise<TResult[]> => {
     if (items.length === 0) return Promise.resolve([]);
+
+    // Lazily create only the number of workers we actually need for this dispatch.
+    // Creating many idle workers is expensive and can destabilize native add-ons in small repos.
+    const size = Math.min(maxSize, items.length);
+    ensureWorkers(size);
 
     // Split items into one chunk per worker
     const chunkSize = Math.ceil(items.length / size);
@@ -85,5 +92,11 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
     workers.length = 0;
   };
 
-  return { dispatch, terminate, size };
+  return {
+    dispatch,
+    terminate,
+    get size() {
+      return workers.length;
+    },
+  };
 };

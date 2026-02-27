@@ -125,3 +125,27 @@ export async function cypherCommand(query: string, options?: {
   });
   output(result);
 }
+
+export async function precedentsCommand(queryText: string, options?: {
+  repo?: string;
+  uid?: string;
+  limit?: string;
+  examples?: string;
+  minHttpConfidence?: string;
+}): Promise<void> {
+  if (!queryText?.trim()) {
+    console.error('Usage: gitnexus precedents <search_query>');
+    process.exit(1);
+  }
+
+  const backend = await getBackend();
+  const result = await backend.callTool('precedents', {
+    query: queryText,
+    anchor_uid: options?.uid,
+    limit: options?.limit ? parseInt(options.limit) : undefined,
+    examples: options?.examples ? parseInt(options.examples) : undefined,
+    min_http_confidence: options?.minHttpConfidence ? parseFloat(options.minHttpConfidence) : undefined,
+    repo: options?.repo,
+  });
+  output(result);
+}

@@ -109,6 +109,16 @@ function createConnection(db: kuzu.Database): kuzu.Connection {
 const LOCK_RETRY_ATTEMPTS = 3;
 const LOCK_RETRY_DELAY_MS = 2000;
 
+const closeQueryResults = async (queryResult: any): Promise<void> => {
+  if (!queryResult) return;
+  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+  for (const r of results) {
+    try {
+      if (r?.close) await r.close();
+    } catch {}
+  }
+};
+
 /**
  * Initialize (or reuse) a Database + connection pool for a specific repo.
  * Retries on lock errors (e.g., when `gitnexus analyze` is running).
@@ -227,9 +237,14 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
   const conn = await checkout(entry);
   try {
     const queryResult = await conn.query(cypher);
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    return rows;
+    const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+    try {
+      const result = results[0];
+      const rows = await result.getAll();
+      return rows;
+    } finally {
+      await closeQueryResults(results);
+    }
   } finally {
     checkin(entry, conn);
   }

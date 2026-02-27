@@ -542,6 +542,74 @@ test('Laravel Eloquent: relationship methods wire to related model classes', asy
   assertEloquentEdge(campaignItems, campaignItemPivotClass, 'laravel-eloquent:hasManyThrough:through');
 });
 
+test('Laravel Eloquent: with/load strings wire to relationship methods', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const controllerIndex = getNodes(graph, 'Method', 'app/Http/Controllers/UserController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(controllerIndex);
+
+  const campaignMembers = getNodes(graph, 'Method', 'app/Models/Campaign/Campaign.php')
+    .find(n => n.properties?.name === 'members');
+  assert.ok(campaignMembers);
+
+  const campaignMemberUser = getNodes(graph, 'Method', 'app/Models/Campaign/CampaignMember.php')
+    .find(n => n.properties?.name === 'user');
+  assert.ok(campaignMemberUser);
+
+  const membersEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerIndex.id
+      && r.targetId === campaignMembers.id
+      && r.reason === 'laravel-eloquent-load:with:members';
+  });
+  assert.equal(membersEdges.length, 1);
+  assert.ok(membersEdges[0].confidence >= 0.9);
+
+  const nestedEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === controllerIndex.id
+      && r.targetId === campaignMemberUser.id
+      && r.reason === 'laravel-eloquent-load:with:members.user';
+  });
+  assert.equal(nestedEdges.length, 1);
+  assert.ok(nestedEdges[0].confidence >= 0.9);
+});
+
+test('Laravel resources: whenLoaded wires to relationship methods (contract edges)', async () => {
+  const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
+
+  const campaignResource = getNodes(graph, 'Class', 'app/Http/Resources/CampaignResource.php')
+    .find(n => n.properties?.name === 'CampaignResource');
+  assert.ok(campaignResource);
+
+  const campaignMembers = getNodes(graph, 'Method', 'app/Models/Campaign/Campaign.php')
+    .find(n => n.properties?.name === 'members');
+  assert.ok(campaignMembers);
+
+  const campaignMemberUser = getNodes(graph, 'Method', 'app/Models/Campaign/CampaignMember.php')
+    .find(n => n.properties?.name === 'user');
+  assert.ok(campaignMemberUser);
+
+  const membersEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === campaignResource.id
+      && r.targetId === campaignMembers.id
+      && r.reason === 'laravel-resource-requires:members';
+  });
+  assert.equal(membersEdges.length, 1);
+  assert.ok(membersEdges[0].confidence >= 0.9);
+
+  const nestedEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === campaignResource.id
+      && r.targetId === campaignMemberUser.id
+      && r.reason === 'laravel-resource-requires:members.user';
+  });
+  assert.equal(nestedEdges.length, 1);
+  assert.ok(nestedEdges[0].confidence >= 0.9);
+});
+
 test('PHP: resolves imports from use statements', async () => {
   const { graph } = await runPipelineFromRepo(fixtureRepoPath, () => {});
 
@@ -1021,6 +1089,10 @@ test('Full-stack: frontend HTTP calls wire to Laravel controller methods', async
     .find(n => n.properties?.name === 'index');
   assert.ok(controllerIndex);
 
+  const endpointGetUsers = getNodes(graph, 'CodeElement', 'routes/api.php')
+    .find(n => n.properties?.name === 'endpoint:get:/api/users');
+  assert.ok(endpointGetUsers);
+
   const httpEdges = graph.relationships.filter(r => {
     return r.type === 'CALLS'
       && r.sourceId === fetchUsers.id
@@ -1029,6 +1101,24 @@ test('Full-stack: frontend HTTP calls wire to Laravel controller methods', async
   });
   assert.equal(httpEdges.length, 1);
   assert.ok(httpEdges[0].confidence >= 0.9);
+
+  const feToEndpointEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchUsers.id
+      && r.targetId === endpointGetUsers.id
+      && r.reason === 'http-get:/api/users';
+  });
+  assert.equal(feToEndpointEdges.length, 1);
+  assert.ok(feToEndpointEdges[0].confidence >= 0.9);
+
+  const endpointToControllerEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === endpointGetUsers.id
+      && r.targetId === controllerIndex.id
+      && String(r.reason || '').startsWith('laravel-endpoint:get:/api/users:');
+  });
+  assert.equal(endpointToControllerEdges.length, 1);
+  assert.ok(endpointToControllerEdges[0].confidence >= 0.95);
 
   const fetchUsersViaClient = getNodes(graph, 'Function', 'apps/dashboard/src/api/instanceClient.ts')
     .find(n => n.properties?.name === 'fetchUsersViaClient');
@@ -1093,6 +1183,113 @@ test('Full-stack: frontend HTTP calls wire to Laravel controller methods', async
   });
   assert.equal(payoutAccountEdges.length, 1);
   assert.ok(payoutAccountEdges[0].confidence >= 0.9);
+
+  const fetchAccountNotifications = getNodes(graph, 'Function', 'apps/dashboard/src/api/notifications.ts')
+    .find(n => n.properties?.name === 'fetchAccountNotifications');
+  assert.ok(fetchAccountNotifications);
+
+  const createAccountNotification = getNodes(graph, 'Function', 'apps/dashboard/src/api/notifications.ts')
+    .find(n => n.properties?.name === 'createAccountNotification');
+  assert.ok(createAccountNotification);
+
+  const fetchAccountNotification = getNodes(graph, 'Function', 'apps/dashboard/src/api/notifications.ts')
+    .find(n => n.properties?.name === 'fetchAccountNotification');
+  assert.ok(fetchAccountNotification);
+
+  const updateAccountNotification = getNodes(graph, 'Function', 'apps/dashboard/src/api/notifications.ts')
+    .find(n => n.properties?.name === 'updateAccountNotification');
+  assert.ok(updateAccountNotification);
+
+  const deleteAccountNotification = getNodes(graph, 'Function', 'apps/dashboard/src/api/notifications.ts')
+    .find(n => n.properties?.name === 'deleteAccountNotification');
+  assert.ok(deleteAccountNotification);
+
+  const notificationIndex = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications/NotificationController.php')
+    .find(n => n.properties?.name === 'index');
+  assert.ok(notificationIndex);
+
+  const notificationStore = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications/NotificationController.php')
+    .find(n => n.properties?.name === 'store');
+  assert.ok(notificationStore);
+
+  const notificationShow = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications/NotificationController.php')
+    .find(n => n.properties?.name === 'show');
+  assert.ok(notificationShow);
+
+  const notificationUpdate = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications/NotificationController.php')
+    .find(n => n.properties?.name === 'update');
+  assert.ok(notificationUpdate);
+
+  const notificationDestroy = getNodes(graph, 'Method', 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications/NotificationController.php')
+    .find(n => n.properties?.name === 'destroy');
+  assert.ok(notificationDestroy);
+
+  const endpointGetAccountNotifications = getNodes(graph, 'CodeElement', 'apps/backend/routes/dashboard.php')
+    .find(n => n.properties?.name === 'endpoint:get:/api/accounts/*/notifications');
+  assert.ok(endpointGetAccountNotifications);
+
+  const fetchNotificationsEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchAccountNotifications.id
+      && r.targetId === notificationIndex.id
+      && r.reason === 'http-get:/api/accounts/*/notifications';
+  });
+  assert.equal(fetchNotificationsEdges.length, 1);
+  assert.ok(fetchNotificationsEdges[0].confidence >= 0.9);
+
+  const fetchNotificationsEndpointEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchAccountNotifications.id
+      && r.targetId === endpointGetAccountNotifications.id
+      && r.reason === 'http-get:/api/accounts/*/notifications';
+  });
+  assert.equal(fetchNotificationsEndpointEdges.length, 1);
+  assert.ok(fetchNotificationsEndpointEdges[0].confidence >= 0.9);
+
+  const notificationsEndpointToControllerEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === endpointGetAccountNotifications.id
+      && r.targetId === notificationIndex.id
+      && String(r.reason || '').startsWith('laravel-endpoint:get:/api/accounts/*/notifications:');
+  });
+  assert.equal(notificationsEndpointToControllerEdges.length, 1);
+  assert.ok(notificationsEndpointToControllerEdges[0].confidence >= 0.95);
+
+  const createNotificationEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === createAccountNotification.id
+      && r.targetId === notificationStore.id
+      && r.reason === 'http-post:/api/accounts/*/notifications';
+  });
+  assert.equal(createNotificationEdges.length, 1);
+  assert.ok(createNotificationEdges[0].confidence >= 0.9);
+
+  const showNotificationEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === fetchAccountNotification.id
+      && r.targetId === notificationShow.id
+      && r.reason === 'http-get:/api/accounts/*/notifications/*';
+  });
+  assert.equal(showNotificationEdges.length, 1);
+  assert.ok(showNotificationEdges[0].confidence >= 0.9);
+
+  const updateNotificationEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === updateAccountNotification.id
+      && r.targetId === notificationUpdate.id
+      && r.reason === 'http-patch:/api/accounts/*/notifications/*';
+  });
+  assert.equal(updateNotificationEdges.length, 1);
+  assert.ok(updateNotificationEdges[0].confidence >= 0.9);
+
+  const deleteNotificationEdges = graph.relationships.filter(r => {
+    return r.type === 'CALLS'
+      && r.sourceId === deleteAccountNotification.id
+      && r.targetId === notificationDestroy.id
+      && r.reason === 'http-delete:/api/accounts/*/notifications/*';
+  });
+  assert.equal(deleteNotificationEdges.length, 1);
+  assert.ok(deleteNotificationEdges[0].confidence >= 0.9);
 
   const fetchHealth = getNodes(graph, 'Function', 'apps/dashboard/src/api/health.ts')
     .find(n => n.properties?.name === 'fetchHealth');

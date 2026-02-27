@@ -101,6 +101,9 @@ Your AI agent gets these tools automatically:
 |------|-------------|--------------|
 | `list_repos` | Discover all indexed repositories | — |
 | `query` | Process-grouped hybrid search (BM25 + semantic + RRF) | Optional |
+| `action_plan` | Decision-ready file list + verification checklist (includes deterministic end-to-end hops when available) | Optional |
+| `archetypes` | Derived flow signatures + exemplar processes (pattern heat map) | Optional |
+| `precedents` | Precedent/template finder — similar callsites to mirror | Optional |
 | `context` | 360-degree symbol view — categorized refs, process participation | Optional |
 | `impact` | Blast radius analysis with depth grouping and confidence | Optional |
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes | Optional |
@@ -108,6 +111,7 @@ Your AI agent gets these tools automatically:
 | `cypher` | Raw Cypher graph queries | Optional |
 
 > With one indexed repo, the `repo` param is optional. With multiple, specify which: `query({query: "auth", repo: "my-app"})`.
+> Tip: if `precedents` returns no results for a fuzzy query, pick a concrete anchor UID (from `action_plan`/`query`/`context`) and rerun with `anchor_uid`.
 
 ## MCP Resources
 
@@ -139,6 +143,12 @@ gitnexus mcp                     # Start MCP server (stdio) — serves all index
 gitnexus serve                   # Start HTTP server for web UI
 gitnexus list                    # List all indexed repositories
 gitnexus status                  # Show index status for current repo
+gitnexus query "<query>"         # Process-grouped search (no MCP overhead)
+gitnexus context "<symbol>"      # 360-degree symbol view (no MCP overhead)
+gitnexus impact "<symbol>"       # Blast radius analysis (no MCP overhead)
+gitnexus cypher "<cypher>"       # Raw graph query (no MCP overhead)
+gitnexus archetypes              # Derived archetype heat map (no MCP overhead)
+gitnexus precedents "<query>"    # Find exemplar flows to mirror (no MCP overhead)
 gitnexus clean                   # Delete index for current repo
 gitnexus clean --all --force     # Delete all indexes
 gitnexus wiki [path]             # Generate LLM-powered docs from knowledge graph
@@ -148,6 +158,8 @@ gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-m
 ## Multi-Repo Support
 
 GitNexus supports indexing multiple repositories. Each `gitnexus analyze` registers the repo in a global registry (`~/.gitnexus/registry.json`). The MCP server serves all indexed repos automatically with lazy KuzuDB connections (max 5 concurrent, evicted after 5 minutes idle).
+
+> Sandbox note: if your environment cannot write to `~/.gitnexus`, run `gitnexus analyze --no-registry --no-hooks` (the index still writes to `.gitnexus/` inside the repo). MCP will still detect refreshes from `.gitnexus/meta.json` without requiring registry writes.
 
 ## Supported Languages
 

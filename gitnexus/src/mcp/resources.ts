@@ -185,7 +185,7 @@ function getReposResource(backend: LocalBackend): string {
   if (repos.length > 1) {
     lines.push('');
     lines.push('# Multiple repos indexed. Use repo parameter in tool calls:');
-    lines.push(`# gitnexus_search({query: "auth", repo: "${repos[0].name}"})`);
+    lines.push(`# query({query: "auth", repo: "${repos[0].name}"})`);
   }
 
   return lines.join('\n');
@@ -225,6 +225,7 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('');
   lines.push('tools_available:');
   lines.push('  - query: Process-grouped code intelligence (execution flows related to a concept)');
+  lines.push('  - archetypes: Derived flow signatures + exemplar processes (pattern heat map)');
   lines.push('  - context: 360-degree symbol view (categorized refs, process participation)');
   lines.push('  - impact: Blast radius analysis (what breaks if you change a symbol)');
   lines.push('  - detect_changes: Git-diff impact analysis (what do your changes affect)');
@@ -232,13 +233,19 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('  - cypher: Raw graph queries');
   lines.push('  - list_repos: Discover all indexed repositories');
   lines.push('');
-  lines.push('re_index: Run `npx gitnexus analyze` in terminal if data is stale');
+  lines.push('re_index: Run `gitnexus analyze` (incremental by default; `--force` for full) if data is stale');
+  lines.push('');
+  lines.push('tips:');
+  lines.push('  - If context/impact returns status=ambiguous, rerun with uid or file_path to disambiguate');
+  lines.push('  - For architecture/implementation, start with archetypes to mirror an existing flow signature');
+  lines.push('  - If indexing in a sandboxed environment, use `gitnexus analyze --no-registry --no-hooks` (or set `GITNEXUS_HOME`)');
   lines.push('');
   lines.push('resources_available:');
   lines.push('  - gitnexus://repos: All indexed repositories');
   lines.push(`  - gitnexus://repo/${context.projectName}/clusters: All functional areas`);
   lines.push(`  - gitnexus://repo/${context.projectName}/processes: All execution flows`);
   lines.push(`  - gitnexus://repo/${context.projectName}/archetypes: Derived flow signatures + exemplars`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/schema: Graph schema for Cypher`);
   lines.push(`  - gitnexus://repo/${context.projectName}/cluster/{name}: Module details`);
   lines.push(`  - gitnexus://repo/${context.projectName}/process/{name}: Process trace`);
   
@@ -270,7 +277,7 @@ async function getClustersResource(backend: LocalBackend, repoName?: string): Pr
     }
 
     if (result.clusters.length > displayLimit) {
-      lines.push(`\n# Showing top ${displayLimit} of ${result.clusters.length} modules. Use gitnexus_query for deeper search.`);
+      lines.push(`\n# Showing top ${displayLimit} of ${result.clusters.length} modules. Use query() for deeper search.`);
     }
 
     return lines.join('\n');
@@ -302,7 +309,7 @@ async function getProcessesResource(backend: LocalBackend, repoName?: string): P
     }
 
     if (result.processes.length > displayLimit) {
-      lines.push(`\n# Showing top ${displayLimit} of ${result.processes.length} processes. Use gitnexus_query for deeper search.`);
+      lines.push(`\n# Showing top ${displayLimit} of ${result.processes.length} processes. Use query() for deeper search.`);
     }
 
     return lines.join('\n');
@@ -403,7 +410,7 @@ example_queries:
   find_community_members: |
     MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
     WHERE c.heuristicLabel = "Auth"
-    RETURN s.name, labels(s)[0] AS type
+    RETURN s.name, labels(s) AS type
   
   trace_process: |
     MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -497,7 +504,7 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
   const repos = backend.listRepos();
   
   if (repos.length === 0) {
-    return '# GitNexus\n\nNo repositories indexed. Run: `npx gitnexus analyze` in a repository.';
+    return '# GitNexus\n\nNo repositories indexed. Run: `gitnexus analyze` in a repository.';
   }
   
   const sections: string[] = [];
@@ -514,6 +521,8 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '| Tool | What it gives you |',
       '|------|-------------------|',
       '| `query` | Process-grouped code intelligence — execution flows related to a concept |',
+      '| `archetypes` | Derived flow signatures + exemplar processes (pattern heat map) |',
+      '| `precedents` | Precedent/template finder — similar callsites to mirror |',
       '| `context` | 360-degree symbol view — categorized refs, processes it participates in |',
       '| `impact` | Symbol blast radius — what breaks at depth 1/2/3 with confidence |',
       '| `detect_changes` | Git-diff impact — what do your current changes affect |',
@@ -521,11 +530,14 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '| `cypher` | Raw graph queries |',
       '| `list_repos` | Discover indexed repos |',
       '',
+      '> Tip: If `context`/`impact` returns `status: ambiguous`, rerun with `uid` or `file_path` to disambiguate.',
+      '',
       '## Resources',
       '',
       `- \`gitnexus://repo/${repo.name}/context\` — Stats, staleness check`,
       `- \`gitnexus://repo/${repo.name}/clusters\` — All functional areas`,
       `- \`gitnexus://repo/${repo.name}/processes\` — All execution flows`,
+      `- \`gitnexus://repo/${repo.name}/archetypes\` — Derived flow signatures + exemplar processes`,
       `- \`gitnexus://repo/${repo.name}/schema\` — Graph schema for Cypher`,
     ];
     sections.push(lines.join('\n'));

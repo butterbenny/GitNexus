@@ -221,3 +221,121 @@ export const processBladeTemplates = (
 
   return { templatesCreated: templates.length, relationshipsAdded };
 };
+
+export const processBladeTemplatesIncremental = (
+  graph: KnowledgeGraph,
+  filesToProcess: { path: string; content: string }[],
+  opts: {
+    /** All Blade template file paths in the repo (used for viewName→Template resolution). */
+    allBladeTemplatePaths: string[];
+    /** All file paths in the repo (used for @vite asset links). */
+    allFilePaths: Set<string>;
+    /** Blade template paths that are being rebuilt (Template nodes/DEFINES should be re-created). */
+    rebuildBladePaths: Set<string>;
+  }
+): { templatesCreated: number; relationshipsAdded: number } => {
+  const bladeFiles = filesToProcess
+    .filter(f => f.path.endsWith(BLADE_SUFFIX))
+    .filter(f => resolveBladeViewInfo(f.path) !== null);
+
+  if (bladeFiles.length === 0) return { templatesCreated: 0, relationshipsAdded: 0 };
+
+  // Build viewName → TemplateId mapping from ALL blade template paths (path-only, no content needed).
+  const viewNameToTemplateId = new Map<string, string>();
+  for (const fp of opts.allBladeTemplatePaths) {
+    const viewInfo = resolveBladeViewInfo(fp);
+    if (!viewInfo) continue;
+    viewNameToTemplateId.set(viewKey(viewInfo.viewRoot, viewInfo.viewName), generateId('Template', fp));
+  }
+
+  let templatesCreated = 0;
+  let relationshipsAdded = 0;
+
+  for (const file of bladeFiles) {
+    const viewInfo = resolveBladeViewInfo(file.path);
+    if (!viewInfo) continue;
+
+    const templateId = generateId('Template', file.path);
+    const lineCount = Math.max(1, file.content.split('\n').length);
+
+    // Only recreate Template nodes + DEFINES when the blade file itself is rebuilt.
+    if (opts.rebuildBladePaths.has(file.path)) {
+      graph.addNode({
+        id: templateId,
+        label: 'Template',
+        properties: {
+          name: viewInfo.viewName,
+          filePath: file.path,
+          startLine: 0,
+          endLine: lineCount - 1,
+          language: 'blade',
+        },
+      } as GraphNode);
+      templatesCreated++;
+
+      const fileId = generateId('File', file.path);
+      const definesId = generateId('DEFINES', `${fileId}->${templateId}`);
+      graph.addRelationship({
+        id: definesId,
+        type: 'DEFINES',
+        sourceId: fileId,
+        targetId: templateId,
+        confidence: 1.0,
+        reason: '',
+      } as GraphRelationship);
+      relationshipsAdded++;
+    }
+
+    const refs = extractBladeTemplateRefs(file.content);
+    const viteAssets = extractBladeViteAssets(file.content);
+
+    for (const viewName of refs.extends) {
+      const targetId = viewNameToTemplateId.get(viewKey(viewInfo.viewRoot, viewName));
+      if (!targetId) continue;
+      const relId = generateId('EXTENDS', `${templateId}->${targetId}`);
+      graph.addRelationship({
+        id: relId,
+        type: 'EXTENDS',
+        sourceId: templateId,
+        targetId,
+        confidence: 1.0,
+        reason: 'blade-extends',
+      });
+      relationshipsAdded++;
+    }
+
+    for (const viewName of refs.imports) {
+      const targetId = viewNameToTemplateId.get(viewKey(viewInfo.viewRoot, viewName));
+      if (!targetId) continue;
+      const relId = generateId('IMPORTS', `${templateId}->${targetId}`);
+      graph.addRelationship({
+        id: relId,
+        type: 'IMPORTS',
+        sourceId: templateId,
+        targetId,
+        confidence: 1.0,
+        reason: 'blade-import',
+      });
+      relationshipsAdded++;
+    }
+
+    for (const assetPath of viteAssets) {
+      const resolvedAssetPath = `${viewInfo.viewRoot}${assetPath}`;
+      if (!opts.allFilePaths.has(resolvedAssetPath)) continue;
+
+      const targetId = generateId('File', resolvedAssetPath);
+      const relId = generateId('IMPORTS', `${templateId}->${targetId}`);
+      graph.addRelationship({
+        id: relId,
+        type: 'IMPORTS',
+        sourceId: templateId,
+        targetId,
+        confidence: 1.0,
+        reason: 'blade-vite',
+      });
+      relationshipsAdded++;
+    }
+  }
+
+  return { templatesCreated, relationshipsAdded };
+};

@@ -241,7 +241,7 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 
 1. **Augmentation over replacement** — Hooks enrich existing AI agent tools (Grep, Glob, Bash) with graph context rather than replacing them
 2. **Native tree-sitter** — Uses N-API bindings (not WASM) in the CLI for performance; WASM in the browser
-3. **Worker thread parsing** — CPU-bound tree-sitter parsing parallelized across `cpus - 1` worker threads
+3. **Worker thread parsing** — CPU-bound tree-sitter parsing parallelized across up to `cpus - 1` worker threads (created lazily per dispatch)
 4. **Hybrid search** — BM25 keyword + semantic vector search combined with Reciprocal Rank Fusion for ranking
 5. **LRU AST cache** — Parsed trees are cached across pipeline phases to avoid redundant re-parsing
 6. **Deterministic IDs** — `generateId(label, qualifiedName)` ensures idempotent graph construction
@@ -267,7 +267,7 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 
 ### Implementation Plan (staged, plug’n’play with current pipeline)
 
-### Current Status (as of 2026-02-26)
+### Current Status (as of 2026-02-27)
 
 - ✅ **M0–M1**: PHP parsing + symbol extraction (classes / methods / functions) is live.
 - ✅ **M2**: PHP imports — Composer PSR-4 + `use` (including alias + grouped imports) are live.
@@ -276,9 +276,9 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 - ✅ **M5**: Blade templates are indexed as `Template` nodes with template-to-template edges + PHP→Blade wiring edges.
 - ✅ **M6**: Svelte `.svelte` files participate via `<script>` extraction + TS parsing/import resolution.
 - ✅ **M7**: acceptance queries are in regular use on a large TS + Laravel monorepo.
-- 🟡 **M8**: MCP ergonomics — stale DB refresh + disambiguation are live; query ranking now returns full process traces and bridges test hits → app symbols (remaining: polish + optional MCP exposure for derived views).
-- ✅ **M9**: semantic enrichment — FormRequest/Resource, auth/permission, Eloquent relationship, and React Query key wiring are live.
-- ✅ **M10**: derived views — flow signatures + archetype report are shipped via `gitnexus archetypes` (remaining: wire into agent workflows).
+- ✅ **M8**: MCP ergonomics — stale DB refresh + disambiguation are live; MCP context/setup resources and packaged skills now advertise archetypes + disambiguation patterns.
+- ✅ **M9**: semantic enrichment — FormRequest/Resource, auth/permission, Eloquent relationship/load/resource, React Query key wiring, and Tactician command-bus dispatch wiring are live.
+- ✅ **M10**: derived views — flow signatures + archetype report are shipped via `gitnexus archetypes` and wired into MCP resources/skills (pattern heat map for build + review).
 
 ### Canonical Build Order (so we don’t “jump”)
 
@@ -319,7 +319,7 @@ The milestones below are written as capability buckets, but the **development or
    - Improve agent UX (disambiguation, fewer “which symbol?” dead ends) without changing graph shapes.
 
 9) **M9 (semantic enrichment edges)**
-   - Add high-confidence “meaning links” (FormRequests/Resources/permissions/query-keys) once core call graphs are reliable.
+   - Add high-confidence “meaning links” (FormRequests/Resources/permissions/query-keys, command-bus dispatch wiring) once core call graphs are reliable.
 
 10) **M10 (derived views: archetypes + heat maps)**
    - Derive “flow signatures” and hotspots from `Process` + `Community` without introducing new graph shapes.
@@ -400,6 +400,9 @@ Milestone 8 — **MCP ergonomics (agent-facing)**
 - Improve disambiguation for graph tools in agent workflows:
   - Allow `impact` to accept either a symbol `uid` or `{ filePath, name }` (in addition to the current `target: string`) to avoid name-collision failures.
   - Keep backwards compatibility: `target: string` should continue to work unchanged.
+- Surface edge metadata inline (trust UX):
+  - `context` incoming/outgoing entries include `confidence` + `reason` (when available), sorted by confidence.
+  - `impact` results include `reason` so cross-language wiring edges (e.g. `http-*`, `laravel-*`) are obvious without Cypher.
 
 Milestone 9 — **Semantic enrichment edges (high-confidence only)**
 - Add domain-aware “meaning” links (still confidence-first; avoid inventing behavior):
@@ -425,6 +428,7 @@ Milestone 10 — **Derived Views: Flow Signatures + Archetype Heat Maps (no sche
 ### Roadmap Item Alignment
 
 - **Incremental indexing** helps iteration speed once PHP is supported, but it isn’t required to ship PHP symbol indexing.
+- Incremental note: incremental mode updates an existing index in-place, but currently does **not** recompute communities/processes (run `gitnexus analyze --force` for a full refresh).
 - **AST decorator detection** isn’t needed for PHP baseline; it may become relevant later for PHP 8 attributes / annotations.
 - **LLM cluster enrichment** is optional; PHP support should work without it.
 
@@ -476,3 +480,50 @@ RETURN count(DISTINCT p);
 ```
 
 > Kuzu gotcha: avoid `=~` regex inside `any(...)` / list predicates — it can return 0 even when matches exist. Prefer `STARTS WITH` / `CONTAINS`, or use the 2-symbol join pattern above.
+
+---
+
+## Post-M10 Backlog: “10/10” Agent Experience (Monorepo-Optimized)
+
+This is a prioritized backlog distilled from real agent usage on a large **TypeScript + Laravel PHP + Blade** monorepo.
+All items must preserve the **confidence-first invariant** (skip uncertain edges rather than guessing).
+
+### P0 — Trust + Reliability (makes results safe to use)
+
+- **Auto staleness banner on tool calls** — every `query/context/impact/cypher/...` response should compare `indexedCommit` vs `HEAD` and print a one-command refresh hint *before* returning results.
+  - Gate: when stale, tool output begins with `⚠️` + includes `gitnexus analyze <repoPath>` (and mentions `--force` for communities/processes refresh).
+- **Sandbox-friendly refresh** — allow `gitnexus analyze` to run without writing outside the repo.
+  - Implement: `gitnexus analyze --no-registry --no-hooks` (skip `~/.gitnexus/registry.json` + hook writes).
+  - Gate: in sandboxed environments, `analyze` completes without “Unable to update global registry” / hook warnings.
+- **Schema compatibility gate** — when Kuzu schema changes, force a full rebuild (avoid silent edge drops).
+  - Gate: meta records schema version; stale schema forces full indexing once.
+
+### P1 — Contract Graph (turns “map” into “brain”)
+
+- **First-class `Endpoint` contract nodes** — model `(verb, path[, routeName])` as nodes and connect:
+  - Frontend callers (fetch/Axios wrappers) → `Endpoint`
+  - `Endpoint` → Laravel route definition → controller method
+  - Controller method → FormRequest / Resource / Permission(s) / tests
+  - Gate: “UI → API → controller → permission/test” is ≤2 hops from any entry point.
+- **Decision-ready views** — add a compact “files-to-touch + checks-to-run” summary view for a query/goal.
+  - Gate: given a goal query, return (a) 5–10 file paths and (b) 5–10 verification bullets, derived from high-confidence edges only.
+
+### P2 — Laravel/Eloquent semantics (reduce runtime guesswork)
+
+- **Relationship load awareness** — parse `with/load/loadMissing/withCount` + dot-path strings and connect them to known Eloquent relationship methods.
+  - Gate: flag likely typos/mismatches (confidence-first: warnings, not edges) and show “requires relation X” for resources.
+- **Resource/serialization contracts** — link Resource fields to their dependent relations / permission checks.
+  - Gate: reviewers can answer “what must be eager-loaded / authorized for this response?” via graph traversal.
+- **Bus/middleware process coherence** — present command → handler → middleware → events as one coherent process signature.
+  - Gate: “charge flow” appears as one process/archetype rather than scattered edges.
+
+### P3 — Workflow acceleration (less scrolling, more action)
+
+- **Precedent/template finder mode** — “find 3 existing callsites with the same control-flow/anatomy” (powered by archetypes + filters).
+  - Gate: for a goal (“add charging path”), return 3 exemplars + their key files, confidence-filtered.
+- **Inline confidence + reason UX** — always show edge confidence + why so agents know when to stop trusting the graph and open code.
+  - Shipped: `context` + `impact` include `confidence` + `reason` so high-confidence edges are distinguishable without Cypher.
+
+### Crush Order (so we don’t jump)
+
+1) P0 staleness banner → 2) P0 sandbox-friendly analyze → 3) P1 Endpoint nodes → 4) P2 Eloquent/load/resource contracts → 5) P3 precedent finder + decision-ready views

@@ -7,6 +7,7 @@ use App\Jobs\{CleanupJob as Clean, SendDigestJob};
 use App\Http\Requests\UpdateUserRequest;
 use App\Http\Resources\UserResource;
 use App\Mail\WelcomeMail;
+use App\Models\Campaign\Campaign;
 use App\Models\User;
 use App\Notifications\SmsNotification;
 use App\Notifications\WelcomeNotification;
@@ -70,6 +71,7 @@ class UserController
         $viaFacadeMake->sendViaFacadeMakeAssigned();
         (new TicketService())->handleViaNew();
         $this->service->update();
+        Campaign::query()->with('members.user')->get();
         return $this->service->handle();
     }
 

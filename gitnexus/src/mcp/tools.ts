@@ -68,6 +68,26 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
     },
   },
   {
+    name: 'action_plan',
+    description: `Decision-ready summary for a goal/query.
+Returns a compact file list + verification checklist derived from high-confidence graph signals.
+
+WHEN TO USE: When you want “what should I open/change/verify?” with minimal scrolling.
+AFTER THIS: Use context() on the top-ranked anchors, then impact() on the change point.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language or keyword search query' },
+        task_context: { type: 'string', description: 'What you are working on (optional). Helps ranking.' },
+        goal: { type: 'string', description: 'What you want to find (optional). Helps ranking.' },
+        limit_files: { type: 'number', description: 'Max files to return (default: 10)', default: 10 },
+        limit_checks: { type: 'number', description: 'Max verification bullets to return (default: 10)', default: 10 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'archetypes',
     description: `Derive "flow signatures" (archetypes) from execution flows, and return exemplar processes.
 
@@ -87,6 +107,32 @@ AFTER THIS: Use query/context on exemplar entry/terminal symbols, then impact on
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],
+    },
+  },
+  {
+    name: 'precedents',
+    description: `Precedent/template finder: find existing callsites with similar control-flow/anatomy.
+
+This is a derived view (no schema changes). It:
+1) Uses query() to find the most relevant execution flows (processes)
+2) Computes the flow signature for each anchor process (layer tags + HTTP hops)
+3) Returns a small set of exemplar processes with the same signature, so you can mirror an existing pattern.
+
+WHEN TO USE: When implementing a feature and you want to copy the established anatomy instead of inventing a new shape.
+Also useful in review: verify new code fits an existing archetype.
+
+AFTER THIS: Open the anchor + exemplar files and mirror their structure; then use impact() on the change point.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language or keyword search query' },
+        anchor_uid: { type: 'string', description: 'Optional explicit anchor symbol UID (preferred when the query does not map cleanly to Process flows).' },
+        limit: { type: 'number', description: 'Max anchor processes to consider (default: 2)', default: 2 },
+        examples: { type: 'number', description: 'Examples per anchor signature (default: 3)', default: 3 },
+        min_http_confidence: { type: 'number', description: 'Minimum confidence for HTTP wiring edges (default: 0.9)', default: 0.9 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: ['query'],
     },
   },
   {
@@ -131,6 +177,7 @@ TIPS:
     name: 'context',
     description: `360-degree view of a single code symbol.
 Shows categorized incoming/outgoing references (calls, imports, extends, implements), process participation, and file location.
+Each reference includes edge metadata: confidence + reason (when available).
 
 WHEN TO USE: After query() to understand a specific symbol in depth. When you need to know all callers, callees, and what execution flows a symbol participates in.
 AFTER THIS: Use impact() if planning changes, or READ gitnexus://repo/{name}/process/{processName} for full execution trace.
@@ -194,7 +241,7 @@ Each edit is tagged with confidence:
   {
     name: 'impact',
     description: `Analyze the blast radius of changing a code symbol.
-Returns all symbols affected by modifying the target, grouped by depth with edge types and confidence.
+Returns all symbols affected by modifying the target, grouped by depth with edge types, confidence, and reason (when available).
 
 WHEN TO USE: Before making code changes — especially refactoring, renaming, or modifying shared code. Shows what would break.
 AFTER THIS: Review d=1 items (WILL BREAK). READ gitnexus://repo/{name}/processes to check affected execution flows.

@@ -36,6 +36,11 @@ function getHookScriptPath(): string {
  * Returns a status message for the CLI output.
  */
 export async function registerClaudeHook(): Promise<{ registered: boolean; message: string }> {
+  const disabled = (process.env.GITNEXUS_DISABLE_CLAUDE_HOOK || '').trim().toLowerCase();
+  if (disabled === '1' || disabled === 'true' || disabled === 'yes') {
+    return { registered: false, message: 'Claude Code hook disabled (GITNEXUS_DISABLE_CLAUDE_HOOK)' };
+  }
+
   const claudeDir = path.join(os.homedir(), '.claude');
   const hooksFile = path.join(claudeDir, 'hooks.json');
   const hookScript = getHookScriptPath();
@@ -105,7 +110,14 @@ export async function registerClaudeHook(): Promise<{ registered: boolean; messa
   });
   
   // Write back
-  await fs.writeFile(hooksFile, JSON.stringify(hooksConfig, null, 2) + '\n', 'utf-8');
-  
-  return { registered: true, message: 'Claude Code hook registered' };
+  try {
+    await fs.writeFile(hooksFile, JSON.stringify(hooksConfig, null, 2) + '\n', 'utf-8');
+    return { registered: true, message: 'Claude Code hook registered' };
+  } catch (e: any) {
+    const code = (e?.code || '').toString();
+    if (code === 'EACCES' || code === 'EPERM') {
+      return { registered: false, message: 'Unable to write Claude Code hook (permission denied)' };
+    }
+    return { registered: false, message: 'Unable to write Claude Code hook (unexpected error)' };
+  }
 }

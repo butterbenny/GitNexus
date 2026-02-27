@@ -16,6 +16,28 @@ let conn: kuzu.Connection | null = null;
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
+const closeQueryResults = async (queryResult: any): Promise<void> => {
+  if (!queryResult) return;
+  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+  for (const r of results) {
+    try {
+      if (r?.close) await r.close();
+    } catch {}
+  }
+};
+
+const queryAllRows = async (targetConn: kuzu.Connection, cypher: string): Promise<any[]> => {
+  const queryResult = await targetConn.query(cypher);
+  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+  try {
+    const result = results[0];
+    const rows = await result.getAll();
+    return rows;
+  } finally {
+    await closeQueryResults(results);
+  }
+};
+
 export const initKuzu = async (dbPath: string) => {
   if (conn) return { db, conn };
 
@@ -48,7 +70,8 @@ export const initKuzu = async (dbPath: string) => {
 
   for (const schemaQuery of SCHEMA_QUERIES) {
     try {
-      await conn.query(schemaQuery);
+      const queryResult = await conn.query(schemaQuery);
+      await closeQueryResults(queryResult);
     } catch (err) {
       // Only ignore "already exists" errors - log everything else
       const msg = err instanceof Error ? err.message : String(err);
@@ -130,11 +153,13 @@ export const loadGraphToKuzu = async (
     const copyQuery = getCopyQuery(table, normalizedPath);
 
     try {
-      await conn.query(copyQuery);
+      const queryResult = await conn.query(copyQuery);
+      await closeQueryResults(queryResult);
     } catch (err) {
       try {
         const retryQuery = copyQuery.replace('auto_detect=false)', 'auto_detect=false, IGNORE_ERRORS=true)');
-        await conn.query(retryQuery);
+        const retryResult = await conn.query(retryQuery);
+        await closeQueryResults(retryResult);
       } catch (retryErr) {
         const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
         throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
@@ -178,11 +203,13 @@ export const loadGraphToKuzu = async (
       }
 
       try {
-        await conn.query(copyQuery);
+        const queryResult = await conn.query(copyQuery);
+        await closeQueryResults(queryResult);
       } catch (err) {
         try {
           const retryQuery = copyQuery.replace('auto_detect=false)', 'auto_detect=false, IGNORE_ERRORS=true)');
-          await conn.query(retryQuery);
+          const retryResult = await conn.query(retryQuery);
+          await closeQueryResults(retryResult);
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           warnings.push(`${fromLabel}->${toLabel} (${lines.length} edges): ${retryMsg.slice(0, 80)}`);
@@ -265,11 +292,12 @@ const fallbackRelationshipInserts = async (
       const confidence = parseFloat(confidenceStr) || 1.0;
       const step = parseInt(stepStr) || 0;
 
-      await conn.query(`
+      const queryResult = await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${fromId.replace(/'/g, "''")}' }),
               (b:${escapeLabel(toLabel)} {id: '${toId.replace(/'/g, "''")}' })
         CREATE (a)-[:${REL_TABLE_NAME} {type: '${relType}', confidence: ${confidence}, reason: '${reason.replace(/'/g, "''")}', step: ${step}}]->(b)
       `);
+      await closeQueryResults(queryResult);
     } catch {
       // skip
     }
@@ -339,7 +367,8 @@ export const insertNodeToKuzu = async (
       const tempDb = new kuzu.Database(targetDbPath);
       const tempConn = new kuzu.Connection(tempDb);
       try {
-        await tempConn.query(query);
+        const queryResult = await tempConn.query(query);
+        await closeQueryResults(queryResult);
         return true;
       } finally {
         try { await tempConn.close(); } catch {}
@@ -347,7 +376,8 @@ export const insertNodeToKuzu = async (
       }
     } else if (conn) {
       // Use existing persistent connection (when called from analyze)
-      await conn.query(query);
+      const queryResult = await conn.query(query);
+      await closeQueryResults(queryResult);
       return true;
     }
     
@@ -399,7 +429,8 @@ export const batchInsertNodesToKuzu = async (
           query = `MERGE (n:${label} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.content = ${escapeValue(properties.content || '')}`;
         }
         
-        await tempConn.query(query);
+        const queryResult = await tempConn.query(query);
+        await closeQueryResults(queryResult);
         inserted++;
       } catch (e: any) {
         // Don't console.error here - it corrupts MCP JSON-RPC on stderr
@@ -419,12 +450,7 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');
   }
 
-  const queryResult = await conn.query(cypher);
-  // kuzu v0.11 uses getAll() instead of hasNext()/getNext()
-  // Query returns QueryResult for single queries, QueryResult[] for multi-statement
-  const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-  const rows = await result.getAll();
-  return rows;
+  return queryAllRows(conn, cypher);
 };
 
 export const executeWithReusedStatement = async (
@@ -446,7 +472,8 @@ export const executeWithReusedStatement = async (
     }
     try {
       for (const params of subBatch) {
-        await conn.execute(stmt, params);
+        const execResult = await conn.execute(stmt, params);
+        await closeQueryResults(execResult);
       }
     } catch (e) {
       // Log the error and continue with next batch
@@ -462,9 +489,7 @@ export const getKuzuStats = async (): Promise<{ nodes: number; edges: number }> 
   let totalNodes = 0;
   for (const tableName of NODE_TABLES) {
     try {
-      const queryResult = await conn.query(`MATCH (n:${tableName}) RETURN count(n) AS cnt`);
-      const nodeResult = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-      const nodeRows = await nodeResult.getAll();
+      const nodeRows = await queryAllRows(conn, `MATCH (n:${tableName}) RETURN count(n) AS cnt`);
       if (nodeRows.length > 0) {
         totalNodes += Number(nodeRows[0]?.cnt ?? nodeRows[0]?.[0] ?? 0);
       }
@@ -475,9 +500,7 @@ export const getKuzuStats = async (): Promise<{ nodes: number; edges: number }> 
 
   let totalEdges = 0;
   try {
-    const queryResult = await conn.query(`MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`);
-    const edgeResult = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const edgeRows = await edgeResult.getAll();
+    const edgeRows = await queryAllRows(conn, `MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`);
     if (edgeRows.length > 0) {
       totalEdges = Number(edgeRows[0]?.cnt ?? edgeRows[0]?.[0] ?? 0);
     }
@@ -504,9 +527,8 @@ export const loadCachedEmbeddings = async (): Promise<{
   const embeddingNodeIds = new Set<string>();
   const embeddings: Array<{ nodeId: string; embedding: number[] }> = [];
   try {
-    const rows = await conn.query(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.embedding AS embedding`);
-    const result = Array.isArray(rows) ? rows[0] : rows;
-    for (const row of await result.getAll()) {
+    const rows = await queryAllRows(conn, `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.embedding AS embedding`);
+    for (const row of rows as any[]) {
       const nodeId = String(row.nodeId ?? row[0] ?? '');
       if (!nodeId) continue;
       embeddingNodeIds.add(nodeId);
@@ -546,7 +568,12 @@ export const isKuzuReady = (): boolean => conn !== null && db !== null;
  * @param dbPath - Optional path to KuzuDB for per-query connection
  * @returns Object with counts of deleted nodes
  */
-export const deleteNodesForFile = async (filePath: string, dbPath?: string): Promise<{ deletedNodes: number }> => {
+export const deleteNodesForFile = async (
+  filePath: string,
+  opts?: { dbPath?: string; includeFileNode?: boolean },
+): Promise<{ deletedNodes: number }> => {
+  const dbPath = opts?.dbPath;
+  const includeFileNode = opts?.includeFileNode ?? true;
   const usePerQuery = !!dbPath;
   
   // Set up connection (either use existing or create per-query)
@@ -571,23 +598,16 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
     for (const tableName of NODE_TABLES) {
       // Skip tables that don't have filePath (Community, Process)
       if (tableName === 'Community' || tableName === 'Process') continue;
+      if (!includeFileNode && tableName === 'File') continue;
       
       try {
-        // First count how many we'll delete
-        const countResult = await targetConn!.query(
-          `MATCH (n:${tableName}) WHERE n.filePath = '${escapedPath}' RETURN count(n) AS cnt`
+        // Delete nodes (and implicitly their relationships via DETACH).
+        // Note: we intentionally do not fetch counts here — some Kuzu builds have
+        // shown instability when mixing large delete workloads with count+getAll().
+        const queryResult = await targetConn!.query(
+          `MATCH (n:${tableName}) WHERE n.filePath = '${escapedPath}' DETACH DELETE n`
         );
-        const result = Array.isArray(countResult) ? countResult[0] : countResult;
-        const rows = await result.getAll();
-        const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
-        
-        if (count > 0) {
-          // Delete nodes (and implicitly their relationships via DETACH)
-          await targetConn!.query(
-            `MATCH (n:${tableName}) WHERE n.filePath = '${escapedPath}' DETACH DELETE n`
-          );
-          deletedNodes += count;
-        }
+        await closeQueryResults(queryResult);
       } catch (e) {
         // Some tables may not support this query, skip
       }
@@ -595,9 +615,10 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
     
     // Also delete any embeddings for nodes in this file
     try {
-      await targetConn!.query(
-        `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId STARTS WITH '${escapedPath}' DELETE e`
+      const queryResult = await targetConn!.query(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId = 'File:${escapedPath}' OR e.nodeId = 'Template:${escapedPath}' OR e.nodeId CONTAINS ':${escapedPath}:' DELETE e`
       );
+      await closeQueryResults(queryResult);
     } catch {
       // Embedding table may not exist or nodeId format may differ
     }
@@ -614,6 +635,124 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
   }
 };
 
+export const deleteOutgoingRelationshipsForFile = async (
+  filePath: string,
+  relationTypes: string[],
+  opts?: { dbPath?: string },
+): Promise<{ deletedEdges: number }> => {
+  const dbPath = opts?.dbPath;
+  const usePerQuery = !!dbPath;
+
+  let tempDb: kuzu.Database | null = null;
+  let tempConn: kuzu.Connection | null = null;
+  let targetConn: kuzu.Connection | null = conn;
+
+  if (usePerQuery) {
+    tempDb = new kuzu.Database(dbPath);
+    tempConn = new kuzu.Connection(tempDb);
+    targetConn = tempConn;
+  } else if (!conn) {
+    throw new Error('KuzuDB not initialized. Provide dbPath or call initKuzu first.');
+  }
+
+  try {
+    const escapedPath = filePath.replace(/'/g, "''");
+    const typeList = relationTypes
+      .map(t => `'${t.replace(/'/g, "''")}'`)
+      .join(', ');
+
+    const cypher = `
+      MATCH (a)-[r:${REL_TABLE_NAME}]->()
+      WHERE a.filePath = '${escapedPath}'${relationTypes.length > 0 ? ` AND r.type IN [${typeList}]` : ''}
+      DELETE r
+    `;
+
+    const queryResult = await targetConn!.query(cypher);
+    await closeQueryResults(queryResult);
+    return { deletedEdges: 0 };
+  } catch {
+    return { deletedEdges: 0 };
+  } finally {
+    if (tempConn) {
+      try { await tempConn.close(); } catch {}
+    }
+    if (tempDb) {
+      try { await tempDb.close(); } catch {}
+    }
+  }
+};
+
+export const getUpstreamFilePathsForFiles = async (filePaths: string[]): Promise<string[]> => {
+  if (!conn) {
+    throw new Error('KuzuDB not initialized. Call initKuzu first.');
+  }
+
+  const unique = Array.from(new Set(filePaths.map(fp => fp.trim()).filter(Boolean)));
+  if (unique.length === 0) return [];
+
+  const escaped = unique.map(fp => `'${fp.replace(/'/g, "''")}'`).join(', ');
+
+  const cypher = `
+    MATCH (src)-[:${REL_TABLE_NAME}]->(tgt)
+    WHERE tgt.filePath IN [${escaped}] AND src.filePath <> ''
+    MATCH (f:File {filePath: src.filePath})
+    RETURN DISTINCT src.filePath AS filePath
+  `;
+
+  try {
+    const rows = await queryAllRows(conn, cypher);
+    const filePathList = rows
+      .map((row: any) => String(row.filePath ?? row[0] ?? '').trim())
+      .filter(Boolean);
+    return Array.from(new Set(filePathList));
+  } catch {
+    return [];
+  }
+};
+
+export const loadSymbolDefinitionsFromKuzu = async (): Promise<Array<{ filePath: string; name: string; nodeId: string; type: string }>> => {
+  if (!conn) {
+    throw new Error('KuzuDB not initialized. Call initKuzu first.');
+  }
+
+  const defs: Array<{ filePath: string; name: string; nodeId: string; type: string }> = [];
+
+  for (const tableName of NODE_TABLES) {
+    if (tableName === 'File' || tableName === 'Folder' || tableName === 'Community' || tableName === 'Process') continue;
+
+    try {
+      const t = escapeTableName(tableName);
+      const rows = await queryAllRows(conn, `MATCH (n:${t}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`);
+      for (const row of rows as any[]) {
+        const nodeId = String(row.id ?? row[0] ?? '').trim();
+        const name = String(row.name ?? row[1] ?? '').trim();
+        const filePath = String(row.filePath ?? row[2] ?? '').trim();
+        if (!nodeId || !name || !filePath) continue;
+        defs.push({ nodeId, name, filePath, type: tableName });
+      }
+    } catch {
+      // table may not exist, skip
+    }
+  }
+
+  return defs;
+};
+
+export const loadEmbeddingNodeIds = async (): Promise<Set<string>> => {
+  if (!conn) return new Set();
+  const ids = new Set<string>();
+  try {
+    const rows = await queryAllRows(conn, `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId`);
+    for (const row of rows as any[]) {
+      const nodeId = String(row.nodeId ?? row[0] ?? '').trim();
+      if (nodeId) ids.add(nodeId);
+    }
+  } catch {
+    // ignore
+  }
+  return ids;
+};
+
 export const getEmbeddingTableName = (): string => EMBEDDING_TABLE_NAME;
 
 // ============================================================================
@@ -628,8 +767,10 @@ export const loadFTSExtension = async (): Promise<void> => {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');
   }
   try {
-    await conn.query('INSTALL fts');
-    await conn.query('LOAD EXTENSION fts');
+    const installResult = await conn.query('INSTALL fts');
+    await closeQueryResults(installResult);
+    const loadResult = await conn.query('LOAD EXTENSION fts');
+    await closeQueryResults(loadResult);
   } catch {
     // Extension may already be loaded
   }
@@ -658,7 +799,8 @@ export const createFTSIndex = async (
   const query = `CALL CREATE_FTS_INDEX('${tableName}', '${indexName}', [${propList}], stemmer := '${stemmer}')`;
   
   try {
-    await conn.query(query);
+    const queryResult = await conn.query(query);
+    await closeQueryResults(queryResult);
   } catch (e: any) {
     // Index may already exist
     if (!e.message?.includes('already exists')) {
@@ -698,10 +840,7 @@ export const queryFTS = async (
   `;
   
   try {
-    const queryResult = await conn.query(cypher);
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    
+    const rows = await queryAllRows(conn, cypher);
     return rows.map((row: any) => {
       const node = row.node || row[0] || {};
       const score = row.score ?? row[1] ?? 0;
@@ -731,7 +870,8 @@ export const dropFTSIndex = async (tableName: string, indexName: string): Promis
   }
   
   try {
-    await conn.query(`CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
+    const queryResult = await conn.query(`CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
+    await closeQueryResults(queryResult);
   } catch {
     // Index may not exist
   }

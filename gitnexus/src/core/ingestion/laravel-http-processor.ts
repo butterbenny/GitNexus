@@ -620,6 +620,7 @@ const extractHttpCallsFromTree = (filePath: string, tree: Parser.Tree): HttpCall
 };
 
 const buildLaravelRouteIndex = (
+  graph: KnowledgeGraph,
   files: { path: string; content: string }[],
   symbolTable: SymbolTable,
   importMap: ImportMap,
@@ -653,6 +654,36 @@ const buildLaravelRouteIndex = (
 
       const verbUpper = def.verb === 'any' ? 'ANY' : def.verb.toUpperCase();
       const fullPath = joinRoutePrefix(prefix, def.path);
+      const canonicalPath = fullPath.replace(/\{[^}]+\}/g, '*');
+
+      // First-class Endpoint contract node (as CodeElement — no new schema needed):
+      // - Stable, addressable node for (verb + path) that links FE callers to Laravel handlers.
+      // - Canonicalize params to wildcards so FE template literals match deterministically.
+      const endpointName = `endpoint:${verbUpper.toLowerCase()}:${canonicalPath}`;
+      const endpointNodeId = generateId('CodeElement', endpointName);
+      graph.addNode({
+        id: endpointNodeId,
+        label: 'CodeElement',
+        properties: {
+          name: endpointName,
+          filePath: file.path,
+          startLine: def.sourceStartLine ?? -1,
+          endLine: def.sourceEndLine ?? -1,
+          isExported: true,
+        }
+      });
+
+      const endpointReason = `laravel-endpoint:${verbUpper.toLowerCase()}:${canonicalPath}:${resolvedController.reason}`;
+      const endpointRelId = generateId('CALLS', `${endpointNodeId}:${endpointReason}->${methodNodeId}`);
+      graph.addRelationship({
+        id: endpointRelId,
+        type: 'CALLS',
+        sourceId: endpointNodeId,
+        targetId: methodNodeId,
+        confidence: resolvedController.confidence,
+        reason: endpointReason,
+      });
+
       const target: ResolvedRouteTarget = {
         httpMethod: verbUpper,
         path: fullPath,
@@ -751,7 +782,7 @@ export const processLaravelHttpWiring = async (
   importMap: ImportMap,
   phpUseAliases: PhpUseAliasMap,
 ): Promise<{ edgesAdded: number }> => {
-  const routeIndex = buildLaravelRouteIndex(files, symbolTable, importMap, phpUseAliases);
+  const routeIndex = buildLaravelRouteIndex(graph, files, symbolTable, importMap, phpUseAliases);
   if (routeIndex.size === 0) return { edgesAdded: 0 };
 
   const parser = await loadParser();
@@ -835,6 +866,19 @@ export const processLaravelHttpWiring = async (
         reason,
       });
       edgesAdded++;
+
+      const canonicalEndpointPath = target.path.replace(/\{[^}]+\}/g, '*');
+      const endpointName = `endpoint:${target.httpMethod.toLowerCase()}:${canonicalEndpointPath}`;
+      const endpointNodeId = generateId('CodeElement', endpointName);
+      const endpointRelId = generateId('CALLS', `${sourceId}:${reason}->${endpointNodeId}`);
+      graph.addRelationship({
+        id: endpointRelId,
+        type: 'CALLS',
+        sourceId,
+        targetId: endpointNodeId,
+        confidence,
+        reason,
+      });
     }
   }
 
@@ -885,6 +929,19 @@ export const processLaravelHttpWiring = async (
         reason,
       });
       edgesAdded++;
+
+      const canonicalEndpointPath = target.path.replace(/\{[^}]+\}/g, '*');
+      const endpointName = `endpoint:${target.httpMethod.toLowerCase()}:${canonicalEndpointPath}`;
+      const endpointNodeId = generateId('CodeElement', endpointName);
+      const endpointRelId = generateId('CALLS', `${sourceId}:${reason}->${endpointNodeId}`);
+      graph.addRelationship({
+        id: endpointRelId,
+        type: 'CALLS',
+        sourceId,
+        targetId: endpointNodeId,
+        confidence,
+        reason,
+      });
     }
   }
 

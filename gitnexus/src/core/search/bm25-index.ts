@@ -49,7 +49,7 @@ async function queryFTSViaExecutor(
 /**
  * Search using KuzuDB's built-in FTS (always fresh, reads from disk)
  * 
- * Queries multiple node tables (File, Function, Class, Method) in parallel
+ * Queries multiple node tables (File, Function, Class, Method, etc.)
  * and merges results by filePath, summing scores for the same file.
  * 
  * @param query - Search query string
@@ -58,7 +58,7 @@ async function queryFTSViaExecutor(
  * @returns Ranked search results from FTS indexes
  */
 export const searchFTSFromKuzu = async (query: string, limit: number = 20, repoId?: string): Promise<BM25SearchResult[]> => {
-  let fileResults: any[], functionResults: any[], classResults: any[], methodResults: any[], interfaceResults: any[];
+  let fileResults: any[], functionResults: any[], classResults: any[], methodResults: any[], interfaceResults: any[], codeElementResults: any[], constResults: any[];
 
   if (repoId) {
     // Use MCP connection pool via dynamic import
@@ -71,6 +71,8 @@ export const searchFTSFromKuzu = async (query: string, limit: number = 20, repoI
     classResults = await queryFTSViaExecutor(executor, 'Class', 'class_fts', query, limit);
     methodResults = await queryFTSViaExecutor(executor, 'Method', 'method_fts', query, limit);
     interfaceResults = await queryFTSViaExecutor(executor, 'Interface', 'interface_fts', query, limit);
+    codeElementResults = await queryFTSViaExecutor(executor, 'CodeElement', 'codeelement_fts', query, limit);
+    constResults = await queryFTSViaExecutor(executor, 'Const', 'const_fts', query, limit);
   } else {
     // Use core kuzu adapter (CLI / pipeline context) — also sequential for safety
     fileResults = await queryFTS('File', 'file_fts', query, limit, false).catch(() => []);
@@ -78,6 +80,8 @@ export const searchFTSFromKuzu = async (query: string, limit: number = 20, repoI
     classResults = await queryFTS('Class', 'class_fts', query, limit, false).catch(() => []);
     methodResults = await queryFTS('Method', 'method_fts', query, limit, false).catch(() => []);
     interfaceResults = await queryFTS('Interface', 'interface_fts', query, limit, false).catch(() => []);
+    codeElementResults = await queryFTS('CodeElement', 'codeelement_fts', query, limit, false).catch(() => []);
+    constResults = await queryFTS('Const', 'const_fts', query, limit, false).catch(() => []);
   }
   
   // Merge results by filePath, summing scores for same file
@@ -99,6 +103,8 @@ export const searchFTSFromKuzu = async (query: string, limit: number = 20, repoI
   addResults(classResults);
   addResults(methodResults);
   addResults(interfaceResults);
+  addResults(codeElementResults);
+  addResults(constResults);
   
   // Sort by score descending and add rank
   const sorted = Array.from(merged.values())
