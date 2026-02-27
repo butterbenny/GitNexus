@@ -1,9 +1,10 @@
-const DEFAULT_IGNORE_LIST = new Set([
+export const DEFAULT_IGNORE_PATH_SEGMENTS = [
     // Version Control
     '.git',
     '.svn',
     '.hg',
     '.bzr',
+    '.gitnexus',        // GitNexus index output (must never be indexed)
     
     // IDEs & Editors
     '.idea',
@@ -94,7 +95,10 @@ const DEFAULT_IGNORE_LIST = new Set([
     'fixtures',         // Test fixtures
     'snapshots',        // Jest snapshots
     '__snapshots__',
-]);
+];
+
+const DEFAULT_IGNORE_LIST = new Set(DEFAULT_IGNORE_PATH_SEGMENTS.filter(segment => !segment.includes('/')));
+const DEFAULT_IGNORE_SUBPATHS = DEFAULT_IGNORE_PATH_SEGMENTS.filter(segment => segment.includes('/'));
 
 const IGNORED_EXTENSIONS = new Set([
     // Images
@@ -188,6 +192,13 @@ const IGNORED_FILES = new Set([
 
 export const shouldIgnorePath = (filePath: string): boolean => {
   const normalizedPath = filePath.replace(/\\/g, '/');
+
+  for (const segment of DEFAULT_IGNORE_SUBPATHS) {
+    if (normalizedPath === segment) return true;
+    if (normalizedPath.startsWith(`${segment}/`)) return true;
+    if (normalizedPath.includes(`/${segment}/`)) return true;
+  }
+
   const parts = normalizedPath.split('/');
   const fileName = parts[parts.length - 1];
   const fileNameLower = fileName.toLowerCase();
@@ -236,4 +247,3 @@ export const shouldIgnorePath = (filePath: string): boolean => {
 
   return false;
 }
-

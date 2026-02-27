@@ -136,6 +136,33 @@ AFTER THIS: Open the anchor + exemplar files and mirror their structure; then us
     },
   },
   {
+    name: 'ui_contract',
+    description: `Generate a UI behavior contract card for a TS/TSX/JSX file.
+
+This is a derived view (no schema changes). It extracts interaction entry points
+(onClick/onSubmit/onOpenChange/etc) and summarizes side-effects (mutations, query invalidations,
+navigation, toasts, and common state-setter calls), plus controlled open-state surfaces and
+pending/disabled UX gates (disabled/isPending/isLoading/etc). It also summarizes query contracts
+(queryKey + key refetch/staleness options) when present.
+
+Optionally enriches with backend endpoint hops by following high-confidence http-* edges reachable
+from symbols defined in the file (surface → API wrapper → controller).
+
+WHEN TO USE: “Why did this close/refetch/navigate/disable?” without spelunking a dozen files.
+AFTER THIS: Use context()/impact() on the high-signal symbols the contract points to.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'File path (relative to repo root, or absolute path inside the repo).' },
+        base_ref: { type: 'string', description: 'Optional git ref/commit to diff the contract against (e.g. "main").' },
+        include_endpoints: { type: 'boolean', description: 'Include endpoint/controller hops via http-* edges (default: true).', default: true },
+        min_http_confidence: { type: 'number', description: 'Minimum confidence for http-* edge enrichment (default: 0.9).', default: 0.9 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: ['file_path'],
+    },
+  },
+  {
     name: 'cypher',
     description: `Execute Cypher query against the code knowledge graph.
 

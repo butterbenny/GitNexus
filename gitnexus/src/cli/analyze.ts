@@ -25,6 +25,8 @@ import { processParsing } from '../core/ingestion/parsing-processor.js';
 import { processImportsFromExtracted, createImportMap, createPhpUseAliasMap } from '../core/ingestion/import-processor.js';
 import { processCallsFromExtracted } from '../core/ingestion/call-processor.js';
 import { processHeritageFromExtracted } from '../core/ingestion/heritage-processor.js';
+import { processCommunities } from '../core/ingestion/community-processor.js';
+import { processProcesses } from '../core/ingestion/process-processor.js';
 import { createWorkerPool, WorkerPool } from '../core/ingestion/workers/worker-pool.js';
 import { processLaravelRoutes, ROUTE_FILE_PATH_RE } from '../core/ingestion/laravel-route-processor.js';
 import { processLaravelHttpWiring } from '../core/ingestion/laravel-http-processor.js';
@@ -45,6 +47,7 @@ import { processLaravelJobDispatch } from '../core/ingestion/laravel-job-dispatc
 import { processLaravelNotifications } from '../core/ingestion/laravel-notification-processor.js';
 import { processLaravelTacticianDispatch } from '../core/ingestion/laravel-tactician-dispatch-processor.js';
 import { processBladeTemplatesIncremental } from '../core/ingestion/blade-template-processor.js';
+import { getLanguageFromFilename } from '../core/ingestion/utils.js';
 
 export interface AnalyzeOptions {
   force?: boolean;
@@ -53,10 +56,16 @@ export interface AnalyzeOptions {
   hooks?: boolean;
   writeContext?: boolean;
   updateGitignore?: boolean;
+  incrementalMaxChanges?: number;
+  incrementalRecomputeProcesses?: boolean;
+  incrementalRecomputeCommunities?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
 const EMBEDDING_NODE_LIMIT = 50_000;
+const INCREMENTAL_MAX_CHANGES_DEFAULT = 500;
+const INCREMENTAL_MAX_CHANGES_CAP = 5_000;
+const INCREMENTAL_MAX_CHANGES_FRACTION_OF_FILES = 0.2;
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -114,7 +123,14 @@ export const analyzeCommand = async (
 
   const filterIndexablePaths = (paths: string[]): string[] => {
     const unique = Array.from(new Set(paths.map(p => p.replace(/\\/g, '/').trim()).filter(Boolean)));
-    return unique.filter(p => !shouldIgnorePath(p));
+    const hasDotPathSegment = (relativePath: string): boolean => {
+      return relativePath
+        .split('/')
+        .some(part => part.startsWith('.') && part !== '.' && part !== '..');
+    };
+    return unique
+      .filter(p => !hasDotPathSegment(p))
+      .filter(p => !shouldIgnorePath(p));
   };
 
   const fileChanges = {
@@ -153,6 +169,26 @@ export const analyzeCommand = async (
   const hasAnyFileChanges = fileChanges.changed.length > 0 || fileChanges.deleted.length > 0;
   const fileChangesTotal = fileChanges.changed.length + fileChanges.deleted.length;
 
+  const computeIncrementalMaxChanges = (): number => {
+    const explicit = options?.incrementalMaxChanges;
+    if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit >= 0) {
+      return Math.floor(explicit);
+    }
+
+    const indexedFileCount = Number((existingMeta as any)?.stats?.files ?? 0) || 0;
+    if (indexedFileCount > 0) {
+      const byFraction = Math.round(indexedFileCount * INCREMENTAL_MAX_CHANGES_FRACTION_OF_FILES);
+      return Math.max(
+        INCREMENTAL_MAX_CHANGES_DEFAULT,
+        Math.min(INCREMENTAL_MAX_CHANGES_CAP, byFraction),
+      );
+    }
+
+    return INCREMENTAL_MAX_CHANGES_DEFAULT;
+  };
+
+  const incrementalMaxChanges = computeIncrementalMaxChanges();
+
   const GLOBAL_FULL_REINDEX_BASENAMES = new Set([
     'tsconfig.json',
     'jsconfig.json',
@@ -174,13 +210,16 @@ export const analyzeCommand = async (
   const shouldForceFullDueToConfig = [...fileChanges.changed, ...fileChanges.deleted].some(fp => {
     const base = path.posix.basename(fp);
     if (GLOBAL_FULL_REINDEX_BASENAMES.has(base)) return true;
-    // Cross-file enrichment can introduce duplicate edges in incremental mode; be conservative.
-    if (/(^|\/)config\/permissions\.php$/i.test(fp)) return true;
     return false;
   });
 
   const hasExistingIndex = existingMeta !== null;
-  const canAttemptIncremental = hasExistingIndex && !options?.force && !schemaMismatch && hasAnyFileChanges && !shouldForceFullDueToConfig && fileChangesTotal <= 500;
+  const canAttemptIncremental = hasExistingIndex
+    && !options?.force
+    && !schemaMismatch
+    && hasAnyFileChanges
+    && !shouldForceFullDueToConfig
+    && fileChangesTotal <= incrementalMaxChanges;
 
   const getFilePathFromNodeId = (nodeId: string): string | null => {
     const firstColon = nodeId.indexOf(':');
@@ -229,15 +268,25 @@ export const analyzeCommand = async (
     communityCount: number;
     processCount: number;
   }> => {
+    const debugEnabled = process.env.GITNEXUS_DEBUG_INCREMENTAL === '1';
+    const debug = (msg: string) => {
+      if (!debugEnabled) return;
+      // stderr so it shows up even when stdout progress bars are suppressed
+      console.error(`[gitnexus][incremental] ${msg}`);
+    };
+
     bar.update(1, { phase: 'Incremental: scanning repo files...' });
+    debug('start');
 
     // Validate index exists on disk
     try {
+      debug('checking kuzu path exists');
       await fs.access(kuzuPath);
     } catch {
       throw new Error('Missing existing KuzuDB index file');
     }
 
+    debug('listing repository files');
     const allRepoFiles = await listRepositoryFiles(repoPath);
     const allRepoFileSet = new Set(allRepoFiles);
 
@@ -253,18 +302,40 @@ export const analyzeCommand = async (
       rebuildFiles.push(fp);
     }
 
-    const rebuildSet = new Set(rebuildFiles);
+    const rebuildFilesSet = new Set<string>(rebuildFiles);
+
+    // Route prefixes can change without route-file edits (RouteServiceProvider),
+    // which affects derived Endpoint contract nodes.
+    const routeProviderTouched = rebuildFiles.some(fp => /(^|\/)app\/Providers\/RouteServiceProvider\.php$/i.test(fp));
+    if (routeProviderTouched) {
+      for (const fp of allRepoFiles) {
+        if (!ROUTE_FILE_PATH_RE.test(fp)) continue;
+        if (shouldIgnorePath(fp)) continue;
+        if (rebuildFilesSet.has(fp)) continue;
+        rebuildFilesSet.add(fp);
+        rebuildFiles.push(fp);
+      }
+    }
+
+    const PERMISSIONS_CONFIG_PATH_RE = /(^|\/)config\/permissions\.php$/i;
+    const permissionsConfigPath = rebuildFiles.find(fp => PERMISSIONS_CONFIG_PATH_RE.test(fp)) || null;
+
+    const rebuildSet = rebuildFilesSet;
 
     bar.update(5, { phase: `Incremental: ${rebuildFiles.length} changed, ${deletedFiles.size} deleted` });
 
     // Open existing KuzuDB (in-place update)
+    debug('initializing kuzu (incremental open)');
     await closeKuzu();
     await initKuzu(kuzuPath);
+    debug('kuzu initialized');
 
     const impactedFiles = Array.from(new Set([...rebuildFiles, ...Array.from(deletedFiles)]));
 
     bar.update(8, { phase: 'Incremental: finding affected callers...' });
+    debug(`finding affected callers for ${impactedFiles.length} file(s)`);
     const upstreamFiles = await getUpstreamFilePathsForFiles(impactedFiles);
+    debug(`upstream callers: ${upstreamFiles.length}`);
 
     const impactedSet = new Set(impactedFiles);
     const refreshEdgeFiles = new Set<string>();
@@ -273,6 +344,49 @@ export const analyzeCommand = async (
       if (!allRepoFileSet.has(fp)) continue;
       if (shouldIgnorePath(fp)) continue;
       refreshEdgeFiles.add(fp);
+    }
+
+    // If permissions config changed, include the referenced Permission enums so we can
+    // build role→permission edges (and slug contract edges) without forcing a full reindex.
+    const permissionEnumFiles = new Set<string>();
+    if (permissionsConfigPath) {
+      try {
+        const configContent = await fs.readFile(path.join(repoPath, permissionsConfigPath), 'utf-8');
+        const baseNames = new Set<string>();
+        const re = /([A-Za-z_\\][A-Za-z0-9_\\]*)\s*::/g;
+        for (const match of configContent.matchAll(re)) {
+          const raw = String(match[1] || '').trim().replace(/^\\+/, '');
+          const parts = raw.split(/[\\/]+/).filter(Boolean);
+          const baseName = parts.at(-1) || '';
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(baseName)) continue;
+          if (!/Permission$/.test(baseName)) continue;
+          baseNames.add(baseName);
+        }
+
+        if (baseNames.size > 0) {
+          const phpFilesByBasename = new Map<string, string[]>();
+          for (const fp of allRepoFiles) {
+            if (!fp.endsWith('.php')) continue;
+            if (shouldIgnorePath(fp)) continue;
+            const base = path.posix.basename(fp);
+            let list = phpFilesByBasename.get(base);
+            if (!list) { list = []; phpFilesByBasename.set(base, list); }
+            list.push(fp);
+          }
+
+          for (const baseName of baseNames) {
+            const candidates = phpFilesByBasename.get(`${baseName}.php`) || [];
+            for (const fp of candidates) {
+              if (impactedSet.has(fp)) continue;
+              if (!allRepoFileSet.has(fp)) continue;
+              permissionEnumFiles.add(fp);
+              refreshEdgeFiles.add(fp);
+            }
+          }
+        }
+      } catch {
+        // best-effort
+      }
     }
 
     // Heuristic: if routes changed, refresh all existing HTTP-wiring sources
@@ -335,10 +449,37 @@ export const analyzeCommand = async (
     const processedFiles = Array.from(new Set([...rebuildFiles, ...Array.from(refreshEdgeFiles)]));
     const processedSet = new Set(processedFiles);
 
+    // Files that may receive new derived nodes even when their content did not change.
+    // Keep this set small to avoid turning incremental updates into full reloads.
+    const nodeInsertFiles = new Set<string>(rebuildFiles);
+
+    // If permissions config changed, we may re-emit permission slug nodes that already exist
+    // (e.g. ticket.view) alongside new ones (e.g. ticket.edit). Kuzu COPY with IGNORE_ERRORS
+    // can still end up skipping the remainder of the file after a duplicate primary key.
+    // Clear existing slug nodes for the referenced Permission enums so inserts are deterministic.
+    if (permissionsConfigPath && permissionEnumFiles.size > 0) {
+      bar.update(11, { phase: 'Incremental: clearing permission slug nodes...' });
+      try {
+        const escapedEnumPaths = Array.from(permissionEnumFiles)
+          .map(fp => `'${fp.replace(/'/g, "''")}'`)
+          .join(', ');
+
+        await executeQuery(`
+          MATCH (n:CodeElement)
+          WHERE n.filePath IN [${escapedEnumPaths}]
+            AND n.id STARTS WITH 'CodeElement:permission:'
+          DETACH DELETE n
+        `);
+      } catch {
+        // best-effort
+      }
+    }
+
     // Delete nodes for removed files
     if (deletedFiles.size > 0) {
       bar.update(12, { phase: 'Incremental: removing deleted files...' });
       for (const fp of deletedFiles) {
+        debug(`deleteNodesForFile (deleted) ${fp}`);
         await deleteNodesForFile(fp, { includeFileNode: true });
       }
     }
@@ -347,6 +488,7 @@ export const analyzeCommand = async (
     if (rebuildFiles.length > 0) {
       bar.update(16, { phase: 'Incremental: clearing changed symbols...' });
       for (const fp of rebuildFiles) {
+        debug(`deleteNodesForFile (changed) ${fp}`);
         await deleteNodesForFile(fp, { includeFileNode: false });
       }
     }
@@ -355,27 +497,33 @@ export const analyzeCommand = async (
     bar.update(20, { phase: 'Incremental: clearing outgoing edges...' });
     const EDGE_TYPES_TO_CLEAR = ['IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS'];
     for (const fp of processedFiles) {
+      debug(`deleteOutgoingRelationshipsForFile ${fp}`);
       await deleteOutgoingRelationshipsForFile(fp, EDGE_TYPES_TO_CLEAR);
     }
 
     // Capture embedding skip set AFTER deletions (so removed embeddings aren't treated as cached)
+    debug('loadEmbeddingNodeIds');
     const cachedEmbeddingNodeIds = await loadEmbeddingNodeIds();
 
     // Load full symbol table from the existing index (post-delete)
     bar.update(24, { phase: 'Incremental: loading symbol table...' });
+    debug('loadSymbolDefinitionsFromKuzu');
     const symbolTable = createSymbolTable();
     const existingDefs = await loadSymbolDefinitionsFromKuzu();
+    debug(`loaded ${existingDefs.length} symbol defs`);
     for (const def of existingDefs) {
       symbolTable.add(def.filePath, def.name, def.nodeId, def.type);
     }
 
     // Read file contents for processed files (changed + edge refresh)
     bar.update(28, { phase: `Incremental: reading ${processedFiles.length} file(s)...` });
+    debug(`readRepositoryFiles (${processedFiles.length})`);
     const processedEntries = await readRepositoryFiles(repoPath, processedFiles, (current, total, filePath) => {
       if (current % 50 !== 0 && current !== total) return;
       const pct = 28 + Math.round((current / Math.max(1, total)) * 14); // 28-42
       bar.update(Math.min(42, pct), { phase: `Reading ${current}/${total}: ${filePath}` });
     });
+    debug(`processedEntries loaded: ${processedEntries.length}`);
 
     const contentByPath = new Map<string, string>();
     for (const entry of processedEntries) contentByPath.set(entry.path, entry.content);
@@ -525,8 +673,16 @@ export const analyzeCommand = async (
       const fp = String(node.properties?.filePath || '').trim();
       if (!fp) continue;
       nodeFilePathById.set(node.id, fp);
-      if (!rebuildSet.has(fp)) continue;
-      insertGraph.addNode(node);
+      if (nodeInsertFiles.has(fp)) {
+        insertGraph.addNode(node);
+        continue;
+      }
+
+      // Derived permission slugs: these nodes belong to the Permission enum filePath (not the changed config),
+      // but they can be created/updated when config/permissions.php changes.
+      if (node.label === 'CodeElement' && node.id.startsWith('CodeElement:permission:')) {
+        insertGraph.addNode(node);
+      }
     }
 
     const getSourceFilePathForEdge = (sourceId: string): string | null => {
@@ -541,7 +697,15 @@ export const analyzeCommand = async (
 
       // Only insert parsed structure edges when the source file was rebuilt (otherwise duplicates).
       if (rel.type === 'DEFINES' || rel.type === 'MEMBER_OF' || rel.type === 'CONTAINS') {
-        if (!rebuildSet.has(srcFilePath)) continue;
+        if (!nodeInsertFiles.has(srcFilePath)) {
+          // Permission slug CodeElements can be newly created even when the enum file didn't change;
+          // allow DEFINES edges from the enum file to the slug nodes without re-inserting the full enum symbols.
+          if (rel.type === 'DEFINES' && rel.targetId.startsWith('CodeElement:permission:') && processedSet.has(srcFilePath)) {
+            // ok
+          } else {
+            continue;
+          }
+        }
       } else {
         // Only insert non-structure edges for files we explicitly refreshed.
         if (!processedSet.has(srcFilePath)) continue;
@@ -550,15 +714,15 @@ export const analyzeCommand = async (
       insertGraph.addRelationship(rel);
     }
 
-    const rebuildContents = new Map<string, string>();
-    for (const fp of rebuildFiles) {
-      rebuildContents.set(fp, contentByPath.get(fp) || '');
+    const insertContents = new Map<string, string>();
+    for (const fp of new Set([...nodeInsertFiles, ...permissionEnumFiles])) {
+      insertContents.set(fp, contentByPath.get(fp) || '');
     }
 
     // Load partial graph into existing KuzuDB
     const t0Kuzu = Date.now();
     let kuzuMsgCount = 0;
-    const kuzuResult = await loadGraphToKuzu(insertGraph, rebuildContents, storagePath, (msg) => {
+    const kuzuResult = await loadGraphToKuzu(insertGraph, insertContents, storagePath, (msg) => {
       kuzuMsgCount++;
       const pct = 78 + Math.min(10, Math.round((kuzuMsgCount / (kuzuMsgCount + 10)) * 10)); // 78-88
       bar.update(pct, { phase: msg });
@@ -579,6 +743,242 @@ export const analyzeCommand = async (
       // best-effort
     }
     const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
+
+    const kuzuWarnings = [...kuzuResult.warnings];
+
+    // Optional: recompute derived views in incremental mode (Communities + Processes).
+    // This is disabled by default because it can be expensive on large graphs.
+    let recomputedMemberships: Array<{ nodeId: string; communityId: string }> | null = null;
+    if (options?.incrementalRecomputeCommunities) {
+      bar.update(88, { phase: 'Incremental: recomputing communities...' });
+      try {
+        const communityInputGraph = createKnowledgeGraph();
+
+        const addNodeRows = (label: 'Function' | 'Class' | 'Method' | 'Interface', rows: any[]) => {
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            const name = String(row.name ?? row[1] ?? '').trim();
+            const filePath = String(row.filePath ?? row[2] ?? '').trim();
+            communityInputGraph.addNode({
+              id,
+              label,
+              properties: {
+                name,
+                filePath,
+              }
+            });
+          }
+        };
+
+        const addRelRows = (type: 'CALLS' | 'EXTENDS' | 'IMPLEMENTS', rows: any[]) => {
+          for (const row of rows) {
+            const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+            const targetId = String(row.targetId ?? row[1] ?? '').trim();
+            if (!sourceId || !targetId) continue;
+            communityInputGraph.addRelationship({
+              id: `inc_comm_${type}_${communityInputGraph.relationshipCount}_${sourceId}->${targetId}`,
+              type,
+              sourceId,
+              targetId,
+              confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
+              reason: String(row.reason ?? row[3] ?? ''),
+            });
+          }
+        };
+
+        addNodeRows('Function', await executeQuery(`MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
+        addNodeRows('Class', await executeQuery(`MATCH (n:Class) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
+        addNodeRows('Method', await executeQuery(`MATCH (n:Method) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
+        addNodeRows('Interface', await executeQuery(`MATCH (n:Interface) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
+
+        addRelRows('CALLS', await executeQuery(`
+          MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+        addRelRows('CALLS', await executeQuery(`
+          MATCH (a:Method)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+        addRelRows('EXTENDS', await executeQuery(`
+          MATCH (a:Class)-[r:CodeRelation {type: 'EXTENDS'}]->(b)
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+        addRelRows('EXTENDS', await executeQuery(`
+          MATCH (a:Interface)-[r:CodeRelation {type: 'EXTENDS'}]->(b)
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+        addRelRows('IMPLEMENTS', await executeQuery(`
+          MATCH (a:Class)-[r:CodeRelation {type: 'IMPLEMENTS'}]->(b)
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+
+        const communityResult = await processCommunities(communityInputGraph, (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(88, { phase: `Communities: ${message}` });
+        });
+        recomputedMemberships = communityResult.memberships;
+
+        await executeQuery(`MATCH (c:Community) DETACH DELETE c`);
+
+        const communityInsertGraph = createKnowledgeGraph();
+        for (const comm of communityResult.communities) {
+          communityInsertGraph.addNode({
+            id: comm.id,
+            label: 'Community',
+            properties: {
+              name: comm.label,
+              filePath: '',
+              heuristicLabel: comm.heuristicLabel,
+              cohesion: comm.cohesion,
+              symbolCount: comm.symbolCount,
+            }
+          });
+        }
+        for (const membership of communityResult.memberships) {
+          communityInsertGraph.addRelationship({
+            id: `${membership.nodeId}_member_of_${membership.communityId}`,
+            type: 'MEMBER_OF',
+            sourceId: membership.nodeId,
+            targetId: membership.communityId,
+            confidence: 1.0,
+            reason: 'leiden-algorithm',
+          });
+        }
+
+        await loadGraphToKuzu(communityInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(88, { phase: msg });
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to recompute communities (${msg.slice(0, 120)})`);
+      }
+    }
+
+    if (options?.incrementalRecomputeProcesses) {
+      bar.update(89, { phase: 'Incremental: recomputing processes...' });
+      try {
+        const processInputGraph = createKnowledgeGraph();
+
+        const addCodeRows = (label: 'Function' | 'Method' | 'CodeElement', rows: any[]) => {
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            const name = String(row.name ?? row[1] ?? '').trim();
+            const filePath = String(row.filePath ?? row[2] ?? '').trim();
+            const language = getLanguageFromFilename(filePath) ?? 'javascript';
+            const isExported = (row.isExported ?? row[3] ?? false) === true;
+            processInputGraph.addNode({
+              id,
+              label,
+              properties: {
+                name,
+                filePath,
+                language,
+                isExported,
+              }
+            });
+          }
+        };
+
+        addCodeRows('Function', await executeQuery(`
+          MATCH (n:Function)
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
+        `));
+        addCodeRows('Method', await executeQuery(`
+          MATCH (n:Method)
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
+        `));
+        addCodeRows('CodeElement', await executeQuery(`
+          MATCH (n:CodeElement)
+          WHERE n.name STARTS WITH 'endpoint:'
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
+        `));
+
+        const addCallRows = (rows: any[]) => {
+          for (const row of rows) {
+            const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+            const targetId = String(row.targetId ?? row[1] ?? '').trim();
+            if (!sourceId || !targetId) continue;
+            processInputGraph.addRelationship({
+              id: `inc_proc_CALLS_${processInputGraph.relationshipCount}_${sourceId}->${targetId}`,
+              type: 'CALLS',
+              sourceId,
+              targetId,
+              confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
+              reason: String(row.reason ?? row[3] ?? ''),
+            });
+          }
+        };
+
+        addCallRows(await executeQuery(`
+          MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          WHERE r.confidence >= 0.5
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+        addCallRows(await executeQuery(`
+          MATCH (a:Method)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          WHERE r.confidence >= 0.5
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+        addCallRows(await executeQuery(`
+          MATCH (a:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          WHERE r.confidence >= 0.5 AND a.name STARTS WITH 'endpoint:'
+          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+        `));
+
+        const symbolCount = processInputGraph.nodes.length;
+        const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
+
+        const processResult = await processProcesses(
+          processInputGraph,
+          recomputedMemberships || [],
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Processes: ${message}` });
+          },
+          { maxProcesses: dynamicMaxProcesses, minSteps: 3 },
+        );
+
+        await executeQuery(`MATCH (p:Process) DETACH DELETE p`);
+
+        const processInsertGraph = createKnowledgeGraph();
+        for (const proc of processResult.processes) {
+          processInsertGraph.addNode({
+            id: proc.id,
+            label: 'Process',
+            properties: {
+              name: proc.label,
+              filePath: '',
+              heuristicLabel: proc.heuristicLabel,
+              processType: proc.processType,
+              stepCount: proc.stepCount,
+              communities: proc.communities,
+              entryPointId: proc.entryPointId,
+              terminalId: proc.terminalId,
+            }
+          });
+        }
+        for (const step of processResult.steps) {
+          processInsertGraph.addRelationship({
+            id: `${step.nodeId}_step_${step.step}_${step.processId}`,
+            type: 'STEP_IN_PROCESS',
+            sourceId: step.nodeId,
+            targetId: step.processId,
+            confidence: 1.0,
+            reason: 'trace-detection',
+            step: step.step,
+          });
+        }
+
+        await loadGraphToKuzu(processInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to recompute processes (${msg.slice(0, 120)})`);
+      }
+    }
 
     // Embeddings (incremental, skip cached)
     const stats = await getKuzuStats();
@@ -611,13 +1011,12 @@ export const analyzeCommand = async (
       embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
     }
 
-    // Note: communities/processes are NOT recomputed in incremental mode.
     const fileCount = await getCount('File');
     const communityCount = await getCount('Community');
     const processCount = await getCount('Process');
 
     return {
-      kuzuWarnings: kuzuResult.warnings,
+      kuzuWarnings,
       kuzuTime,
       ftsTime,
       embeddingTime,
@@ -729,7 +1128,16 @@ export const analyzeCommand = async (
       console.log(`  ${inc.stats.nodes.toLocaleString()} nodes | ${inc.stats.edges.toLocaleString()} edges | ${inc.communityCount} clusters | ${inc.processCount} flows`);
       console.log(`  KuzuDB ${inc.kuzuTime}s | FTS ${inc.ftsTime}s | Embeddings ${inc.embeddingSkipped ? inc.embeddingSkipReason : inc.embeddingTime + 's'}`);
       console.log(`  ${repoPath}`);
-      console.log(`  Incremental note: communities/processes are not recomputed (run with --force for full refresh).`);
+      const derivedParts: string[] = [];
+      if (options?.incrementalRecomputeCommunities) derivedParts.push('communities');
+      if (options?.incrementalRecomputeProcesses) derivedParts.push('processes');
+      if (derivedParts.length === 0) {
+        console.log(`  Incremental note: communities/processes were not recomputed (use --incremental-recompute-communities / --incremental-recompute-processes, or --force).`);
+      } else if (derivedParts.length === 2) {
+        console.log(`  Incremental note: communities/processes recomputed.`);
+      } else {
+        console.log(`  Incremental note: recomputed ${derivedParts.join(' + ')} (use the other --incremental-recompute-* flag, or --force).`);
+      }
 
       if (aiContext.files.length > 0) {
         console.log(`  Context: ${aiContext.files.join(', ')}`);

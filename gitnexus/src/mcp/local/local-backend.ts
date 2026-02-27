@@ -18,6 +18,7 @@ import {
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 import { buildArchetypeReport, computeProcessArchetype, deriveLayerTag, type ArchetypeExample, type ArchetypeReport, type HttpEdgeInfo, type ProcessTraceInfo } from '../../core/derived/archetypes.js';
+import { extractUiContractCard } from '../../core/derived/ui-contract.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -410,6 +411,9 @@ export class LocalBackend {
         break;
       case 'precedents':
         result = await this.precedents(repo, params);
+        break;
+      case 'ui_contract':
+        result = await this.uiContract(repo, params);
         break;
       case 'cypher':
         result = await this.cypher(repo, params);
@@ -2153,6 +2157,72 @@ export class LocalBackend {
       }
     } catch { /* ignore */ }
 
+    const cache_effects: any[] = [];
+    try {
+      const tsLikeFiles = files
+        .map(f => String(f?.filePath || '').trim())
+        .filter(Boolean)
+        .filter(isTsLikeFilePath)
+        .slice(0, 3);
+
+      for (const filePath of tsLikeFiles) {
+        const fullPath = path.join(repo.repoPath, filePath);
+        let content: string;
+        try {
+          content = await fs.readFile(fullPath, 'utf-8');
+        } catch {
+          continue;
+        }
+
+        const card = await extractUiContractCard(filePath, content);
+        const cacheLinks = Array.isArray((card as any)?.cacheLinks) ? (card as any).cacheLinks : [];
+        const queries = Array.isArray((card as any)?.queries) ? (card as any).queries : [];
+        if (cacheLinks.length === 0 && queries.length === 0) continue;
+
+        const linkSummaries = cacheLinks
+          .map((l: any) => ({
+            operation: l?.operation || null,
+            matches: Array.isArray(l?.matches) ? l.matches : [],
+          }))
+          .filter((l: any) => l.operation && l.operation.method && l.operation.queryKey)
+          .map((l: any) => ({
+            operation: {
+              kind: l.operation.kind,
+              method: l.operation.method,
+              queryKey: l.operation.queryKey,
+              line: l.operation.line,
+              confidence: l.operation.confidence,
+            },
+            matches: l.matches.map((m: any) => ({
+              hook: m.hook,
+              queryKey: m.queryKey,
+              match: m.match,
+              line: m.line,
+              confidence: m.confidence,
+            })),
+          }));
+
+        const matched = linkSummaries.filter((l: any) => l.matches.length > 0);
+        const refetchCount = linkSummaries.filter((l: any) => l.operation.kind === 'refetch').length;
+        const writeCount = linkSummaries.filter((l: any) => l.operation.kind === 'write').length;
+        const removeCount = linkSummaries.filter((l: any) => l.operation.kind === 'remove').length;
+
+        cache_effects.push({
+          filePath,
+          summary: {
+            queries: queries.length,
+            operations: linkSummaries.length,
+            matched_operations: matched.length,
+            unmatched_operations: linkSummaries.length - matched.length,
+            refetch_triggers: refetchCount,
+            cache_writes: writeCount,
+            cache_removes: removeCount,
+          },
+          links: matched.slice(0, 25),
+        });
+      }
+    } catch { /* ignore */ }
+
     return {
       status: 'ok',
       repo: repo.name,
@@ -2161,6 +2231,7 @@ export class LocalBackend {
       checks: checks.slice(0, limitChecks),
       top_processes: Array.isArray(result?.processes) ? result.processes.slice(0, 3) : [],
       hops,
+      cache_effects,
     };
   }
 
@@ -2298,6 +2369,257 @@ export class LocalBackend {
       console.error('GitNexus: Semantic search unavailable -', err.message);
       return [];
     }
+  }
+
+  private async uiContract(repo: RepoHandle, params: {
+    file_path: string;
+    base_ref?: string;
+    include_endpoints?: boolean;
+    min_http_confidence?: number;
+  }): Promise<any> {
+    const rawPath = String(params.file_path || '').trim();
+    if (!rawPath) return { error: 'file_path is required and cannot be empty.' };
+
+    const normalizedInput = rawPath.replace(/\\/g, '/');
+    const absPath = path.isAbsolute(normalizedInput)
+      ? normalizedInput
+      : path.join(repo.repoPath, normalizedInput);
+
+    const relativePath = path.relative(repo.repoPath, absPath).replace(/\\/g, '/');
+    if (!relativePath || relativePath.startsWith('..')) {
+      return { error: `file_path must be inside the repo (${repo.repoPath})` };
+    }
+
+    const fullPath = path.join(repo.repoPath, relativePath);
+
+    let content: string;
+    try {
+      content = await fs.readFile(fullPath, 'utf-8');
+    } catch (err: any) {
+      return { error: `Unable to read file: ${relativePath} (${err?.message || 'unknown error'})` };
+    }
+
+    const card = await extractUiContractCard(relativePath, content);
+
+    const includeEndpoints = params.include_endpoints !== false;
+    const minHttpConfidence = params.min_http_confidence ?? 0.9;
+
+    let endpoints: any[] = [];
+    if (includeEndpoints) {
+      await this.ensureInitialized(repo.id);
+
+      const fileEsc = relativePath.replace(/'/g, "''");
+      const conf = Math.max(0, Math.min(1, minHttpConfidence));
+
+      const directRows = await executeQuery(repo.id, `
+        MATCH (f:File {filePath: '${fileEsc}'})-[d:CodeRelation {type: 'DEFINES'}]->(src)
+        MATCH (src)-[r:CodeRelation {type: 'CALLS'}]->(target:Method)
+        WHERE r.reason STARTS WITH 'http-' AND r.confidence >= ${conf}
+        OPTIONAL MATCH (target)-[:CodeRelation {type: 'MEMBER_OF'}]->(container:Class)
+        RETURN src.id AS surfaceId,
+               src.name AS surfaceName,
+               src.filePath AS surfaceFilePath,
+               src.startLine AS surfaceStartLine,
+               src.id AS httpCallerId,
+               src.name AS httpCallerName,
+               src.filePath AS httpCallerFilePath,
+               src.startLine AS httpCallerStartLine,
+               r.reason AS reason,
+               r.confidence AS confidence,
+               target.id AS controllerId,
+               target.name AS controllerName,
+               target.filePath AS controllerFilePath,
+               target.startLine AS controllerStartLine,
+               container.name AS controllerClassName
+        ORDER BY confidence DESC
+        LIMIT 200
+      `);
+
+      const hopRows = await executeQuery(repo.id, `
+        MATCH (f:File {filePath: '${fileEsc}'})-[d:CodeRelation {type: 'DEFINES'}]->(src)
+        MATCH (src)-[:CodeRelation {type: 'CALLS'}]->(mid)-[r:CodeRelation {type: 'CALLS'}]->(target:Method)
+        WHERE r.reason STARTS WITH 'http-' AND r.confidence >= ${conf}
+        OPTIONAL MATCH (target)-[:CodeRelation {type: 'MEMBER_OF'}]->(container:Class)
+        RETURN src.id AS surfaceId,
+               src.name AS surfaceName,
+               src.filePath AS surfaceFilePath,
+               src.startLine AS surfaceStartLine,
+               mid.id AS httpCallerId,
+               mid.name AS httpCallerName,
+               mid.filePath AS httpCallerFilePath,
+               mid.startLine AS httpCallerStartLine,
+               r.reason AS reason,
+               r.confidence AS confidence,
+               target.id AS controllerId,
+               target.name AS controllerName,
+               target.filePath AS controllerFilePath,
+               target.startLine AS controllerStartLine,
+               container.name AS controllerClassName
+        ORDER BY confidence DESC
+        LIMIT 200
+      `);
+
+      const rows = [...directRows, ...hopRows];
+
+      const seen = new Set<string>();
+      endpoints = rows
+        .map((row: any) => ({
+          http: { reason: row.reason ?? row[8] ?? '', confidence: row.confidence ?? row[9] ?? 1.0 },
+          surface: {
+            uid: row.surfaceId ?? row[0] ?? '',
+            name: row.surfaceName ?? row[1] ?? '',
+            filePath: row.surfaceFilePath ?? row[2] ?? '',
+            startLine: row.surfaceStartLine ?? row[3] ?? undefined,
+          },
+          http_caller: {
+            uid: row.httpCallerId ?? row[4] ?? '',
+            name: row.httpCallerName ?? row[5] ?? '',
+            filePath: row.httpCallerFilePath ?? row[6] ?? '',
+            startLine: row.httpCallerStartLine ?? row[7] ?? undefined,
+          },
+          controller: {
+            uid: row.controllerId ?? row[10] ?? '',
+            name: (() => {
+              const base = row.controllerName ?? row[11] ?? '';
+              const cls = row.controllerClassName ?? row[14] ?? '';
+              return cls && base ? `${cls}::${base}` : base;
+            })(),
+            filePath: row.controllerFilePath ?? row[12] ?? '',
+            startLine: row.controllerStartLine ?? row[13] ?? undefined,
+            type: 'Method',
+          },
+        }))
+        .filter((e: any) => e.http.reason)
+        .filter((e: any) => {
+          const key = `${e.http.reason}::${e.controller.uid}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .slice(0, 50);
+    }
+
+    const baseRef = String(params.base_ref || '').trim();
+    if (!baseRef) {
+      return {
+        status: 'ok',
+        file_path: relativePath,
+        contract: card,
+        endpoints,
+      };
+    }
+
+    const readFileAtRef = async (): Promise<string | null> => {
+      const { spawn } = await import('child_process');
+      return await new Promise(resolve => {
+        const child = spawn('git', ['-C', repo.repoPath, 'show', `${baseRef}:./${relativePath}`], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        const stdoutChunks: Buffer[] = [];
+        child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
+        child.on('error', () => resolve(null));
+        child.on('close', code => {
+          if (code !== 0) return resolve(null);
+          resolve(Buffer.concat(stdoutChunks).toString('utf-8'));
+        });
+      });
+    };
+
+    const baseContent = await readFileAtRef();
+    if (baseContent === null) {
+      return {
+        status: 'ok',
+        file_path: relativePath,
+        contract: card,
+        endpoints,
+        diff: { error: `Unable to read ${relativePath} at ${baseRef} (git show failed).` },
+      };
+    }
+
+    const baseCard = await extractUiContractCard(relativePath, baseContent);
+
+    const keyControlled = (s: any): string => `${s.element}|open:${s.open}|onOpenChange:${s.onOpenChange}`;
+    const keyInteraction = (i: any): string => `${i.event}|${i.element}|${i.handler?.kind || ''}|${i.handler?.name || ''}`;
+    const keySmell = (s: any): string => `${s.kind}|${s.message}`;
+    const keyQuery = (q: any): string => {
+      const hook = q?.hook ?? '';
+      const queryKey = q?.queryKey ?? '';
+      const enabled = q?.enabled ?? '';
+      const staleTime = q?.staleTime ?? '';
+      const refetchOnMount = q?.refetchOnMount ?? '';
+      const refetchOnWindowFocus = q?.refetchOnWindowFocus ?? '';
+      const refetchInterval = q?.refetchInterval ?? '';
+      const gcTime = q?.gcTime ?? '';
+      return `${hook}|${queryKey}|enabled:${enabled}|staleTime:${staleTime}|refetchOnMount:${refetchOnMount}|refetchOnWindowFocus:${refetchOnWindowFocus}|refetchInterval:${refetchInterval}|gcTime:${gcTime}`;
+    };
+
+    const toSet = (list: any[], keyFn: (v: any) => string): Set<string> => new Set(list.map(keyFn).filter(Boolean));
+
+    const baseControlled = toSet(baseCard.controlled, keyControlled);
+    const currControlled = toSet(card.controlled, keyControlled);
+    const baseInteractions = toSet(baseCard.interactions, keyInteraction);
+    const currInteractions = toSet(card.interactions, keyInteraction);
+    const baseSmells = toSet(baseCard.smells, keySmell);
+    const currSmells = toSet(card.smells, keySmell);
+    const baseQueries = toSet(baseCard.queries || [], keyQuery);
+    const currQueries = toSet(card.queries || [], keyQuery);
+
+    const effectKey = (e: any): string => `${e.kind}|${e.callee}|${e.args}`;
+    const effectsByInteraction = (c: any): Map<string, Set<string>> => {
+      const map = new Map<string, Set<string>>();
+      for (const interaction of c?.interactions || []) {
+        const key = keyInteraction(interaction);
+        const set = new Set<string>();
+        for (const eff of interaction.effects || []) {
+          const k = effectKey(eff);
+          if (k) set.add(k);
+        }
+        map.set(key, set);
+      }
+      return map;
+    };
+
+    const baseEffects = effectsByInteraction(baseCard);
+    const currEffects = effectsByInteraction(card);
+
+    const interaction_effects_diff = [...currInteractions]
+      .map(key => {
+        const baseSet = baseEffects.get(key) || new Set<string>();
+        const currSet = currEffects.get(key) || new Set<string>();
+        const added = [...currSet].filter(e => !baseSet.has(e));
+        const removed = [...baseSet].filter(e => !currSet.has(e));
+        if (added.length === 0 && removed.length === 0) return null;
+        return { interaction: key, added: added.slice(0, 25), removed: removed.slice(0, 25) };
+      })
+      .filter(Boolean)
+      .slice(0, 50);
+
+    const diff = {
+      base_ref: baseRef,
+      controlled_added: [...currControlled].filter(k => !baseControlled.has(k)),
+      controlled_removed: [...baseControlled].filter(k => !currControlled.has(k)),
+      interactions_added: [...currInteractions].filter(k => !baseInteractions.has(k)),
+      interactions_removed: [...baseInteractions].filter(k => !currInteractions.has(k)),
+      smells_added: [...currSmells].filter(k => !baseSmells.has(k)),
+      smells_removed: [...baseSmells].filter(k => !currSmells.has(k)),
+      queries_added: [...currQueries].filter(k => !baseQueries.has(k)),
+      queries_removed: [...baseQueries].filter(k => !currQueries.has(k)),
+      interaction_effects_diff,
+      effects_summary: {
+        base: baseCard.effectsSummary,
+        current: card.effectsSummary,
+      },
+    };
+
+    return {
+      status: 'ok',
+      file_path: relativePath,
+      contract: card,
+      endpoints,
+      base_contract: baseCard,
+      diff,
+    };
   }
 
   private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
