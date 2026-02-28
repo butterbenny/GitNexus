@@ -19,6 +19,7 @@ import { registerClaudeHook } from './claude-hooks.js';
 import { shouldIgnorePath } from '../config/ignore-service.js';
 import { listRepositoryFiles, readRepositoryFiles } from '../core/ingestion/filesystem-walker.js';
 import { createKnowledgeGraph } from '../core/graph/graph.js';
+import { NodeLabel, RelationshipType } from '../core/graph/types.js';
 import { createSymbolTable } from '../core/ingestion/symbol-table.js';
 import { createASTCache } from '../core/ingestion/ast-cache.js';
 import { processParsing } from '../core/ingestion/parsing-processor.js';
@@ -27,6 +28,16 @@ import { processCallsFromExtracted } from '../core/ingestion/call-processor.js';
 import { processHeritageFromExtracted } from '../core/ingestion/heritage-processor.js';
 import { processCommunities } from '../core/ingestion/community-processor.js';
 import { processProcesses } from '../core/ingestion/process-processor.js';
+import { processFeatureSlices } from '../core/ingestion/feature-slice-processor.js';
+import { processGaps } from '../core/ingestion/gap-processor.js';
+import { processGitHistoryCochange } from '../core/ingestion/git-history-cochange-processor.js';
+import { processEvidenceSpans } from '../core/ingestion/evidence-span-processor.js';
+import { saveEvidenceSpanSnapshot } from '../core/ingestion/evidence-span-store.js';
+import { processMicroDataflow } from '../core/ingestion/micro-dataflow-processor.js';
+import { processPrecisionOverlay } from '../core/ingestion/precision-overlay-processor.js';
+import { PrecisionOverlayMode, normalizePrecisionOverlayMode } from '../core/ingestion/precision-overlay-producer.js';
+import { processProvenanceEdges } from '../core/ingestion/provenance-processor.js';
+import { processValueGraph } from '../core/ingestion/value-graph-processor.js';
 import { createWorkerPool, WorkerPool } from '../core/ingestion/workers/worker-pool.js';
 import { processLaravelRoutes, ROUTE_FILE_PATH_RE } from '../core/ingestion/laravel-route-processor.js';
 import { processLaravelHttpWiring } from '../core/ingestion/laravel-http-processor.js';
@@ -41,6 +52,7 @@ import { processLaravelEloquentRelationships } from '../core/ingestion/laravel-e
 import { processLaravelEloquentLoadEdges } from '../core/ingestion/laravel-eloquent-load-processor.js';
 import { processLaravelResourceContracts } from '../core/ingestion/laravel-resource-contract-processor.js';
 import { processReactQueryKeyWiring } from '../core/ingestion/react-query-processor.js';
+import { processContractShapes } from '../core/ingestion/contract-shape-processor.js';
 import { processLaravelViewsAndMail } from '../core/ingestion/laravel-view-mail-processor.js';
 import { processLaravelEvents } from '../core/ingestion/laravel-event-processor.js';
 import { processLaravelEventDispatch } from '../core/ingestion/laravel-event-dispatch-processor.js';
@@ -63,6 +75,10 @@ export interface AnalyzeOptions {
   incrementalMaxChanges?: number;
   incrementalRecomputeProcesses?: boolean;
   incrementalRecomputeCommunities?: boolean;
+  precisionOverlay?: PrecisionOverlayMode | string;
+  precisionOverlayPath?: string;
+  precisionOverlayForce?: boolean;
+  graphExpectationPath?: string;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -77,9 +93,18 @@ const PHASE_LABELS: Record<string, string> = {
   parsing: 'Parsing code',
   imports: 'Resolving imports',
   calls: 'Tracing calls',
+  shapes: 'Materializing contract shapes',
   heritage: 'Extracting inheritance',
+  precision: 'Applying precision overlay',
+  microflow: 'Materializing targeted micro-dataflow',
+  values: 'Materializing value graph',
+  provenance: 'Materializing provenance edges',
+  evidence: 'Materializing evidence spans',
   communities: 'Detecting communities',
   processes: 'Detecting processes',
+  slices: 'Materializing feature slices',
+  gaps: 'Materializing gap graph',
+  cochange: 'Materializing git-history cochange graph',
   complete: 'Pipeline complete',
   kuzu: 'Loading into KuzuDB',
   fts: 'Creating search indexes',
@@ -117,6 +142,7 @@ export const analyzeCommand = async (
   const existingMeta = await loadMeta(storagePath);
   const existingSchemaVersion = existingMeta?.kuzuSchemaVersion ?? 1;
   const schemaMismatch = existingMeta !== null && existingSchemaVersion !== KUZU_SCHEMA_VERSION;
+  const precisionOverlayMode = normalizePrecisionOverlayMode(options?.precisionOverlay);
 
   const rawChanges = existingMeta && !options?.force
     ? mergeGitFileChanges(
@@ -271,6 +297,55 @@ export const analyzeCommand = async (
     fileCount: number;
     communityCount: number;
     processCount: number;
+    precision?: {
+      mode: PrecisionOverlayMode;
+      provider: string;
+      overlayFound: boolean;
+      declaredRelations: number;
+      emittedEdges: number;
+      producer?: string;
+      producerCacheHit?: boolean;
+      producerSkipped?: boolean;
+      producerSkipReason?: string;
+    };
+    microDataflow?: {
+      emittedEdges: number;
+      requestFieldReads: number;
+      responseFieldWrites: number;
+      endpointRequestClosures: number;
+      endpointResponseClosures: number;
+      queryInvalidationClosures: number;
+      endpointEventClosures: number;
+      endpointPermissionClosures: number;
+    };
+    valueGraph?: {
+      valueCount: number;
+      edgeCount: number;
+      permissionValues: number;
+      endpointValues: number;
+      routeNameValues: number;
+      cacheKeyValues: number;
+      skippedDuplicates: number;
+      skippedMalformed: number;
+    };
+    provenance?: {
+      emittedEdges: number;
+      routeExpansionEdges: number;
+      enumToSlugEdges: number;
+      configDrivenEdges: number;
+      compiledArtifactEdges: number;
+      frameworkDerivedEdges: number;
+      skippedDuplicates: number;
+      skippedMalformed: number;
+    };
+    evidenceSpans?: {
+      nodeEvidenceCount: number;
+      edgeEvidenceCount: number;
+      uniqueFiles: number;
+      primarySpanCount: number;
+      witnessSpanCount: number;
+      proofSpanCount: number;
+    };
   }> => {
     const debugEnabled = process.env.GITNEXUS_DEBUG_INCREMENTAL === '1';
     const debug = (msg: string) => {
@@ -792,6 +867,274 @@ export const analyzeCommand = async (
 
     const kuzuWarnings = [...kuzuResult.warnings];
 
+    let precisionSummary: {
+      mode: PrecisionOverlayMode;
+      provider: string;
+      overlayFound: boolean;
+      declaredRelations: number;
+      emittedEdges: number;
+      producer?: string;
+      producerCacheHit?: boolean;
+      producerSkipped?: boolean;
+      producerSkipReason?: string;
+    } | undefined;
+    let microDataflowSummary: {
+      emittedEdges: number;
+      requestFieldReads: number;
+      responseFieldWrites: number;
+      endpointRequestClosures: number;
+      endpointResponseClosures: number;
+      queryInvalidationClosures: number;
+      endpointEventClosures: number;
+      endpointPermissionClosures: number;
+    } | undefined;
+    let valueGraphSummary: {
+      valueCount: number;
+      edgeCount: number;
+      permissionValues: number;
+      endpointValues: number;
+      routeNameValues: number;
+      cacheKeyValues: number;
+      skippedDuplicates: number;
+      skippedMalformed: number;
+    } | undefined;
+    let provenanceSummary: {
+      emittedEdges: number;
+      routeExpansionEdges: number;
+      enumToSlugEdges: number;
+      configDrivenEdges: number;
+      compiledArtifactEdges: number;
+      frameworkDerivedEdges: number;
+      skippedDuplicates: number;
+      skippedMalformed: number;
+    } | undefined;
+    let evidenceSpanSummary: {
+      nodeEvidenceCount: number;
+      edgeEvidenceCount: number;
+      uniqueFiles: number;
+      primarySpanCount: number;
+      witnessSpanCount: number;
+      proofSpanCount: number;
+    } | undefined;
+    const flowNodeLabels = [
+      'File',
+      'Function',
+      'Class',
+      'Interface',
+      'Method',
+      'CodeElement',
+      'Struct',
+      'Enum',
+      'Macro',
+      'Typedef',
+      'Union',
+      'Namespace',
+      'Trait',
+      'Impl',
+      'TypeAlias',
+      'Const',
+      'Static',
+      'Property',
+      'Record',
+      'Delegate',
+      'Annotation',
+      'Constructor',
+      'Template',
+      'Module',
+    ] as const;
+    const backtickFlowNodeLabels = new Set([
+      'Struct',
+      'Enum',
+      'Macro',
+      'Typedef',
+      'Union',
+      'Namespace',
+      'Trait',
+      'Impl',
+      'TypeAlias',
+      'Const',
+      'Static',
+      'Property',
+      'Record',
+      'Delegate',
+      'Annotation',
+      'Constructor',
+      'Template',
+      'Module',
+    ]);
+
+    bar.update(88, { phase: 'Incremental: refreshing precision overlay...' });
+    try {
+      await executeQuery(`
+        MATCH ()-[r:CodeRelation]->()
+        WHERE r.reason STARTS WITH 'precision-overlay:'
+        DELETE r
+      `);
+
+      const precisionInputGraph = createKnowledgeGraph();
+      for (const label of flowNodeLabels) {
+        const cypherLabel = backtickFlowNodeLabels.has(label) ? `\`${label}\`` : label;
+        const rows = await executeQuery(`
+          MATCH (n:${cypherLabel})
+          RETURN n.id AS id,
+                 n.name AS name,
+                 n.filePath AS filePath,
+                 n.startLine AS startLine,
+                 n.endLine AS endLine
+        `);
+
+        for (const row of rows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          precisionInputGraph.addNode({
+            id,
+            label: label as NodeLabel,
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+            },
+          });
+        }
+      }
+
+      const precisionResult = await processPrecisionOverlay(
+        repoPath,
+        precisionInputGraph,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(88, { phase: `Precision overlay: ${message}` });
+        },
+        {
+          producerMode: precisionOverlayMode,
+          producerForceRefresh: options?.precisionOverlayForce,
+          overlayPath: options?.precisionOverlayPath,
+        },
+      );
+
+      precisionSummary = {
+        mode: precisionOverlayMode,
+        provider: precisionResult.stats.provider,
+        overlayFound: precisionResult.stats.overlayFound,
+        declaredRelations: precisionResult.stats.declaredRelations,
+        emittedEdges: precisionResult.stats.emittedEdges,
+        producer: precisionResult.stats.producer,
+        producerCacheHit: precisionResult.stats.producerCacheHit,
+        producerSkipped: precisionResult.stats.producerSkipped,
+        producerSkipReason: precisionResult.stats.producerSkipReason,
+      };
+
+      if (precisionResult.edges.length > 0) {
+        const precisionInsertGraph = createKnowledgeGraph();
+        for (const edge of precisionResult.edges) {
+          precisionInsertGraph.addRelationship(edge);
+        }
+        await loadGraphToKuzu(precisionInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(88, { phase: msg });
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to refresh precision overlay (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(88, { phase: 'Incremental: refreshing targeted micro-dataflow...' });
+    try {
+      await executeQuery(`
+        MATCH ()-[r:CodeRelation]->()
+        WHERE r.reason STARTS WITH 'micro-dataflow:'
+        DELETE r
+      `);
+
+      const microDataflowGraph = createKnowledgeGraph();
+
+      for (const label of flowNodeLabels) {
+        const cypherLabel = backtickFlowNodeLabels.has(label) ? `\`${label}\`` : label;
+        const rows = await executeQuery(`
+          MATCH (n:${cypherLabel})
+          RETURN n.id AS id,
+                 n.name AS name,
+                 n.filePath AS filePath,
+                 n.startLine AS startLine,
+                 n.endLine AS endLine
+        `);
+
+        for (const row of rows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          microDataflowGraph.addNode({
+            id,
+            label: label as NodeLabel,
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+            },
+          });
+        }
+      }
+
+      const relationshipRows = await executeQuery(`
+        MATCH (a)-[r:CodeRelation]->(b)
+        WHERE r.type IN ['CALLS', 'VALIDATES_FIELD', 'SERIALIZES_FIELD', 'DEFINES', 'INVALIDATES_KEY', 'READS_FIELD', 'WRITES_FIELD']
+        RETURN a.id AS sourceId,
+               b.id AS targetId,
+               r.type AS type,
+               r.confidence AS confidence,
+               r.reason AS reason
+      `);
+
+      for (const row of relationshipRows) {
+        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+        const targetId = String(row.targetId ?? row[1] ?? '').trim();
+        const type = String(row.type ?? row[2] ?? '').trim();
+        if (!sourceId || !targetId || !type) continue;
+
+        microDataflowGraph.addRelationship({
+          id: `inc_micro_${type}_${sourceId}->${targetId}`,
+          type: type as RelationshipType,
+          sourceId,
+          targetId,
+          confidence: Number(row.confidence ?? row[3] ?? 0.8) || 0.8,
+          reason: String(row.reason ?? row[4] ?? ''),
+        });
+      }
+
+      const microDataflowResult = await processMicroDataflow(
+        microDataflowGraph,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(88, { phase: `Micro-dataflow: ${message}` });
+        },
+      );
+
+      microDataflowSummary = {
+        emittedEdges: microDataflowResult.stats.emittedEdges,
+        requestFieldReads: microDataflowResult.stats.requestFieldReads,
+        responseFieldWrites: microDataflowResult.stats.responseFieldWrites,
+        endpointRequestClosures: microDataflowResult.stats.endpointRequestClosures,
+        endpointResponseClosures: microDataflowResult.stats.endpointResponseClosures,
+        queryInvalidationClosures: microDataflowResult.stats.queryInvalidationClosures,
+        endpointEventClosures: microDataflowResult.stats.endpointEventClosures,
+        endpointPermissionClosures: microDataflowResult.stats.endpointPermissionClosures,
+      };
+
+      if (microDataflowResult.edges.length > 0) {
+        const microInsertGraph = createKnowledgeGraph();
+        for (const edge of microDataflowResult.edges) {
+          microInsertGraph.addRelationship(edge);
+        }
+        await loadGraphToKuzu(microInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(88, { phase: msg });
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to refresh targeted micro-dataflow (${msg.slice(0, 120)})`);
+    }
+
     // Optional: recompute derived views in incremental mode (Communities + Processes).
     // This is disabled by default because it can be expensive on large graphs.
     let recomputedMemberships: Array<{ nodeId: string; communityId: string }> | null = null;
@@ -1026,6 +1369,775 @@ export const analyzeCommand = async (
       }
     }
 
+    bar.update(89, { phase: 'Incremental: recomputing feature slices...' });
+    try {
+      const featureSliceInputGraph = createKnowledgeGraph();
+      const featureSliceNodeIds = new Set<string>();
+      const sliceLabels = [
+        'Function',
+        'Class',
+        'Interface',
+        'Method',
+        'CodeElement',
+        'Struct',
+        'Enum',
+        'Macro',
+        'Typedef',
+        'Union',
+        'Namespace',
+        'Trait',
+        'Impl',
+        'TypeAlias',
+        'Const',
+        'Static',
+        'Property',
+        'Record',
+        'Delegate',
+        'Annotation',
+        'Constructor',
+        'Template',
+        'Module',
+      ] as const;
+      const backtickLabels = new Set([
+        'Struct',
+        'Enum',
+        'Macro',
+        'Typedef',
+        'Union',
+        'Namespace',
+        'Trait',
+        'Impl',
+        'TypeAlias',
+        'Const',
+        'Static',
+        'Property',
+        'Record',
+        'Delegate',
+        'Annotation',
+        'Constructor',
+        'Template',
+        'Module',
+      ]);
+
+      for (const label of sliceLabels) {
+        const cypherLabel = backtickLabels.has(label) ? `\`${label}\`` : label;
+        const rows = await executeQuery(`
+          MATCH (n:${cypherLabel})
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath
+        `);
+
+        for (const row of rows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          const name = String(row.name ?? row[1] ?? '').trim();
+          const filePath = String(row.filePath ?? row[2] ?? '').trim();
+          featureSliceInputGraph.addNode({
+            id,
+            label,
+            properties: {
+              name,
+              filePath,
+            },
+          });
+          featureSliceNodeIds.add(id);
+        }
+      }
+
+      const callRows = await executeQuery(`
+        MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
+        WHERE r.confidence >= 0.9
+        RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
+      `);
+
+      for (const row of callRows) {
+        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+        const targetId = String(row.targetId ?? row[1] ?? '').trim();
+        if (!sourceId || !targetId) continue;
+        if (!featureSliceNodeIds.has(sourceId) || !featureSliceNodeIds.has(targetId)) continue;
+        featureSliceInputGraph.addRelationship({
+          id: `inc_slice_CALLS_${featureSliceInputGraph.relationshipCount}_${sourceId}->${targetId}`,
+          type: 'CALLS',
+          sourceId,
+          targetId,
+          confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
+          reason: String(row.reason ?? row[3] ?? ''),
+        });
+      }
+
+      const featureSliceResult = await processFeatureSlices(
+        featureSliceInputGraph,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Feature slices: ${message}` });
+        },
+      );
+
+      await executeQuery(`MATCH (s:FeatureSlice) DETACH DELETE s`);
+
+      const featureSliceInsertGraph = createKnowledgeGraph();
+      for (const slice of featureSliceResult.slices) {
+        featureSliceInsertGraph.addNode({
+          id: slice.id,
+          label: 'FeatureSlice',
+          properties: {
+            name: slice.label,
+            filePath: '',
+            heuristicLabel: slice.heuristicLabel,
+            sliceType: slice.sliceType,
+            anchorId: slice.anchorId,
+            anchorName: slice.anchorName,
+            closureSlots: slice.closureSlots,
+            closedSlots: slice.closedSlots,
+            closureScore: slice.closureScore,
+          },
+        });
+      }
+
+      for (const membership of featureSliceResult.memberships) {
+        featureSliceInsertGraph.addRelationship({
+          id: `${membership.nodeId}_member_of_${membership.sliceId}`,
+          type: 'MEMBER_OF',
+          sourceId: membership.nodeId,
+          targetId: membership.sliceId,
+          confidence: 1.0,
+          reason: `feature-slice:${membership.role}`,
+        });
+      }
+
+      await loadGraphToKuzu(featureSliceInsertGraph, new Map(), storagePath, (msg) => {
+        bar.update(89, { phase: msg });
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to recompute feature slices (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(89, { phase: 'Incremental: recomputing gap graph...' });
+    try {
+      const gapInputGraph = createKnowledgeGraph();
+      const memberLabels = new Set([
+        'Function',
+        'Class',
+        'Interface',
+        'Method',
+        'CodeElement',
+        'Struct',
+        'Enum',
+        'Macro',
+        'Typedef',
+        'Union',
+        'Namespace',
+        'Trait',
+        'Impl',
+        'TypeAlias',
+        'Const',
+        'Static',
+        'Property',
+        'Record',
+        'Delegate',
+        'Annotation',
+        'Constructor',
+        'Template',
+        'Module',
+      ]);
+
+      const sliceRows = await executeQuery(`
+        MATCH (s:FeatureSlice)
+        RETURN
+          s.id AS id,
+          s.label AS label,
+          s.heuristicLabel AS heuristicLabel,
+          s.sliceType AS sliceType,
+          s.anchorId AS anchorId,
+          s.anchorName AS anchorName,
+          s.closureSlots AS closureSlots,
+          s.closedSlots AS closedSlots,
+          s.closureScore AS closureScore
+      `);
+
+      for (const row of sliceRows) {
+        const id = String(row.id ?? row[0] ?? '').trim();
+        if (!id) continue;
+        gapInputGraph.addNode({
+          id,
+          label: 'FeatureSlice',
+          properties: {
+            name: String(row.label ?? row[1] ?? '').trim(),
+            filePath: '',
+            heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
+            sliceType: String(row.sliceType ?? row[3] ?? '').trim(),
+            anchorId: String(row.anchorId ?? row[4] ?? '').trim(),
+            anchorName: String(row.anchorName ?? row[5] ?? '').trim(),
+            closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((slot: any) => String(slot)) : [],
+            closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((slot: any) => String(slot)) : [],
+            closureScore: Number(row.closureScore ?? row[8] ?? 0) || 0,
+          },
+        });
+      }
+
+      const membershipRows = await executeQuery(`
+        MATCH (src)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+        WHERE r.reason STARTS WITH 'feature-slice:'
+        RETURN
+          src.id AS sourceId,
+          src.name AS sourceName,
+          src.filePath AS sourceFilePath,
+          labels(src) AS sourceLabels,
+          s.id AS sliceId,
+          r.reason AS reason
+      `);
+
+      for (const row of membershipRows) {
+        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+        const sliceId = String(row.sliceId ?? row[4] ?? '').trim();
+        if (!sourceId || !sliceId) continue;
+
+        const sourceLabels = Array.isArray(row.sourceLabels) ? row.sourceLabels.map((label: any) => String(label)) : [];
+        const primaryLabel = sourceLabels.find(label => memberLabels.has(label)) || 'CodeElement';
+        if (!memberLabels.has(primaryLabel)) continue;
+
+        gapInputGraph.addNode({
+          id: sourceId,
+          label: primaryLabel as NodeLabel,
+          properties: {
+            name: String(row.sourceName ?? row[1] ?? '').trim(),
+            filePath: String(row.sourceFilePath ?? row[2] ?? '').trim(),
+          },
+        });
+
+        gapInputGraph.addRelationship({
+          id: `${sourceId}_member_of_${sliceId}`,
+          type: 'MEMBER_OF',
+          sourceId,
+          targetId: sliceId,
+          confidence: 1.0,
+          reason: String(row.reason ?? row[5] ?? ''),
+        });
+      }
+
+      const gapResult = await processGaps(
+        gapInputGraph,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Gaps: ${message}` });
+        },
+        {
+          repoPath,
+          expectationPath: options?.graphExpectationPath,
+        },
+      );
+
+      await executeQuery(`MATCH (g:Gap) DETACH DELETE g`);
+
+      const gapInsertGraph = createKnowledgeGraph();
+      for (const gap of gapResult.gaps) {
+        gapInsertGraph.addNode({
+          id: gap.id,
+          label: 'Gap',
+          properties: {
+            name: gap.label,
+            filePath: '',
+            heuristicLabel: gap.heuristicLabel,
+            gapType: gap.gapType,
+            absenceTier: gap.absenceTier,
+            severity: gap.severity,
+            sliceId: gap.sliceId,
+            anchorId: gap.anchorId,
+            missingSlots: gap.missingSlots,
+            evidence: gap.evidence,
+          },
+        });
+      }
+
+      for (const link of gapResult.links) {
+        gapInsertGraph.addRelationship({
+          id: `${link.gapId}_member_of_${link.sliceId}`,
+          type: 'MEMBER_OF',
+          sourceId: link.gapId,
+          targetId: link.sliceId,
+          confidence: 1.0,
+          reason: 'gap-membership',
+        });
+      }
+
+      await loadGraphToKuzu(gapInsertGraph, new Map(), storagePath, (msg) => {
+        bar.update(89, { phase: msg });
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to recompute gap graph (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(89, { phase: 'Incremental: recomputing shape graph...' });
+    try {
+      const isJsTsFile = (filePath: string): boolean => /\.(c|m)?(t|j)sx?$/i.test(filePath);
+      const isTestFile = (filePath: string): boolean => /(^|\/)(__tests__|tests?|testing|spec)(\/|$)|(\.test\.|\.spec\.)|(_test\.)|(^test_)/i.test(filePath);
+      const shapeFilePaths = allRepoFiles.filter(filePath => {
+        const normalized = filePath.replace(/\\/g, '/');
+        if (normalized.includes('/Http/Requests/')) return true;
+        if (normalized.includes('/Http/Resources/')) return true;
+        if (isTestFile(normalized)) return true;
+        if (isJsTsFile(normalized) && !normalized.endsWith('.d.ts')) return true;
+        return false;
+      });
+
+      const shapeInputGraph = createKnowledgeGraph();
+      for (const filePath of shapeFilePaths) {
+        shapeInputGraph.addNode({
+          id: `File:${filePath}`,
+          label: 'File',
+          properties: {
+            name: path.posix.basename(filePath),
+            filePath,
+          },
+        });
+      }
+
+      const classRows = await executeQuery(`
+        MATCH (c:Class)
+        WHERE c.filePath CONTAINS '/Http/Requests/' OR c.filePath CONTAINS '/Http/Resources/'
+        RETURN c.id AS id, c.name AS name, c.filePath AS filePath
+      `);
+      for (const row of classRows) {
+        const id = String(row.id ?? row[0] ?? '').trim();
+        if (!id) continue;
+        shapeInputGraph.addNode({
+          id,
+          label: 'Class',
+          properties: {
+            name: String(row.name ?? row[1] ?? '').trim(),
+            filePath: String(row.filePath ?? row[2] ?? '').trim(),
+          },
+        });
+      }
+
+      const functionRows = await executeQuery(`
+        MATCH (f:Function)
+        WHERE LOWER(f.name) CONTAINS 'querykeys.'
+        RETURN f.id AS id, f.name AS name, f.filePath AS filePath
+      `);
+      for (const row of functionRows) {
+        const id = String(row.id ?? row[0] ?? '').trim();
+        if (!id) continue;
+        shapeInputGraph.addNode({
+          id,
+          label: 'Function',
+          properties: {
+            name: String(row.name ?? row[1] ?? '').trim(),
+            filePath: String(row.filePath ?? row[2] ?? '').trim(),
+          },
+        });
+      }
+
+      const shapeFiles = await readRepositoryFiles(repoPath, shapeFilePaths);
+      const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
+        if (progress % 20 !== 0 && progress !== 100) return;
+        bar.update(89, { phase: `Shapes: ${message}` });
+      });
+
+      await executeQuery(`MATCH (f:ContractField) DETACH DELETE f`);
+      await executeQuery(`MATCH (s:ContractShape) DETACH DELETE s`);
+      await executeQuery(`MATCH (k:CacheKey) DETACH DELETE k`);
+      await executeQuery(`MATCH (t:TestCase) DETACH DELETE t`);
+
+      const shapeInsertGraph = createKnowledgeGraph();
+      for (const shape of shapeResult.shapes) {
+        shapeInsertGraph.addNode({
+          id: shape.id,
+          label: 'ContractShape',
+          properties: {
+            name: shape.label,
+            filePath: '',
+            heuristicLabel: shape.heuristicLabel,
+            shapeType: shape.shapeType,
+            sourceNodeId: shape.sourceNodeId,
+            sourceFilePath: shape.sourceFilePath,
+          },
+        });
+      }
+
+      for (const field of shapeResult.fields) {
+        shapeInsertGraph.addNode({
+          id: field.id,
+          label: 'ContractField',
+          properties: {
+            name: field.label,
+            filePath: '',
+            heuristicLabel: field.heuristicLabel,
+            fieldName: field.fieldName,
+            shapeId: field.shapeId,
+            shapeType: field.shapeType,
+          },
+        });
+      }
+
+      for (const cacheKey of shapeResult.cacheKeys) {
+        shapeInsertGraph.addNode({
+          id: cacheKey.id,
+          label: 'CacheKey',
+          properties: {
+            name: cacheKey.label,
+            filePath: '',
+            heuristicLabel: cacheKey.heuristicLabel,
+            keyName: cacheKey.keyName,
+            keyType: cacheKey.keyType,
+            sourceNodeId: cacheKey.sourceNodeId,
+          },
+        });
+      }
+
+      for (const testCase of shapeResult.testCases) {
+        shapeInsertGraph.addNode({
+          id: testCase.id,
+          label: 'TestCase',
+          properties: {
+            name: testCase.name,
+            filePath: testCase.filePath,
+            startLine: testCase.startLine,
+            endLine: testCase.endLine,
+          },
+        });
+      }
+
+      for (const edge of shapeResult.edges) {
+        shapeInsertGraph.addRelationship({
+          id: edge.id,
+          type: edge.type,
+          sourceId: edge.sourceId,
+          targetId: edge.targetId,
+          confidence: edge.confidence,
+          reason: edge.reason,
+        });
+      }
+
+      await loadGraphToKuzu(shapeInsertGraph, new Map(), storagePath, (msg) => {
+        bar.update(89, { phase: msg });
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to recompute shape graph (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(89, { phase: 'Incremental: refreshing value graph...' });
+    try {
+      await executeQuery(`
+        MATCH ()-[r:CodeRelation]->()
+        WHERE r.reason STARTS WITH 'value-graph:'
+        DELETE r
+      `);
+      await executeQuery(`MATCH (n:ValueNode) DETACH DELETE n`);
+
+      const valueGraphInput = createKnowledgeGraph();
+      const valueGraphNodeIds = new Set<string>();
+      const valueGraphNodeLabels = ['File', ...flowNodeLabels, 'CacheKey'] as const;
+
+      for (const label of valueGraphNodeLabels) {
+        const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
+        const rows = await executeQuery(`
+          MATCH (n:${cypherLabel})
+          RETURN n.id AS id,
+                 n.name AS name,
+                 n.label AS label,
+                 n.filePath AS filePath,
+                 n.keyName AS keyName
+        `);
+
+        for (const row of rows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+
+          valueGraphInput.addNode({
+            id,
+            label: label as NodeLabel,
+            properties: {
+              name: String(row.name ?? row.label ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[3] ?? '').trim(),
+              keyName: String(row.keyName ?? row[4] ?? '').trim(),
+            },
+          });
+          valueGraphNodeIds.add(id);
+        }
+      }
+
+      const routeNameCallRows = await executeQuery(`
+        MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
+        WHERE r.reason STARTS WITH 'route-name:'
+        RETURN a.id AS sourceId,
+               b.id AS targetId,
+               r.confidence AS confidence,
+               r.reason AS reason
+      `);
+
+      for (const row of routeNameCallRows) {
+        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+        const targetId = String(row.targetId ?? row[1] ?? '').trim();
+        if (!sourceId || !targetId || !valueGraphNodeIds.has(sourceId)) continue;
+
+        valueGraphInput.addRelationship({
+          id: `inc_value_CALLS_${sourceId}->${targetId}`,
+          type: 'CALLS',
+          sourceId,
+          targetId,
+          confidence: Number(row.confidence ?? row[2] ?? 0.9) || 0.9,
+          reason: String(row.reason ?? row[3] ?? ''),
+        });
+      }
+
+      const valueGraphResult = await processValueGraph(
+        valueGraphInput,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Value graph: ${message}` });
+        },
+      );
+
+      valueGraphSummary = {
+        valueCount: valueGraphResult.stats.valueCount,
+        edgeCount: valueGraphResult.stats.edgeCount,
+        permissionValues: valueGraphResult.stats.permissionValues,
+        endpointValues: valueGraphResult.stats.endpointValues,
+        routeNameValues: valueGraphResult.stats.routeNameValues,
+        cacheKeyValues: valueGraphResult.stats.cacheKeyValues,
+        skippedDuplicates: valueGraphResult.stats.skippedDuplicates,
+        skippedMalformed: valueGraphResult.stats.skippedMalformed,
+      };
+
+      if (valueGraphResult.values.length > 0 || valueGraphResult.edges.length > 0) {
+        const valueGraphInsert = createKnowledgeGraph();
+        for (const value of valueGraphResult.values) {
+          valueGraphInsert.addNode({
+            id: value.id,
+            label: 'ValueNode',
+            properties: {
+              name: value.label,
+              filePath: '',
+              heuristicLabel: value.heuristicLabel,
+              valueType: value.valueType,
+              valueKey: value.valueKey,
+              valueRaw: value.valueRaw,
+            },
+          });
+        }
+
+        for (const edge of valueGraphResult.edges) {
+          valueGraphInsert.addRelationship(edge);
+        }
+
+        await loadGraphToKuzu(valueGraphInsert, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to refresh value graph (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(89, { phase: 'Incremental: refreshing provenance edges...' });
+    try {
+      await executeQuery(`
+        MATCH ()-[r:CodeRelation]->()
+        WHERE r.reason STARTS WITH 'provenance:'
+        DELETE r
+      `);
+
+      const provenanceGraph = createKnowledgeGraph();
+      const provenanceNodeIds = new Set<string>();
+      const provenanceNodeLabels = ['File', ...flowNodeLabels, 'ValueNode', 'TestCase'] as const;
+
+      for (const label of provenanceNodeLabels) {
+        const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
+        const rows = await executeQuery(`
+          MATCH (n:${cypherLabel})
+          RETURN n.id AS id,
+                 n.name AS name,
+                 n.filePath AS filePath,
+                 n.startLine AS startLine,
+                 n.endLine AS endLine
+        `);
+
+        for (const row of rows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+
+          provenanceGraph.addNode({
+            id,
+            label: label as NodeLabel,
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+            },
+          });
+          provenanceNodeIds.add(id);
+        }
+      }
+
+      const relationshipRows = await executeQuery(`
+        MATCH (a)-[r:CodeRelation]->(b)
+        WHERE r.type IN ['CALLS', 'DEFINES']
+        RETURN a.id AS sourceId,
+               b.id AS targetId,
+               r.type AS type,
+               r.confidence AS confidence,
+               r.reason AS reason
+      `);
+
+      for (const row of relationshipRows) {
+        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+        const targetId = String(row.targetId ?? row[1] ?? '').trim();
+        const type = String(row.type ?? row[2] ?? '').trim();
+        if (!sourceId || !targetId || !type) continue;
+        if (!provenanceNodeIds.has(sourceId) && !provenanceNodeIds.has(targetId)) continue;
+
+        provenanceGraph.addRelationship({
+          id: `inc_provenance_${type}_${sourceId}->${targetId}`,
+          type: type as RelationshipType,
+          sourceId,
+          targetId,
+          confidence: Number(row.confidence ?? row[3] ?? 1.0) || 1.0,
+          reason: String(row.reason ?? row[4] ?? ''),
+        });
+      }
+
+      const provenanceResult = await processProvenanceEdges(
+        provenanceGraph,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Provenance: ${message}` });
+        },
+      );
+
+      provenanceSummary = {
+        emittedEdges: provenanceResult.stats.emittedEdges,
+        routeExpansionEdges: provenanceResult.stats.routeExpansionEdges,
+        enumToSlugEdges: provenanceResult.stats.enumToSlugEdges,
+        configDrivenEdges: provenanceResult.stats.configDrivenEdges,
+        compiledArtifactEdges: provenanceResult.stats.compiledArtifactEdges,
+        frameworkDerivedEdges: provenanceResult.stats.frameworkDerivedEdges,
+        skippedDuplicates: provenanceResult.stats.skippedDuplicates,
+        skippedMalformed: provenanceResult.stats.skippedMalformed,
+      };
+
+      if (provenanceResult.edges.length > 0) {
+        const provenanceInsert = createKnowledgeGraph();
+        for (const edge of provenanceResult.edges) {
+          provenanceInsert.addRelationship(edge);
+        }
+        await loadGraphToKuzu(provenanceInsert, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to refresh provenance edges (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(89, { phase: 'Incremental: recomputing git-history cochange graph...' });
+    try {
+      const cochangeResult = await processGitHistoryCochange(repoPath, allRepoFiles, (message, progress) => {
+        if (progress % 20 !== 0 && progress !== 100) return;
+        bar.update(89, { phase: `Cochange: ${message}` });
+      });
+
+      await executeQuery(`MATCH ()-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->() DELETE r`);
+
+      const cochangeInsertGraph = createKnowledgeGraph();
+      for (const edge of cochangeResult.edges) {
+        cochangeInsertGraph.addRelationship(edge);
+      }
+
+      await loadGraphToKuzu(cochangeInsertGraph, new Map(), storagePath, (msg) => {
+        bar.update(89, { phase: msg });
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to recompute cochange graph (${msg.slice(0, 120)})`);
+    }
+
+    bar.update(89, { phase: 'Incremental: refreshing evidence spans...' });
+    try {
+      const evidenceGraph = createKnowledgeGraph();
+      const evidenceNodeIds = new Set<string>();
+      const evidenceNodeLabels = ['File', ...flowNodeLabels, 'TestCase'] as const;
+
+      for (const label of evidenceNodeLabels) {
+        const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
+        const rows = await executeQuery(`
+          MATCH (n:${cypherLabel})
+          RETURN n.id AS id,
+                 n.name AS name,
+                 n.filePath AS filePath,
+                 n.startLine AS startLine,
+                 n.endLine AS endLine
+        `);
+
+        for (const row of rows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+
+          evidenceGraph.addNode({
+            id,
+            label: label as NodeLabel,
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+            },
+          });
+          evidenceNodeIds.add(id);
+        }
+      }
+
+      const relationshipRows = await executeQuery(`
+        MATCH (a)-[r:CodeRelation]->(b)
+        RETURN a.id AS sourceId,
+               b.id AS targetId,
+               r.type AS type,
+               r.confidence AS confidence,
+               r.reason AS reason
+      `);
+
+      for (const row of relationshipRows) {
+        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+        const targetId = String(row.targetId ?? row[1] ?? '').trim();
+        const type = String(row.type ?? row[2] ?? '').trim();
+        if (!sourceId || !targetId || !type) continue;
+        if (!evidenceNodeIds.has(sourceId) && !evidenceNodeIds.has(targetId)) continue;
+
+        evidenceGraph.addRelationship({
+          id: `inc_evidence_${type}_${sourceId}->${targetId}`,
+          type: type as RelationshipType,
+          sourceId,
+          targetId,
+          confidence: Number(row.confidence ?? row[3] ?? 1.0) || 1.0,
+          reason: String(row.reason ?? row[4] ?? ''),
+        });
+      }
+
+      const evidenceSnapshot = await processEvidenceSpans(
+        evidenceGraph,
+        (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Evidence spans: ${message}` });
+        },
+      );
+
+      await saveEvidenceSpanSnapshot(storagePath, evidenceSnapshot);
+      evidenceSpanSummary = {
+        nodeEvidenceCount: evidenceSnapshot.stats.nodeEvidenceCount,
+        edgeEvidenceCount: evidenceSnapshot.stats.edgeEvidenceCount,
+        uniqueFiles: evidenceSnapshot.stats.uniqueFiles,
+        primarySpanCount: evidenceSnapshot.stats.primarySpanCount,
+        witnessSpanCount: evidenceSnapshot.stats.witnessSpanCount,
+        proofSpanCount: evidenceSnapshot.stats.proofSpanCount,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Incremental: unable to refresh evidence spans (${msg.slice(0, 120)})`);
+    }
+
     // Embeddings (incremental, skip cached)
     const stats = await getKuzuStats();
     let embeddingTime = '0.0';
@@ -1072,6 +2184,11 @@ export const analyzeCommand = async (
       fileCount,
       communityCount,
       processCount,
+      precision: precisionSummary,
+      microDataflow: microDataflowSummary,
+      valueGraph: valueGraphSummary,
+      provenance: provenanceSummary,
+      evidenceSpans: evidenceSpanSummary,
     };
   };
 
@@ -1173,6 +2290,38 @@ export const analyzeCommand = async (
       console.log(`\n  Repository updated incrementally (${totalTime}s)\n`);
       console.log(`  ${inc.stats.nodes.toLocaleString()} nodes | ${inc.stats.edges.toLocaleString()} edges | ${inc.communityCount} clusters | ${inc.processCount} flows`);
       console.log(`  KuzuDB ${inc.kuzuTime}s | FTS ${inc.ftsTime}s | Embeddings ${inc.embeddingSkipped ? inc.embeddingSkipReason : inc.embeddingTime + 's'}`);
+      if (inc.precision) {
+        const producerBits: string[] = [];
+        if (inc.precision.producer) producerBits.push(inc.precision.producer);
+        if (inc.precision.producerSkipped && inc.precision.producerSkipReason) {
+          producerBits.push(`skipped (${inc.precision.producerSkipReason})`);
+        } else if (inc.precision.producerCacheHit) {
+          producerBits.push('cache-hit');
+        }
+        console.log(
+          `  Precision ${inc.precision.mode}: ${inc.precision.emittedEdges} imported / ${inc.precision.declaredRelations} declared${producerBits.length > 0 ? ` [${producerBits.join(', ')}]` : ''}`,
+        );
+      }
+      if (inc.microDataflow) {
+        console.log(
+          `  Micro-dataflow: ${inc.microDataflow.emittedEdges} derived edges (request ${inc.microDataflow.requestFieldReads}, response ${inc.microDataflow.responseFieldWrites}, invalidation ${inc.microDataflow.queryInvalidationClosures})`,
+        );
+      }
+      if (inc.valueGraph) {
+        console.log(
+          `  Value graph: ${inc.valueGraph.valueCount} values / ${inc.valueGraph.edgeCount} edges (permission ${inc.valueGraph.permissionValues}, endpoint ${inc.valueGraph.endpointValues}, route ${inc.valueGraph.routeNameValues}, cache ${inc.valueGraph.cacheKeyValues})`,
+        );
+      }
+      if (inc.provenance) {
+        console.log(
+          `  Provenance: ${inc.provenance.emittedEdges} edges (route ${inc.provenance.routeExpansionEdges}, enum ${inc.provenance.enumToSlugEdges}, config ${inc.provenance.configDrivenEdges}, framework ${inc.provenance.frameworkDerivedEdges})`,
+        );
+      }
+      if (inc.evidenceSpans) {
+        console.log(
+          `  Evidence spans: ${inc.evidenceSpans.nodeEvidenceCount} nodes / ${inc.evidenceSpans.edgeEvidenceCount} edges (${inc.evidenceSpans.witnessSpanCount} witness, ${inc.evidenceSpans.proofSpanCount} proof)`,
+        );
+      }
       console.log(`  ${repoPath}`);
       const derivedParts: string[] = [];
       if (options?.incrementalRecomputeCommunities) derivedParts.push('communities');
@@ -1236,7 +2385,21 @@ export const analyzeCommand = async (
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
     bar.update(scaled, { phase: phaseLabel });
+  }, {
+    precisionOverlayMode,
+    precisionOverlayPath: options?.precisionOverlayPath,
+    precisionOverlayForce: options?.precisionOverlayForce,
+    graphExpectationPath: options?.graphExpectationPath,
   });
+
+  let fullEvidenceSpanSummary: {
+    nodeEvidenceCount: number;
+    edgeEvidenceCount: number;
+    uniqueFiles: number;
+    primarySpanCount: number;
+    witnessSpanCount: number;
+    proofSpanCount: number;
+  } | undefined;
 
   // ── Phase 2: KuzuDB (60–85%) ──────────────────────────────────────
   bar.update(60, { phase: 'Loading into KuzuDB...' });
@@ -1257,6 +2420,29 @@ export const analyzeCommand = async (
   });
   const kuzuTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
   const kuzuWarnings = kuzuResult.warnings;
+
+  try {
+    bar.update(84, { phase: 'Materializing evidence spans...' });
+    const evidenceSnapshot = await processEvidenceSpans(
+      pipelineResult.graph,
+      (message, progress) => {
+        if (progress % 20 !== 0 && progress !== 100) return;
+        bar.update(84, { phase: `Evidence spans: ${message}` });
+      },
+    );
+    await saveEvidenceSpanSnapshot(storagePath, evidenceSnapshot);
+    fullEvidenceSpanSummary = {
+      nodeEvidenceCount: evidenceSnapshot.stats.nodeEvidenceCount,
+      edgeEvidenceCount: evidenceSnapshot.stats.edgeEvidenceCount,
+      uniqueFiles: evidenceSnapshot.stats.uniqueFiles,
+      primarySpanCount: evidenceSnapshot.stats.primarySpanCount,
+      witnessSpanCount: evidenceSnapshot.stats.witnessSpanCount,
+      proofSpanCount: evidenceSnapshot.stats.proofSpanCount,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    kuzuWarnings.push(`Unable to refresh evidence spans (${msg.slice(0, 120)})`);
+  }
 
   // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
   bar.update(85, { phase: 'Creating search indexes...' });
@@ -1395,6 +2581,43 @@ export const analyzeCommand = async (
   console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
   console.log(`  KuzuDB ${kuzuTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
+  if (pipelineResult.precisionOverlayResult) {
+    const precision = pipelineResult.precisionOverlayResult.stats;
+    const producerBits: string[] = [];
+    if (precision.producer) producerBits.push(precision.producer);
+    if (precision.producerSkipped && precision.producerSkipReason) {
+      producerBits.push(`skipped (${precision.producerSkipReason})`);
+    } else if (precision.producerCacheHit) {
+      producerBits.push('cache-hit');
+    }
+    const modeLabel = precision.producerMode || precisionOverlayMode;
+    console.log(
+      `  Precision ${modeLabel}: ${precision.emittedEdges} imported / ${precision.declaredRelations} declared${producerBits.length > 0 ? ` [${producerBits.join(', ')}]` : ''}`,
+    );
+  }
+  if (pipelineResult.microDataflowResult) {
+    const microflow = pipelineResult.microDataflowResult.stats;
+    console.log(
+      `  Micro-dataflow: ${microflow.emittedEdges} derived edges (request ${microflow.requestFieldReads}, response ${microflow.responseFieldWrites}, invalidation ${microflow.queryInvalidationClosures})`,
+    );
+  }
+  if (pipelineResult.valueGraphResult) {
+    const valueGraph = pipelineResult.valueGraphResult.stats;
+    console.log(
+      `  Value graph: ${valueGraph.valueCount} values / ${valueGraph.edgeCount} edges (permission ${valueGraph.permissionValues}, endpoint ${valueGraph.endpointValues}, route ${valueGraph.routeNameValues}, cache ${valueGraph.cacheKeyValues})`,
+    );
+  }
+  if (pipelineResult.provenanceResult) {
+    const provenance = pipelineResult.provenanceResult.stats;
+    console.log(
+      `  Provenance: ${provenance.emittedEdges} edges (route ${provenance.routeExpansionEdges}, enum ${provenance.enumToSlugEdges}, config ${provenance.configDrivenEdges}, framework ${provenance.frameworkDerivedEdges})`,
+    );
+  }
+  if (fullEvidenceSpanSummary) {
+    console.log(
+      `  Evidence spans: ${fullEvidenceSpanSummary.nodeEvidenceCount} nodes / ${fullEvidenceSpanSummary.edgeEvidenceCount} edges (${fullEvidenceSpanSummary.witnessSpanCount} witness, ${fullEvidenceSpanSummary.proofSpanCount} proof)`,
+    );
+  }
   console.log(`  ${repoPath}`);
 
   if (aiContext.files.length > 0) {

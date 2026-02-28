@@ -318,6 +318,24 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   if (table === 'Process') {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
+  if (table === 'FeatureSlice') {
+    return `COPY ${t}(id, label, heuristicLabel, sliceType, anchorId, anchorName, closureSlots, closedSlots, closureScore) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Gap') {
+    return `COPY ${t}(id, label, heuristicLabel, gapType, absenceTier, severity, sliceId, anchorId, missingSlots, evidence) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'ContractShape') {
+    return `COPY ${t}(id, label, heuristicLabel, shapeType, sourceNodeId, sourceFilePath) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'ContractField') {
+    return `COPY ${t}(id, label, heuristicLabel, fieldName, shapeId, shapeType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'CacheKey') {
+    return `COPY ${t}(id, label, heuristicLabel, keyName, keyType, sourceNodeId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'ValueNode') {
+    return `COPY ${t}(id, label, heuristicLabel, valueType, valueKey, valueRaw) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
   if (EXPORTED_CODE_TABLES.has(table)) {
     return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
@@ -596,8 +614,8 @@ export const deleteNodesForFile = async (
     // Delete nodes from each table that has filePath
     // DETACH DELETE removes the node and all its relationships
     for (const tableName of NODE_TABLES) {
-      // Skip tables that don't have filePath (Community, Process)
-      if (tableName === 'Community' || tableName === 'Process') continue;
+      // Skip tables that don't have filePath
+      if (tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'ValueNode') continue;
       if (!includeFileNode && tableName === 'File') continue;
       
       try {
@@ -718,7 +736,7 @@ export const loadSymbolDefinitionsFromKuzu = async (): Promise<Array<{ filePath:
   const defs: Array<{ filePath: string; name: string; nodeId: string; type: string }> = [];
 
   for (const tableName of NODE_TABLES) {
-    if (tableName === 'File' || tableName === 'Folder' || tableName === 'Community' || tableName === 'Process') continue;
+    if (tableName === 'File' || tableName === 'Folder' || tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'ValueNode') continue;
 
     try {
       const t = escapeTableName(tableName);

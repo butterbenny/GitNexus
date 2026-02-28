@@ -78,6 +78,18 @@ export function getResourceTemplates(): ResourceTemplate[] {
       mimeType: 'text/yaml',
     },
     {
+      uriTemplate: 'gitnexus://repo/{name}/episode',
+      name: 'Episode Graph',
+      description: 'Session working-memory overlay (opened spans, hypotheses, errors, edits)',
+      mimeType: 'text/yaml',
+    },
+    {
+      uriTemplate: 'gitnexus://repo/{name}/evidence',
+      name: 'Evidence Spans',
+      description: 'Line-level primary/witness/proof spans for symbols and relations',
+      mimeType: 'text/yaml',
+    },
+    {
       uriTemplate: 'gitnexus://repo/{name}/cluster/{clusterName}',
       name: 'Module Detail',
       description: 'Deep dive into a specific functional area',
@@ -148,6 +160,10 @@ export async function readResource(uri: string, backend: LocalBackend): Promise<
       return getArchetypesResource(backend, repoName);
     case 'schema':
       return getSchemaResource();
+    case 'episode':
+      return getEpisodeResource(backend, repoName);
+    case 'evidence':
+      return getEvidenceResource(backend, repoName);
     case 'cluster':
       return getClusterDetailResource(parsed.param!, backend, repoName);
     case 'process':
@@ -229,6 +245,9 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('  - context: 360-degree symbol view (categorized refs, process participation)');
   lines.push('  - impact: Blast radius analysis (what breaks if you change a symbol)');
   lines.push('  - detect_changes: Git-diff impact analysis (what do your changes affect)');
+  lines.push('  - episode_state: Read EpisodeGraph sidecar working memory');
+  lines.push('  - episode_update: Update EpisodeGraph sidecar with hypotheses/tests/errors');
+  lines.push('  - evidence_spans: Read EvidenceSpan sidecar line-level proof/witness ranges');
   lines.push('  - rename: Multi-file coordinated rename with confidence tags');
   lines.push('  - cypher: Raw graph queries');
   lines.push('  - list_repos: Discover all indexed repositories');
@@ -246,10 +265,127 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push(`  - gitnexus://repo/${context.projectName}/processes: All execution flows`);
   lines.push(`  - gitnexus://repo/${context.projectName}/archetypes: Derived flow signatures + exemplars`);
   lines.push(`  - gitnexus://repo/${context.projectName}/schema: Graph schema for Cypher`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/episode: EpisodeGraph sidecar state`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/evidence: EvidenceSpan sidecar summary`);
   lines.push(`  - gitnexus://repo/${context.projectName}/cluster/{name}: Module details`);
   lines.push(`  - gitnexus://repo/${context.projectName}/process/{name}: Process trace`);
   
   return lines.join('\n');
+}
+
+async function getEpisodeResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  try {
+    const result = await backend.queryEpisodeState(repoName, { limit: 15, include_events: true });
+    const episode = result?.episode || {};
+
+    const lines: string[] = [];
+    lines.push(`status: "${result?.status || 'ok'}"`);
+    lines.push(`repo: "${String(result?.repo || repoName || '').replace(/"/g, '\\"')}"`);
+    lines.push(`updated_at: "${String(episode.updated_at || '').replace(/"/g, '\\"')}"`);
+
+    const target = episode.target || {};
+    lines.push('target:');
+    lines.push(`  branch: "${String(target.branch || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  taskId: "${String(target.taskId || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  updatedAt: "${String(target.updatedAt || '').replace(/"/g, '\\"')}"`);
+
+    const counts = episode.counts || {};
+    lines.push('counts:');
+    lines.push(`  nodes: ${Number(counts.nodes || 0)}`);
+    lines.push(`  edges: ${Number(counts.edges || 0)}`);
+    lines.push(`  hypotheses: ${Number(counts.hypotheses || 0)}`);
+    lines.push(`  failing_tests: ${Number(counts.failing_tests || 0)}`);
+    lines.push(`  errors: ${Number(counts.errors || 0)}`);
+    lines.push(`  edit_set: ${Number(counts.edit_set || 0)}`);
+    lines.push(`  witness_paths: ${Number(counts.witness_paths || 0)}`);
+    lines.push(`  precedents: ${Number(counts.precedents || 0)}`);
+    lines.push(`  events: ${Number(counts.events || 0)}`);
+
+    lines.push('recent_symbols:');
+    for (const symbol of Array.isArray(episode.recent_symbols) ? episode.recent_symbols.slice(0, 15) : []) {
+      lines.push(`  - symbolId: "${String(symbol.symbolId || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    name: "${String(symbol.name || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    filePath: "${String(symbol.filePath || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    startLine: ${Number(symbol.startLine || 0)}`);
+      lines.push(`    lastSeenAt: "${String(symbol.lastSeenAt || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    count: ${Number(symbol.count || 0)}`);
+    }
+
+    lines.push('edit_set:');
+    for (const filePath of Array.isArray(episode.edit_set) ? episode.edit_set.slice(0, 20) : []) {
+      lines.push(`  - "${String(filePath || '').replace(/"/g, '\\"')}"`);
+    }
+
+    lines.push('witness_paths:');
+    for (const witness of Array.isArray(episode.witness_paths) ? episode.witness_paths.slice(0, 20) : []) {
+      lines.push(`  - "${String(witness || '').replace(/"/g, '\\"')}"`);
+    }
+
+    lines.push('hypotheses:');
+    for (const item of Array.isArray(episode.hypotheses) ? episode.hypotheses.slice(0, 20) : []) {
+      lines.push(`  - text: "${String(item.text || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    status: "${String(item.status || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    lastSeenAt: "${String(item.lastSeenAt || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    count: ${Number(item.count || 0)}`);
+    }
+
+    lines.push('errors:');
+    for (const value of Array.isArray(episode.errors) ? episode.errors.slice(0, 20) : []) {
+      lines.push(`  - "${String(value || '').replace(/"/g, '\\"')}"`);
+    }
+
+    lines.push('failing_tests:');
+    for (const value of Array.isArray(episode.failing_tests) ? episode.failing_tests.slice(0, 20) : []) {
+      lines.push(`  - "${String(value || '').replace(/"/g, '\\"')}"`);
+    }
+
+    return lines.join('\n');
+  } catch (err: any) {
+    return `error: ${String(err?.message || err || 'failed to read episode state')}`;
+  }
+}
+
+async function getEvidenceResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  try {
+    const result = await backend.callTool('evidence_spans', { repo: repoName, limit: 25, include_nodes: true, include_edges: true });
+    const evidence = result?.evidence || {};
+    const stats = evidence?.stats || {};
+    const lines: string[] = [];
+
+    lines.push(`status: "${String(result?.status || 'ok').replace(/"/g, '\\"')}"`);
+    lines.push(`repo: "${String(result?.repo || repoName || '').replace(/"/g, '\\"')}"`);
+    lines.push(`updated_at: "${String(evidence?.updated_at || '').replace(/"/g, '\\"')}"`);
+    lines.push('stats:');
+    lines.push(`  node_evidence: ${Number(stats.nodeEvidenceCount || 0)}`);
+    lines.push(`  edge_evidence: ${Number(stats.edgeEvidenceCount || 0)}`);
+    lines.push(`  unique_files: ${Number(stats.uniqueFiles || 0)}`);
+    lines.push(`  primary_spans: ${Number(stats.primarySpanCount || 0)}`);
+    lines.push(`  witness_spans: ${Number(stats.witnessSpanCount || 0)}`);
+    lines.push(`  proof_spans: ${Number(stats.proofSpanCount || 0)}`);
+
+    lines.push('nodes:');
+    for (const node of Array.isArray(evidence?.nodes) ? evidence.nodes.slice(0, 25) : []) {
+      lines.push(`  - nodeId: "${String(node.nodeId || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    label: "${String(node.nodeLabel || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    name: "${String(node.nodeName || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    span: "${String(node?.primarySpan?.filePath || '').replace(/"/g, '\\"')}:${Number(node?.primarySpan?.startLine || 0)}:${Number(node?.primarySpan?.endLine || 0)}"`);
+    }
+
+    lines.push('edges:');
+    for (const edge of Array.isArray(evidence?.edges) ? evidence.edges.slice(0, 25) : []) {
+      lines.push(`  - edgeId: "${String(edge.edgeId || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    type: "${String(edge.relationType || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    sourceId: "${String(edge.sourceId || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    targetId: "${String(edge.targetId || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    witness_count: ${Array.isArray(edge.witnessSpans) ? edge.witnessSpans.length : 0}`);
+      lines.push(`    proof_count: ${Array.isArray(edge.proofSpans) ? edge.proofSpans.length : 0}`);
+      lines.push(`    reason: "${String(edge.reason || '').replace(/"/g, '\\"')}"`);
+    }
+
+    return lines.join('\n');
+  } catch (err: any) {
+    return `error: ${String(err?.message || err || 'failed to read evidence spans')}`;
+  }
 }
 
 /**
@@ -387,20 +523,40 @@ nodes:
   - CodeElement: Catch-all for other code elements
   - Community: Auto-detected functional area (Leiden algorithm)
   - Process: Execution flow trace
+  - FeatureSlice: Closure-oriented vertical feature capsule
+  - Gap: First-class absence signal linked to FeatureSlice
+  - ContractShape: Field/payload contract container
+  - ContractField: Field-level contract node
+  - CacheKey: Query/cache key contract node
+  - ValueNode: Literal/value contract node (permission/endpoint/route/cache signals)
+  - TestCase: Static test case node linked to shape coverage
 
 additional_node_types: "Multi-language: Struct, Enum, Macro, Typedef, Union, Namespace, Trait, Impl, TypeAlias, Const, Static, Property, Record, Delegate, Annotation, Constructor, Template, Module (use backticks in queries: \`Struct\`, \`Enum\`, etc.)"
 
 relationships:
   - CONTAINS: File/Folder contains child
+  - CO_CHANGES_WITH: Historical git cochange affinity between files (empirical signal)
   - DEFINES: File defines a symbol
   - CALLS: Function/method invocation
   - IMPORTS: Module imports
   - EXTENDS: Class inheritance
   - IMPLEMENTS: Interface implementation
-  - MEMBER_OF: Symbol belongs to community
+  - MEMBER_OF: Symbol/group membership (Community, FeatureSlice, ContractShape) and Gap nodes attach to slices
   - STEP_IN_PROCESS: Symbol is step N in process
+  - VALIDATES_FIELD: Validator/source defines field validation contract
+  - SERIALIZES_FIELD: Resource/source serializes a contract field
+  - READS_FIELD: Consumer reads a contract field
+  - WRITES_FIELD: Writer mutates a contract field
+  - DERIVES_FROM: Derived/generated artifact provenance edge to source-of-truth symbol/file
+  - DERIVES_FROM_COLUMN: Field derives from storage column
+  - INVALIDATES_KEY: Mutation/invalidation source invalidates cache key
+  - TESTS_SHAPE: Test case asserts contract shape behavior
 
 relationship_table: "All relationships use a single CodeRelation table with a 'type' property. Properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)"
+provenance_reason_prefixes: "precision-overlay:* marks stack-graph/SCIP/LSP-derived relation overlays; value-graph:* marks literal/value graph overlays; provenance:* marks generated/derived artifact ancestry edges; native parser/framework edges keep existing reason families."
+sidecars:
+  - EpisodeGraph: "gitnexus://repo/{name}/episode (working-memory overlay)"
+  - EvidenceSpan: "gitnexus://repo/{name}/evidence (line-level primary/witness/proof spans)"
 
 example_queries:
   find_callers: |
@@ -522,10 +678,11 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '|------|-------------------|',
       '| `query` | Process-grouped code intelligence — execution flows related to a concept |',
       '| `archetypes` | Derived flow signatures + exemplar processes (pattern heat map) |',
-      '| `precedents` | Precedent/template finder — similar callsites to mirror |',
+      '| `precedents` | Precedent/template finder — slice-first exemplars with hop/process fallback |',
       '| `context` | 360-degree symbol view — categorized refs, processes it participates in |',
       '| `impact` | Symbol blast radius — what breaks at depth 1/2/3 with confidence |',
       '| `detect_changes` | Git-diff impact — what do your current changes affect |',
+      '| `evidence_spans` | Read EvidenceSpan sidecar line-level proof/witness ranges |',
       '| `rename` | Multi-file coordinated rename with confidence-tagged edits |',
       '| `cypher` | Raw graph queries |',
       '| `list_repos` | Discover indexed repos |',
@@ -539,6 +696,7 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       `- \`gitnexus://repo/${repo.name}/processes\` — All execution flows`,
       `- \`gitnexus://repo/${repo.name}/archetypes\` — Derived flow signatures + exemplar processes`,
       `- \`gitnexus://repo/${repo.name}/schema\` — Graph schema for Cypher`,
+      `- \`gitnexus://repo/${repo.name}/evidence\` — EvidenceSpan sidecar summary`,
     ];
     sections.push(lines.join('\n'));
   }

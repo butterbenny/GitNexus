@@ -191,10 +191,18 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.equal(fooContract.diff.effects_summary.base.invalidate, 1);
   assert.equal(fooContract.diff.effects_summary.current.invalidate, 2);
 
+  assert.ok(result.semantic_diffs, 'expected semantic_diffs payload');
+  assert.ok(result.semantic_diffs.summary, 'expected semantic_diffs summary');
+  assert.ok(Array.isArray(result.semantic_diffs.families), 'expected semantic_diffs families list');
+  assert.ok(result.semantic_diffs.gap_signals, 'expected semantic_diffs gap_signals');
+  assert.ok(Array.isArray(result.semantic_diffs.gap_signals.gaps), 'expected semantic_diffs gap_signals.gaps list');
+  assert.equal(result.summary.semantic_families, result.semantic_diffs.summary.family_count);
+  assert.equal(result.summary.semantic_gap_signals, result.semantic_diffs.summary.gap_signals);
+
   // Scoped mode should drop FooPage.tsx
   const scoped = runTool('review_mode', { repo: repoPath, scope: 'unstaged', path_prefixes: ['src/'] }, env);
   assert.equal(scoped.status, 'ok');
   assert.ok(scoped.changed_files.every(f => String(f.filePath || '').startsWith('src/')));
   assert.ok(!scoped.changed_files.some(f => f.filePath === 'apps/dashboard/src/pages/FooPage.tsx'));
+  assert.ok(scoped.semantic_diffs, 'expected scoped semantic_diffs payload');
 });
-

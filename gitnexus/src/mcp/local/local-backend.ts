@@ -20,6 +20,22 @@ import {
 } from '../../storage/repo-manager.js';
 import { buildArchetypeReport, computeProcessArchetype, deriveLayerTag, type ArchetypeExample, type ArchetypeReport, type HttpEdgeInfo, type ProcessTraceInfo } from '../../core/derived/archetypes.js';
 import { extractUiContractCard } from '../../core/derived/ui-contract.js';
+import {
+  buildEpisodeOverlay,
+  clearEpisodeGraphState,
+  loadEpisodeGraphState,
+  parseEpisodeSpanTokens,
+  recordEpisodeObservation,
+  summarizeEpisodeGraphState,
+  type EpisodeObservation,
+  type EpisodeSymbolRef,
+  type EpisodeProcessRef,
+  type EpisodePrecedentRef,
+} from './episode-graph.js';
+import {
+  loadEvidenceSpanSnapshot,
+  summarizeEvidenceSpanSnapshot,
+} from '../../core/ingestion/evidence-span-store.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -90,10 +106,36 @@ function filePathTouchesPrefixes(filePath: string, pathPrefixes: string[]): bool
   return false;
 }
 
+function parseStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map(item => String(item || '').trim())
+      .filter(Boolean);
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+
+  if (raw.startsWith('[') && raw.endsWith(']')) {
+    const inner = raw.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner
+      .split(',')
+      .map(item => item.trim().replace(/^'+|'+$/g, '').replace(/^"+|"+$/g, ''))
+      .filter(Boolean);
+  }
+
+  return raw
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
 /** Valid KuzuDB node labels for safe Cypher query construction */
 const VALID_NODE_LABELS = new Set([
   'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement',
-  'Community', 'Process', 'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
+  'Community', 'Process', 'FeatureSlice', 'Gap', 'ContractShape', 'ContractField', 'CacheKey', 'ValueNode', 'TestCase',
+  'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
   'Namespace', 'Trait', 'Impl', 'TypeAlias', 'Const', 'Static', 'Property',
   'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
 ]);
@@ -540,6 +582,15 @@ export class LocalBackend {
       case 'review_mode':
         result = await this.reviewMode(repo, params);
         break;
+      case 'episode_state':
+        result = await this.episodeState(repo, params);
+        break;
+      case 'episode_update':
+        result = await this.episodeUpdate(repo, params);
+        break;
+      case 'evidence_spans':
+        result = await this.evidenceSpans(repo, params);
+        break;
       case 'rename':
         result = await this.rename(repo, params);
         break;
@@ -557,11 +608,311 @@ export class LocalBackend {
         throw new Error(`Unknown tool: ${method}`);
     }
 
+    try {
+      if (method !== 'episode_state' && method !== 'episode_update' && method !== 'evidence_spans') {
+        await this.recordEpisodeFromTool(repo, method, params, result);
+      }
+    } catch {
+      // Episode sidecar is best-effort and must never break normal tool execution.
+    }
+
     if (indexStatus.isStale && result && typeof result === 'object' && !Array.isArray(result)) {
       result.index_status = indexStatus;
     }
 
     return result;
+  }
+
+  private toStringArray(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value
+        .map(item => String(item || '').trim())
+        .filter(Boolean);
+    }
+    if (typeof value === 'string') {
+      const cleaned = value.trim();
+      return cleaned ? [cleaned] : [];
+    }
+    return [];
+  }
+
+  private async recordEpisodeFromTool(
+    repo: RepoHandle,
+    method: string,
+    params: any,
+    result: any,
+  ): Promise<void> {
+    if (!result || typeof result !== 'object') return;
+
+    const openedSymbols: EpisodeSymbolRef[] = [];
+    const openedProcesses: EpisodeProcessRef[] = [];
+    const openedSpans: Array<{ filePath: string; startLine?: number; endLine?: number; sourceSymbolId?: string; sourceProcessId?: string }> = [];
+    const chosenPrecedents: EpisodePrecedentRef[] = [];
+    const editFiles: string[] = [];
+    const witnessPaths: string[] = [];
+
+    const addFile = (filePath: unknown) => {
+      const value = String(filePath || '').trim().replace(/\\/g, '/');
+      if (!value) return;
+      editFiles.push(value);
+    };
+
+    const addSpan = (item: any, sourceSymbolId?: string, sourceProcessId?: string) => {
+      const filePath = String(item?.filePath || '').trim().replace(/\\/g, '/');
+      if (!filePath) return;
+      const startRaw = item?.startLine ?? item?.line ?? item?.start_line;
+      const endRaw = item?.endLine ?? item?.end_line;
+      const startLine = Number.isFinite(Number(startRaw)) ? Number(startRaw) : undefined;
+      const endLine = Number.isFinite(Number(endRaw)) ? Number(endRaw) : undefined;
+      openedSpans.push({
+        filePath,
+        ...(startLine && startLine > 0 ? { startLine } : {}),
+        ...(endLine && endLine > 0 ? { endLine } : {}),
+        ...(sourceSymbolId ? { sourceSymbolId } : {}),
+        ...(sourceProcessId ? { sourceProcessId } : {}),
+      });
+    };
+
+    const addSymbol = (item: any, processId?: string) => {
+      const symbolId = String(item?.id || item?.uid || '').trim();
+      if (!symbolId) return;
+      openedSymbols.push({
+        symbolId,
+        name: String(item?.name || '').trim() || undefined,
+        kind: String(item?.type || item?.kind || '').trim() || undefined,
+        filePath: String(item?.filePath || '').trim().replace(/\\/g, '/') || undefined,
+        startLine: Number.isFinite(Number(item?.startLine)) ? Number(item.startLine) : undefined,
+        endLine: Number.isFinite(Number(item?.endLine)) ? Number(item.endLine) : undefined,
+        ...(processId ? { processId } : {}),
+      });
+      addSpan(item, symbolId, processId);
+    };
+
+    const addProcess = (item: any) => {
+      const processId = String(item?.id || '').trim();
+      if (!processId) return;
+      openedProcesses.push({
+        processId,
+        name: String(item?.summary || item?.name || item?.label || '').trim() || undefined,
+        stepCount: Number.isFinite(Number(item?.step_count ?? item?.stepCount))
+          ? Number(item?.step_count ?? item?.stepCount)
+          : undefined,
+      });
+    };
+
+    if (method === 'query') {
+      for (const proc of Array.isArray(result.processes) ? result.processes.slice(0, 30) : []) {
+        addProcess(proc);
+      }
+      for (const sym of Array.isArray(result.process_symbols) ? result.process_symbols.slice(0, 120) : []) {
+        const processId = String(sym?.process_id || '').trim() || undefined;
+        addSymbol(sym, processId);
+      }
+      for (const def of Array.isArray(result.definitions) ? result.definitions.slice(0, 40) : []) {
+        addSymbol(def);
+      }
+    }
+
+    if (method === 'context' && result.status === 'found') {
+      if (result.symbol) addSymbol(result.symbol);
+      for (const proc of Array.isArray(result.processes) ? result.processes.slice(0, 20) : []) {
+        addProcess({ id: proc.id, name: proc.name, step_count: proc.step_count });
+      }
+    }
+
+    if (method === 'impact') {
+      if (result.target) addSymbol(result.target);
+      const byDepth = result.byDepth || {};
+      for (const key of Object.keys(byDepth)) {
+        const rows = Array.isArray(byDepth[key]) ? byDepth[key] : [];
+        for (const row of rows.slice(0, 40)) {
+          addSymbol(row);
+        }
+      }
+    }
+
+    if (method === 'detect_changes') {
+      const changedSymbols = Array.isArray(result.changed_symbols) ? result.changed_symbols : [];
+      for (const symbol of changedSymbols.slice(0, 80)) {
+        addSymbol(symbol);
+        addFile(symbol?.filePath);
+      }
+    }
+
+    if (method === 'review_mode') {
+      const changedFiles = Array.isArray(result.changed_files) ? result.changed_files : [];
+      for (const file of changedFiles) addFile(file?.filePath);
+      const changedSymbols = Array.isArray(result.changed_symbols) ? result.changed_symbols : [];
+      for (const symbol of changedSymbols.slice(0, 100)) addSymbol(symbol);
+      const suggestedTests = Array.isArray(result.suggested_tests) ? result.suggested_tests : [];
+      for (const test of suggestedTests.slice(0, 30)) {
+        const name = String(test?.name || test?.test || '').trim();
+        if (name) witnessPaths.push(`test:${name}`);
+      }
+    }
+
+    if (method === 'action_plan') {
+      const files = Array.isArray(result.files) ? result.files : [];
+      for (const file of files.slice(0, 50)) {
+        addFile(file?.filePath);
+        const anchors = Array.isArray(file?.anchors) ? file.anchors : [];
+        for (const anchor of anchors.slice(0, 5)) addSpan(anchor);
+      }
+      const hops = Array.isArray(result.hops) ? result.hops : [];
+      for (const hop of hops.slice(0, 30)) {
+        const ui = hop?.ui;
+        const endpoint = hop?.endpoint;
+        const controller = hop?.controller;
+        const chain = [ui?.name, endpoint?.name, controller?.name].filter(Boolean).join(' -> ');
+        if (chain) witnessPaths.push(chain);
+      }
+    }
+
+    if (method === 'precedents') {
+      const precedents = Array.isArray(result.precedents) ? result.precedents : [];
+      for (const precedent of precedents.slice(0, 40)) {
+        const anchor = precedent?.anchor || {};
+        const anchorUid = String(anchor?.uid || anchor?.entry?.uid || '').trim() || undefined;
+        const processId = String(anchor?.processId || anchor?.id || '').trim() || undefined;
+        const signature = String(precedent?.signature || '').trim() || undefined;
+        chosenPrecedents.push({
+          kind: String(precedent?.kind || '').trim() || undefined,
+          signature,
+          anchorUid,
+          processId,
+        });
+      }
+    }
+
+    if (method === 'ui_contract') {
+      const filePath = String(result?.filePath || params?.file_path || '').trim();
+      if (filePath) addSpan({ filePath });
+    }
+
+    const errorStrings = result.error ? [String(result.error)] : [];
+    const targetBranch = String(params?.target_branch || '').trim() || undefined;
+    const taskId = String(params?.task_id || params?.task || '').trim() || undefined;
+
+    if (
+      openedSymbols.length === 0 &&
+      openedProcesses.length === 0 &&
+      openedSpans.length === 0 &&
+      chosenPrecedents.length === 0 &&
+      editFiles.length === 0 &&
+      witnessPaths.length === 0 &&
+      errorStrings.length === 0 &&
+      !targetBranch &&
+      !taskId
+    ) {
+      return;
+    }
+
+    const observation: EpisodeObservation = {
+      tool: method,
+      ...(targetBranch ? { targetBranch } : {}),
+      ...(taskId ? { taskId } : {}),
+      ...(openedSymbols.length > 0 ? { openedSymbols } : {}),
+      ...(openedProcesses.length > 0 ? { openedProcesses } : {}),
+      ...(openedSpans.length > 0 ? { openedSpans } : {}),
+      ...(chosenPrecedents.length > 0 ? { chosenPrecedents } : {}),
+      ...(editFiles.length > 0 ? { editFiles } : {}),
+      ...(witnessPaths.length > 0 ? { witnessPaths } : {}),
+      ...(errorStrings.length > 0 ? { errorStrings } : {}),
+    };
+
+    await recordEpisodeObservation(repo.storagePath, observation);
+  }
+
+  private async episodeState(repo: RepoHandle, params: {
+    limit?: number;
+    include_events?: boolean;
+  }): Promise<any> {
+    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 10;
+    const includeEvents = params.include_events !== false;
+    const state = await loadEpisodeGraphState(repo.storagePath);
+    return {
+      status: 'ok',
+      repo: repo.name,
+      episode: summarizeEpisodeGraphState(state, { limit, includeEvents }),
+    };
+  }
+
+  private async episodeUpdate(repo: RepoHandle, params: {
+    clear?: boolean;
+    target_branch?: string;
+    task_id?: string;
+    accepted_hypotheses?: string[];
+    rejected_hypotheses?: string[];
+    candidate_hypotheses?: string[];
+    failing_tests?: string[];
+    error_strings?: string[];
+    witness_paths?: string[];
+    edit_files?: string[];
+    opened_spans?: string[];
+    limit?: number;
+    include_events?: boolean;
+  }): Promise<any> {
+    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 10;
+    const includeEvents = params.include_events !== false;
+
+    if (params.clear === true) {
+      const cleared = await clearEpisodeGraphState(repo.storagePath);
+      return {
+        status: 'ok',
+        repo: repo.name,
+        cleared: true,
+        episode: summarizeEpisodeGraphState(cleared, { limit, includeEvents }),
+      };
+    }
+
+    const openedSpanTokens = this.toStringArray(params.opened_spans);
+    const openedSpans = parseEpisodeSpanTokens(openedSpanTokens);
+
+    const observation: EpisodeObservation = {
+      tool: 'episode_update',
+      targetBranch: String(params.target_branch || '').trim() || undefined,
+      taskId: String(params.task_id || '').trim() || undefined,
+      acceptedHypotheses: this.toStringArray(params.accepted_hypotheses),
+      rejectedHypotheses: this.toStringArray(params.rejected_hypotheses),
+      candidateHypotheses: this.toStringArray(params.candidate_hypotheses),
+      failingTests: this.toStringArray(params.failing_tests),
+      errorStrings: this.toStringArray(params.error_strings),
+      witnessPaths: this.toStringArray(params.witness_paths),
+      editFiles: this.toStringArray(params.edit_files),
+      ...(openedSpans.length > 0 ? { openedSpans } : {}),
+    };
+
+    const updated = await recordEpisodeObservation(repo.storagePath, observation);
+    return {
+      status: 'ok',
+      repo: repo.name,
+      updated: true,
+      episode: summarizeEpisodeGraphState(updated, { limit, includeEvents }),
+    };
+  }
+
+  private async evidenceSpans(repo: RepoHandle, params: {
+    limit?: number;
+    symbol_id?: string;
+    file_path?: string;
+    include_nodes?: boolean;
+    include_edges?: boolean;
+  }): Promise<any> {
+    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 20;
+    const snapshot = await loadEvidenceSpanSnapshot(repo.storagePath);
+    const evidence = summarizeEvidenceSpanSnapshot(snapshot, {
+      limit,
+      symbolId: String(params.symbol_id || '').trim(),
+      filePath: String(params.file_path || '').trim(),
+      includeNodes: params.include_nodes !== false,
+      includeEdges: params.include_edges !== false,
+    });
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      evidence,
+    };
   }
 
   private async archetypes(repo: RepoHandle, params: {
@@ -778,6 +1129,269 @@ export class LocalBackend {
         .slice(0, 12);
     };
 
+    type SliceMember = {
+      nodeId: string;
+      nodeName: string;
+      filePath: string;
+      role: string;
+    };
+
+    type SliceSummary = {
+      id: string;
+      label: string;
+      heuristicLabel: string;
+      sliceType: string;
+      anchorId: string;
+      anchorName: string;
+      closureSlots: string[];
+      closedSlots: string[];
+      closureScore: number;
+      members: SliceMember[];
+      roles: string[];
+      memberFiles: string[];
+      searchText: string;
+    };
+
+    const toTokenSet = (value: string): Set<string> => {
+      return new Set(
+        getQueryTokens(value)
+          .map(t => t.toLowerCase())
+          .filter(Boolean),
+      );
+    };
+
+    const jaccard = (left: Iterable<string>, right: Iterable<string>): number => {
+      const a = new Set(Array.from(left).map(v => String(v || '').trim()).filter(Boolean));
+      const b = new Set(Array.from(right).map(v => String(v || '').trim()).filter(Boolean));
+      if (a.size === 0 || b.size === 0) return 0;
+
+      let intersection = 0;
+      for (const value of a) {
+        if (b.has(value)) intersection++;
+      }
+
+      const union = a.size + b.size - intersection;
+      if (union <= 0) return 0;
+      return intersection / union;
+    };
+
+    const extractSliceRoleFromReason = (reason: string): string => {
+      const raw = String(reason || '').trim();
+      if (!raw.startsWith('feature-slice:')) return '';
+      return raw.slice('feature-slice:'.length).trim();
+    };
+
+    const loadSliceSummaries = async (): Promise<{
+      byId: Map<string, SliceSummary>;
+      byMemberNodeId: Map<string, Set<string>>;
+      byAnchorNodeId: Map<string, Set<string>>;
+      inScope: SliceSummary[];
+    }> => {
+      let sliceRows: any[] = [];
+      let memberRows: any[] = [];
+      try {
+        sliceRows = await executeQuery(repo.id, `
+          MATCH (s:FeatureSlice)
+          RETURN s.id AS sliceId,
+                 s.label AS label,
+                 s.heuristicLabel AS heuristicLabel,
+                 s.sliceType AS sliceType,
+                 s.anchorId AS anchorId,
+                 s.anchorName AS anchorName,
+                 s.closureSlots AS closureSlots,
+                 s.closedSlots AS closedSlots,
+                 s.closureScore AS closureScore
+          LIMIT 4000
+        `);
+      } catch {
+        return {
+          byId: new Map(),
+          byMemberNodeId: new Map(),
+          byAnchorNodeId: new Map(),
+          inScope: [],
+        };
+      }
+
+      try {
+        memberRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+          WHERE r.reason STARTS WITH 'feature-slice:'
+          RETURN s.id AS sliceId,
+                 n.id AS nodeId,
+                 n.name AS nodeName,
+                 n.filePath AS filePath,
+                 r.reason AS reason
+          LIMIT 20000
+        `);
+      } catch {
+        memberRows = [];
+      }
+
+      const byId = new Map<string, SliceSummary>();
+      for (const row of sliceRows) {
+        const id = String(row.sliceId || row[0] || '').trim();
+        if (!id) continue;
+        byId.set(id, {
+          id,
+          label: String(row.label || row[1] || '').trim(),
+          heuristicLabel: String(row.heuristicLabel || row[2] || '').trim(),
+          sliceType: String(row.sliceType || row[3] || '').trim(),
+          anchorId: String(row.anchorId || row[4] || '').trim(),
+          anchorName: String(row.anchorName || row[5] || '').trim(),
+          closureSlots: parseStringList(row.closureSlots ?? row[6]),
+          closedSlots: parseStringList(row.closedSlots ?? row[7]),
+          closureScore: Number(row.closureScore ?? row[8] ?? 0) || 0,
+          members: [],
+          roles: [],
+          memberFiles: [],
+          searchText: '',
+        });
+      }
+
+      const byMemberNodeId = new Map<string, Set<string>>();
+      const byAnchorNodeId = new Map<string, Set<string>>();
+
+      for (const slice of byId.values()) {
+        if (!slice.anchorId) continue;
+        const list = byAnchorNodeId.get(slice.anchorId) || new Set<string>();
+        list.add(slice.id);
+        byAnchorNodeId.set(slice.anchorId, list);
+      }
+
+      for (const row of memberRows) {
+        const sliceId = String(row.sliceId || row[0] || '').trim();
+        const nodeId = String(row.nodeId || row[1] || '').trim();
+        if (!sliceId || !nodeId) continue;
+        const slice = byId.get(sliceId);
+        if (!slice) continue;
+
+        const reason = String(row.reason || row[4] || '').trim();
+        const role = extractSliceRoleFromReason(reason);
+        if (!role) continue;
+
+        const filePath = String(row.filePath || row[3] || '').trim().replace(/\\/g, '/');
+        slice.members.push({
+          nodeId,
+          nodeName: String(row.nodeName || row[2] || '').trim(),
+          filePath,
+          role,
+        });
+
+        const memberSet = byMemberNodeId.get(nodeId) || new Set<string>();
+        memberSet.add(sliceId);
+        byMemberNodeId.set(nodeId, memberSet);
+      }
+
+      for (const slice of byId.values()) {
+        const roles = new Set<string>();
+        const files = new Set<string>();
+        const searchTokens: string[] = [
+          slice.label,
+          slice.heuristicLabel,
+          slice.anchorName,
+          slice.anchorId,
+          slice.sliceType,
+        ];
+
+        for (const member of slice.members) {
+          if (member.role) roles.add(member.role);
+          if (member.filePath) files.add(normalizeRepoRelativePath(member.filePath));
+          if (member.nodeName) searchTokens.push(member.nodeName);
+          if (member.filePath) searchTokens.push(member.filePath);
+        }
+
+        slice.roles = Array.from(roles).sort();
+        slice.memberFiles = Array.from(files).sort();
+        slice.searchText = searchTokens.join(' ').toLowerCase();
+      }
+
+      const inScope = Array.from(byId.values()).filter(slice => {
+        if (pathPrefixes.length === 0) return true;
+        return slice.memberFiles.some(filePath => filePathTouchesPrefixes(filePath, pathPrefixes));
+      });
+
+      return { byId, byMemberNodeId, byAnchorNodeId, inScope };
+    };
+
+    const loadCochangeMap = async (): Promise<Map<string, Map<string, number>>> => {
+      let rows: any[] = [];
+      try {
+        rows = await executeQuery(repo.id, `
+          MATCH (a:File)-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->(b:File)
+          RETURN a.filePath AS sourceFilePath,
+                 b.filePath AS targetFilePath,
+                 r.confidence AS confidence
+          LIMIT 30000
+        `);
+      } catch {
+        return new Map();
+      }
+
+      const graph = new Map<string, Map<string, number>>();
+      for (const row of rows) {
+        const source = normalizeRepoRelativePath(String(row.sourceFilePath || row[0] || ''));
+        const target = normalizeRepoRelativePath(String(row.targetFilePath || row[1] || ''));
+        if (!source || !target) continue;
+
+        if (pathPrefixes.length > 0) {
+          const touchesScope = filePathTouchesPrefixes(source, pathPrefixes) || filePathTouchesPrefixes(target, pathPrefixes);
+          if (!touchesScope) continue;
+        }
+
+        const confidence = Number(row.confidence ?? row[2] ?? 0) || 0;
+        const neighbors = graph.get(source) || new Map<string, number>();
+        const previous = neighbors.get(target) || 0;
+        if (confidence > previous) neighbors.set(target, confidence);
+        graph.set(source, neighbors);
+      }
+
+      return graph;
+    };
+
+    const cochangeScoreForSlices = (
+      leftFiles: string[],
+      rightFiles: string[],
+      cochangeMap: Map<string, Map<string, number>>,
+    ): { score: number; pairCount: number } => {
+      if (leftFiles.length === 0 || rightFiles.length === 0) return { score: 0, pairCount: 0 };
+      let pairCount = 0;
+      let confidenceSum = 0;
+
+      for (const leftFile of leftFiles) {
+        const neighbors = cochangeMap.get(leftFile);
+        if (!neighbors || neighbors.size === 0) continue;
+        for (const rightFile of rightFiles) {
+          const confidence = neighbors.get(rightFile);
+          if (!confidence || confidence <= 0) continue;
+          pairCount += 1;
+          confidenceSum += confidence;
+        }
+      }
+
+      if (pairCount === 0) return { score: 0, pairCount: 0 };
+      return { score: Math.min(1, confidenceSum / pairCount), pairCount };
+    };
+
+    const reduceSliceForOutput = (slice: SliceSummary, extra?: { score?: number; evidence?: any }): any => {
+      const out: any = {
+        uid: slice.id,
+        label: slice.label || slice.heuristicLabel || slice.id,
+        slice_type: slice.sliceType,
+        anchor_id: slice.anchorId,
+        anchor_name: slice.anchorName,
+        closure_score: Number(slice.closureScore.toFixed(3)),
+        closure_slots: slice.closureSlots,
+        closed_slots: slice.closedSlots,
+        roles: slice.roles,
+        member_count: slice.members.length,
+        member_files: slice.memberFiles.slice(0, 10),
+      };
+
+      if (extra?.score !== undefined) out.score = Number(extra.score.toFixed(3));
+      if (extra?.evidence) out.evidence = extra.evidence;
+      return out;
+    };
+
     const reduceHopForOutput = (hop: any): any => {
       if (!hop || typeof hop !== 'object') return null;
       const out: any = {
@@ -963,6 +1577,103 @@ export class LocalBackend {
       return out;
     };
 
+    const buildSliceSignature = (slice: SliceSummary): string => {
+      const slots = [...slice.closedSlots].sort();
+      const roles = [...slice.roles].sort();
+      const slotPart = slots.length > 0 ? slots.join('+') : 'none';
+      const rolePart = roles.length > 0 ? roles.join('+') : 'none';
+      return `Slice:${slice.sliceType} → Slots:${slotPart} → Roles:${rolePart}`;
+    };
+
+    const buildSlicePrecedents = (
+      anchorSliceScores: Map<string, number>,
+      scopedSlices: SliceSummary[],
+      byId: Map<string, SliceSummary>,
+      cochangeMap: Map<string, Map<string, number>>,
+    ): any[] => {
+      if (anchorSliceScores.size === 0) return [];
+
+      const queryTokenSet = toTokenSet(queryText);
+      const scopedByType = new Map<string, SliceSummary[]>();
+      for (const slice of scopedSlices) {
+        const list = scopedByType.get(slice.sliceType) || [];
+        list.push(slice);
+        scopedByType.set(slice.sliceType, list);
+      }
+
+      const anchorIds = Array.from(anchorSliceScores.entries())
+        .sort((left, right) => {
+          if (right[1] !== left[1]) return right[1] - left[1];
+          return left[0].localeCompare(right[0]);
+        })
+        .slice(0, limit)
+        .map(([sliceId]) => sliceId);
+
+      const out: any[] = [];
+      for (const anchorId of anchorIds) {
+        const anchor = byId.get(anchorId);
+        if (!anchor) continue;
+        if (!scopedSlices.some(s => s.id === anchor.id)) continue;
+
+        const anchorTypePeers = (scopedByType.get(anchor.sliceType) || []).filter(candidate => candidate.id !== anchor.id);
+        if (anchorTypePeers.length === 0) continue;
+
+        const anchorSlotSet = new Set(anchor.closedSlots);
+        const anchorRoleSet = new Set(anchor.roles);
+        const anchorTokenSet = toTokenSet(`${anchor.anchorName} ${anchor.label} ${anchor.heuristicLabel}`);
+        const scoredExamples = anchorTypePeers.map(candidate => {
+          const sharedSlots = anchor.closedSlots.filter(slot => candidate.closedSlots.includes(slot));
+          const sharedRoles = anchor.roles.filter(role => candidate.roles.includes(role));
+          const candidateTokenSet = toTokenSet(`${candidate.anchorName} ${candidate.label} ${candidate.heuristicLabel}`);
+          const sharedTokens = Array.from(candidateTokenSet).filter(token => anchorTokenSet.has(token) || queryTokenSet.has(token));
+
+          const slotScore = jaccard(anchorSlotSet, new Set(candidate.closedSlots));
+          const roleScore = jaccard(anchorRoleSet, new Set(candidate.roles));
+          const lexicalScore = jaccard(anchorTokenSet, candidateTokenSet);
+          const closureScore = 1 - Math.min(1, Math.abs(anchor.closureScore - candidate.closureScore));
+          const cochange = cochangeScoreForSlices(anchor.memberFiles, candidate.memberFiles, cochangeMap);
+
+          const score = (slotScore * 4) + (roleScore * 3) + (lexicalScore * 2) + (closureScore * 1) + (cochange.score * 2);
+          const evidence: any = {
+            shared_slots: sharedSlots.slice(0, 8),
+            shared_roles: sharedRoles.slice(0, 8),
+            lexical_overlap: sharedTokens.slice(0, 8),
+          };
+          if (cochange.pairCount > 0) {
+            evidence.cochange = {
+              score: Number(cochange.score.toFixed(3)),
+              pair_count: cochange.pairCount,
+            };
+          }
+
+          return {
+            candidate,
+            score,
+            evidence,
+          };
+        });
+
+        scoredExamples.sort((left, right) => {
+          if (right.score !== left.score) return right.score - left.score;
+          if (right.candidate.closureScore !== left.candidate.closureScore) return right.candidate.closureScore - left.candidate.closureScore;
+          return left.candidate.id.localeCompare(right.candidate.id);
+        });
+
+        const examples = scoredExamples
+          .slice(0, examplesPer)
+          .map(example => reduceSliceForOutput(example.candidate, { score: example.score, evidence: example.evidence }));
+
+        out.push({
+          kind: 'slice',
+          signature: buildSliceSignature(anchor),
+          anchor: reduceSliceForOutput(anchor, { score: anchorSliceScores.get(anchor.id) || 0 }),
+          examples,
+        });
+      }
+
+      return out;
+    };
+
     const findProcessesForUid = async (uid: string, maxCount: number): Promise<string[]> => {
       const escaped = uid.replace(/'/g, "''");
       let rows: any[] = [];
@@ -976,6 +1687,23 @@ export class LocalBackend {
         return [];
       }
       return rows.map(r => r.pid || r[0]).filter((x: any): x is string => typeof x === 'string' && x.length > 0);
+    };
+
+    const findStepNodeIdsForProcess = async (processId: string, maxCount: number): Promise<string[]> => {
+      const escaped = processId.replace(/'/g, "''");
+      let rows: any[] = [];
+      try {
+        rows = await executeQuery(repo.id, `
+          MATCH (n)-[:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escaped}'})
+          RETURN DISTINCT n.id AS nodeId
+          LIMIT ${Math.max(1, Math.min(80, maxCount))}
+        `);
+      } catch {
+        return [];
+      }
+      return rows
+        .map(r => r.nodeId || r[0])
+        .filter((value: any): value is string => typeof value === 'string' && value.length > 0);
     };
 
     const findHopsForUid = async (uid: string, maxCount: number): Promise<any[]> => {
@@ -1182,10 +1910,41 @@ export class LocalBackend {
 
     const anchorProcessIds: string[] = [];
     const anchorHops: any[] = [];
+    const { byId: slicesById, byMemberNodeId: slicesByMemberNodeId, byAnchorNodeId: slicesByAnchorNodeId, inScope: inScopeSlices } = await loadSliceSummaries();
+    const inScopeSliceIds = new Set(inScopeSlices.map(slice => slice.id));
+    const cochangeMap = await loadCochangeMap();
+
+    const anchorSliceScores = new Map<string, number>();
+    const addAnchorSlice = (sliceId: string, score: number): void => {
+      if (!sliceId) return;
+      if (!inScopeSliceIds.has(sliceId)) return;
+      const current = anchorSliceScores.get(sliceId) || 0;
+      anchorSliceScores.set(sliceId, current + Math.max(0.1, score));
+    };
+
+    const addSlicesForNode = (nodeUid: string, score: number): void => {
+      const uid = String(nodeUid || '').trim();
+      if (!uid) return;
+
+      if (slicesById.has(uid)) {
+        addAnchorSlice(uid, score + 2);
+      }
+
+      const memberSlices = slicesByMemberNodeId.get(uid);
+      if (memberSlices) {
+        for (const sliceId of memberSlices) addAnchorSlice(sliceId, score);
+      }
+
+      const anchoredSlices = slicesByAnchorNodeId.get(uid);
+      if (anchoredSlices) {
+        for (const sliceId of anchoredSlices) addAnchorSlice(sliceId, score + 1);
+      }
+    };
 
     if (anchorUid) {
       anchorProcessIds.push(...await findProcessesForUid(anchorUid, limit));
       anchorHops.push(...await findHopsForUid(anchorUid, limit * 4));
+      addSlicesForNode(anchorUid, 8);
     } else {
       // Use action_plan as the anchor finder: it can find deterministic HTTP hops even
       // when a flow is not part of the (capped) Process sample.
@@ -1224,27 +1983,71 @@ export class LocalBackend {
       })
       : anchorHops;
 
+    const queryTokens = getQueryTokens(queryText);
+    for (const hop of inScopeHops) {
+      const baseScore = Math.max(1, rankHop(hop, queryTokens) + 1);
+      addSlicesForNode(String(hop?.ui?.uid || ''), baseScore);
+      addSlicesForNode(String(hop?.endpoint?.uid || ''), baseScore + 0.5);
+      addSlicesForNode(String(hop?.controller?.uid || ''), baseScore);
+    }
+
+    for (const pid of anchorProcessIds.slice(0, limit * 3)) {
+      const stepNodeIds = await findStepNodeIdsForProcess(pid, 48);
+      for (const nodeId of stepNodeIds) {
+        addSlicesForNode(nodeId, 0.75);
+      }
+    }
+
+    if (anchorSliceScores.size === 0 && queryTokens.length > 0 && inScopeSlices.length > 0) {
+      const tokenRankedSlices = inScopeSlices
+        .map(slice => {
+          const hay = slice.searchText;
+          let score = 0;
+          for (const token of queryTokens) {
+            if (!token) continue;
+            if (hay.includes(token)) score += 1;
+            if (String(slice.anchorName || '').toLowerCase().includes(token)) score += 1;
+          }
+          return { sliceId: slice.id, score };
+        })
+        .filter(item => item.score > 0)
+        .sort((left, right) => {
+          if (right.score !== left.score) return right.score - left.score;
+          return left.sliceId.localeCompare(right.sliceId);
+        })
+        .slice(0, Math.max(limit * 3, examplesPer * 2));
+
+      for (const item of tokenRankedSlices) {
+        addAnchorSlice(item.sliceId, item.score);
+      }
+    }
+
+    const slicePrecedents = buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById, cochangeMap);
     const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
     for (const pid of anchorProcessIds.slice(0, limit)) {
       addProcessPrecedent(pid);
     }
 
-    const precedents = [...hopPrecedents, ...processPrecedents].slice(0, Math.max(limit, hopPrecedents.length + processPrecedents.length));
+    const precedents = [...slicePrecedents, ...hopPrecedents, ...processPrecedents]
+      .slice(0, Math.max(limit, slicePrecedents.length + hopPrecedents.length + processPrecedents.length));
 
     const diagnostics: any = {
       anchor_uid: anchorUid || undefined,
       anchor_processes: anchorProcessIds.length,
       anchor_hops: anchorHops.length,
       scoped_hops: inScopeHops.length,
+      anchor_slices: anchorSliceScores.size,
+      scoped_slices: inScopeSlices.length,
+      slice_precedents: slicePrecedents.length,
       path_prefixes: pathPrefixes,
     };
     if (precedents.length === 0) {
-      diagnostics.note = 'No precedents found (no anchor processes or deterministic HTTP hops matched this query).';
+      diagnostics.note = 'No precedents found (no anchor slices, deterministic HTTP hops, or process matches found for this query).';
       diagnostics.suggestions = [
         'Try action_plan(query) first to get a concrete anchor (UI function / endpoint / controller).',
         'Then rerun precedents() with anchor_uid set to a specific symbol uid.',
-        'If this is a backend-only flow, it may not be represented in the capped Process sample.',
+        'If this is a backend-only flow, use a concrete symbol anchor_uid so slice/process matching can resolve deterministically.',
       ];
     }
 
@@ -1383,6 +2186,40 @@ export class LocalBackend {
       .sort((a, b) => b.score - a.score)
       .slice(0, searchLimit)
       .map((item, idx) => ({ ...item, mergedRank: idx + 1 }));
+
+    let episodeOverlayInfo: { boosted_symbols: number; boosted_files: number; target?: { branch?: string; taskId?: string } } | undefined;
+    try {
+      const episodeState = await loadEpisodeGraphState(repo.storagePath);
+      const overlay = buildEpisodeOverlay(episodeState);
+
+      if (overlay.symbolBoosts.size > 0 || overlay.fileBoosts.size > 0) {
+        for (const item of merged) {
+          const nodeId = String(item?.data?.nodeId || '').trim();
+          const filePath = normalizePath(String(item?.data?.filePath || ''));
+          if (nodeId && overlay.symbolBoosts.has(nodeId)) {
+            item.score += overlay.symbolBoosts.get(nodeId)!;
+          }
+          if (filePath && overlay.fileBoosts.has(filePath)) {
+            item.score += overlay.fileBoosts.get(filePath)!;
+          }
+        }
+
+        merged.sort((a, b) => b.score - a.score);
+        for (let i = 0; i < merged.length; i++) {
+          merged[i].mergedRank = i + 1;
+        }
+
+        episodeOverlayInfo = {
+          boosted_symbols: overlay.symbolBoosts.size,
+          boosted_files: overlay.fileBoosts.size,
+          ...(overlay.target?.branch || overlay.target?.taskId
+            ? { target: { branch: overlay.target.branch, taskId: overlay.target.taskId } }
+            : {}),
+        };
+      }
+    } catch {
+      // Ignore episode sidecar read errors and continue with base ranking.
+    }
 
     const hitMeta = new Map<string, { score: number; rank: number }>();
     for (const item of merged) {
@@ -1708,6 +2545,7 @@ export class LocalBackend {
       processes,
       process_symbols: processSymbols,
       definitions: inScopeDefinitions.slice(0, 20), // cap standalone definitions
+      ...(episodeOverlayInfo ? { episode_overlay: episodeOverlayInfo } : {}),
     };
   }
 
@@ -3033,8 +3871,50 @@ export class LocalBackend {
       hunks: DiffHunk[];
       binary?: boolean;
     };
+    type SemanticFamily = 'auth' | 'shape' | 'cache' | 'test' | 'event' | 'template';
 
     const { execFileSync } = await import('child_process');
+
+    const buildEmptySemanticDiffs = () => ({
+      summary: {
+        touched_edges: 0,
+        family_count: 0,
+        gap_signals: 0,
+      },
+      families: [] as Array<{
+        family: SemanticFamily;
+        edge_count: number;
+        changed_symbols: number;
+        incoming_edges: number;
+        outgoing_edges: number;
+        reasons: Array<{ reason: string; count: number }>;
+        sample_edges: Array<{
+          source: { uid: string; name: string; kind: string; filePath: string };
+          target: { uid: string; name: string; kind: string; filePath: string };
+          edge: { type: string; reason: string; confidence: number };
+          direction: 'incoming' | 'outgoing' | 'internal';
+        }>;
+      }>,
+      gap_signals: {
+        total: 0,
+        deterministic: 0,
+        pattern: 0,
+        heuristic: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        gaps: [] as Array<{
+          id: string;
+          gapType: string;
+          absenceTier: string;
+          severity: string;
+          sliceId: string;
+          anchorId: string;
+          missingSlots: string[];
+          evidence: string[];
+        }>,
+      },
+    });
 
     const buildDiffArgs = (withPatch: boolean): string[] => {
       const args = ['diff', '--no-color'];
@@ -3074,13 +3954,20 @@ export class LocalBackend {
       .filter(f => isInScope(f));
 
     if (changedFiles.length === 0) {
+      const semantic_diffs = buildEmptySemanticDiffs();
       return {
         status: 'ok',
         repo: repo.name,
         scope,
         base_ref: baseRef || undefined,
         path_prefixes: pathPrefixes,
-        summary: { changed_files: 0, changed_symbols: 0, suggested_tests: 0 },
+        summary: {
+          changed_files: 0,
+          changed_symbols: 0,
+          suggested_tests: 0,
+          semantic_families: semantic_diffs.summary.family_count,
+          semantic_gap_signals: semantic_diffs.summary.gap_signals,
+        },
         changed_files: [],
         changed_symbols: [],
         symbols: [],
@@ -3088,6 +3975,7 @@ export class LocalBackend {
         ui_contracts: [],
         route_targets: [],
         authz: [],
+        semantic_diffs,
       };
     }
 
@@ -3382,6 +4270,255 @@ export class LocalBackend {
         reasons: meta.reasons,
       }));
 
+    const semanticFamilyOrder: SemanticFamily[] = ['auth', 'shape', 'cache', 'test', 'event', 'template'];
+    const semantic_diffs = buildEmptySemanticDiffs();
+    const changedSymbolIds = Array.from(new Set(
+      changedSymbols
+        .map(sym => String(sym?.uid || '').trim())
+        .filter(Boolean)
+    ));
+    const changedSymbolIdSet = new Set(changedSymbolIds);
+
+    if (changedSymbolIds.length > 0) {
+      const pickPrimaryLabel = (value: any): string => {
+        if (Array.isArray(value)) return String(value[0] || '').trim();
+        return String(value || '').trim();
+      };
+
+      const classifySemanticFamily = (edge: {
+        type: string;
+        reason: string;
+        sourceName: string;
+        targetName: string;
+        sourceFilePath: string;
+        targetFilePath: string;
+      }): SemanticFamily | null => {
+        const type = String(edge.type || '').trim().toUpperCase();
+        const reason = String(edge.reason || '').trim().toLowerCase();
+        const sourceName = String(edge.sourceName || '').trim().toLowerCase();
+        const targetName = String(edge.targetName || '').trim().toLowerCase();
+        const sourceFilePath = String(edge.sourceFilePath || '').trim();
+        const targetFilePath = String(edge.targetFilePath || '').trim();
+
+        if (type === 'TESTS_SHAPE') return 'test';
+        if (type === 'VALIDATES_FIELD' || type === 'SERIALIZES_FIELD' || type === 'READS_FIELD' || type === 'WRITES_FIELD' || type === 'DERIVES_FROM_COLUMN') return 'shape';
+        if (type === 'INVALIDATES_KEY' || reason.startsWith('react-query-key:') || reason.startsWith('micro-dataflow:query-invalidation')) return 'cache';
+
+        const hasPermissionSignal = (
+          sourceName.startsWith('permission:')
+          || targetName.startsWith('permission:')
+          || reason.includes('permission')
+          || reason.startsWith('laravel-authorize:')
+          || reason.startsWith('laravel-gate:')
+          || reason.startsWith('laravel-can:')
+          || reason.startsWith('laravel-route-middleware:can:')
+        );
+        if (hasPermissionSignal) return 'auth';
+
+        if (
+          reason.startsWith('laravel-event')
+          || reason.startsWith('laravel-job-dispatch')
+          || reason.startsWith('laravel-notify')
+          || reason.startsWith('laravel-tactician-dispatch')
+          || reason.startsWith('laravel-tactician-pipeline')
+          || reason.startsWith('micro-dataflow:event-chain')
+        ) {
+          return 'event';
+        }
+
+        if (
+          reason.startsWith('blade-')
+          || reason.startsWith('mjml-')
+          || reason.startsWith('laravel-view-mail')
+          || reason.startsWith('template-method-call')
+        ) {
+          return 'template';
+        }
+
+        if (isTestFilePath(sourceFilePath) || isTestFilePath(targetFilePath)) return 'test';
+        return null;
+      };
+
+      try {
+        const semanticIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+
+        const semanticRows = await executeQuery(repo.id, `
+          MATCH (a)-[r:CodeRelation]->(b)
+          WHERE r.confidence >= ${minConfidence}
+            AND (a.id IN ${semanticIdsCypher} OR b.id IN ${semanticIdsCypher})
+          RETURN
+            a.id AS sourceId,
+            a.name AS sourceName,
+            labels(a) AS sourceKind,
+            a.filePath AS sourceFilePath,
+            b.id AS targetId,
+            b.name AS targetName,
+            labels(b) AS targetKind,
+            b.filePath AS targetFilePath,
+            r.type AS relType,
+            r.reason AS reason,
+            r.confidence AS confidence
+          LIMIT 3000
+        `);
+
+        const familyStats = new Map<SemanticFamily, {
+        family: SemanticFamily;
+        edge_count: number;
+        incoming_edges: number;
+        outgoing_edges: number;
+        changed_symbol_ids: Set<string>;
+        reasonCounts: Map<string, number>;
+        sample_edges: Array<{
+          source: { uid: string; name: string; kind: string; filePath: string };
+          target: { uid: string; name: string; kind: string; filePath: string };
+          edge: { type: string; reason: string; confidence: number };
+          direction: 'incoming' | 'outgoing' | 'internal';
+        }>;
+      }>();
+
+        for (const raw of semanticRows) {
+        const sourceId = String(raw.sourceId ?? raw[0] ?? '').trim();
+        const targetId = String(raw.targetId ?? raw[4] ?? '').trim();
+        if (!sourceId || !targetId) continue;
+
+        const relType = String(raw.relType ?? raw[8] ?? '').trim();
+        const reason = String(raw.reason ?? raw[9] ?? '').trim();
+        const sourceName = String(raw.sourceName ?? raw[1] ?? '').trim();
+        const targetName = String(raw.targetName ?? raw[5] ?? '').trim();
+        const sourceFilePath = String(raw.sourceFilePath ?? raw[3] ?? '').trim();
+        const targetFilePath = String(raw.targetFilePath ?? raw[7] ?? '').trim();
+        const confidence = Number(raw.confidence ?? raw[10] ?? 1);
+
+        const family = classifySemanticFamily({
+          type: relType,
+          reason,
+          sourceName,
+          targetName,
+          sourceFilePath,
+          targetFilePath,
+        });
+        if (!family) continue;
+
+        const sourceChanged = changedSymbolIdSet.has(sourceId);
+        const targetChanged = changedSymbolIdSet.has(targetId);
+        const direction: 'incoming' | 'outgoing' | 'internal' = sourceChanged && targetChanged
+          ? 'internal'
+          : sourceChanged
+            ? 'outgoing'
+            : 'incoming';
+
+        const entry = familyStats.get(family) || {
+          family,
+          edge_count: 0,
+          incoming_edges: 0,
+          outgoing_edges: 0,
+          changed_symbol_ids: new Set<string>(),
+          reasonCounts: new Map<string, number>(),
+          sample_edges: [],
+        };
+
+        entry.edge_count++;
+        if (sourceChanged) {
+          entry.outgoing_edges++;
+          entry.changed_symbol_ids.add(sourceId);
+        }
+        if (targetChanged) {
+          entry.incoming_edges++;
+          entry.changed_symbol_ids.add(targetId);
+        }
+
+        const reasonKey = reason || relType || 'unknown';
+        entry.reasonCounts.set(reasonKey, (entry.reasonCounts.get(reasonKey) || 0) + 1);
+
+        if (entry.sample_edges.length < 5) {
+          entry.sample_edges.push({
+            source: {
+              uid: sourceId,
+              name: sourceName,
+              kind: pickPrimaryLabel(raw.sourceKind ?? raw[2]),
+              filePath: sourceFilePath,
+            },
+            target: {
+              uid: targetId,
+              name: targetName,
+              kind: pickPrimaryLabel(raw.targetKind ?? raw[6]),
+              filePath: targetFilePath,
+            },
+            edge: {
+              type: relType,
+              reason,
+              confidence: Number.isFinite(confidence) ? confidence : 1,
+            },
+            direction,
+          });
+        }
+
+          familyStats.set(family, entry);
+        }
+
+        const families = semanticFamilyOrder
+          .map(family => familyStats.get(family))
+          .filter((item): item is NonNullable<typeof item> => !!item)
+          .map(item => ({
+          family: item.family,
+          edge_count: item.edge_count,
+          changed_symbols: item.changed_symbol_ids.size,
+          incoming_edges: item.incoming_edges,
+          outgoing_edges: item.outgoing_edges,
+          reasons: Array.from(item.reasonCounts.entries())
+            .sort((left, right) => right[1] - left[1])
+            .slice(0, 5)
+            .map(([reasonValue, count]) => ({ reason: reasonValue, count })),
+          sample_edges: item.sample_edges,
+          }));
+
+        const gapRows = await executeQuery(repo.id, `
+          MATCH (s)-[r:CodeRelation {type: 'MEMBER_OF'}]->(slice:FeatureSlice)
+          WHERE s.id IN ${semanticIdsCypher}
+            AND r.reason STARTS WITH 'feature-slice:'
+          MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(slice)
+          RETURN DISTINCT
+            g.id AS id,
+            g.gapType AS gapType,
+            g.absenceTier AS absenceTier,
+            g.severity AS severity,
+            g.sliceId AS sliceId,
+            g.anchorId AS anchorId,
+            g.missingSlots AS missingSlots,
+            g.evidence AS evidence
+          LIMIT 100
+        `);
+
+        const gaps = gapRows.map((row: any) => ({
+          id: String(row.id ?? row[0] ?? '').trim(),
+          gapType: String(row.gapType ?? row[1] ?? '').trim(),
+          absenceTier: String(row.absenceTier ?? row[2] ?? '').trim(),
+          severity: String(row.severity ?? row[3] ?? '').trim(),
+          sliceId: String(row.sliceId ?? row[4] ?? '').trim(),
+          anchorId: String(row.anchorId ?? row[5] ?? '').trim(),
+          missingSlots: Array.isArray(row.missingSlots) ? row.missingSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+          evidence: Array.isArray(row.evidence) ? row.evidence.map((item: any) => String(item || '')).filter(Boolean) : [],
+        })).filter(gap => gap.id && gap.gapType);
+
+        semantic_diffs.summary.touched_edges = families.reduce((sum, family) => sum + family.edge_count, 0);
+        semantic_diffs.summary.family_count = families.length;
+        semantic_diffs.summary.gap_signals = gaps.length;
+        semantic_diffs.families = families;
+        semantic_diffs.gap_signals = {
+          total: gaps.length,
+          deterministic: gaps.filter(gap => gap.absenceTier === 'deterministic_missing').length,
+          pattern: gaps.filter(gap => gap.absenceTier === 'pattern_missing').length,
+          heuristic: gaps.filter(gap => gap.absenceTier === 'heuristic_suspicion').length,
+          high: gaps.filter(gap => gap.severity === 'high').length,
+          medium: gaps.filter(gap => gap.severity === 'medium').length,
+          low: gaps.filter(gap => gap.severity === 'low').length,
+          gaps: gaps.slice(0, 20),
+        };
+      } catch {
+        // best-effort enrichment
+      }
+    }
+
     const ui_contracts: any[] = [];
     if (includeUiContracts && maxUiContractFiles > 0) {
       const baseRefForUi = scope === 'compare' ? baseRef : 'HEAD';
@@ -3572,6 +4709,8 @@ export class LocalBackend {
         ui_contracts: ui_contracts.length,
         route_files: route_targets.length,
         authz_controllers: authz.length,
+        semantic_families: semantic_diffs.summary.family_count,
+        semantic_gap_signals: semantic_diffs.summary.gap_signals,
       },
       changed_files: changedFileObjs.map(f => ({
         filePath: normalizePath(f.filePath),
@@ -3586,6 +4725,7 @@ export class LocalBackend {
       ui_contracts,
       route_targets,
       authz,
+      semantic_diffs,
       _review_mode: {
         knobs: {
           limit_symbols: limitSymbols,
@@ -4347,6 +5487,21 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       byDepth: grouped,
+    };
+  }
+
+  async queryEpisodeState(repoName?: string, options?: {
+    limit?: number;
+    include_events?: boolean;
+  }): Promise<any> {
+    const repo = this.resolveRepo(repoName);
+    const limit = Number.isFinite(Number(options?.limit)) ? Number(options?.limit) : 10;
+    const includeEvents = options?.include_events !== false;
+    const state = await loadEpisodeGraphState(repo.storagePath);
+    return {
+      status: 'ok',
+      repo: repo.name,
+      episode: summarizeEpisodeGraphState(state, { limit, includeEvents }),
     };
   }
 

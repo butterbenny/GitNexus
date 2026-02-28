@@ -32,7 +32,14 @@ export type NodeLabel =
   | 'Type'
   | 'CodeElement'
   | 'Community'
-  | 'Process';
+  | 'Process'
+  | 'FeatureSlice'
+  | 'Gap'
+  | 'ContractShape'
+  | 'ContractField'
+  | 'CacheKey'
+  | 'ValueNode'
+  | 'TestCase';
 
 
 export type NodeProperties = {
@@ -55,6 +62,34 @@ export type NodeProperties = {
   communities?: string[],
   entryPointId?: string,
   terminalId?: string,
+  // FeatureSlice-specific properties
+  sliceType?: string,
+  anchorId?: string,
+  anchorName?: string,
+  closureSlots?: string[],
+  closedSlots?: string[],
+  closureScore?: number,
+  // Gap-specific properties
+  gapType?: string,
+  absenceTier?: 'deterministic_missing' | 'pattern_missing' | 'heuristic_suspicion',
+  severity?: 'high' | 'medium' | 'low',
+  sliceId?: string,
+  missingSlots?: string[],
+  evidence?: string[],
+  // ContractShape-specific properties
+  shapeType?: string,
+  sourceNodeId?: string,
+  sourceFilePath?: string,
+  // ContractField-specific properties
+  fieldName?: string,
+  shapeId?: string,
+  // CacheKey-specific properties
+  keyName?: string,
+  keyType?: string,
+  // ValueNode-specific properties
+  valueType?: string,
+  valueKey?: string,
+  valueRaw?: string,
   // Entry point scoring (computed by process detection)
   entryPointScore?: number,
   entryPointReason?: string,
@@ -62,12 +97,21 @@ export type NodeProperties = {
 
 export type RelationshipType = 
   | 'CONTAINS' 
+  | 'CO_CHANGES_WITH'
   | 'CALLS' 
   | 'INHERITS' 
   | 'OVERRIDES' 
   | 'IMPORTS'
   | 'USES'
   | 'DEFINES'
+  | 'VALIDATES_FIELD'
+  | 'SERIALIZES_FIELD'
+  | 'READS_FIELD'
+  | 'WRITES_FIELD'
+  | 'DERIVES_FROM'
+  | 'DERIVES_FROM_COLUMN'
+  | 'INVALIDATES_KEY'
+  | 'TESTS_SHAPE'
   | 'DECORATES'
   | 'IMPLEMENTS'
   | 'EXTENDS'

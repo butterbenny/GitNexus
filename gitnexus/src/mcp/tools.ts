@@ -40,6 +40,76 @@ on other tools (query, context, impact, etc.) to target the correct one.`,
     },
   },
   {
+    name: 'episode_state',
+    description: `Read the EpisodeGraph sidecar (working memory overlay) for a repository.
+
+Returns a compact summary of recently opened symbols/spans, hypotheses, failing tests,
+error strings, chosen precedents, edit-set files, witness paths, and target branch/task context.
+
+WHEN TO USE: At the start or middle of long-running implementation/review/debug sessions to resume context quickly.
+AFTER THIS: Use query()/context()/impact() with the surfaced anchors.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max entries per section (default: 10)', default: 10 },
+        include_events: { type: 'boolean', description: 'Include recent tool-event timeline (default: true)', default: true },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'episode_update',
+    description: `Update the EpisodeGraph sidecar (working memory overlay) without mutating the durable Kuzu index.
+
+Supports recording manual context such as accepted/rejected hypotheses, failing tests, errors,
+witness paths, edit-set files, opened spans, and target branch/task metadata.
+
+WHEN TO USE: During implementation/review/debug when you learn durable session facts.
+AFTER THIS: Query again; EpisodeGraph overlay will be merged at retrieval time.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        clear: { type: 'boolean', description: 'Reset/clear episode graph state for this repo (default: false)', default: false },
+        target_branch: { type: 'string', description: 'Current target branch name (optional)' },
+        task_id: { type: 'string', description: 'Current task/ticket identifier (optional)' },
+        accepted_hypotheses: { type: 'array', description: 'Hypotheses marked accepted', items: { type: 'string' } },
+        rejected_hypotheses: { type: 'array', description: 'Hypotheses marked rejected', items: { type: 'string' } },
+        candidate_hypotheses: { type: 'array', description: 'Hypotheses still under investigation', items: { type: 'string' } },
+        failing_tests: { type: 'array', description: 'Failing test identifiers/messages', items: { type: 'string' } },
+        error_strings: { type: 'array', description: 'Error strings/stack signatures', items: { type: 'string' } },
+        witness_paths: { type: 'array', description: 'Last proven witness paths or proof breadcrumbs', items: { type: 'string' } },
+        edit_files: { type: 'array', description: 'Current edit-set file paths', items: { type: 'string' } },
+        opened_spans: { type: 'array', description: 'Opened spans as file[:line[:end]] tokens', items: { type: 'string' } },
+        limit: { type: 'number', description: 'Max entries per section in response (default: 10)', default: 10 },
+        include_events: { type: 'boolean', description: 'Include recent tool-event timeline (default: true)', default: true },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'evidence_spans',
+    description: `Read EvidenceSpan snapshot entries (line-level proof/witness ranges) for a repository.
+
+Returns primary/witness/proof spans for symbols and relationships so follow-up work can open exact lines instead of whole files.
+
+WHEN TO USE: After query/context/review/debug when you need concrete line anchors and proof breadcrumbs.
+AFTER THIS: Open the returned file:line spans, then continue with context()/impact() on exact symbols.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol_id: { type: 'string', description: 'Optional symbol/node ID to filter spans (exact node id).' },
+        file_path: { type: 'string', description: 'Optional repo-relative file path to filter spans.' },
+        include_nodes: { type: 'boolean', description: 'Include node-level span entries (default: true).', default: true },
+        include_edges: { type: 'boolean', description: 'Include edge-level span entries (default: true).', default: true },
+        limit: { type: 'number', description: 'Max node/edge entries per section (default: 20).', default: 20 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'query',
     description: `Query the code knowledge graph for execution flows related to a concept.
 Returns processes (call chains) ranked by relevance, each with its symbols and file locations.
@@ -129,9 +199,9 @@ AFTER THIS: Use query/context on exemplar entry/terminal symbols, then impact on
     description: `Precedent/template finder: find existing callsites with similar control-flow/anatomy.
 
 This is a derived view (no schema changes). It:
-1) Uses query() to find the most relevant execution flows (processes)
-2) Computes the flow signature for each anchor process (layer tags + HTTP hops)
-3) Returns a small set of exemplar processes with the same signature, so you can mirror an existing pattern.
+1) Finds anchor FeatureSlice(s) from the query/anchor symbol (fallback: process + HTTP hop anchors)
+2) Ranks sibling slices by closure-slot/role overlap (plus cochange signal when available)
+3) Returns compact exemplar callsites you can mirror (slice-first, then hop/process fallback).
 
 WHEN TO USE: When implementing a feature and you want to copy the established anatomy instead of inventing a new shape.
 Also useful in review: verify new code fits an existing archetype.
@@ -195,10 +265,10 @@ WHEN TO USE: Complex structural queries that search/explore can't answer. READ g
 AFTER THIS: Use context() on result symbols for deeper context.
 
 SCHEMA:
-- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process
+- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, FeatureSlice, Gap, ContractShape, ContractField, CacheKey, ValueNode, TestCase
 - Multi-language nodes (use backticks): \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`, etc.
 - All edges via single CodeRelation table with 'type' property
-- Edge types: CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, MEMBER_OF, STEP_IN_PROCESS
+- Edge types: CONTAINS, CO_CHANGES_WITH, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, MEMBER_OF, STEP_IN_PROCESS, VALIDATES_FIELD, SERIALIZES_FIELD, READS_FIELD, WRITES_FIELD, DERIVES_FROM, DERIVES_FROM_COLUMN, INVALIDATES_KEY, TESTS_SHAPE
 - Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)
 
 EXAMPLES:
@@ -215,7 +285,7 @@ TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
 - Community = auto-detected functional area (Leiden algorithm)
 - Process = execution flow trace from entry point to terminal
-- Use heuristicLabel (not label) for human-readable community/process names`,
+- Use heuristicLabel (not label) for human-readable community/process/slice/gap names`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -274,6 +344,7 @@ Builds on detect_changes-style diffing, then surfaces:
 - changed files + changed symbols (by diff hunk → symbol span)
 - upstream callers + suggested tests (confidence-first)
 - contract signals (UI contract diffs, Laravel route targets, controller auth checks)
+- semantic relation-family deltas (auth/shape/cache/test/event/template) + slice-linked gap signals
 
 WHEN TO USE: PR review, behavior/contract audits, “what should I verify?” after a change.
 AFTER THIS: Use context()/impact() on the highest-risk changed symbols or route/controller anchors.`,

@@ -322,6 +322,167 @@ const generateProcessCSV = (nodes: GraphNode[]): string => {
 };
 
 /**
+ * Generate CSV for FeatureSlice nodes
+ * Headers: id,label,heuristicLabel,sliceType,anchorId,anchorName,closureSlots,closedSlots,closureScore
+ */
+const generateFeatureSliceCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'sliceType', 'anchorId', 'anchorName', 'closureSlots', 'closedSlots', 'closureScore'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'FeatureSlice') continue;
+
+    const closureSlots = (node.properties as any).closureSlots || [];
+    const closedSlots = (node.properties as any).closedSlots || [];
+    const closureSlotsStr = `[${closureSlots.map((slot: string) => `'${slot.replace(/'/g, "''")}'`).join(',')}]`;
+    const closedSlotsStr = `[${closedSlots.map((slot: string) => `'${slot.replace(/'/g, "''")}'`).join(',')}]`;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).sliceType || ''),
+      escapeCSVField((node.properties as any).anchorId || ''),
+      escapeCSVField((node.properties as any).anchorName || ''),
+      escapeCSVField(closureSlotsStr),
+      escapeCSVField(closedSlotsStr),
+      escapeCSVNumber((node.properties as any).closureScore, 0),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for Gap nodes
+ * Headers: id,label,heuristicLabel,gapType,absenceTier,severity,sliceId,anchorId,missingSlots,evidence
+ */
+const generateGapCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'gapType', 'absenceTier', 'severity', 'sliceId', 'anchorId', 'missingSlots', 'evidence'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'Gap') continue;
+
+    const missingSlots = (node.properties as any).missingSlots || [];
+    const evidence = (node.properties as any).evidence || [];
+    const missingSlotsStr = `[${missingSlots.map((slot: string) => `'${slot.replace(/'/g, "''")}'`).join(',')}]`;
+    const evidenceStr = `[${evidence.map((item: string) => `'${item.replace(/'/g, "''")}'`).join(',')}]`;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).gapType || ''),
+      escapeCSVField((node.properties as any).absenceTier || ''),
+      escapeCSVField((node.properties as any).severity || ''),
+      escapeCSVField((node.properties as any).sliceId || ''),
+      escapeCSVField((node.properties as any).anchorId || ''),
+      escapeCSVField(missingSlotsStr),
+      escapeCSVField(evidenceStr),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for ContractShape nodes
+ * Headers: id,label,heuristicLabel,shapeType,sourceNodeId,sourceFilePath
+ */
+const generateContractShapeCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'shapeType', 'sourceNodeId', 'sourceFilePath'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'ContractShape') continue;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).shapeType || ''),
+      escapeCSVField((node.properties as any).sourceNodeId || ''),
+      escapeCSVField((node.properties as any).sourceFilePath || ''),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for ContractField nodes
+ * Headers: id,label,heuristicLabel,fieldName,shapeId,shapeType
+ */
+const generateContractFieldCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'fieldName', 'shapeId', 'shapeType'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'ContractField') continue;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).fieldName || ''),
+      escapeCSVField((node.properties as any).shapeId || ''),
+      escapeCSVField((node.properties as any).shapeType || ''),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for CacheKey nodes
+ * Headers: id,label,heuristicLabel,keyName,keyType,sourceNodeId
+ */
+const generateCacheKeyCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'keyName', 'keyType', 'sourceNodeId'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'CacheKey') continue;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).keyName || ''),
+      escapeCSVField((node.properties as any).keyType || ''),
+      escapeCSVField((node.properties as any).sourceNodeId || ''),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for ValueNode nodes
+ * Headers: id,label,heuristicLabel,valueType,valueKey,valueRaw
+ */
+const generateValueNodeCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'valueType', 'valueKey', 'valueRaw'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'ValueNode') continue;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).valueType || ''),
+      escapeCSVField((node.properties as any).valueKey || ''),
+      escapeCSVField((node.properties as any).valueRaw || ''),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
  * Generate CSV for the single CodeRelation table
  * Headers: from,to,type,confidence,reason
  * 
@@ -378,6 +539,30 @@ export const generateAllCSVs = (
     }
     if (tableName === 'Process') {
       nodeCSVs.set(tableName, generateProcessCSV(nodes));
+      continue;
+    }
+    if (tableName === 'FeatureSlice') {
+      nodeCSVs.set(tableName, generateFeatureSliceCSV(nodes));
+      continue;
+    }
+    if (tableName === 'Gap') {
+      nodeCSVs.set(tableName, generateGapCSV(nodes));
+      continue;
+    }
+    if (tableName === 'ContractShape') {
+      nodeCSVs.set(tableName, generateContractShapeCSV(nodes));
+      continue;
+    }
+    if (tableName === 'ContractField') {
+      nodeCSVs.set(tableName, generateContractFieldCSV(nodes));
+      continue;
+    }
+    if (tableName === 'CacheKey') {
+      nodeCSVs.set(tableName, generateCacheKeyCSV(nodes));
+      continue;
+    }
+    if (tableName === 'ValueNode') {
+      nodeCSVs.set(tableName, generateValueNodeCSV(nodes));
       continue;
     }
 

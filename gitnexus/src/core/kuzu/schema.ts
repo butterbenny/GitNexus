@@ -13,7 +13,8 @@
 // NODE TABLE NAMES
 // ============================================================================
 export const NODE_TABLES = [
-  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process',
+  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process', 'FeatureSlice', 'Gap',
+  'ContractShape', 'ContractField', 'CacheKey', 'ValueNode', 'TestCase',
   // Multi-language support
   'Struct', 'Enum', 'Macro', 'Typedef', 'Union', 'Namespace', 'Trait', 'Impl',
   'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module'
@@ -27,10 +28,28 @@ export const REL_TABLE_NAME = 'CodeRelation';
 
 // Increment when Kuzu schema changes (node/rel table definitions).
 // Used to force full re-index when upgrading existing indexes.
-export const KUZU_SCHEMA_VERSION = 3;
+export const KUZU_SCHEMA_VERSION = 8;
 
 // Valid relation types
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'MEMBER_OF', 'STEP_IN_PROCESS'] as const;
+export const REL_TYPES = [
+  'CONTAINS',
+  'CO_CHANGES_WITH',
+  'DEFINES',
+  'IMPORTS',
+  'CALLS',
+  'EXTENDS',
+  'IMPLEMENTS',
+  'MEMBER_OF',
+  'STEP_IN_PROCESS',
+  'VALIDATES_FIELD',
+  'SERIALIZES_FIELD',
+  'READS_FIELD',
+  'WRITES_FIELD',
+  'DERIVES_FROM',
+  'DERIVES_FROM_COLUMN',
+  'INVALIDATES_KEY',
+  'TESTS_SHAPE',
+] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -153,6 +172,90 @@ CREATE NODE TABLE Process (
   PRIMARY KEY (id)
 )`;
 
+export const FEATURE_SLICE_SCHEMA = `
+CREATE NODE TABLE FeatureSlice (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  sliceType STRING,
+  anchorId STRING,
+  anchorName STRING,
+  closureSlots STRING[],
+  closedSlots STRING[],
+  closureScore DOUBLE,
+  PRIMARY KEY (id)
+)`;
+
+export const GAP_SCHEMA = `
+CREATE NODE TABLE Gap (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  gapType STRING,
+  absenceTier STRING,
+  severity STRING,
+  sliceId STRING,
+  anchorId STRING,
+  missingSlots STRING[],
+  evidence STRING[],
+  PRIMARY KEY (id)
+)`;
+
+export const CONTRACT_SHAPE_SCHEMA = `
+CREATE NODE TABLE ContractShape (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  shapeType STRING,
+  sourceNodeId STRING,
+  sourceFilePath STRING,
+  PRIMARY KEY (id)
+)`;
+
+export const CONTRACT_FIELD_SCHEMA = `
+CREATE NODE TABLE ContractField (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  fieldName STRING,
+  shapeId STRING,
+  shapeType STRING,
+  PRIMARY KEY (id)
+)`;
+
+export const CACHE_KEY_SCHEMA = `
+CREATE NODE TABLE CacheKey (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  keyName STRING,
+  keyType STRING,
+  sourceNodeId STRING,
+  PRIMARY KEY (id)
+)`;
+
+export const VALUE_NODE_SCHEMA = `
+CREATE NODE TABLE ValueNode (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  valueType STRING,
+  valueKey STRING,
+  valueRaw STRING,
+  PRIMARY KEY (id)
+)`;
+
+export const TEST_CASE_SCHEMA = `
+CREATE NODE TABLE TestCase (
+  id STRING,
+  name STRING,
+  filePath STRING,
+  startLine INT64,
+  endLine INT64,
+  content STRING,
+  PRIMARY KEY (id)
+)`;
+
 // ============================================================================
 // MULTI-LANGUAGE NODE TABLE SCHEMAS
 // ============================================================================
@@ -220,6 +323,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM File TO \`Constructor\`,
   FROM File TO \`Template\`,
   FROM File TO \`Module\`,
+  FROM File TO TestCase,
   FROM Folder TO Folder,
   FROM Folder TO File,
   FROM Function TO Function,
@@ -284,6 +388,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Template\` TO \`Constructor\`,
   FROM \`Module\` TO \`Module\`,
   FROM CodeElement TO Community,
+  FROM CodeElement TO File,
   FROM CodeElement TO CodeElement,
   FROM CodeElement TO Function,
   FROM CodeElement TO Method,
@@ -360,6 +465,49 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Annotation\` TO Process,
   FROM \`Template\` TO Process,
   FROM CodeElement TO Process,
+  FROM Function TO FeatureSlice,
+  FROM Class TO FeatureSlice,
+  FROM Interface TO FeatureSlice,
+  FROM Method TO FeatureSlice,
+  FROM CodeElement TO FeatureSlice,
+  FROM \`Struct\` TO FeatureSlice,
+  FROM \`Enum\` TO FeatureSlice,
+  FROM \`Macro\` TO FeatureSlice,
+  FROM \`Typedef\` TO FeatureSlice,
+  FROM \`Union\` TO FeatureSlice,
+  FROM \`Namespace\` TO FeatureSlice,
+  FROM \`Trait\` TO FeatureSlice,
+  FROM \`Impl\` TO FeatureSlice,
+  FROM \`TypeAlias\` TO FeatureSlice,
+  FROM \`Const\` TO FeatureSlice,
+  FROM \`Static\` TO FeatureSlice,
+  FROM \`Property\` TO FeatureSlice,
+  FROM \`Record\` TO FeatureSlice,
+  FROM \`Delegate\` TO FeatureSlice,
+  FROM \`Annotation\` TO FeatureSlice,
+  FROM \`Constructor\` TO FeatureSlice,
+  FROM \`Template\` TO FeatureSlice,
+  FROM \`Module\` TO FeatureSlice,
+  FROM Gap TO FeatureSlice,
+  FROM Class TO ContractShape,
+  FROM Class TO ContractField,
+  FROM Method TO ContractField,
+  FROM Function TO ContractField,
+  FROM ContractField TO ContractShape,
+  FROM File TO CacheKey,
+  FROM File TO ValueNode,
+  FROM Function TO CacheKey,
+  FROM Function TO ValueNode,
+  FROM Method TO CacheKey,
+  FROM Method TO ValueNode,
+  FROM Class TO ValueNode,
+  FROM Interface TO ValueNode,
+  FROM CodeElement TO ValueNode,
+  FROM \`Const\` TO ValueNode,
+  FROM \`Template\` TO ValueNode,
+  FROM \`Module\` TO ValueNode,
+  FROM CacheKey TO ValueNode,
+  FROM TestCase TO ContractShape,
   type STRING,
   confidence DOUBLE,
   reason STRING,
@@ -401,6 +549,13 @@ export const NODE_SCHEMA_QUERIES = [
   CODE_ELEMENT_SCHEMA,
   COMMUNITY_SCHEMA,
   PROCESS_SCHEMA,
+  FEATURE_SLICE_SCHEMA,
+  GAP_SCHEMA,
+  CONTRACT_SHAPE_SCHEMA,
+  CONTRACT_FIELD_SCHEMA,
+  CACHE_KEY_SCHEMA,
+  VALUE_NODE_SCHEMA,
+  TEST_CASE_SCHEMA,
   // Multi-language support
   STRUCT_SCHEMA,
   ENUM_SCHEMA,

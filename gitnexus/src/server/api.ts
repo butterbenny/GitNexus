@@ -16,6 +16,7 @@ import { searchFTSFromKuzu } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 import { semanticSearch } from '../core/embeddings/embedding-pipeline.js';
 import { isEmbedderReady } from '../core/embeddings/embedder.js';
+import { loadEvidenceSpanSnapshot } from '../core/ingestion/evidence-span-store.js';
 
 const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
@@ -30,6 +31,18 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
         query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
       } else if (table === 'Process') {
         query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
+      } else if (table === 'FeatureSlice') {
+        query = `MATCH (n:FeatureSlice) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.sliceType AS sliceType, n.anchorId AS anchorId, n.anchorName AS anchorName, n.closureSlots AS closureSlots, n.closedSlots AS closedSlots, n.closureScore AS closureScore`;
+      } else if (table === 'Gap') {
+        query = `MATCH (n:Gap) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.gapType AS gapType, n.absenceTier AS absenceTier, n.severity AS severity, n.sliceId AS sliceId, n.anchorId AS anchorId, n.missingSlots AS missingSlots, n.evidence AS evidence`;
+      } else if (table === 'ContractShape') {
+        query = `MATCH (n:ContractShape) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.shapeType AS shapeType, n.sourceNodeId AS sourceNodeId, n.sourceFilePath AS sourceFilePath`;
+      } else if (table === 'ContractField') {
+        query = `MATCH (n:ContractField) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.fieldName AS fieldName, n.shapeId AS shapeId, n.shapeType AS shapeType`;
+      } else if (table === 'CacheKey') {
+        query = `MATCH (n:CacheKey) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.keyName AS keyName, n.keyType AS keyType, n.sourceNodeId AS sourceNodeId`;
+      } else if (table === 'ValueNode') {
+        query = `MATCH (n:ValueNode) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.valueType AS valueType, n.valueKey AS valueKey, n.valueRaw AS valueRaw`;
       } else {
         query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
       }
@@ -53,6 +66,28 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
             communities: row.communities,
             entryPointId: row.entryPointId,
             terminalId: row.terminalId,
+            sliceType: row.sliceType,
+            anchorId: row.anchorId,
+            anchorName: row.anchorName,
+            closureSlots: row.closureSlots,
+            closedSlots: row.closedSlots,
+            closureScore: row.closureScore,
+            gapType: row.gapType,
+            absenceTier: row.absenceTier,
+            severity: row.severity,
+            sliceId: row.sliceId,
+            missingSlots: row.missingSlots,
+            evidence: row.evidence,
+            shapeType: row.shapeType,
+            sourceNodeId: row.sourceNodeId,
+            sourceFilePath: row.sourceFilePath,
+            fieldName: row.fieldName,
+            shapeId: row.shapeId,
+            keyName: row.keyName,
+            keyType: row.keyType,
+            valueType: row.valueType,
+            valueKey: row.valueKey,
+            valueRaw: row.valueRaw,
           } as GraphNode['properties'],
         });
       }
@@ -121,6 +156,18 @@ export const createServer = async (port: number) => {
     await initKuzu(repo.kuzuPath);
     const result = await executeQuery(req.body.cypher);
     res.json({ result });
+  });
+
+  // Read evidence span sidecar
+  app.get('/api/evidence', async (_req, res) => {
+    const repo = await findRepo(process.cwd());
+    if (!repo) {
+      res.status(404).json({ error: 'Repository not indexed' });
+      return;
+    }
+
+    const evidence = await loadEvidenceSpanSnapshot(repo.storagePath);
+    res.json(evidence);
   });
 
   // Search

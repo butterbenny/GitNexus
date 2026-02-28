@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { RELATION_SCHEMA } from '../dist/core/kuzu/schema.js';
+import { RELATION_SCHEMA, REL_TYPES } from '../dist/core/kuzu/schema.js';
 
 test('Kuzu schema: CodeRelation allows Function/Method -> Trait/Typedef/Union', () => {
   assert.match(RELATION_SCHEMA, /FROM Function TO `Trait`/);
@@ -31,4 +31,46 @@ test('Kuzu schema: CodeRelation allows endpoint wiring', () => {
   assert.match(RELATION_SCHEMA, /FROM Function TO CodeElement/);
   assert.match(RELATION_SCHEMA, /FROM Method TO CodeElement/);
   assert.match(RELATION_SCHEMA, /FROM CodeElement TO Method/);
+  assert.match(RELATION_SCHEMA, /FROM CodeElement TO File/);
+});
+
+test('Kuzu schema: CodeRelation allows feature-slice memberships', () => {
+  assert.match(RELATION_SCHEMA, /FROM Function TO FeatureSlice/);
+  assert.match(RELATION_SCHEMA, /FROM Method TO FeatureSlice/);
+  assert.match(RELATION_SCHEMA, /FROM CodeElement TO FeatureSlice/);
+});
+
+test('Kuzu schema: CodeRelation allows gap-to-slice links', () => {
+  assert.match(RELATION_SCHEMA, /FROM Gap TO FeatureSlice/);
+});
+
+test('Kuzu schema: CodeRelation allows contract shape links', () => {
+  assert.match(RELATION_SCHEMA, /FROM Class TO ContractShape/);
+  assert.match(RELATION_SCHEMA, /FROM Class TO ContractField/);
+  assert.match(RELATION_SCHEMA, /FROM ContractField TO ContractShape/);
+});
+
+test('Kuzu schema: CodeRelation allows cache key links', () => {
+  assert.match(RELATION_SCHEMA, /FROM Function TO CacheKey/);
+  assert.match(RELATION_SCHEMA, /FROM File TO CacheKey/);
+});
+
+test('Kuzu schema: CodeRelation allows value graph links', () => {
+  assert.match(RELATION_SCHEMA, /FROM File TO ValueNode/);
+  assert.match(RELATION_SCHEMA, /FROM Function TO ValueNode/);
+  assert.match(RELATION_SCHEMA, /FROM Method TO ValueNode/);
+  assert.match(RELATION_SCHEMA, /FROM CacheKey TO ValueNode/);
+});
+
+test('Kuzu schema: CodeRelation allows static test closure links', () => {
+  assert.match(RELATION_SCHEMA, /FROM File TO TestCase/);
+  assert.match(RELATION_SCHEMA, /FROM TestCase TO ContractShape/);
+});
+
+test('Kuzu schema: relation type list includes git cochange edges', () => {
+  assert.ok(REL_TYPES.includes('CO_CHANGES_WITH'));
+});
+
+test('Kuzu schema: relation type list includes provenance derives-from edges', () => {
+  assert.ok(REL_TYPES.includes('DERIVES_FROM'));
 });

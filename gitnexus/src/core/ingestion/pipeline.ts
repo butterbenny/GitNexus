@@ -15,6 +15,7 @@ import { processLaravelEloquentRelationships } from './laravel-eloquent-relation
 import { processLaravelEloquentLoadEdges } from './laravel-eloquent-load-processor.js';
 import { processLaravelResourceContracts } from './laravel-resource-contract-processor.js';
 import { processReactQueryKeyWiring } from './react-query-processor.js';
+import { processContractShapes } from './contract-shape-processor.js';
 import { processLaravelViewsAndMail } from './laravel-view-mail-processor.js';
 import { processLaravelEvents } from './laravel-event-processor.js';
 import { processLaravelEventDispatch } from './laravel-event-dispatch-processor.js';
@@ -29,6 +30,14 @@ import { processTemplateMethodCallWiring } from './template-method-call-processo
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
+import { processFeatureSlices } from './feature-slice-processor.js';
+import { processGaps } from './gap-processor.js';
+import { processGitHistoryCochange } from './git-history-cochange-processor.js';
+import { processMicroDataflow } from './micro-dataflow-processor.js';
+import { processPrecisionOverlay } from './precision-overlay-processor.js';
+import { processProvenanceEdges } from './provenance-processor.js';
+import { processValueGraph } from './value-graph-processor.js';
+import { PrecisionOverlayMode } from './precision-overlay-producer.js';
 import { createSymbolTable } from './symbol-table.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
@@ -37,9 +46,19 @@ import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
+export interface PipelineRunOptions {
+  precisionOverlayMode?: PrecisionOverlayMode;
+  precisionOverlayPath?: string;
+  precisionOverlayForce?: boolean;
+  precisionOverlayScipJson?: string;
+  graphExpectationPath?: string;
+  graphExpectationJson?: string;
+}
+
 export const runPipelineFromRepo = async (
   repoPath: string,
-  onProgress: (progress: PipelineProgress) => void
+  onProgress: (progress: PipelineProgress) => void,
+  options?: PipelineRunOptions,
 ): Promise<PipelineResult> => {
   const graph = createKnowledgeGraph();
   const fileContents = new Map<string, string>();
@@ -234,8 +253,97 @@ export const runPipelineFromRepo = async (
     await processReactQueryKeyWiring(graph, files, astCache, symbolTable, importMap);
 
     onProgress({
+      phase: 'shapes',
+      percent: 93,
+      message: 'Materializing contract shapes...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const shapeResult = await processContractShapes(
+      graph,
+      files,
+      (message) => {
+        onProgress({
+          phase: 'shapes',
+          percent: 93,
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
+
+    shapeResult.shapes.forEach(shape => {
+      graph.addNode({
+        id: shape.id,
+        label: 'ContractShape',
+        properties: {
+          name: shape.label,
+          filePath: '',
+          heuristicLabel: shape.heuristicLabel,
+          shapeType: shape.shapeType,
+          sourceNodeId: shape.sourceNodeId,
+          sourceFilePath: shape.sourceFilePath,
+        },
+      });
+    });
+
+    shapeResult.fields.forEach(field => {
+      graph.addNode({
+        id: field.id,
+        label: 'ContractField',
+        properties: {
+          name: field.label,
+          filePath: '',
+          heuristicLabel: field.heuristicLabel,
+          fieldName: field.fieldName,
+          shapeId: field.shapeId,
+          shapeType: field.shapeType,
+        },
+      });
+    });
+
+    shapeResult.cacheKeys.forEach(cacheKey => {
+      graph.addNode({
+        id: cacheKey.id,
+        label: 'CacheKey',
+        properties: {
+          name: cacheKey.label,
+          filePath: '',
+          heuristicLabel: cacheKey.heuristicLabel,
+          keyName: cacheKey.keyName,
+          keyType: cacheKey.keyType,
+          sourceNodeId: cacheKey.sourceNodeId,
+        },
+      });
+    });
+
+    shapeResult.testCases.forEach(testCase => {
+      graph.addNode({
+        id: testCase.id,
+        label: 'TestCase',
+        properties: {
+          name: testCase.name,
+          filePath: testCase.filePath,
+          startLine: testCase.startLine,
+          endLine: testCase.endLine,
+        },
+      });
+    });
+
+    shapeResult.edges.forEach(edge => {
+      graph.addRelationship({
+        id: edge.id,
+        type: edge.type,
+        sourceId: edge.sourceId,
+        targetId: edge.targetId,
+        confidence: edge.confidence,
+        reason: edge.reason,
+      });
+    });
+
+    onProgress({
       phase: 'heritage',
-      percent: 92,
+      percent: 94,
       message: 'Extracting class inheritance...',
       stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
@@ -243,7 +351,7 @@ export const runPipelineFromRepo = async (
     if (workerData) {
       // Fast path: heritage already extracted by workers, just resolve symbols
       await processHeritageFromExtracted(graph, workerData.heritage, symbolTable, (current, total) => {
-        const heritageProgress = 88 + ((current / total) * 4);
+        const heritageProgress = 94 + ((current / total) * 2);
         onProgress({
           phase: 'heritage',
           percent: Math.round(heritageProgress),
@@ -254,7 +362,7 @@ export const runPipelineFromRepo = async (
     } else {
       // Fallback: full parse + resolve (sequential path)
       await processHeritage(graph, files, astCache, symbolTable, (current, total) => {
-        const heritageProgress = 88 + ((current / total) * 4);
+        const heritageProgress = 94 + ((current / total) * 2);
         onProgress({
           phase: 'heritage',
           percent: Math.round(heritageProgress),
@@ -265,14 +373,132 @@ export const runPipelineFromRepo = async (
     }
 
     onProgress({
+      phase: 'precision',
+      percent: 95,
+      message: 'Applying precision overlay...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const precisionOverlayResult = await processPrecisionOverlay(
+      repoPath,
+      graph,
+      (message, progress) => {
+        const precisionProgress = 95 + (progress * 0.01);
+        onProgress({
+          phase: 'precision',
+          percent: Math.round(precisionProgress),
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+      {
+        overlayPath: options?.precisionOverlayPath,
+        producerMode: options?.precisionOverlayMode,
+        producerForceRefresh: options?.precisionOverlayForce,
+        producerScipJson: options?.precisionOverlayScipJson,
+      },
+    );
+
+    precisionOverlayResult.edges.forEach(edge => {
+      graph.addRelationship(edge);
+    });
+
+    onProgress({
+      phase: 'microflow',
+      percent: 96,
+      message: 'Materializing targeted micro-dataflow...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const microDataflowResult = await processMicroDataflow(
+      graph,
+      (message, progress) => {
+        const microflowProgress = 96 + (progress * 0.01);
+        onProgress({
+          phase: 'microflow',
+          percent: Math.round(microflowProgress),
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
+
+    microDataflowResult.edges.forEach(edge => {
+      graph.addRelationship(edge);
+    });
+
+    onProgress({
+      phase: 'values',
+      percent: 97,
+      message: 'Materializing value graph...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const valueGraphResult = await processValueGraph(
+      graph,
+      (message, progress) => {
+        const valueProgress = 97 + (progress * 0.005);
+        onProgress({
+          phase: 'values',
+          percent: Math.round(valueProgress),
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
+
+    valueGraphResult.values.forEach(valueNode => {
+      graph.addNode({
+        id: valueNode.id,
+        label: 'ValueNode',
+        properties: {
+          name: valueNode.label,
+          filePath: '',
+          heuristicLabel: valueNode.heuristicLabel,
+          valueType: valueNode.valueType,
+          valueKey: valueNode.valueKey,
+          valueRaw: valueNode.valueRaw,
+        },
+      });
+    });
+
+    valueGraphResult.edges.forEach(edge => {
+      graph.addRelationship(edge);
+    });
+
+    onProgress({
+      phase: 'provenance',
+      percent: 97,
+      message: 'Materializing provenance edges...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const provenanceResult = await processProvenanceEdges(
+      graph,
+      (message, progress) => {
+        const provenanceProgress = 97 + (progress * 0.005);
+        onProgress({
+          phase: 'provenance',
+          percent: Math.round(provenanceProgress),
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
+
+    provenanceResult.edges.forEach(edge => {
+      graph.addRelationship(edge);
+    });
+
+    onProgress({
       phase: 'communities',
-      percent: 92,
+      percent: 97,
       message: 'Detecting code communities...',
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
     const communityResult = await processCommunities(graph, (message, progress) => {
-      const communityProgress = 92 + (progress * 0.06);
+      const communityProgress = 97 + (progress * 0.01);
       onProgress({
         phase: 'communities',
         percent: Math.round(communityProgress),
@@ -370,6 +596,132 @@ export const runPipelineFromRepo = async (
     });
 
     onProgress({
+      phase: 'slices',
+      percent: 99,
+      message: 'Materializing feature slices...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const featureSliceResult = await processFeatureSlices(
+      graph,
+      (message) => {
+        onProgress({
+          phase: 'slices',
+          percent: 99,
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
+
+    featureSliceResult.slices.forEach(slice => {
+      graph.addNode({
+        id: slice.id,
+        label: 'FeatureSlice',
+        properties: {
+          name: slice.label,
+          filePath: '',
+          heuristicLabel: slice.heuristicLabel,
+          sliceType: slice.sliceType,
+          anchorId: slice.anchorId,
+          anchorName: slice.anchorName,
+          closureSlots: slice.closureSlots,
+          closedSlots: slice.closedSlots,
+          closureScore: slice.closureScore,
+        },
+      });
+    });
+
+    featureSliceResult.memberships.forEach(membership => {
+      graph.addRelationship({
+        id: `${membership.nodeId}_member_of_${membership.sliceId}`,
+        type: 'MEMBER_OF',
+        sourceId: membership.nodeId,
+        targetId: membership.sliceId,
+        confidence: 1.0,
+        reason: `feature-slice:${membership.role}`,
+      });
+    });
+
+    onProgress({
+      phase: 'gaps',
+      percent: 99,
+      message: 'Materializing gap graph...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const gapResult = await processGaps(
+      graph,
+      (message) => {
+        onProgress({
+          phase: 'gaps',
+          percent: 99,
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+      {
+        repoPath,
+        expectationPath: options?.graphExpectationPath,
+        expectationJson: options?.graphExpectationJson,
+      },
+    );
+
+    gapResult.gaps.forEach(gap => {
+      graph.addNode({
+        id: gap.id,
+        label: 'Gap',
+        properties: {
+          name: gap.label,
+          filePath: '',
+          heuristicLabel: gap.heuristicLabel,
+          gapType: gap.gapType,
+          absenceTier: gap.absenceTier,
+          severity: gap.severity,
+          sliceId: gap.sliceId,
+          anchorId: gap.anchorId,
+          missingSlots: gap.missingSlots,
+          evidence: gap.evidence,
+        },
+      });
+    });
+
+    gapResult.links.forEach(link => {
+      graph.addRelationship({
+        id: `${link.gapId}_member_of_${link.sliceId}`,
+        type: 'MEMBER_OF',
+        sourceId: link.gapId,
+        targetId: link.sliceId,
+        confidence: 1.0,
+        reason: 'gap-membership',
+      });
+    });
+
+    onProgress({
+      phase: 'cochange',
+      percent: 99,
+      message: 'Materializing git-history cochange graph...',
+      stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    });
+
+    const cochangeResult = await processGitHistoryCochange(
+      repoPath,
+      filePaths,
+      (message) => {
+        onProgress({
+          phase: 'cochange',
+          percent: 99,
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
+
+    cochangeResult.edges.forEach(edge => {
+      graph.addRelationship(edge);
+    });
+
+    onProgress({
       phase: 'complete',
       percent: 100,
       message: `Graph complete! ${communityResult.stats.totalCommunities} communities, ${processResult.stats.totalProcesses} processes detected.`,
@@ -382,7 +734,16 @@ export const runPipelineFromRepo = async (
 
     astCache.clear();
 
-    return { graph, fileContents, communityResult, processResult };
+    return {
+      graph,
+      fileContents,
+      communityResult,
+      processResult,
+      precisionOverlayResult,
+      microDataflowResult,
+      valueGraphResult,
+      provenanceResult,
+    };
   } catch (error) {
     cleanup();
     throw error;

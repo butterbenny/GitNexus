@@ -204,6 +204,14 @@ test('precedents: returns exemplar processes with the same flow signature', asyn
   assert.ok(Array.isArray(result.precedents));
   assert.ok(result.precedents.length > 0);
 
+  const slicePrec = result.precedents.find(p => p?.kind === 'slice');
+  assert.ok(slicePrec);
+  assert.ok(String(slicePrec.signature || '').startsWith('Slice:endpoint'));
+  assert.equal(slicePrec.anchor?.slice_type, 'endpoint');
+  assert.ok(Array.isArray(slicePrec.examples));
+  const sliceExampleAnchorNames = slicePrec.examples.map(e => String(e?.anchor_name || '').toLowerCase());
+  assert.ok(sliceExampleAnchorNames.some(name => name.includes('messages')));
+
   const p0 = result.precedents.find(p => p?.kind === 'process');
   assert.ok(p0);
   assert.ok(typeof p0.signature === 'string' && p0.signature.length > 0);
