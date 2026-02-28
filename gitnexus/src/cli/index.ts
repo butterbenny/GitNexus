@@ -10,7 +10,18 @@ import { setupCommand } from './setup.js';
 import { augmentCommand } from './augment.js';
 import { wikiCommand } from './wiki.js';
 import { archetypesCommand } from './archetypes.js';
-import { queryCommand, contextCommand, impactCommand, cypherCommand, precedentsCommand } from './tool.js';
+import {
+  queryCommand,
+  queryModeCommand,
+  implementModeCommand,
+  reviewModeCommand,
+  debugModeCommand,
+  modeRouterCommand,
+  contextCommand,
+  impactCommand,
+  cypherCommand,
+  precedentsCommand,
+} from './tool.js';
 import { evalServerCommand } from './eval-server.js';
 const program = new Command();
 
@@ -30,6 +41,7 @@ program
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--skip-embeddings', 'Skip embedding generation (faster)')
   .option('--incremental-max-changes <n>', 'Override incremental change limit (0 disables incremental)', (value) => parseInt(value, 10))
+  .option('--incremental-derived <mode>', 'Incremental derived refresh mode: full|fast', 'full')
   .option('--incremental-recompute-processes', 'Recompute execution flows (Process nodes) after incremental update')
   .option('--incremental-recompute-communities', 'Recompute communities/clusters (Community nodes) after incremental update')
   .option('--precision-overlay <mode>', 'Precision overlay mode: auto|scip|shadow|lsp-probe|off', 'auto')
@@ -119,6 +131,197 @@ program
   )
   .option('--content', 'Include full symbol source code')
   .action(queryCommand);
+
+program
+  .command('query-mode <search_query>')
+  .description('Kernel query head: top slices, symbols, precedents, and action hints')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('-c, --context <text>', 'Task context to improve ranking')
+  .option('-g, --goal <text>', 'What you want to find')
+  .option('-l, --limit <n>', 'Max processes to return (default: 5)')
+  .option('--limit-slices <n>', 'Max slice cards to include (default: 2)')
+  .option('--limit-symbols <n>', 'Max symbols to include (default: 12)')
+  .option('--limit-precedents <n>', 'Max precedents to include (default: 2)')
+  .option('--limit-hops <n>', 'Max action-hint hops to include (default: 4)')
+  .option('--no-precedents', 'Disable precedent lookup in query_mode')
+  .option('--no-action-hints', 'Disable action-hint synthesis in query_mode')
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict results to files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .action((searchQuery, options) => queryModeCommand(searchQuery, {
+    repo: options.repo,
+    context: options.context,
+    goal: options.goal,
+    limit: options.limit,
+    limitSlices: options.limitSlices,
+    limitSymbols: options.limitSymbols,
+    limitPrecedents: options.limitPrecedents,
+    limitHops: options.limitHops,
+    includePrecedents: options.precedents,
+    includeActionHints: options.actionHints,
+    pathPrefix: options.pathPrefix,
+  }));
+
+program
+  .command('implement-mode <search_query>')
+  .description('Kernel implement head: target slice, companions, write anchors, review handoff')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('-c, --context <text>', 'Task context to improve ranking')
+  .option('-g, --goal <text>', 'What you want to find')
+  .option('-l, --limit <n>', 'Max query-head processes to return (default: 5)')
+  .option('--limit-companions <n>', 'Max companion files to include (default: 12)')
+  .option('--limit-write-anchors <n>', 'Max ordered write anchors (default: 12)')
+  .option('--limit-precedents <n>', 'Max precedents to include (default: 3)')
+  .option('--limit-hops <n>', 'Max action-hint hops to include (default: 4)')
+  .option('--no-precedents', 'Disable precedent lookup in implement_mode')
+  .option('--no-action-hints', 'Disable action-hint synthesis in implement_mode')
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict results to files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .action((searchQuery, options) => implementModeCommand(searchQuery, {
+    repo: options.repo,
+    context: options.context,
+    goal: options.goal,
+    limit: options.limit,
+    limitCompanions: options.limitCompanions,
+    limitWriteAnchors: options.limitWriteAnchors,
+    limitPrecedents: options.limitPrecedents,
+    limitHops: options.limitHops,
+    includePrecedents: options.precedents,
+    includeActionHints: options.actionHints,
+    pathPrefix: options.pathPrefix,
+  }));
+
+program
+  .command('review-mode')
+  .description('Kernel review head: semantic diffs, risks, proof-pack, and test suggestions')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('--scope <scope>', 'Review scope: unstaged|staged|all|compare (default: unstaged)')
+  .option('--base-ref <ref>', 'Base ref/commit for compare scope (e.g. origin/main)')
+  .option('--limit-symbols <n>', 'Max changed symbols to analyze (default: 60)')
+  .option('--limit-callers <n>', 'Max upstream callers per symbol (default: 10)')
+  .option('--limit-tests <n>', 'Max suggested tests (default: 10)')
+  .option('--min-confidence <n>', 'Minimum confidence for edges (default: 0.9)')
+  .option('--no-ui-contracts', 'Disable UI contract diffs')
+  .option('--max-ui-contract-files <n>', 'Max UI contract files to analyze (default: 5)')
+  .option('--no-evidence-spans', 'Disable proof-pack evidence spans')
+  .option('--limit-evidence <n>', 'Max proof-pack symbol/edge evidence entries (default: 40)')
+  .option('--no-slice-stencil', 'Disable slice-stencil comparison output')
+  .option('--limit-slice-stencil <n>', 'Max changed slices in stencil output (default: 8)')
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict review to files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .action(options => reviewModeCommand({
+    repo: options.repo,
+    scope: options.scope,
+    baseRef: options.baseRef,
+    limitSymbols: options.limitSymbols,
+    limitCallers: options.limitCallers,
+    limitTests: options.limitTests,
+    minConfidence: options.minConfidence,
+    includeUiContracts: options.uiContracts,
+    maxUiContractFiles: options.maxUiContractFiles,
+    includeEvidenceSpans: options.evidenceSpans,
+    limitEvidence: options.limitEvidence,
+    includeSliceStencil: options.sliceStencil,
+    limitSliceStencil: options.limitSliceStencil,
+    pathPrefix: options.pathPrefix,
+  }));
+
+program
+  .command('debug-mode [search_query]')
+  .description('Kernel debug head: symptom-first loop localization and ranked hypotheses')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('--query <text>', 'Anchor query used to seed debug search')
+  .option('--symptom <text>', 'Observed symptom summary (recommended)')
+  .option('-c, --context <text>', 'Task context to improve ranking')
+  .option('-g, --goal <text>', 'Investigation goal to improve ranking')
+  .option('--limit-candidates <n>', 'Max ranked broken-loop candidates (default: 8)')
+  .option('--limit-hops <n>', 'Max anchored HTTP hops to include (default: 6)')
+  .option('--no-precedents', 'Disable sibling precedent diff')
+  .option(
+    '--failing-test <id>',
+    'Failing test identifier/message (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option(
+    '--error-string <text>',
+    'Error string or stack snippet (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict debug analysis to files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .action((searchQuery, options) => debugModeCommand(searchQuery, {
+    repo: options.repo,
+    query: options.query,
+    symptom: options.symptom,
+    context: options.context,
+    goal: options.goal,
+    limitCandidates: options.limitCandidates,
+    limitHops: options.limitHops,
+    includePrecedents: options.precedents,
+    failingTest: options.failingTest,
+    errorString: options.errorString,
+    pathPrefix: options.pathPrefix,
+  }));
+
+program
+  .command('mode-router [search_query]')
+  .description('Auto-route into query/implement/review/debug kernel heads')
+  .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
+  .option('--mode <mode>', 'Route mode: auto|query|implement|review|debug (default: auto)', 'auto')
+  .option('--query <text>', 'Anchor query used by query/implement/debug routes')
+  .option('--symptom <text>', 'Observed symptom summary for debug routing')
+  .option('-c, --context <text>', 'Task context to improve ranking')
+  .option('-g, --goal <text>', 'Routing goal to improve ranking')
+  .option('--scope <scope>', 'Review scope when route resolves to review (default: unstaged)')
+  .option('--base-ref <ref>', 'Base ref for compare review scope')
+  .option(
+    '--failing-test <id>',
+    'Failing test identifier/message (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option(
+    '--error-string <text>',
+    'Error string or stack snippet (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict routing context to files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .action((searchQuery, options) => modeRouterCommand(searchQuery, {
+    repo: options.repo,
+    mode: options.mode,
+    query: options.query,
+    symptom: options.symptom,
+    context: options.context,
+    goal: options.goal,
+    scope: options.scope,
+    baseRef: options.baseRef,
+    failingTest: options.failingTest,
+    errorString: options.errorString,
+    pathPrefix: options.pathPrefix,
+  }));
 
 program
   .command('precedents <search_query>')

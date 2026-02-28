@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { RELATION_SCHEMA, REL_TYPES } from '../dist/core/kuzu/schema.js';
+import { NODE_TABLES, RELATION_SCHEMA, REL_TYPES } from '../dist/core/kuzu/schema.js';
 
 test('Kuzu schema: CodeRelation allows Function/Method -> Trait/Typedef/Union', () => {
   assert.match(RELATION_SCHEMA, /FROM Function TO `Trait`/);
@@ -73,4 +73,22 @@ test('Kuzu schema: relation type list includes git cochange edges', () => {
 
 test('Kuzu schema: relation type list includes provenance derives-from edges', () => {
   assert.ok(REL_TYPES.includes('DERIVES_FROM'));
+});
+
+test('Kuzu schema: CodeRelation persists edge metadata columns', () => {
+  assert.match(RELATION_SCHEMA, /certaintyTier STRING/);
+  assert.match(RELATION_SCHEMA, /provenanceFamily STRING/);
+  assert.match(RELATION_SCHEMA, /absenceSemantics STRING/);
+  assert.match(RELATION_SCHEMA, /witnessPathIds STRING/);
+});
+
+test('Kuzu schema: includes DBTable/DBColumn contract nodes', () => {
+  assert.ok(NODE_TABLES.includes('DBTable'));
+  assert.ok(NODE_TABLES.includes('DBColumn'));
+});
+
+test('Kuzu schema: CodeRelation allows ContractField -> DBColumn -> DBTable links', () => {
+  assert.match(RELATION_SCHEMA, /FROM ContractField TO DBColumn/);
+  assert.match(RELATION_SCHEMA, /FROM DBColumn TO DBTable/);
+  assert.match(RELATION_SCHEMA, /FROM File TO DBTable/);
 });

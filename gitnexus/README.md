@@ -101,7 +101,10 @@ Your AI agent gets these tools automatically:
 |------|-------------|--------------|
 | `list_repos` | Discover all indexed repositories | — |
 | `query` | Process-grouped hybrid search (BM25 + semantic + RRF) | Optional |
+| `mode_router` | Auto-router: picks query/implement/review/debug planner mode | Optional |
+| `query_mode` | Query-head planner: slices/symbols + precedents + action hints | Optional |
 | `action_plan` | Decision-ready file list + verification checklist (includes deterministic end-to-end hops when available) | Optional |
+| `implement_mode` | Implementation planner: target slice + companion files + write order + review handoff | Optional |
 | `archetypes` | Derived flow signatures + exemplar processes (pattern heat map) | Optional |
 | `precedents` | Precedent/template finder — similar callsites to mirror | Optional |
 | `context` | 360-degree symbol view — categorized refs, process participation | Optional |
@@ -139,6 +142,7 @@ gitnexus setup                    # Configure MCP for your editors (one-time)
 gitnexus analyze [path]           # Index a repository (or update stale index)
 gitnexus analyze --force          # Force full re-index
 gitnexus analyze --skip-embeddings  # Skip embedding generation (faster)
+gitnexus analyze --incremental-derived fast  # Faster incremental refresh (skips expensive derived passes)
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start HTTP server for web UI
 gitnexus list                    # List all indexed repositories

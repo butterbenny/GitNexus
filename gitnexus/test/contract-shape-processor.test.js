@@ -11,6 +11,7 @@ test('Contract shapes: extracts request/resource fields and cache-key invalidati
   const queryKeyFile = 'apps/dashboard/src/query-keys.ts';
   const invalidateFile = 'apps/dashboard/src/pages/orders.tsx';
   const requestTestFile = 'tests/Feature/Http/Requests/UpdateOrderRequestTest.php';
+  const migrationFile = 'database/migrations/2026_01_01_000000_create_orders_table.php';
 
   graph.addNode({
     id: `File:${requestFile}`,
@@ -36,6 +37,11 @@ test('Contract shapes: extracts request/resource fields and cache-key invalidati
     id: `File:${requestTestFile}`,
     label: 'File',
     properties: { name: 'UpdateOrderRequestTest.php', filePath: requestTestFile },
+  });
+  graph.addNode({
+    id: `File:${migrationFile}`,
+    label: 'File',
+    properties: { name: '2026_01_01_000000_create_orders_table.php', filePath: migrationFile },
   });
 
   graph.addNode({
@@ -91,6 +97,19 @@ test('Contract shapes: extracts request/resource fields and cache-key invalidati
       `,
     },
     {
+      path: migrationFile,
+      content: `
+        <?php
+        Schema::create('orders', function (Blueprint $table) {
+          $table->id();
+          $table->string('email');
+          $table->string('name');
+          $table->string('status');
+          $table->timestamps();
+        });
+      `,
+    },
+    {
       path: requestTestFile,
       content: `
         <?php
@@ -111,10 +130,13 @@ test('Contract shapes: extracts request/resource fields and cache-key invalidati
   assert.ok(result.stats.shapeCount >= 2);
   assert.ok(result.stats.fieldCount >= 4);
   assert.ok(result.stats.cacheKeyCount >= 2);
+  assert.ok(result.stats.dbTableCount >= 1);
+  assert.ok(result.stats.dbColumnCount >= 4);
   assert.ok(result.stats.testCaseCount >= 1);
   assert.ok(result.stats.validatedFieldEdges >= 2);
   assert.ok(result.stats.serializedFieldEdges >= 2);
   assert.ok(result.stats.invalidationEdges >= 2);
+  assert.ok(result.stats.derivesFromColumnEdges >= 2);
   assert.ok(result.stats.testsShapeEdges >= 1);
 
   const requestShape = result.shapes.find(shape => shape.shapeType === 'form_request');
@@ -127,10 +149,13 @@ test('Contract shapes: extracts request/resource fields and cache-key invalidati
 
   assert.ok(result.cacheKeys.some(key => key.keyType === 'query_key_factory' && key.keyName === 'campaignQueryKeys.intents'));
   assert.ok(result.cacheKeys.some(key => key.keyType === 'literal' && key.keyName === 'supporters'));
+  assert.ok(result.dbTables.some(table => table.tableName === 'orders'));
+  assert.ok(result.dbColumns.some(column => column.columnName === 'email'));
   assert.ok(result.testCases.some(testCase => testCase.filePath === requestTestFile));
 
   assert.ok(result.edges.some(edge => edge.type === 'VALIDATES_FIELD'));
   assert.ok(result.edges.some(edge => edge.type === 'SERIALIZES_FIELD'));
   assert.ok(result.edges.some(edge => edge.type === 'INVALIDATES_KEY'));
+  assert.ok(result.edges.some(edge => edge.type === 'DERIVES_FROM_COLUMN'));
   assert.ok(result.edges.some(edge => edge.type === 'TESTS_SHAPE'));
 });

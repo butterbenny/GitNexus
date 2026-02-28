@@ -708,6 +708,36 @@ Checklist - steps/phases complete:
 - [x] Step 13 (`ValueGraph` literal-node generalization) — completed on 2026-02-28
 - [x] Step 14 (`EvidenceSpan` storage for line-level proof spans) — completed on 2026-02-28
 - [x] Step 15 (`provenance edges for generated/derived artifacts`) — completed on 2026-02-28
+- [x] Step 16 (`structured hierarchical summaries as overlays`) — completed on 2026-02-28
+- [x] Step 17 (`ClosureTemplate overlays per slice family`) — completed on 2026-02-28
+- [x] Step 18 (`edge provenance metadata upgrade`) — completed on 2026-02-28
+- [x] Step 19 (`DBTable/DBColumn shape-graph bridge nodes`) — completed on 2026-02-28
+- [x] Step 20 (`ValueGraph literal-family expansion`) — completed on 2026-02-28
+- [x] Step 21 (`ValueGraph deterministic family coverage + incremental parity`) — completed on 2026-02-28
+- [x] Step 22 (`review_mode proof-pack evidence spans`) — completed on 2026-02-28
+- [x] Step 23 (`query intent planner + slice cards + proof spans`) — completed on 2026-02-28
+- [x] Step 24 (`review_mode slice stencil + closure-template deltas`) — completed on 2026-02-28
+- [x] Step 25 (`action_plan implement kernel planner`) — completed on 2026-02-28
+- [x] Step 26 (`debug_mode broken-loop localization kernel`) — completed on 2026-02-28
+- [x] Step 27 (`query_mode exploration kernel wrapper`) — completed on 2026-02-28
+- [x] Step 28 (`implement_mode execution planner wrapper`) — completed on 2026-02-28
+- [x] Step 29 (`review_mode review-kernel synthesis`) — completed on 2026-02-28
+- [x] Step 30 (`mode_router unified kernel dispatcher`) — completed on 2026-02-28
+- [x] Step 31 (`mode_router unified handoff envelope`) — completed on 2026-02-28
+- [x] Step 32 (`mode_router decision trace + no-query fallback`) — completed on 2026-02-28
+- [x] Step 33 (`mode_router EpisodeGraph writeback hardening`) — completed on 2026-02-28
+- [x] Step 34 (`CLI kernel-head parity for mode_router/query/review/implement/debug`) — completed on 2026-02-28
+- [x] Step 35 (`eval-server kernel-head formatting + guidance parity`) — completed on 2026-02-28
+- [x] Step 36 (`HTTP API kernel-head parity via /api/tool`) — completed on 2026-02-28
+- [x] Step 37 (`HTTP API tool-dispatch extraction + kernel-head contract test`) — completed on 2026-02-28
+- [x] Step 38 (`HTTP API/MCP tool-registry single-source parity`) — completed on 2026-02-28
+- [x] Step 39 (`eval-server/MCP tool-registry single-source parity`) — completed on 2026-02-28
+- [x] Step 40 (`LocalBackend/MCP dispatch-coverage parity guard`) — completed on 2026-02-28
+- [x] Step 41 (`Codex skills scaffold for query/implement/review/debug`) — completed on 2026-02-28
+
+Milestone status:
+- Core architecture milestone: **completed at Step 33** on 2026-02-28 (`mode_router EpisodeGraph writeback hardening`).
+- Post-core hardening tranche: **Steps 34–40** on 2026-02-28 (CLI/eval-server/HTTP parity and registry/dispatch drift guards).
 
 Progress log:
 - 2026-02-28: Materialized `FeatureSlice` nodes from endpoint/permission/query-key anchors, attached `feature-slice:*` `MEMBER_OF` edges, and integrated into full + incremental analyze flows.
@@ -747,6 +777,57 @@ Progress log:
 - 2026-02-28: Exposed EvidenceSpan retrieval across MCP/API surfaces (`evidence_spans` tool, `gitnexus://repo/{name}/evidence` resource, `/api/evidence`) and updated context/schema docs to advertise line-level proof/witness anchors.
 - 2026-02-28: Materialized Step 15 provenance processing via `processProvenanceEdges`, emitting `DERIVES_FROM` ancestry edges with `provenance:*` reasons for route expansion (file/handler), enum-to-slug expansion, config-driven behavior, framework-derived middleware permission links, and compiled template/file artifacts.
 - 2026-02-28: Integrated provenance refresh into both full pipeline and incremental analyze flows (delete/rebuild `provenance:*` edges, reload, and summarize emitted edge families), and extended schema/docs/test coverage for `DERIVES_FROM` including `CodeElement -> File` allowances.
+- 2026-02-28: Materialized Step 16 structured-summary overlay generation via `processStructuredSummaryOverlay` to emit deterministic, non-prose summaries for symbol/file/slice/community/process/archetype levels with responsibilities, inbound/downstream contracts, auth/cache/shape signals, companions, and sibling precedent hints.
+- 2026-02-28: Added summary overlay sidecar lifecycle at `.gitnexus/summary-overlays.json`, integrated refresh into both full and incremental `analyze` flows, and exposed read surfaces via MCP (`summary_overlay` tool, `gitnexus://repo/{name}/summaries` resource) and HTTP (`/api/summaries`).
+- 2026-02-28: Materialized Step 17 closure-template overlays via `processClosureTemplates` to derive per-slice-family closure expectations (required/optional slots, role coverage, exemplar slices, average closure score) from `FeatureSlice` + `feature-slice:*` membership signals.
+- 2026-02-28: Added closure-template sidecar lifecycle at `.gitnexus/closure-templates.json`, integrated refresh into both full and incremental `analyze` flows, and exposed read surfaces via MCP (`closure_templates` tool, `gitnexus://repo/{name}/closure-templates` resource) and HTTP (`/api/closure-templates`).
+- 2026-02-28: Materialized Step 18 edge metadata normalization via `enrichRelationshipMetadata` so every relation carries `certaintyTier`, `provenanceFamily`, `absenceSemantics`, and stable `witnessPathIds` defaults in the in-memory graph and CSV export path.
+- 2026-02-28: Extended CodeRelation storage/query surfaces for edge metadata (schema version `9`, relation CSV/COPY + fallback insert fields, HTTP graph export fields, MCP schema/tool docs, and AI context schema notes).
+- 2026-02-28: Materialized Step 19 `ShapeGraph` DB bridge nodes by extending `processContractShapes` with migration extraction for `DBTable`/`DBColumn`, `File -> DBTable` + `DBColumn -> DBTable` contract edges, and `ContractField -> DBColumn` `DERIVES_FROM_COLUMN` links using field/table hint arbitration.
+- 2026-02-28: Extended schema/storage/query surfaces for DB contract nodes (schema version `10`, `DBTable`/`DBColumn` node tables + CSV/COPY wiring, ContractField/DB relation allowances, incremental shape refresh deletion/reinsert lifecycle, and API/MCP/AI context label docs).
+- 2026-02-28: Materialized Step 20 ValueGraph literal-family expansion by deriving additional `ValueNode` types (`role_slug`, `query_key_family`, `route_segment`, `table_name`, `table_column`) from deterministic role/codeelement signals, cache key families, route-name edges, and `DBTable`/`DBColumn` bridge nodes.
+- 2026-02-28: Extended incremental/full `analyze` value-graph summaries with family-level counters (role/query-family/route-segment/table/table-column) to expose expanded literal coverage directly in run reports.
+- 2026-02-28: Materialized Step 21 ValueGraph deterministic-family coverage by deriving additional `ValueNode` types for `feature_flag`, `config_key`, `env_var`, `queue_name`, `broadcast_channel`, `event_name`, `command_name`, and `i18n_key` from deterministic `CodeElement` prefix signals plus class/file-path conventions (`Events`, `Console/Commands`, `Jobs`, `Broadcasting`).
+- 2026-02-28: Added incremental/full parity for DB-backed value extraction by loading `DBTable`/`DBColumn` nodes (including `tableName`/`columnName` properties) into incremental ValueGraph recomputation, and extended run summaries with the new family counters.
+- 2026-02-28: Materialized Step 22 review proof-pack support by extending `review_mode` with an EvidenceSpan-backed `proof_pack` payload (changed-symbol spans + sampled semantic-edge witness/proof spans + witness path IDs) and summary counters for proof-symbol/proof-edge coverage.
+- 2026-02-28: Extended `review_mode` tool schema with `include_evidence_spans` and `limit_evidence` knobs, and propagated settings through `_review_mode.knobs` for deterministic replay of review payload shape.
+- 2026-02-28: Materialized Step 23 query planner upgrades by adding intent classification + exact entity lookup before hybrid retrieval, then returning `query_plan` diagnostics to expose intent and retrieval mode decisions.
+- 2026-02-28: Extended query output/tool schema with slice-first `slice_cards` (closure/gap signals + matched members) and optional EvidenceSpan-backed slice proof spans via `include_slice_cards` / `limit_slices` / `include_evidence_spans` / `limit_evidence`.
+- 2026-02-28: Materialized Step 24 review stencil matching by mapping changed symbols to `FeatureSlice` capsules, attaching closure-template expectations, and returning per-slice missing required slots/roles plus closure-score deltas.
+- 2026-02-28: Extended `review_mode` output/tool schema with `slice_stencil` payloads (changed slices, sibling precedents, gap-signal rollups) and replay knobs `include_slice_stencil` / `limit_slice_stencil`.
+- 2026-02-28: Materialized Step 25 implement-kernel planning in `action_plan`: target intent/archetype + target slice selection, precedent retrieval, companion-file synthesis from slice membership + cochange + shape edges, and ordered write anchors.
+- 2026-02-28: Added `implement_plan.post_edit_review` contract so implement flows hand off directly to `review_mode` with slice-stencil/evidence enabled after edits.
+- 2026-02-28: Materialized Step 26 `debug_mode` planner with symptom classification (`auth/cache/shape/routing/event`), anchored loop candidates (HTTP chain/cache coverage/slice gaps), and ranked findings by symptom fit + confidence.
+- 2026-02-28: Added sibling precedent diff + actionable debug handoff (`context`/`impact`/`review_mode`) and integrated episode memory capture for `debug_mode` anchors/hypotheses.
+- 2026-02-28: Materialized Step 27 `query_mode` exploration wrapper that packages `query` intent diagnostics, top slice cards, process/symbol anchors, sibling precedents, and compact action hints in one response.
+- 2026-02-28: Integrated `query_mode` into MCP dispatch/tool schemas/context resources and added episode memory capture + targeted contract test coverage.
+- 2026-02-28: Materialized Step 28 `implement_mode` wrapper that consolidates implement target anatomy, closure template signals, ranked companion files, ordered write anchors, and post-edit review contract into a single response.
+- 2026-02-28: Integrated `implement_mode` into MCP dispatch/tool schemas/context resources and added episode memory capture + targeted contract test coverage.
+- 2026-02-28: Materialized Step 29 review-kernel synthesis in `review_mode` with deterministic risk scoring, top findings, hypothesis generation, and action sequencing over semantic gap + slice stencil signals.
+- 2026-02-28: Extended `review_mode` outputs/docs/tests to include `review_kernel` guidance payloads for fast triage after diff analysis.
+- 2026-02-28: Materialized Step 30 `mode_router` dispatcher to auto-route requests into `query_mode` / `implement_mode` / `review_mode` / `debug_mode` using explicit mode or intent signals.
+- 2026-02-28: Integrated `mode_router` into MCP dispatch/tool schemas/context resources and added targeted contract test coverage for auto + explicit routing.
+- 2026-02-28: Materialized Step 31 `mode_router` unified handoff envelope with normalized primary symbols/files, findings, hypotheses, next actions, risk summary, and recommended follow-up tool handoff.
+- 2026-02-28: Extended `mode_router` docs/tests to assert unified envelope stability across auto and explicit routing paths.
+- 2026-02-28: Materialized Step 32 `mode_router` decision trace with scored mode candidates/reasons and deterministic fallback metadata for route selection replay.
+- 2026-02-28: Hardened `mode_router` auto behavior to route no-query/no-symptom requests to `review_mode` (instead of query error) and extended tests for fallback + trace assertions.
+- 2026-02-28: Materialized Step 33 `mode_router` EpisodeGraph writeback hardening so route-candidate reasoning, handoff intent, unified hypotheses, failing tests, and error strings are auto-recorded into episode working memory.
+- 2026-02-28: Materialized Step 34 direct CLI kernel-head parity by adding `query-mode`, `implement-mode`, `review-mode`, `debug-mode`, and `mode-router` commands that map 1:1 to MCP kernel tool params (including path-prefix/failing-test/error-string controls).
+- 2026-02-28: Added CLI integration coverage for `mode-router` command output envelope + routing behavior (`status`, selected mode, unified envelope, route trace).
+- 2026-02-28: Materialized Step 35 eval-server kernel parity by adding compact formatters and next-step hints for `query_mode`, `implement_mode`, `review_mode`, `debug_mode`, and `mode_router`, plus startup endpoint visibility for these heads.
+- 2026-02-28: Added eval-server formatter tests to lock readable kernel summaries and actionable hint coverage for router + head outputs.
+- 2026-02-28: Materialized Step 36 HTTP API kernel parity with `GET /api/tools` + `POST /api/tool/:name`, default repo fallback, and LocalBackend-backed dispatch for `query_mode` / `implement_mode` / `review_mode` / `debug_mode` / `mode_router` (plus existing tools).
+- 2026-02-28: Added HTTP API integration coverage proving tool discovery, `mode_router` JSON envelope retrieval, and unknown-tool rejection semantics.
+- 2026-02-28: Materialized Step 37 HTTP API tool-dispatch extraction via `HTTP_API_TOOL_NAMES` + `callHttpApiTool(...)` in `api.ts`, so `/api/tools` and `/api/tool/:name` share one deterministic validation/default-repo dispatch contract.
+- 2026-02-28: Added no-socket HTTP API dispatch contract coverage in `test/http-api-tool-dispatch.test.js` for kernel-head availability, `mode_router` envelope retrieval, and unknown-tool rejection semantics.
+- 2026-02-28: Materialized Step 38 HTTP API/MCP registry parity by deriving `HTTP_API_TOOL_NAMES` directly from `GITNEXUS_TOOLS` and enforcing lookup via a shared name-set, eliminating duplicate tool-name lists across surfaces.
+- 2026-02-28: Extended `test/http-api-tool-dispatch.test.js` to assert HTTP `/api/tools` exposure stays in exact parity with MCP tool definitions.
+- 2026-02-28: Materialized Step 39 eval-server/MCP registry parity by deriving `EVAL_SERVER_TOOL_NAMES` directly from `GITNEXUS_TOOLS`, adding centralized eval tool-name validation (`resolveEvalToolName`), and exposing `GET /tools` for deterministic tool discovery.
+- 2026-02-28: Extended eval-server coverage to assert tool-registry parity and unknown-tool/missing-tool rejection semantics via exported resolver helpers.
+- 2026-02-28: Materialized Step 40 LocalBackend dispatch guard by checking MCP-declared tool names in `callTool` default handling and surfacing explicit `Tool handler not implemented` errors for registry/dispatcher drift instead of generic unknown-tool failures.
+- 2026-02-28: Added `test/local-backend-tool-dispatch-parity.test.js` to probe every MCP tool through LocalBackend and assert dispatch-path recognition (no unknown/not-implemented rejections) against a real indexed temp repo.
+- 2026-02-28: Materialized Step 41 codex skill scaffolds for kernel-native workflows by adding `.claude/skills/gitnexus/query|implement|review|debug/SKILL.md` with startup preflight and stale-index refresh guidance.
+- 2026-02-28: Updated `AGENTS.md` skill-routing table so future agents map directly to kernel heads (`query_mode`, `implement_mode`, `review_mode`, `debug_mode`) before legacy exploratory/refactor workflows.
 - 2026-02-28: Validation passed via `npm run build` and targeted tests:
   - `npm run build`
   - `node --test test/git-history-cochange-processor.test.js`
@@ -765,3 +846,19 @@ Progress log:
   - `node --test test/blade-route-name-incremental.test.js`
   - `node --test test/evidence-span-processor.test.js`
   - `node --test test/provenance-processor.test.js test/kuzu-schema.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/summary-overlay-processor.test.js test/provenance-processor.test.js test/kuzu-schema.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/review-mode.test.js test/precedents.test.js`
+  - `node --test test/closure-template-processor.test.js test/feature-slice-processor.test.js test/gap-processor.test.js test/summary-overlay-processor.test.js test/provenance-processor.test.js test/kuzu-schema.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/edge-metadata.test.js test/kuzu-schema.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/contract-shape-processor.test.js test/kuzu-schema.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/value-graph-processor.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/value-graph-processor.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/review-mode.test.js test/value-graph-processor.test.js test/incremental-indexing.test.js test/blade-route-name-incremental.test.js`
+  - `node --test test/query-codeelement.test.js test/path-prefixes.test.js`
+  - `node --test test/review-mode.test.js`
+  - `node --test test/action-plan-hops.test.js`
+  - `node --test test/debug-mode.test.js`
+  - `node --test test/query-mode.test.js`
+  - `node --test test/implement-mode.test.js`
+  - `node --test test/review-mode.test.js`
+  - `node --test test/mode-router.test.js`

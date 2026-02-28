@@ -38,6 +38,8 @@ export type NodeLabel =
   | 'ContractShape'
   | 'ContractField'
   | 'CacheKey'
+  | 'DBTable'
+  | 'DBColumn'
   | 'ValueNode'
   | 'TestCase';
 
@@ -86,6 +88,10 @@ export type NodeProperties = {
   // CacheKey-specific properties
   keyName?: string,
   keyType?: string,
+  // DBTable/DBColumn-specific properties
+  tableName?: string,
+  columnName?: string,
+  tableId?: string,
   // ValueNode-specific properties
   valueType?: string,
   valueKey?: string,
@@ -118,6 +124,18 @@ export type RelationshipType =
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
 
+export type RelationshipCertaintyTier =
+  | 'deterministic'
+  | 'typed'
+  | 'historical'
+  | 'semantic'
+  | 'heuristic';
+
+export type RelationshipAbsenceSemantics =
+  | 'closed_world'
+  | 'open_world'
+  | 'not_applicable';
+
 export interface GraphNode {
   id:  string,
   label: NodeLabel,
@@ -135,6 +153,14 @@ export interface GraphRelationship {
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
+  /** Certainty tier for relation ranking/guardrails */
+  certaintyTier?: RelationshipCertaintyTier,
+  /** Provenance family inferred from relation reason/type */
+  provenanceFamily?: string,
+  /** Whether absence of this relation family should be treated as meaningful */
+  absenceSemantics?: RelationshipAbsenceSemantics,
+  /** Stable witness path identifiers for proof-pack linking */
+  witnessPathIds?: string[],
 }
 
 export interface KnowledgeGraph {

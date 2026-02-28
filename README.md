@@ -120,13 +120,16 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 
 ### What Your AI Agent Gets
 
-**12 tools** exposed via MCP:
+**15 tools** exposed via MCP:
 
 | Tool               | What It Does                                                      | `repo` Param |
 | ------------------ | ----------------------------------------------------------------- | -------------- |
 | `list_repos`     | Discover all indexed repositories                                 | —             |
 | `query`          | Process-grouped hybrid search (BM25 + semantic + RRF); supports `path_prefixes` scoping | Optional       |
+| `mode_router`    | Auto-router: picks query/implement/review/debug planner mode      | Optional       |
+| `query_mode`     | Query-head planner: slices/symbols + precedents + action hints    | Optional       |
 | `action_plan`    | Decision-ready file list + verification checklist (confidence-first); supports `path_prefixes` | Optional       |
+| `implement_mode` | Implementation planner: target slice + companion files + write order + review handoff | Optional       |
 | `context`        | 360-degree symbol view — categorized refs, process participation | Optional       |
 | `impact`         | Blast radius analysis with depth grouping and confidence          | Optional       |
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes       | Optional       |

@@ -1,0 +1,286 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { test } from 'node:test';
+
+const runGit = (repoPath, args) => {
+  execFileSync('git', args, { cwd: repoPath, stdio: 'ignore' });
+};
+
+const runAnalyze = (repoPath, env) => {
+  try {
+    return execFileSync(
+      'node',
+      [path.resolve('dist/cli/index.js'), 'analyze', repoPath, '--skip-embeddings'],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, ...env },
+        encoding: 'utf-8',
+      }
+    );
+  } catch (e) {
+    const err = e;
+    const stdout = (err?.stdout || '').toString();
+    const stderr = (err?.stderr || '').toString();
+    const status = err?.status ?? err?.code ?? 'unknown';
+    throw new Error(
+      [
+        `analyze failed (status: ${status})`,
+        stdout && `STDOUT:\n${stdout}`,
+        stderr && `STDERR:\n${stderr}`,
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+    );
+  }
+};
+
+const runTool = (method, params, env) => {
+  const script = [
+    "import { LocalBackend } from './dist/mcp/local/local-backend.js';",
+    'const backend = new LocalBackend();',
+    'await backend.init();',
+    `const result = await backend.callTool(${JSON.stringify(method)}, ${JSON.stringify(params)});`,
+    'process.stdout.write(JSON.stringify(result));',
+  ].join('\n');
+
+  const raw = execFileSync('node', ['--input-type=module', '-e', script], {
+    cwd: process.cwd(),
+    env: { ...process.env, ...env },
+    encoding: 'utf-8',
+  });
+  return JSON.parse(raw);
+};
+
+test('MCP mode_router: auto-routes and explicit-routes to kernel modes', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-mode-router-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+
+  await fs.mkdir(path.join(repoPath, 'apps/dashboard/src/api'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'apps/dashboard/src/customHooks'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'apps/backend/routes'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'apps/backend/app/Providers'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'app/Domains/AccessControl/Permissions'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'config'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/dashboard/src/customHooks/useConfigureHttpClient.ts'),
+    [
+      "import Axios from 'axios';",
+      '',
+      'export const useConfigureHttpClient = () => {',
+      "  const apiUrl = 'https://example.com';",
+      '  Axios.defaults.baseURL = `${apiUrl}/api`;',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/dashboard/src/api/notifications.ts'),
+    [
+      "import Axios from 'axios';",
+      '',
+      'export const fetchAccountNotifications = (accountId: number) => {',
+      '  return Axios.get(`/accounts/${accountId}/notifications`);',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/backend/app/Providers/RouteServiceProvider.php'),
+    [
+      '<?php',
+      '',
+      'namespace App\\Providers;',
+      '',
+      'use Illuminate\\Foundation\\Support\\Providers\\RouteServiceProvider as ServiceProvider;',
+      'use Illuminate\\Support\\Facades\\Route;',
+      '',
+      'class RouteServiceProvider extends ServiceProvider',
+      '{',
+      "    protected $namespace = 'App\\\\Http\\\\Controllers';",
+      '',
+      '    public function map(): void',
+      '    {',
+      '        $this->mapDashboardRoutes();',
+      '    }',
+      '',
+      '    protected function mapDashboardRoutes(): void',
+      '    {',
+      "        Route::prefix('api')",
+      "            ->middleware('api')",
+      "            ->namespace($this->namespace . '\\\\Dashboard')",
+      "            ->group(base_path('routes/dashboard.php'));",
+      '    }',
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/backend/routes/dashboard.php'),
+    [
+      '<?php',
+      '',
+      'use Illuminate\\Support\\Facades\\Route;',
+      '',
+      "Route::apiResource('accounts.notifications', 'API\\\\Notifications\\\\NotificationController');",
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications/NotificationController.php'),
+    [
+      '<?php',
+      '',
+      'namespace App\\Http\\Controllers\\Dashboard\\API\\Notifications;',
+      '',
+      'use App\\Domains\\AccessControl\\Permissions\\AccountPermission;',
+      '',
+      'class NotificationController',
+      '{',
+      '    public function index(): array',
+      '    {',
+      '        $this->authorize(AccountPermission::VIEW);',
+      '        return [];',
+      '    }',
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'app/Domains/AccessControl/Permissions/AccountPermission.php'),
+    [
+      '<?php',
+      '',
+      'namespace App\\Domains\\AccessControl\\Permissions;',
+      '',
+      'enum AccountPermission: string',
+      '{',
+      "    case VIEW = 'account.view';",
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'config/permissions.php'),
+    [
+      '<?php',
+      '',
+      'return [',
+      "    'roles' => [",
+      "      'admin' => [",
+      "        'permissions' => [",
+      "          'account.view',",
+      '        ],',
+      '      ],',
+      '    ],',
+      '];',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output = runAnalyze(repoPath, env);
+  assert.match(output, /Repository indexed successfully/i);
+
+  const autoDebug = runTool('mode_router', {
+    query: 'fetchAccountNotifications',
+    symptom: '403 forbidden on notifications page',
+    failing_tests: ['NotificationControllerTest::test_forbidden'],
+    error_strings: ['ForbiddenException: account.view'],
+  }, env);
+  assert.equal(autoDebug.status, 'ok');
+  assert.equal(autoDebug.mode_router?.selected_mode, 'debug');
+  assert.equal(autoDebug.mode_router?.result?.debug?.classification?.family, 'auth');
+  assert.ok(autoDebug.mode_router?.unified, 'expected unified router envelope');
+  assert.ok(autoDebug.mode_router?.route_trace, 'expected route_trace payload');
+  assert.ok(Array.isArray(autoDebug.mode_router.unified?.top_findings), 'expected unified top_findings');
+  assert.ok(autoDebug.mode_router.unified?.risk, 'expected unified risk payload');
+  assert.ok(Array.isArray(autoDebug.mode_router.route_trace?.candidates), 'expected route_trace candidates');
+  assert.equal(autoDebug.mode_router.route_trace?.selected_mode, 'debug');
+
+  const episodeAfterAutoDebug = runTool('episode_state', { limit: 25 }, env);
+  assert.equal(episodeAfterAutoDebug.status, 'ok');
+  assert.ok(Array.isArray(episodeAfterAutoDebug.episode?.hypotheses), 'expected episode hypotheses');
+  assert.ok(
+    episodeAfterAutoDebug.episode.hypotheses.some(item => item?.status === 'candidate'),
+    'expected candidate hypothesis from mode_router writeback',
+  );
+  assert.ok(
+    episodeAfterAutoDebug.episode.witness_paths.some(item => String(item || '').startsWith('route-candidate:')),
+    'expected route candidate witness path',
+  );
+  assert.ok(
+    episodeAfterAutoDebug.episode.witness_paths.some(item => String(item || '').startsWith('handoff:')),
+    'expected handoff witness path',
+  );
+  assert.ok(
+    episodeAfterAutoDebug.episode.failing_tests.some(item => String(item || '').includes('NotificationControllerTest')),
+    'expected failing tests to be written into episode memory',
+  );
+  assert.ok(
+    episodeAfterAutoDebug.episode.errors.some(item => String(item || '').includes('ForbiddenException')),
+    'expected error strings to be written into episode memory',
+  );
+
+  const autoQuery = runTool('mode_router', {
+    query: 'fetchAccountNotifications',
+  }, env);
+  assert.equal(autoQuery.status, 'ok');
+  assert.equal(autoQuery.mode_router?.selected_mode, 'query');
+  assert.ok(Array.isArray(autoQuery.mode_router?.result?.query_mode?.symbols));
+  assert.ok(Array.isArray(autoQuery.mode_router?.unified?.primary_symbols), 'expected unified primary_symbols');
+  assert.ok(autoQuery.mode_router.unified.primary_symbols.length > 0);
+  assert.equal(autoQuery.mode_router?.unified?.recommended_handoff?.tool, 'implement_mode');
+
+  const autoNoQuery = runTool('mode_router', {}, env);
+  assert.equal(autoNoQuery.status, 'ok');
+  assert.equal(autoNoQuery.mode_router?.selected_mode, 'review');
+  assert.equal(autoNoQuery.mode_router?.route_trace?.requested_mode, 'auto');
+  assert.equal(autoNoQuery.mode_router?.route_trace?.fallback_applied, true);
+  assert.ok(Array.isArray(autoNoQuery.mode_router?.route_trace?.candidates), 'expected no-query route candidates');
+  assert.ok(autoNoQuery.mode_router?.result?.review_kernel, 'expected no-query auto route to run review_mode');
+
+  const explicitImplement = runTool('mode_router', {
+    mode: 'implement',
+    query: 'fetchAccountNotifications',
+  }, env);
+  assert.equal(explicitImplement.status, 'ok');
+  assert.equal(explicitImplement.mode_router?.selected_mode, 'implement');
+  assert.ok(Array.isArray(explicitImplement.mode_router?.result?.implement_mode?.write_plan));
+  assert.ok(Array.isArray(explicitImplement.mode_router?.result?.implement_mode?.companion_files));
+  assert.equal(explicitImplement.mode_router?.unified?.recommended_handoff?.tool, 'review_mode');
+
+  const explicitReview = runTool('mode_router', {
+    mode: 'review',
+    scope: 'unstaged',
+  }, env);
+  assert.equal(explicitReview.status, 'ok');
+  assert.equal(explicitReview.mode_router?.selected_mode, 'review');
+  assert.ok(explicitReview.mode_router?.result?.review_kernel);
+  assert.ok(Array.isArray(explicitReview.mode_router?.unified?.next_actions));
+  assert.ok(Array.isArray(explicitReview.mode_router?.unified?.top_findings));
+  assert.equal(explicitReview._mode_router?.knobs?.requested_mode, 'review');
+});

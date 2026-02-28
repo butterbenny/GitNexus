@@ -31,6 +31,24 @@ export interface CacheKeyNode {
   sourceNodeId: string;
 }
 
+export interface DBTableNode {
+  id: string;
+  label: string;
+  heuristicLabel: string;
+  tableName: string;
+  sourceFilePath: string;
+}
+
+export interface DBColumnNode {
+  id: string;
+  label: string;
+  heuristicLabel: string;
+  columnName: string;
+  tableId: string;
+  tableName: string;
+  sourceFilePath: string;
+}
+
 export interface TestCaseNode {
   id: string;
   name: string;
@@ -41,7 +59,14 @@ export interface TestCaseNode {
 
 export interface ShapeEdge {
   id: string;
-  type: 'DEFINES' | 'MEMBER_OF' | 'VALIDATES_FIELD' | 'SERIALIZES_FIELD' | 'INVALIDATES_KEY' | 'TESTS_SHAPE';
+  type:
+    | 'DEFINES'
+    | 'MEMBER_OF'
+    | 'VALIDATES_FIELD'
+    | 'SERIALIZES_FIELD'
+    | 'INVALIDATES_KEY'
+    | 'TESTS_SHAPE'
+    | 'DERIVES_FROM_COLUMN';
   sourceId: string;
   targetId: string;
   confidence: number;
@@ -52,17 +77,22 @@ export interface ContractShapeResult {
   shapes: ContractShapeNode[];
   fields: ContractFieldNode[];
   cacheKeys: CacheKeyNode[];
+  dbTables: DBTableNode[];
+  dbColumns: DBColumnNode[];
   testCases: TestCaseNode[];
   edges: ShapeEdge[];
   stats: {
     shapeCount: number;
     fieldCount: number;
     cacheKeyCount: number;
+    dbTableCount: number;
+    dbColumnCount: number;
     testCaseCount: number;
     edgeCount: number;
     validatedFieldEdges: number;
     serializedFieldEdges: number;
     invalidationEdges: number;
+    derivesFromColumnEdges: number;
     testsShapeEdges: number;
   };
 }
@@ -339,6 +369,183 @@ const extractLiteralKey = (expression: string): string | null => {
   return String(match[1]).trim();
 };
 
+interface MigrationTableBlock {
+  tableName: string;
+  body: string;
+  sourceFilePath: string;
+}
+
+const MIGRATION_FILE_RE = /(^|\/)database\/migrations\/.+\.php$/i;
+
+const normalizeDbName = (value: string): string => {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+};
+
+const toSnakeCase = (value: string): string => {
+  return String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1_$2')
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toLowerCase();
+};
+
+const pluralizeSimple = (value: string): string => {
+  const token = normalizeDbName(value);
+  if (!token) return '';
+  if (/(s|x|z|ch|sh)$/i.test(token)) return `${token}es`;
+  if (/[^aeiou]y$/i.test(token)) return `${token.slice(0, -1)}ies`;
+  return `${token}s`;
+};
+
+const extractQuotedArgs = (argsText: string): string[] => {
+  const matches = argsText.matchAll(/['"]([A-Za-z0-9_]+)['"]/g);
+  return Array.from(matches).map(match => String(match[1] || '').trim()).filter(Boolean);
+};
+
+const extractMigrationTableBlocks = (filePath: string, content: string): MigrationTableBlock[] => {
+  const blocks: MigrationTableBlock[] = [];
+  const schemaCallRe = /Schema::(?:create|table)\s*\(\s*(['"])([A-Za-z0-9_]+)\1\s*,\s*function\s*\([^)]*\)\s*\{/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = schemaCallRe.exec(content)) !== null) {
+    const tableName = normalizeDbName(String(match[2] || ''));
+    if (!tableName) continue;
+
+    const openBraceIndex = (match.index + match[0].length) - 1;
+    const closeBraceIndex = findBalancedEnd(content, openBraceIndex, '{', '}');
+    if (closeBraceIndex <= openBraceIndex) continue;
+
+    blocks.push({
+      tableName,
+      body: content.slice(openBraceIndex + 1, closeBraceIndex),
+      sourceFilePath: normalizePath(filePath),
+    });
+  }
+
+  return blocks;
+};
+
+const DEFAULT_MIGRATION_COLUMN_BY_METHOD = new Map<string, string>([
+  ['id', 'id'],
+  ['bigIncrements', 'id'],
+  ['increments', 'id'],
+  ['rememberToken', 'remember_token'],
+  ['softDeletes', 'deleted_at'],
+  ['softDeletesTz', 'deleted_at'],
+]);
+
+const NO_COLUMN_METHODS = new Set([
+  'drop',
+  'dropColumn',
+  'dropIfExists',
+  'renameColumn',
+  'dropTimestamps',
+  'dropSoftDeletes',
+  'dropRememberToken',
+  'dropMorphs',
+  'dropConstrainedForeignId',
+  'dropForeign',
+  'dropIndex',
+  'dropUnique',
+  'dropPrimary',
+  'primary',
+  'unique',
+  'index',
+  'comment',
+  'nullable',
+  'default',
+  'unsigned',
+]);
+
+const extractMigrationColumnNames = (body: string): string[] => {
+  const names = new Set<string>();
+  const callRe = /\$table->([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*?)\)\s*(?:->[A-Za-z_][A-Za-z0-9_]*\([^)]*\)\s*)*;/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = callRe.exec(body)) !== null) {
+    const method = String(match[1] || '').trim();
+    const argsText = String(match[2] || '');
+    if (!method || NO_COLUMN_METHODS.has(method)) continue;
+
+    if (method === 'timestamps' || method === 'timestampsTz') {
+      names.add('created_at');
+      names.add('updated_at');
+      continue;
+    }
+
+    if (method === 'morphs' || method === 'nullableMorphs' || method === 'uuidMorphs') {
+      const arg = extractQuotedArgs(argsText)[0];
+      const stem = normalizeDbName(arg);
+      if (!stem) continue;
+      names.add(`${stem}_type`);
+      names.add(`${stem}_id`);
+      continue;
+    }
+
+    const args = extractQuotedArgs(argsText);
+    let columnName = '';
+    if (args.length > 0) columnName = normalizeDbName(args[0]);
+    if (!columnName && method === 'foreignIdFor' && args.length > 1) {
+      columnName = normalizeDbName(args[1]);
+    }
+    if (!columnName) {
+      columnName = normalizeDbName(DEFAULT_MIGRATION_COLUMN_BY_METHOD.get(method) || '');
+    }
+    if (!columnName) continue;
+    names.add(columnName);
+  }
+
+  return Array.from(names);
+};
+
+const normalizeFieldKeyForColumn = (fieldName: string): string => {
+  const normalized = String(fieldName || '').trim();
+  if (!normalized) return '';
+
+  const dotExpanded = normalized
+    .replace(/\[/g, '.')
+    .replace(/\]/g, '.')
+    .replace(/\.+/g, '.')
+    .replace(/^\.|\.$/g, '');
+
+  const segments = dotExpanded
+    .split('.')
+    .map(segment => segment.trim())
+    .filter(segment => Boolean(segment) && segment !== '*' && !/^\d+$/.test(segment));
+
+  if (segments.length === 0) return normalizeDbName(normalized);
+  return normalizeDbName(segments[segments.length - 1]);
+};
+
+const extractShapeTableHints = (className: string, sourceFilePath: string): string[] => {
+  const candidates = new Set<string>();
+  const normalizedClass = String(className || '').trim();
+  const classCore = normalizedClass.replace(/(Request|Resource|Controller|Model|Policy)$/i, '').trim();
+  const classSnake = normalizeDbName(toSnakeCase(classCore));
+  if (classSnake) {
+    candidates.add(classSnake);
+    candidates.add(pluralizeSimple(classSnake));
+  }
+
+  const fileBase = normalizePath(sourceFilePath)
+    .split('/')
+    .pop()
+    ?.replace(/\.[^.]+$/, '')
+    ?.replace(/(_request|_resource|request|resource)$/i, '') || '';
+  const fileSnake = normalizeDbName(toSnakeCase(fileBase));
+  if (fileSnake) {
+    candidates.add(fileSnake);
+    candidates.add(pluralizeSimple(fileSnake));
+  }
+
+  return Array.from(candidates).filter(Boolean);
+};
+
 const resolveFunctionByName = (
   functionByName: Map<string, GraphNode[]>,
   functionName: string,
@@ -530,6 +737,10 @@ export const processContractShapes = async (
   const shapeNodeMap = new Map<string, ContractShapeNode>();
   const fieldNodeMap = new Map<string, ContractFieldNode>();
   const cacheKeyNodeMap = new Map<string, CacheKeyNode>();
+  const dbTableNodeMap = new Map<string, DBTableNode>();
+  const dbColumnNodeMap = new Map<string, DBColumnNode>();
+  const dbColumnsByName = new Map<string, DBColumnNode[]>();
+  const dbColumnsByTableAndName = new Map<string, DBColumnNode>();
   const testCaseNodeMap = new Map<string, TestCaseNode>();
   const edgeMap = new Map<string, ShapeEdge>();
   const cacheKeyIdBySourceNodeId = new Map<string, string>();
@@ -630,6 +841,99 @@ export const processContractShapes = async (
     return node;
   };
 
+  const ensureDBTable = (
+    tableNameRaw: string,
+    sourceFilePath: string,
+  ): DBTableNode | null => {
+    const tableName = normalizeDbName(tableNameRaw);
+    if (!tableName) return null;
+
+    const id = generateId('DBTable', tableName);
+    const existing = dbTableNodeMap.get(id);
+    if (existing) return existing;
+
+    const label = buildLabel('DB Table', tableName);
+    const node: DBTableNode = {
+      id,
+      label,
+      heuristicLabel: label,
+      tableName,
+      sourceFilePath: normalizePath(sourceFilePath),
+    };
+    dbTableNodeMap.set(id, node);
+    return node;
+  };
+
+  const ensureDBColumn = (
+    table: DBTableNode,
+    columnNameRaw: string,
+    sourceFilePath: string,
+  ): DBColumnNode | null => {
+    const columnName = normalizeDbName(columnNameRaw);
+    if (!columnName) return null;
+
+    const id = generateId('DBColumn', `${table.tableName}.${columnName}`);
+    const existing = dbColumnNodeMap.get(id);
+    if (existing) return existing;
+
+    const label = buildLabel('DB Column', `${table.tableName}.${columnName}`);
+    const node: DBColumnNode = {
+      id,
+      label,
+      heuristicLabel: label,
+      columnName,
+      tableId: table.id,
+      tableName: table.tableName,
+      sourceFilePath: normalizePath(sourceFilePath),
+    };
+    dbColumnNodeMap.set(id, node);
+    dbColumnsByTableAndName.set(`${table.tableName}|${columnName}`, node);
+
+    const byName = dbColumnsByName.get(columnName) || [];
+    byName.push(node);
+    dbColumnsByName.set(columnName, byName);
+
+    addEdge({
+      id: generateId('MEMBER_OF', `${id}->${table.id}`),
+      type: 'MEMBER_OF',
+      sourceId: id,
+      targetId: table.id,
+      confidence: 1.0,
+      reason: 'db-schema:column',
+    });
+
+    return node;
+  };
+
+  onProgress?.('Extracting migration table/column contracts...', 15);
+
+  const migrationCandidates = files.filter(file => MIGRATION_FILE_RE.test(normalizePath(file.path)));
+  for (const file of migrationCandidates) {
+    const normalizedPath = normalizePath(file.path);
+    const fileNodeId = generateId('File', normalizedPath);
+    const tableBlocks = extractMigrationTableBlocks(normalizedPath, file.content);
+    if (tableBlocks.length === 0) continue;
+
+    for (const block of tableBlocks) {
+      const dbTable = ensureDBTable(block.tableName, block.sourceFilePath);
+      if (!dbTable) continue;
+
+      addEdge({
+        id: generateId('DEFINES', `${fileNodeId}->${dbTable.id}`),
+        type: 'DEFINES',
+        sourceId: fileNodeId,
+        targetId: dbTable.id,
+        confidence: 0.95,
+        reason: 'db-schema:migration-table',
+      });
+
+      const columns = extractMigrationColumnNames(block.body);
+      for (const columnName of columns) {
+        ensureDBColumn(dbTable, columnName, block.sourceFilePath);
+      }
+    }
+  }
+
   const requestCandidates = files.filter(file => {
     const filePath = normalizePath(file.path);
     return filePath.includes('/Http/Requests/') && /\bfunction\s+rules\s*\(/.test(file.content);
@@ -689,6 +993,49 @@ export const processContractShapes = async (
         reason: 'laravel-resource:to-array',
       });
       serializedFieldEdges++;
+    }
+  }
+
+  let derivesFromColumnEdges = 0;
+  if (dbColumnNodeMap.size > 0 && fieldNodeMap.size > 0) {
+    for (const field of fieldNodeMap.values()) {
+      const columnKey = normalizeFieldKeyForColumn(field.fieldName);
+      if (!columnKey) continue;
+
+      const candidates = dbColumnsByName.get(columnKey) || [];
+      if (candidates.length === 0) continue;
+
+      let selected: DBColumnNode | null = null;
+      let reason = 'db-schema:field-name-exact';
+      let confidence = 0.86;
+
+      if (candidates.length === 1) {
+        selected = candidates[0];
+      } else {
+        const shape = shapeNodeMap.get(field.shapeId);
+        const sourceClass = shape ? classById.get(shape.sourceNodeId) : null;
+        const tableHints = extractShapeTableHints(
+          String(sourceClass?.properties?.name || ''),
+          String(shape?.sourceFilePath || ''),
+        );
+        const narrowed = candidates.filter(candidate => tableHints.includes(candidate.tableName));
+        if (narrowed.length === 1) {
+          selected = narrowed[0];
+          reason = 'db-schema:field-name-shape-table';
+          confidence = 0.82;
+        }
+      }
+
+      if (!selected) continue;
+      addEdge({
+        id: generateId('DERIVES_FROM_COLUMN', `${field.id}->${selected.id}`),
+        type: 'DERIVES_FROM_COLUMN',
+        sourceId: field.id,
+        targetId: selected.id,
+        confidence,
+        reason,
+      });
+      derivesFromColumnEdges++;
     }
   }
 
@@ -832,17 +1179,22 @@ export const processContractShapes = async (
     shapes: Array.from(shapeNodeMap.values()),
     fields: Array.from(fieldNodeMap.values()),
     cacheKeys: Array.from(cacheKeyNodeMap.values()),
+    dbTables: Array.from(dbTableNodeMap.values()),
+    dbColumns: Array.from(dbColumnNodeMap.values()),
     testCases: Array.from(testCaseNodeMap.values()),
     edges: Array.from(edgeMap.values()),
     stats: {
       shapeCount: shapeNodeMap.size,
       fieldCount: fieldNodeMap.size,
       cacheKeyCount: cacheKeyNodeMap.size,
+      dbTableCount: dbTableNodeMap.size,
+      dbColumnCount: dbColumnNodeMap.size,
       testCaseCount: testCaseNodeMap.size,
       edgeCount: edgeMap.size,
       validatedFieldEdges,
       serializedFieldEdges,
       invalidationEdges,
+      derivesFromColumnEdges,
       testsShapeEdges,
     },
   };

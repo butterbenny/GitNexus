@@ -282,20 +282,33 @@ const fallbackRelationshipInserts = async (
   for (let i = 1; i < validRelLines.length; i++) {
     const line = validRelLines[i];
     try {
-      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
+      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+),"([^"]*)","([^"]*)","([^"]*)","([^"]*)"/);
       if (!match) continue;
-      const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
+      const [, fromId, toId, relType, confidenceStr, reason, stepStr, certaintyTierRaw, provenanceFamilyRaw, absenceSemanticsRaw, witnessPathIdsRaw] = match;
       const fromLabel = getNodeLabel(fromId);
       const toLabel = getNodeLabel(toId);
       if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
 
       const confidence = parseFloat(confidenceStr) || 1.0;
       const step = parseInt(stepStr) || 0;
+      const certaintyTier = String(certaintyTierRaw || '').replace(/'/g, "''");
+      const provenanceFamily = String(provenanceFamilyRaw || '').replace(/'/g, "''");
+      const absenceSemantics = String(absenceSemanticsRaw || '').replace(/'/g, "''");
+      const witnessPathIds = String(witnessPathIdsRaw || '').replace(/'/g, "''");
 
       const queryResult = await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${fromId.replace(/'/g, "''")}' }),
               (b:${escapeLabel(toLabel)} {id: '${toId.replace(/'/g, "''")}' })
-        CREATE (a)-[:${REL_TABLE_NAME} {type: '${relType}', confidence: ${confidence}, reason: '${reason.replace(/'/g, "''")}', step: ${step}}]->(b)
+        CREATE (a)-[:${REL_TABLE_NAME} {
+          type: '${relType}',
+          confidence: ${confidence},
+          reason: '${reason.replace(/'/g, "''")}',
+          step: ${step},
+          certaintyTier: '${certaintyTier}',
+          provenanceFamily: '${provenanceFamily}',
+          absenceSemantics: '${absenceSemantics}',
+          witnessPathIds: '${witnessPathIds}'
+        }]->(b)
       `);
       await closeQueryResults(queryResult);
     } catch {
@@ -332,6 +345,12 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   }
   if (table === 'CacheKey') {
     return `COPY ${t}(id, label, heuristicLabel, keyName, keyType, sourceNodeId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'DBTable') {
+    return `COPY ${t}(id, label, heuristicLabel, tableName, sourceFilePath) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'DBColumn') {
+    return `COPY ${t}(id, label, heuristicLabel, columnName, tableId, tableName, sourceFilePath) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'ValueNode') {
     return `COPY ${t}(id, label, heuristicLabel, valueType, valueKey, valueRaw) FROM "${filePath}" ${COPY_CSV_OPTS}`;
@@ -615,7 +634,7 @@ export const deleteNodesForFile = async (
     // DETACH DELETE removes the node and all its relationships
     for (const tableName of NODE_TABLES) {
       // Skip tables that don't have filePath
-      if (tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'ValueNode') continue;
+      if (tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'DBTable' || tableName === 'DBColumn' || tableName === 'ValueNode') continue;
       if (!includeFileNode && tableName === 'File') continue;
       
       try {
@@ -736,7 +755,7 @@ export const loadSymbolDefinitionsFromKuzu = async (): Promise<Array<{ filePath:
   const defs: Array<{ filePath: string; name: string; nodeId: string; type: string }> = [];
 
   for (const tableName of NODE_TABLES) {
-    if (tableName === 'File' || tableName === 'Folder' || tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'ValueNode') continue;
+    if (tableName === 'File' || tableName === 'Folder' || tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'DBTable' || tableName === 'DBColumn' || tableName === 'ValueNode') continue;
 
     try {
       const t = escapeTableName(tableName);

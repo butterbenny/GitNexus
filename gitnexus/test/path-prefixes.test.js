@@ -106,12 +106,22 @@ test('MCP query/action_plan: supports path_prefixes scoping', async () => {
   assert.ok(unscopedSymbols.some(s => s?.filePath === 'apps/dashboard/src/users.ts'), 'expected unscoped query to include dashboard symbol');
 
   const scoped = runTool('query', { query: 'fetchUsers', path_prefixes: ['apps/backend/'] }, env);
+  assert.equal(scoped?.query_plan?.retrieval?.path_scoped, true);
+  assert.ok(Array.isArray(scoped?.slice_cards), 'expected query to return slice_cards array');
   const scopedSymbols = collectSymbols(scoped);
   assert.ok(scopedSymbols.length > 0, 'expected scoped query to return at least one symbol');
   assert.ok(
     scopedSymbols.every(s => typeof s?.filePath === 'string' && s.filePath.startsWith('apps/backend/')),
     'expected all scoped symbols to be under apps/backend/'
   );
+
+  const scopedNoSlices = runTool(
+    'query',
+    { query: 'fetchUsers', path_prefixes: ['apps/backend/'], include_slice_cards: false },
+    env
+  );
+  assert.ok(Array.isArray(scopedNoSlices?.slice_cards), 'expected query to return slice_cards array when disabled');
+  assert.equal(scopedNoSlices.slice_cards.length, 0, 'expected no slice cards when include_slice_cards=false');
 
   const scopedAbs = runTool(
     'query',
@@ -137,4 +147,3 @@ test('MCP query/action_plan: supports path_prefixes scoping', async () => {
     'expected all action_plan files to be under apps/backend/'
   );
 });
-

@@ -317,6 +317,36 @@ export const runPipelineFromRepo = async (
       });
     });
 
+    shapeResult.dbTables.forEach(dbTable => {
+      graph.addNode({
+        id: dbTable.id,
+        label: 'DBTable',
+        properties: {
+          name: dbTable.label,
+          filePath: dbTable.sourceFilePath,
+          heuristicLabel: dbTable.heuristicLabel,
+          tableName: dbTable.tableName,
+          sourceFilePath: dbTable.sourceFilePath,
+        },
+      });
+    });
+
+    shapeResult.dbColumns.forEach(dbColumn => {
+      graph.addNode({
+        id: dbColumn.id,
+        label: 'DBColumn',
+        properties: {
+          name: dbColumn.label,
+          filePath: dbColumn.sourceFilePath,
+          heuristicLabel: dbColumn.heuristicLabel,
+          columnName: dbColumn.columnName,
+          tableId: dbColumn.tableId,
+          tableName: dbColumn.tableName,
+          sourceFilePath: dbColumn.sourceFilePath,
+        },
+      });
+    });
+
     shapeResult.testCases.forEach(testCase => {
       graph.addNode({
         id: testCase.id,

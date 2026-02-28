@@ -11,6 +11,7 @@
  */
 
 import { KnowledgeGraph, GraphNode } from '../graph/types.js';
+import { enrichRelationshipMetadata, serializeWitnessPathIds } from '../graph/edge-metadata.js';
 import { NODE_TABLES, NodeTableName } from './schema.js';
 
 // ============================================================================
@@ -136,7 +137,7 @@ const extractContent = (
 
 export interface CSVData {
   nodes: Map<NodeTableName, string>;
-  relCSV: string;  // Single relation CSV with from,to,type,confidence,reason columns
+  relCSV: string;  // Single relation CSV with relation metadata columns
 }
 
 // ============================================================================
@@ -459,6 +460,54 @@ const generateCacheKeyCSV = (nodes: GraphNode[]): string => {
 };
 
 /**
+ * Generate CSV for DBTable nodes
+ * Headers: id,label,heuristicLabel,tableName,sourceFilePath
+ */
+const generateDBTableCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'tableName', 'sourceFilePath'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'DBTable') continue;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).tableName || ''),
+      escapeCSVField((node.properties as any).sourceFilePath || ''),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
+ * Generate CSV for DBColumn nodes
+ * Headers: id,label,heuristicLabel,columnName,tableId,tableName,sourceFilePath
+ */
+const generateDBColumnCSV = (nodes: GraphNode[]): string => {
+  const headers = ['id', 'label', 'heuristicLabel', 'columnName', 'tableId', 'tableName', 'sourceFilePath'];
+  const rows: string[] = [headers.join(',')];
+
+  for (const node of nodes) {
+    if (node.label !== 'DBColumn') continue;
+
+    rows.push([
+      escapeCSVField(node.id),
+      escapeCSVField(node.properties.name || ''),
+      escapeCSVField((node.properties as any).heuristicLabel || ''),
+      escapeCSVField((node.properties as any).columnName || ''),
+      escapeCSVField((node.properties as any).tableId || ''),
+      escapeCSVField((node.properties as any).tableName || ''),
+      escapeCSVField((node.properties as any).sourceFilePath || ''),
+    ].join(','));
+  }
+
+  return rows.join('\n');
+};
+
+/**
  * Generate CSV for ValueNode nodes
  * Headers: id,label,heuristicLabel,valueType,valueKey,valueRaw
  */
@@ -484,23 +533,39 @@ const generateValueNodeCSV = (nodes: GraphNode[]): string => {
 
 /**
  * Generate CSV for the single CodeRelation table
- * Headers: from,to,type,confidence,reason
+ * Headers: from,to,type,confidence,reason,step,certaintyTier,provenanceFamily,absenceSemantics,witnessPathIds
  * 
  * confidence: 0-1 score for CALLS edges (how sure are we about the target?)
  * reason: 'import-resolved' | 'same-file' | 'fuzzy-global' (or empty for non-CALLS)
  */
 const generateRelationCSV = (graph: KnowledgeGraph): string => {
-  const headers = ['from', 'to', 'type', 'confidence', 'reason', 'step'];
+  const headers = [
+    'from',
+    'to',
+    'type',
+    'confidence',
+    'reason',
+    'step',
+    'certaintyTier',
+    'provenanceFamily',
+    'absenceSemantics',
+    'witnessPathIds',
+  ];
   const rows: string[] = [headers.join(',')];
   
   for (const rel of graph.relationships) {
+    const metadata = enrichRelationshipMetadata(rel);
     rows.push([
-      escapeCSVField(rel.sourceId),
-      escapeCSVField(rel.targetId),
-      escapeCSVField(rel.type),
-      escapeCSVNumber(rel.confidence, 1.0),
-      escapeCSVField(rel.reason),
-      escapeCSVNumber((rel as any).step, 0),
+      escapeCSVField(metadata.sourceId),
+      escapeCSVField(metadata.targetId),
+      escapeCSVField(metadata.type),
+      escapeCSVNumber(metadata.confidence, 1.0),
+      escapeCSVField(metadata.reason),
+      escapeCSVNumber(metadata.step, 0),
+      escapeCSVField(metadata.certaintyTier || ''),
+      escapeCSVField(metadata.provenanceFamily || ''),
+      escapeCSVField(metadata.absenceSemantics || ''),
+      escapeCSVField(serializeWitnessPathIds(metadata.witnessPathIds)),
     ].join(','));
   }
   
@@ -559,6 +624,14 @@ export const generateAllCSVs = (
     }
     if (tableName === 'CacheKey') {
       nodeCSVs.set(tableName, generateCacheKeyCSV(nodes));
+      continue;
+    }
+    if (tableName === 'DBTable') {
+      nodeCSVs.set(tableName, generateDBTableCSV(nodes));
+      continue;
+    }
+    if (tableName === 'DBColumn') {
+      nodeCSVs.set(tableName, generateDBColumnCSV(nodes));
       continue;
     }
     if (tableName === 'ValueNode') {

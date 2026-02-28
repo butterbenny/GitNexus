@@ -105,6 +105,8 @@ test('Query: surfaces CodeElement roles + permission slugs', async () => {
   assert.match(analyzeOutput, /Repository indexed successfully/i);
 
   const financeResult = parseJson(runGitNexus(['query', 'finance'], env));
+  assert.equal(financeResult?.query_plan?.intent, 'entity');
+  assert.ok(Array.isArray(financeResult?.slice_cards), 'expected query to return slice_cards array');
   const financeSymbols = collectSymbols(financeResult);
   assert.ok(
     financeSymbols.some(s => s?.type === 'CodeElement' && s?.name === 'role:finance'),
@@ -112,6 +114,8 @@ test('Query: surfaces CodeElement roles + permission slugs', async () => {
   );
 
   const permResult = parseJson(runGitNexus(['query', 'ticket.view'], env));
+  assert.equal(permResult?.query_plan?.intent, 'contract');
+  assert.ok((permResult?.query_plan?.exact_lookup?.hits || 0) >= 1, 'expected exact lookup hits for ticket.view');
   const permSymbols = collectSymbols(permResult);
   assert.ok(
     permSymbols.some(s => s?.type === 'CodeElement' && s?.name === 'ticket.view'),

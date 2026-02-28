@@ -20,6 +20,19 @@ export interface ValueGraphResult {
     endpointValues: number;
     routeNameValues: number;
     cacheKeyValues: number;
+    roleValues: number;
+    featureFlagValues: number;
+    configKeyValues: number;
+    envVarValues: number;
+    queueNameValues: number;
+    broadcastChannelValues: number;
+    eventNameValues: number;
+    commandNameValues: number;
+    i18nKeyValues: number;
+    queryKeyFamilyValues: number;
+    routeSegmentValues: number;
+    tableNameValues: number;
+    tableColumnValues: number;
     skippedDuplicates: number;
     skippedMalformed: number;
   };
@@ -72,6 +85,82 @@ const parseRouteNameFromReason = (reason: string): string | null => {
   return normalizeValue(match[1] || '') || null;
 };
 
+const parseRoleSlug = (node: GraphNode): string | null => {
+  const name = String(node.properties?.name || '').trim();
+  if (name.startsWith('role:')) {
+    return normalizeValue(name.slice('role:'.length)) || null;
+  }
+
+  const id = String(node.id || '');
+  const marker = ':role:';
+  const markerIndex = id.lastIndexOf(marker);
+  if (markerIndex >= 0) {
+    return normalizeValue(id.slice(markerIndex + marker.length)) || null;
+  }
+
+  return null;
+};
+
+const parsePrefixedName = (node: GraphNode, prefixes: string[]): string | null => {
+  const name = String(node.properties?.name || '').trim();
+  if (!name) return null;
+  const lowered = name.toLowerCase();
+
+  for (const prefix of prefixes) {
+    const token = `${prefix.toLowerCase()}:`;
+    if (!lowered.startsWith(token)) continue;
+    const value = normalizeValue(name.slice(token.length));
+    if (value) return value;
+  }
+
+  return null;
+};
+
+const parseClassNameByPath = (node: GraphNode, pathRe: RegExp): string | null => {
+  if (node.label !== 'Class') return null;
+  const filePath = String(node.properties?.filePath || '').trim();
+  if (!pathRe.test(filePath)) return null;
+  return normalizeValue(String(node.properties?.name || '')) || null;
+};
+
+const parseQueryKeyFamily = (cacheKey: string): string | null => {
+  const normalized = normalizeValue(cacheKey);
+  if (!normalized) return null;
+
+  const bracketArrayMatch = /^\[\s*['"]([^'"]+)['"]/.exec(normalized);
+  if (bracketArrayMatch?.[1]) {
+    return normalizeValue(bracketArrayMatch[1]) || null;
+  }
+
+  const firstToken = normalized.split(/[.\[/:(\s]+/).find(Boolean) || '';
+  return normalizeValue(firstToken) || null;
+};
+
+const parseRouteSegment = (routeName: string): string | null => {
+  const normalized = normalizeValue(routeName);
+  if (!normalized) return null;
+  const firstSegment = normalized.split(/[./:\s]+/).find(Boolean) || '';
+  return normalizeValue(firstSegment) || null;
+};
+
+const parseTableName = (node: GraphNode): string | null => {
+  const fromProps = normalizeValue(String((node.properties as any)?.tableName || ''));
+  if (fromProps) return fromProps;
+
+  const name = String(node.properties?.name || '').trim();
+  const match = /^DB Table:\s*(.+)$/i.exec(name);
+  if (!match?.[1]) return null;
+  return normalizeValue(match[1]) || null;
+};
+
+const parseTableColumn = (node: GraphNode): string | null => {
+  const tableName = normalizeValue(String((node.properties as any)?.tableName || ''));
+  const columnName = normalizeValue(String((node.properties as any)?.columnName || ''));
+  if (!columnName) return null;
+  if (!tableName) return columnName;
+  return `${tableName}.${columnName}`;
+};
+
 const addUnique = <T>(map: Map<string, T>, key: string, value: T): T => {
   const existing = map.get(key);
   if (existing) return existing;
@@ -102,6 +191,19 @@ export const processValueGraph = async (
   let endpointValues = 0;
   let routeNameValues = 0;
   let cacheKeyValues = 0;
+  let roleValues = 0;
+  let featureFlagValues = 0;
+  let configKeyValues = 0;
+  let envVarValues = 0;
+  let queueNameValues = 0;
+  let broadcastChannelValues = 0;
+  let eventNameValues = 0;
+  let commandNameValues = 0;
+  let i18nKeyValues = 0;
+  let queryKeyFamilyValues = 0;
+  let routeSegmentValues = 0;
+  let tableNameValues = 0;
+  let tableColumnValues = 0;
 
   const addValueNode = (valueType: string, rawValue: string): ValueGraphNode | null => {
     const valueRaw = normalizeValue(rawValue);
@@ -171,6 +273,112 @@ export const processValueGraph = async (
           addEdge(node.id, valueNode, 0.98, 'value-graph:endpoint_signature');
         }
       }
+
+      const roleSlug = parseRoleSlug(node);
+      if (roleSlug) {
+        const valueNode = addValueNode('role_slug', roleSlug);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.98, 'value-graph:role_slug');
+        }
+      }
+
+      const featureFlag = parsePrefixedName(node, ['feature', 'flag']);
+      if (featureFlag) {
+        const valueNode = addValueNode('feature_flag', featureFlag);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:feature_flag');
+        }
+      }
+
+      const configKey = parsePrefixedName(node, ['config']);
+      if (configKey) {
+        const valueNode = addValueNode('config_key', configKey);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:config_key');
+        }
+      }
+
+      const envVar = parsePrefixedName(node, ['env']);
+      if (envVar) {
+        const valueNode = addValueNode('env_var', envVar);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:env_var');
+        }
+      }
+
+      const queueName = parsePrefixedName(node, ['queue']);
+      if (queueName) {
+        const valueNode = addValueNode('queue_name', queueName);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:queue_name');
+        }
+      }
+
+      const broadcastChannel = parsePrefixedName(node, ['broadcast', 'channel']);
+      if (broadcastChannel) {
+        const valueNode = addValueNode('broadcast_channel', broadcastChannel);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:broadcast_channel');
+        }
+      }
+
+      const eventName = parsePrefixedName(node, ['event']);
+      if (eventName) {
+        const valueNode = addValueNode('event_name', eventName);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:event_name');
+        }
+      }
+
+      const commandName = parsePrefixedName(node, ['command']);
+      if (commandName) {
+        const valueNode = addValueNode('command_name', commandName);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:command_name');
+        }
+      }
+
+      const i18nKey = parsePrefixedName(node, ['i18n', 'trans', 'lang']);
+      if (i18nKey) {
+        const valueNode = addValueNode('i18n_key', i18nKey);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.95, 'value-graph:i18n_key');
+        }
+      }
+    }
+
+    if (node.label === 'Class') {
+      const eventName = parseClassNameByPath(node, /(^|\/)events\//i);
+      if (eventName) {
+        const valueNode = addValueNode('event_name', eventName);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.93, 'value-graph:event_name');
+        }
+      }
+
+      const commandName = parseClassNameByPath(node, /(^|\/)console\/commands\//i);
+      if (commandName) {
+        const valueNode = addValueNode('command_name', commandName);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.93, 'value-graph:command_name');
+        }
+      }
+
+      const queueName = parseClassNameByPath(node, /(^|\/)jobs\//i);
+      if (queueName) {
+        const valueNode = addValueNode('queue_name', queueName);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.92, 'value-graph:queue_name');
+        }
+      }
+
+      const broadcastChannel = parseClassNameByPath(node, /(^|\/)broadcast(?:ing)?\//i);
+      if (broadcastChannel) {
+        const valueNode = addValueNode('broadcast_channel', broadcastChannel);
+        if (valueNode) {
+          addEdge(node.id, valueNode, 0.92, 'value-graph:broadcast_channel');
+        }
+      }
     }
 
     if (node.label === 'CacheKey') {
@@ -179,10 +387,32 @@ export const processValueGraph = async (
       const valueNode = addValueNode('cache_key', keyName);
       if (!valueNode) continue;
       addEdge(node.id, valueNode, 0.99, 'value-graph:cache_key');
+
+      const family = parseQueryKeyFamily(keyName);
+      if (!family) continue;
+      const familyNode = addValueNode('query_key_family', family);
+      if (!familyNode) continue;
+      addEdge(node.id, familyNode, 0.97, 'value-graph:query_key_family');
+    }
+
+    if (node.label === 'DBTable') {
+      const tableName = parseTableName(node);
+      if (!tableName) continue;
+      const valueNode = addValueNode('table_name', tableName);
+      if (!valueNode) continue;
+      addEdge(node.id, valueNode, 0.99, 'value-graph:table_name');
+    }
+
+    if (node.label === 'DBColumn') {
+      const tableColumn = parseTableColumn(node);
+      if (!tableColumn) continue;
+      const valueNode = addValueNode('table_column', tableColumn);
+      if (!valueNode) continue;
+      addEdge(node.id, valueNode, 0.99, 'value-graph:table_column');
     }
   }
 
-  onProgress?.('Extracting route-name literal graph...', 55);
+  onProgress?.('Extracting route-name and segment literal graph...', 55);
 
   for (const rel of knowledgeGraph.relationships) {
     if (rel.type !== 'CALLS') continue;
@@ -192,6 +422,12 @@ export const processValueGraph = async (
     const valueNode = addValueNode('route_name', routeName);
     if (!valueNode) continue;
     addEdge(rel.sourceId, valueNode, rel.confidence || 0.9, 'value-graph:route_name');
+
+    const routeSegment = parseRouteSegment(routeName);
+    if (!routeSegment) continue;
+    const segmentNode = addValueNode('route_segment', routeSegment);
+    if (!segmentNode) continue;
+    addEdge(rel.sourceId, segmentNode, rel.confidence || 0.9, 'value-graph:route_segment');
   }
 
   const values = Array.from(valuesByComposite.values());
@@ -200,6 +436,19 @@ export const processValueGraph = async (
     if (valueNode.valueType === 'endpoint_signature') endpointValues++;
     if (valueNode.valueType === 'route_name') routeNameValues++;
     if (valueNode.valueType === 'cache_key') cacheKeyValues++;
+    if (valueNode.valueType === 'role_slug') roleValues++;
+    if (valueNode.valueType === 'feature_flag') featureFlagValues++;
+    if (valueNode.valueType === 'config_key') configKeyValues++;
+    if (valueNode.valueType === 'env_var') envVarValues++;
+    if (valueNode.valueType === 'queue_name') queueNameValues++;
+    if (valueNode.valueType === 'broadcast_channel') broadcastChannelValues++;
+    if (valueNode.valueType === 'event_name') eventNameValues++;
+    if (valueNode.valueType === 'command_name') commandNameValues++;
+    if (valueNode.valueType === 'i18n_key') i18nKeyValues++;
+    if (valueNode.valueType === 'query_key_family') queryKeyFamilyValues++;
+    if (valueNode.valueType === 'route_segment') routeSegmentValues++;
+    if (valueNode.valueType === 'table_name') tableNameValues++;
+    if (valueNode.valueType === 'table_column') tableColumnValues++;
   }
 
   onProgress?.('ValueGraph materialization complete.', 100);
@@ -214,6 +463,19 @@ export const processValueGraph = async (
       endpointValues,
       routeNameValues,
       cacheKeyValues,
+      roleValues,
+      featureFlagValues,
+      configKeyValues,
+      envVarValues,
+      queueNameValues,
+      broadcastChannelValues,
+      eventNameValues,
+      commandNameValues,
+      i18nKeyValues,
+      queryKeyFamilyValues,
+      routeSegmentValues,
+      tableNameValues,
+      tableColumnValues,
       skippedDuplicates: skipped.duplicates,
       skippedMalformed: skipped.malformed,
     },

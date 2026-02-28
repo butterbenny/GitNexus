@@ -68,6 +68,9 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | Tool | What it gives you |
 |------|-------------------|
 | \`query\` | Process-grouped code intelligence — execution flows related to a concept |
+| \`mode_router\` | Auto-router — dispatches to query/implement/review/debug kernel modes |
+| \`query_mode\` | Query-head planner — top slices/symbols + precedents + action hints |
+| \`implement_mode\` | Implementation planner — target slice, companion files, write order, review handoff |
 | \`context\` | 360-degree symbol view — categorized refs, processes it participates in |
 | \`impact\` | Symbol blast radius — what breaks at depth 1/2/3 with confidence |
 | \`detect_changes\` | Git-diff impact — what do your current changes affect |
@@ -75,6 +78,8 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | \`episode_state\` | Read EpisodeGraph sidecar working memory state |
 | \`episode_update\` | Update EpisodeGraph sidecar with hypotheses/tests/errors |
 | \`evidence_spans\` | Read EvidenceSpan sidecar line-level proof/witness ranges |
+| \`summary_overlay\` | Read structured hierarchical summary overlays |
+| \`closure_templates\` | Read closure-template overlays for slice families |
 | \`cypher\` | Raw graph queries (read \`gitnexus://repo/{name}/schema\` first) |
 | \`list_repos\` | Discover indexed repos |
 
@@ -91,13 +96,16 @@ Lightweight reads (~100-500 tokens) for navigation:
 | \`gitnexus://repo/{name}/process/{processName}\` | Step-by-step trace |
 | \`gitnexus://repo/{name}/episode\` | EpisodeGraph sidecar state |
 | \`gitnexus://repo/{name}/evidence\` | EvidenceSpan sidecar summary |
+| \`gitnexus://repo/{name}/summaries\` | Structured summary overlay |
+| \`gitnexus://repo/{name}/closure-templates\` | Closure-template overlays |
 | \`gitnexus://repo/{name}/schema\` | Graph schema for Cypher |
 
 ## Graph Schema
 
-**Nodes:** File, Function, Class, Interface, Method, Community, Process, FeatureSlice, Gap, ContractShape, ContractField, CacheKey, ValueNode, TestCase
+**Nodes:** File, Function, Class, Interface, Method, Community, Process, FeatureSlice, Gap, ContractShape, ContractField, CacheKey, DBTable, DBColumn, ValueNode, TestCase
 **Edges (via CodeRelation.type):** CALLS, CO_CHANGES_WITH, IMPORTS, EXTENDS, IMPLEMENTS, DEFINES, MEMBER_OF, STEP_IN_PROCESS, VALIDATES_FIELD, SERIALIZES_FIELD, READS_FIELD, WRITES_FIELD, DERIVES_FROM, DERIVES_FROM_COLUMN, INVALIDATES_KEY, TESTS_SHAPE
 **Reason provenance:** precision overlay edges use \`reason\` prefix \`precision-overlay:*\`; ValueGraph literal edges use \`value-graph:*\`; generated/derived artifact provenance uses \`provenance:*\`.
+**Edge metadata:** \`certaintyTier\` and \`provenanceFamily\` are persisted on all CodeRelation edges, with \`absenceSemantics\` and \`witnessPathIds\` for closure/proof-aware workflows.
 
 \`\`\`cypher
 MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: "myFunc"})

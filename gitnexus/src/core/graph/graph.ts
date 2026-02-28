@@ -1,4 +1,5 @@
 import { GraphNode, GraphRelationship, KnowledgeGraph } from './types.js'
+import { enrichRelationshipMetadata } from './edge-metadata.js';
 
 export const createKnowledgeGraph = (): KnowledgeGraph => {
   const nodeMap = new Map<string, GraphNode>();
@@ -11,8 +12,9 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
   };
 
   const addRelationship = (relationship: GraphRelationship) => {
-    if (!relationshipMap.has(relationship.id)) {
-      relationshipMap.set(relationship.id, relationship);
+    const enriched = enrichRelationshipMetadata(relationship);
+    if (!relationshipMap.has(enriched.id)) {
+      relationshipMap.set(enriched.id, enriched);
     }
   };
 

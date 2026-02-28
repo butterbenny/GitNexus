@@ -198,6 +198,35 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(Array.isArray(result.semantic_diffs.gap_signals.gaps), 'expected semantic_diffs gap_signals.gaps list');
   assert.equal(result.summary.semantic_families, result.semantic_diffs.summary.family_count);
   assert.equal(result.summary.semantic_gap_signals, result.semantic_diffs.summary.gap_signals);
+  assert.ok(result.proof_pack, 'expected proof_pack payload');
+  assert.ok(result.proof_pack.summary, 'expected proof_pack summary');
+  assert.ok(Array.isArray(result.proof_pack.symbols), 'expected proof_pack symbols list');
+  assert.ok(Array.isArray(result.proof_pack.edges), 'expected proof_pack edges list');
+  assert.ok(
+    result.proof_pack.symbols.some(item => item?.symbol?.filePath === 'src/doThing.ts'),
+    'expected proof_pack symbols to include src/doThing.ts'
+  );
+  assert.equal(result.summary.proof_symbols, result.proof_pack.summary.symbol_spans);
+  assert.equal(result.summary.proof_edges, result.proof_pack.summary.edge_spans);
+  assert.ok(result.slice_stencil, 'expected slice_stencil payload');
+  assert.ok(result.slice_stencil.summary, 'expected slice_stencil summary');
+  assert.ok(Array.isArray(result.slice_stencil.slices), 'expected slice_stencil slices list');
+  assert.equal(result.summary.stencil_slices, result.slice_stencil.summary.changed_slices);
+  assert.equal(result.summary.stencil_templates, result.slice_stencil.summary.with_templates);
+  assert.ok(result.review_kernel, 'expected review_kernel payload');
+  assert.ok(result.review_kernel.risk, 'expected review_kernel risk section');
+  assert.ok(Array.isArray(result.review_kernel.top_findings), 'expected review_kernel top_findings list');
+  assert.ok(Array.isArray(result.review_kernel.hypotheses), 'expected review_kernel hypotheses list');
+  assert.ok(Array.isArray(result.review_kernel.next_actions), 'expected review_kernel next_actions list');
+  assert.ok(result.review_kernel.next_actions.some(step => String(step).includes('impact()')));
+  assert.equal(result._review_mode?.knobs?.include_evidence_spans, true);
+  assert.equal(result._review_mode?.knobs?.include_slice_stencil, true);
+
+  const noStencil = runTool('review_mode', { repo: repoPath, scope: 'unstaged', include_slice_stencil: false }, env);
+  assert.equal(noStencil.status, 'ok');
+  assert.ok(Array.isArray(noStencil.slice_stencil?.slices), 'expected disabled review_mode to keep slice_stencil shape');
+  assert.equal(noStencil.slice_stencil.slices.length, 0);
+  assert.equal(noStencil.summary.stencil_slices, 0);
 
   // Scoped mode should drop FooPage.tsx
   const scoped = runTool('review_mode', { repo: repoPath, scope: 'unstaged', path_prefixes: ['src/'] }, env);
@@ -205,4 +234,135 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(scoped.changed_files.every(f => String(f.filePath || '').startsWith('src/')));
   assert.ok(!scoped.changed_files.some(f => f.filePath === 'apps/dashboard/src/pages/FooPage.tsx'));
   assert.ok(scoped.semantic_diffs, 'expected scoped semantic_diffs payload');
+});
+
+test('MCP review_mode: falls back when direct test callers are missing', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-review-mode-fallback-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'tests'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'src/config.ts'),
+    [
+      'export class AppConfig {',
+      "  static version = 'v1';",
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'tests/config.test.ts'),
+    [
+      "import { AppConfig } from '../src/config';",
+      '',
+      'void AppConfig;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output1 = runAnalyze(repoPath, env);
+  assert.match(output1, /Repository (indexed successfully|updated incrementally)/i);
+
+  await fs.writeFile(
+    path.join(repoPath, 'src/config.ts'),
+    [
+      'export class AppConfig {',
+      "  static version = 'v2';",
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  const output2 = runAnalyze(repoPath, env);
+  assert.match(output2, /Repository (indexed successfully|updated incrementally)/i);
+
+  const result = runTool('review_mode', { repo: repoPath, scope: 'unstaged', min_confidence: 0.95, limit_tests: 25 }, env);
+  assert.equal(result.status, 'ok');
+  assert.ok(Array.isArray(result.changed_files) && result.changed_files.some(f => f.filePath === 'src/config.ts'));
+  assert.ok(Number(result.summary?.changed_symbols || 0) >= 1, 'expected changed symbols for src/config.ts');
+  assert.ok(
+    (result.symbols || []).every(card => Array.isArray(card?.test_callers) && card.test_callers.length === 0),
+    'expected no direct high-confidence test callers'
+  );
+  assert.ok(
+    Array.isArray(result.suggested_tests) && result.suggested_tests.some(t => t.filePath === 'tests/config.test.ts'),
+    'expected fallback suggested_tests to include tests/config.test.ts'
+  );
+  assert.ok(
+    result.suggested_tests
+      .flatMap(t => Array.isArray(t?.reasons) ? t.reasons : [])
+      .some(reason => String(reason).includes('low-confidence caller') || String(reason).includes('imports changed file')),
+    'expected fallback reason metadata to be populated'
+  );
+});
+
+test('MCP review_mode: compare scope falls back to all when compare is empty', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-review-mode-compare-fallback-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'tests'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'src/toggle.ts'),
+    [
+      'export const getToggle = (): boolean => true;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'tests/toggle.test.ts'),
+    [
+      "import { getToggle } from '../src/toggle';",
+      '',
+      'void getToggle;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output1 = runAnalyze(repoPath, env);
+  assert.match(output1, /Repository (indexed successfully|updated incrementally)/i);
+
+  await fs.writeFile(
+    path.join(repoPath, 'src/toggle.ts'),
+    [
+      'export const getToggle = (): boolean => false;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  const output2 = runAnalyze(repoPath, env);
+  assert.match(output2, /Repository (indexed successfully|updated incrementally)/i);
+
+  const result = runTool('review_mode', { repo: repoPath, scope: 'compare', base_ref: 'HEAD', limit_tests: 25 }, env);
+  assert.equal(result.status, 'ok');
+  assert.ok(Array.isArray(result.changed_files) && result.changed_files.some(f => f.filePath === 'src/toggle.ts'));
+  assert.equal(result._review_mode?.diff?.requested_scope, 'compare');
+  assert.equal(result._review_mode?.diff?.effective_scope, 'all');
+  assert.equal(result._review_mode?.diff?.fallback_applied, true);
+  assert.equal(result._review_mode?.diff?.source, 'compare-empty->all');
 });

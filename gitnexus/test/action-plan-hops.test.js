@@ -213,6 +213,15 @@ test('MCP action_plan: emits end-to-end HTTP + permission/role hops when availab
   assert.equal(plan.status, 'ok');
   assert.ok(Array.isArray(plan.hops));
   assert.ok(plan.hops.length > 0);
+  assert.ok(plan.implement_plan, 'expected implement_plan payload');
+  assert.ok(plan.implement_plan.target, 'expected implement_plan target');
+  assert.ok(Array.isArray(plan.implement_plan.precedents), 'expected implement_plan precedents list');
+  assert.ok(Array.isArray(plan.implement_plan.companion_set?.files), 'expected implement_plan companion files');
+  assert.ok(Array.isArray(plan.implement_plan.write_order), 'expected implement_plan write_order list');
+  assert.equal(plan.implement_plan.post_edit_review?.tool, 'review_mode');
+  assert.ok(plan.implement_plan.target.slice, 'expected implement_plan target slice');
+  assert.equal(plan.implement_plan.target.slice.slice_type, 'endpoint');
+  assert.equal(plan.implement_plan.target.query_intent, 'entity');
 
   const hop = plan.hops.find(h => h?.http?.reason === 'http-get:/api/accounts/*/notifications');
   assert.ok(hop);

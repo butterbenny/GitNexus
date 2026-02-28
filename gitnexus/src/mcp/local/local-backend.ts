@@ -36,8 +36,20 @@ import {
   loadEvidenceSpanSnapshot,
   summarizeEvidenceSpanSnapshot,
 } from '../../core/ingestion/evidence-span-store.js';
+import {
+  loadStructuredSummarySnapshot,
+  summarizeStructuredSummarySnapshot,
+} from '../../core/ingestion/summary-overlay-store.js';
+import {
+  loadClosureTemplateSnapshot,
+  summarizeClosureTemplateSnapshot,
+} from '../../core/ingestion/closure-template-store.js';
+import { parseWitnessPathIds } from '../../core/graph/edge-metadata.js';
+import { GITNEXUS_TOOLS } from '../tools.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+
+const MCP_TOOL_NAME_SET = new Set(GITNEXUS_TOOLS.map(tool => tool.name));
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -134,7 +146,7 @@ function parseStringList(value: unknown): string[] {
 /** Valid KuzuDB node labels for safe Cypher query construction */
 const VALID_NODE_LABELS = new Set([
   'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement',
-  'Community', 'Process', 'FeatureSlice', 'Gap', 'ContractShape', 'ContractField', 'CacheKey', 'ValueNode', 'TestCase',
+  'Community', 'Process', 'FeatureSlice', 'Gap', 'ContractShape', 'ContractField', 'CacheKey', 'DBTable', 'DBColumn', 'ValueNode', 'TestCase',
   'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
   'Namespace', 'Trait', 'Impl', 'TypeAlias', 'Const', 'Static', 'Property',
   'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
@@ -428,6 +440,15 @@ export class LocalBackend {
   }
 
   /**
+   * Ensure a repo handle is refreshed from on-disk .gitnexus/meta.json if changed.
+   * Used by MCP resources path to avoid stale metadata when analyze ran with --no-registry.
+   */
+  async refreshRepoMetaForResource(repoParam?: string): Promise<void> {
+    const repo = this.resolveRepo(repoParam);
+    await this.refreshRepoMetaIfNeeded(repo, true);
+  }
+
+  /**
    * List all registered repos with their metadata.
    */
   listRepos(): Array<{ name: string; path: string; indexedAt: string; lastCommit: string; stats?: any }> {
@@ -487,10 +508,10 @@ export class LocalBackend {
    * because LocalBackend traditionally only refreshed when ~/.gitnexus/registry.json
    * mtime changed. With this, agents can refresh deterministically without HOME writes.
    */
-  private async refreshRepoMetaIfNeeded(repo: RepoHandle): Promise<void> {
+  private async refreshRepoMetaIfNeeded(repo: RepoHandle, forceCheck = false): Promise<void> {
     const now = Date.now();
     const lastCheckedAt = this.repoMetaCheckedAtMs.get(repo.id) ?? 0;
-    if (now - lastCheckedAt < 2000) return;
+    if (!forceCheck && now - lastCheckedAt < 2000) return;
     this.repoMetaCheckedAtMs.set(repo.id, now);
 
     const metaPath = path.join(repo.storagePath, 'meta.json');
@@ -547,13 +568,22 @@ export class LocalBackend {
 
     // Resolve repo from optional param
     const repo = this.resolveRepo(params?.repo);
-    await this.refreshRepoMetaIfNeeded(repo);
+    await this.refreshRepoMetaIfNeeded(repo, true);
     const indexStatus = await this.getIndexStatus(repo);
 
     let result: any;
     switch (method) {
       case 'query':
         result = await this.query(repo, params);
+        break;
+      case 'query_mode':
+        result = await this.queryMode(repo, params);
+        break;
+      case 'mode_router':
+        result = await this.modeRouter(repo, params);
+        break;
+      case 'implement_mode':
+        result = await this.implementMode(repo, params);
         break;
       case 'action_plan':
         result = await this.actionPlan(repo, params);
@@ -582,6 +612,9 @@ export class LocalBackend {
       case 'review_mode':
         result = await this.reviewMode(repo, params);
         break;
+      case 'debug_mode':
+        result = await this.debugMode(repo, params);
+        break;
       case 'episode_state':
         result = await this.episodeState(repo, params);
         break;
@@ -590,6 +623,12 @@ export class LocalBackend {
         break;
       case 'evidence_spans':
         result = await this.evidenceSpans(repo, params);
+        break;
+      case 'summary_overlay':
+        result = await this.summaryOverlay(repo, params);
+        break;
+      case 'closure_templates':
+        result = await this.closureTemplates(repo, params);
         break;
       case 'rename':
         result = await this.rename(repo, params);
@@ -605,11 +644,20 @@ export class LocalBackend {
         result = await this.overview(repo, params);
         break;
       default:
+        if (MCP_TOOL_NAME_SET.has(method)) {
+          throw new Error(`Tool handler not implemented: ${method}`);
+        }
         throw new Error(`Unknown tool: ${method}`);
     }
 
     try {
-      if (method !== 'episode_state' && method !== 'episode_update' && method !== 'evidence_spans') {
+      if (
+        method !== 'episode_state'
+        && method !== 'episode_update'
+        && method !== 'evidence_spans'
+        && method !== 'summary_overlay'
+        && method !== 'closure_templates'
+      ) {
         await this.recordEpisodeFromTool(repo, method, params, result);
       }
     } catch {
@@ -650,6 +698,9 @@ export class LocalBackend {
     const chosenPrecedents: EpisodePrecedentRef[] = [];
     const editFiles: string[] = [];
     const witnessPaths: string[] = [];
+    const failingTests: string[] = [];
+    const candidateHypotheses: string[] = [];
+    const errorStrings: string[] = [];
 
     const addFile = (filePath: unknown) => {
       const value = String(filePath || '').trim().replace(/\\/g, '/');
@@ -713,6 +764,109 @@ export class LocalBackend {
       }
     }
 
+    if (method === 'query_mode') {
+      const processes = Array.isArray(result?.query_mode?.processes) ? result.query_mode.processes : [];
+      const symbols = Array.isArray(result?.query_mode?.symbols) ? result.query_mode.symbols : [];
+      const hops = Array.isArray(result?.query_mode?.action_hints?.hops) ? result.query_mode.action_hints.hops : [];
+
+      for (const proc of processes.slice(0, 30)) addProcess(proc);
+      for (const symbol of symbols.slice(0, 120)) addSymbol(symbol);
+      for (const hop of hops.slice(0, 30)) {
+        const chain = [hop?.ui?.name, hop?.endpoint?.name, hop?.controller?.name].filter(Boolean).join(' -> ');
+        if (chain) witnessPaths.push(chain);
+      }
+    }
+
+    if (method === 'implement_mode') {
+      const symbols = Array.isArray(result?.implement_mode?.query_head?.symbols) ? result.implement_mode.query_head.symbols : [];
+      const companionFiles = Array.isArray(result?.implement_mode?.companion_files) ? result.implement_mode.companion_files : [];
+      const writePlan = Array.isArray(result?.implement_mode?.write_plan) ? result.implement_mode.write_plan : [];
+      const checks = Array.isArray(result?.implement_mode?.action_hints?.checks) ? result.implement_mode.action_hints.checks : [];
+      const hops = Array.isArray(result?.implement_mode?.action_hints?.hops) ? result.implement_mode.action_hints.hops : [];
+      const hypotheses = Array.isArray(result?.implement_mode?.hypotheses) ? result.implement_mode.hypotheses : [];
+
+      for (const symbol of symbols.slice(0, 120)) addSymbol(symbol);
+      for (const file of companionFiles.slice(0, 40)) addFile(file?.filePath);
+      for (const step of writePlan.slice(0, 40)) addSpan(step, String(step?.uid || '').trim() || undefined);
+      for (const check of checks.slice(0, 40)) {
+        const text = String(check || '').trim();
+        if (text) witnessPaths.push(`check:${text}`);
+      }
+      for (const hop of hops.slice(0, 30)) {
+        const chain = [hop?.ui?.name, hop?.endpoint?.name, hop?.controller?.name].filter(Boolean).join(' -> ');
+        if (chain) witnessPaths.push(chain);
+      }
+      for (const hypothesis of hypotheses.slice(0, 20)) {
+        const text = String(hypothesis || '').trim();
+        if (text) witnessPaths.push(`hypothesis:${text}`);
+      }
+    }
+
+    if (method === 'mode_router') {
+      const selectedMode = String(result?.mode_router?.selected_mode || '').trim();
+      const routed = result?.mode_router?.result || {};
+      const routeTrace = result?.mode_router?.route_trace || {};
+      const unified = result?.mode_router?.unified || {};
+
+      if (selectedMode) witnessPaths.push(`mode:${selectedMode}`);
+      if (routeTrace?.fallback_applied === true) witnessPaths.push('mode_router:fallback_applied');
+
+      const routeCandidates = Array.isArray(routeTrace?.candidates) ? routeTrace.candidates : [];
+      for (const candidate of routeCandidates.slice(0, 5)) {
+        const mode = String(candidate?.mode || '').trim();
+        const reasons = Array.isArray(candidate?.reasons)
+          ? candidate.reasons
+            .map((reason: unknown) => String(reason || '').trim())
+            .filter(Boolean)
+            .slice(0, 3)
+          : [];
+        if (mode && reasons.length > 0) witnessPaths.push(`route-candidate:${mode}:${reasons.join(' | ')}`);
+      }
+
+      const recommendedHandoff = String(unified?.recommended_handoff?.tool || '').trim();
+      if (recommendedHandoff) witnessPaths.push(`handoff:${recommendedHandoff}`);
+
+      const unifiedHypotheses = Array.isArray(unified?.hypotheses) ? unified.hypotheses : [];
+      for (const hypothesis of unifiedHypotheses.slice(0, 20)) {
+        const text = String(hypothesis || '').trim();
+        if (!text) continue;
+        candidateHypotheses.push(text);
+        witnessPaths.push(`hypothesis:${text}`);
+      }
+
+      for (const testName of this.toStringArray(params?.failing_tests).slice(0, 40)) {
+        failingTests.push(testName);
+        witnessPaths.push(`failing-test:${testName}`);
+      }
+      for (const errorText of this.toStringArray(params?.error_strings).slice(0, 40)) {
+        errorStrings.push(errorText);
+      }
+
+      const routedSymbols = [
+        ...(Array.isArray(routed?.query_mode?.symbols) ? routed.query_mode.symbols : []),
+        ...(Array.isArray(routed?.implement_mode?.query_head?.symbols) ? routed.implement_mode.query_head.symbols : []),
+        ...(Array.isArray(routed?.debug?.anchors?.top_symbols) ? routed.debug.anchors.top_symbols : []),
+        ...(Array.isArray(routed?.changed_symbols) ? routed.changed_symbols : []),
+      ];
+      for (const symbol of routedSymbols.slice(0, 100)) addSymbol(symbol);
+
+      const routedHops = [
+        ...(Array.isArray(routed?.query_mode?.action_hints?.hops) ? routed.query_mode.action_hints.hops : []),
+        ...(Array.isArray(routed?.implement_mode?.action_hints?.hops) ? routed.implement_mode.action_hints.hops : []),
+        ...(Array.isArray(routed?.debug?.anchors?.hops) ? routed.debug.anchors.hops : []),
+      ];
+      for (const hop of routedHops.slice(0, 30)) {
+        const chain = [hop?.ui?.name, hop?.endpoint?.name, hop?.controller?.name].filter(Boolean).join(' -> ');
+        if (chain) witnessPaths.push(chain);
+      }
+
+      const routedFiles = [
+        ...(Array.isArray(routed?.implement_mode?.companion_files) ? routed.implement_mode.companion_files : []),
+        ...(Array.isArray(routed?.changed_files) ? routed.changed_files : []),
+      ];
+      for (const file of routedFiles.slice(0, 40)) addFile(file?.filePath);
+    }
+
     if (method === 'context' && result.status === 'found') {
       if (result.symbol) addSymbol(result.symbol);
       for (const proc of Array.isArray(result.processes) ? result.processes.slice(0, 20) : []) {
@@ -748,6 +902,25 @@ export class LocalBackend {
       for (const test of suggestedTests.slice(0, 30)) {
         const name = String(test?.name || test?.test || '').trim();
         if (name) witnessPaths.push(`test:${name}`);
+      }
+    }
+
+    if (method === 'debug_mode') {
+      const topSymbols = Array.isArray(result?.debug?.anchors?.top_symbols) ? result.debug.anchors.top_symbols : [];
+      for (const symbol of topSymbols.slice(0, 60)) addSymbol(symbol);
+
+      const hops = Array.isArray(result?.debug?.anchors?.hops) ? result.debug.anchors.hops : [];
+      for (const hop of hops.slice(0, 30)) {
+        const chain = [hop?.ui?.name, hop?.endpoint?.name, hop?.controller?.name].filter(Boolean).join(' -> ');
+        if (chain) witnessPaths.push(chain);
+      }
+
+      const hypotheses = Array.isArray(result?.debug?.hypotheses) ? result.debug.hypotheses : [];
+      for (const hypothesis of hypotheses.slice(0, 20)) {
+        const text = String(hypothesis || '').trim();
+        if (!text) continue;
+        candidateHypotheses.push(text);
+        witnessPaths.push(`hypothesis:${text}`);
       }
     }
 
@@ -789,7 +962,10 @@ export class LocalBackend {
       if (filePath) addSpan({ filePath });
     }
 
-    const errorStrings = result.error ? [String(result.error)] : [];
+    if (result.error) {
+      const text = String(result.error).trim();
+      if (text) errorStrings.push(text);
+    }
     const targetBranch = String(params?.target_branch || '').trim() || undefined;
     const taskId = String(params?.task_id || params?.task || '').trim() || undefined;
 
@@ -800,6 +976,8 @@ export class LocalBackend {
       chosenPrecedents.length === 0 &&
       editFiles.length === 0 &&
       witnessPaths.length === 0 &&
+      failingTests.length === 0 &&
+      candidateHypotheses.length === 0 &&
       errorStrings.length === 0 &&
       !targetBranch &&
       !taskId
@@ -817,6 +995,8 @@ export class LocalBackend {
       ...(chosenPrecedents.length > 0 ? { chosenPrecedents } : {}),
       ...(editFiles.length > 0 ? { editFiles } : {}),
       ...(witnessPaths.length > 0 ? { witnessPaths } : {}),
+      ...(failingTests.length > 0 ? { failingTests } : {}),
+      ...(candidateHypotheses.length > 0 ? { candidateHypotheses } : {}),
       ...(errorStrings.length > 0 ? { errorStrings } : {}),
     };
 
@@ -912,6 +1092,52 @@ export class LocalBackend {
       status: 'ok',
       repo: repo.name,
       evidence,
+    };
+  }
+
+  private async summaryOverlay(repo: RepoHandle, params: {
+    limit?: number;
+    level?: string;
+    entity_id?: string;
+    file_path?: string;
+    query?: string;
+  }): Promise<any> {
+    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 20;
+    const snapshot = await loadStructuredSummarySnapshot(repo.storagePath);
+    const summaries = summarizeStructuredSummarySnapshot(snapshot, {
+      limit,
+      level: String(params.level || '').trim(),
+      entityId: String(params.entity_id || '').trim(),
+      filePath: String(params.file_path || '').trim(),
+      query: String(params.query || '').trim(),
+    });
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      summaries,
+    };
+  }
+
+  private async closureTemplates(repo: RepoHandle, params: {
+    limit?: number;
+    slice_type?: string;
+    template_key?: string;
+    query?: string;
+  }): Promise<any> {
+    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 20;
+    const snapshot = await loadClosureTemplateSnapshot(repo.storagePath);
+    const templates = summarizeClosureTemplateSnapshot(snapshot, {
+      limit,
+      sliceType: String(params.slice_type || '').trim(),
+      templateKey: String(params.template_key || '').trim(),
+      query: String(params.query || '').trim(),
+    });
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      templates,
     };
   }
 
@@ -1955,6 +2181,7 @@ export class LocalBackend {
         path_prefixes: pathPrefixes,
         limit_files: 12,
         limit_checks: 1,
+        __skip_precedents: true,
       });
 
       if (Array.isArray(ap?.top_processes)) {
@@ -2079,6 +2306,10 @@ export class LocalBackend {
     max_symbols?: number;
     include_content?: boolean;
     path_prefixes?: string[];
+    include_slice_cards?: boolean;
+    limit_slices?: number;
+    include_evidence_spans?: boolean;
+    limit_evidence?: number;
   }): Promise<any> {
     if (!params.query?.trim()) {
       return { error: 'query parameter is required and cannot be empty.' };
@@ -2089,7 +2320,31 @@ export class LocalBackend {
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
+    const includeSliceCards = params.include_slice_cards !== false;
+    const limitSlices = Math.max(1, Math.min(5, params.limit_slices ?? 2));
+    const includeEvidenceSpans = params.include_evidence_spans !== false;
+    const limitEvidence = Math.max(1, Math.min(100, params.limit_evidence ?? 20));
     const searchQuery = params.query.trim();
+    const escapedSearchQuery = searchQuery.replace(/'/g, "''");
+
+    type QueryIntent = 'entity' | 'contract' | 'symptom' | 'concept';
+    const classifyQueryIntent = (query: string): QueryIntent => {
+      const value = String(query || '').trim();
+      if (!value) return 'concept';
+
+      const lower = value.toLowerCase();
+      if (/\b(error|exception|failing|broken|bug|regression|403|404|500|null|undefined|timeout|stale|missing)\b/.test(lower)) {
+        return 'symptom';
+      }
+      if (/[/.]|::|->|route|permission|query key|cache key|shape|payload|field/i.test(value)) {
+        return 'contract';
+      }
+      if (!/\s/.test(value) && /^[A-Za-z_][$A-Za-z0-9_:/.-]*$/.test(value)) {
+        return 'entity';
+      }
+      return 'concept';
+    };
+    const queryIntent = classifyQueryIntent(searchQuery);
 
     const normalizePath = (value: string): string => {
       return String(value || '')
@@ -2132,6 +2387,47 @@ export class LocalBackend {
       }
       return false;
     };
+
+    const parseRoleFromSliceReason = (reason: string): string => {
+      const raw = String(reason || '').trim();
+      if (!raw) return '';
+      if (!raw.startsWith('feature-slice:')) return raw;
+      return raw.slice('feature-slice:'.length).trim();
+    };
+
+    const pickPrimaryLabel = (value: any): string => {
+      if (Array.isArray(value)) return String(value[0] || '').trim();
+      return String(value || '').trim();
+    };
+
+    let exactRaw: any[] = [];
+    try {
+      exactRaw = await executeQuery(repo.id, `
+        MATCH (n)
+        WHERE n.id = '${escapedSearchQuery}'
+           OR n.name = '${escapedSearchQuery}'
+           OR n.filePath = '${escapedSearchQuery}'
+        RETURN n.id AS nodeId, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        LIMIT ${Math.max(20, processLimit * maxSymbolsPerProcess)}
+      `);
+    } catch {
+      exactRaw = [];
+    }
+
+    const exactResultsRaw = exactRaw
+      .map((row: any) => ({
+        nodeId: String(row.nodeId ?? row[0] ?? '').trim(),
+        name: String(row.name ?? row[1] ?? '').trim(),
+        type: pickPrimaryLabel(row.type ?? row[2]),
+        filePath: String(row.filePath ?? row[3] ?? '').trim(),
+        startLine: Number.isFinite(Number(row.startLine ?? row[4])) ? Number(row.startLine ?? row[4]) : undefined,
+        endLine: Number.isFinite(Number(row.endLine ?? row[5])) ? Number(row.endLine ?? row[5]) : undefined,
+      }))
+      .filter((row: any) => row.nodeId || row.filePath);
+
+    const exactResults = pathPrefixes.length > 0
+      ? exactResultsRaw.filter(r => isInScope(r?.filePath || ''))
+      : exactResultsRaw;
     
     // Step 1: Run hybrid search to get matching symbols
     const baseSearchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
@@ -2157,6 +2453,20 @@ export class LocalBackend {
     
     // Merge via reciprocal rank fusion (RRF)
     const scoreMap = new Map<string, { score: number; data: any }>();
+
+    const exactHitNodeIds = new Set<string>();
+    for (let i = 0; i < exactResults.length; i++) {
+      const result = exactResults[i];
+      const key = result.nodeId || result.filePath || `exact:${i}`;
+      const exactScore = 1 / (5 + i + 1);
+      const existing = scoreMap.get(key);
+      if (result.nodeId) exactHitNodeIds.add(result.nodeId);
+      if (existing) {
+        existing.score += exactScore;
+      } else {
+        scoreMap.set(key, { score: exactScore, data: result });
+      }
+    }
 
     for (let i = 0; i < bm25Results.length; i++) {
       const result = bm25Results[i];
@@ -2541,11 +2851,987 @@ export class LocalBackend {
       ? dedupedDefinitions.filter((d: any) => isInScope(d?.filePath || ''))
       : dedupedDefinitions;
 
+    const processSymbolIdSet = new Set(
+      processSymbols
+        .map(sym => String(sym?.id || '').trim())
+        .filter(Boolean),
+    );
+    const definitionIdSet = new Set(
+      inScopeDefinitions
+        .map(sym => String(sym?.id || '').trim())
+        .filter(Boolean),
+    );
+
+    const slice_cards: any[] = [];
+    if (includeSliceCards) {
+      const candidateNodeIds = Array.from(new Set(
+        [
+          ...merged.slice(0, Math.max(40, processLimit * maxSymbolsPerProcess)).map(item => String(item?.data?.nodeId || '').trim()),
+          ...Array.from(processSymbolIdSet),
+          ...Array.from(definitionIdSet),
+        ].filter(Boolean),
+      )).slice(0, 300);
+
+      if (candidateNodeIds.length > 0) {
+        const escapedIds = candidateNodeIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+        const candidateIdsCypher = `[${escapedIds}]`;
+
+        let sliceRows: any[] = [];
+        try {
+          sliceRows = await executeQuery(repo.id, `
+            MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+            WHERE n.id IN ${candidateIdsCypher}
+              AND r.reason STARTS WITH 'feature-slice:'
+            RETURN s.id AS sliceId,
+                   s.label AS sliceLabel,
+                   s.heuristicLabel AS heuristicLabel,
+                   s.anchorId AS anchorId,
+                   s.anchorName AS anchorName,
+                   s.sliceType AS sliceType,
+                   s.closureScore AS closureScore,
+                   s.closureSlots AS closureSlots,
+                   s.closedSlots AS closedSlots,
+                   n.id AS memberId,
+                   n.name AS memberName,
+                   labels(n) AS memberKind,
+                   n.filePath AS memberFilePath,
+                   n.startLine AS memberStartLine,
+                   n.endLine AS memberEndLine,
+                   r.reason AS memberRoleReason
+            LIMIT 2000
+          `);
+        } catch {
+          sliceRows = [];
+        }
+
+        const bySliceId = new Map<string, {
+          id: string;
+          label: string;
+          heuristicLabel: string;
+          anchorId: string;
+          anchorName: string;
+          sliceType: string;
+          closureScore: number;
+          closureSlots: string[];
+          closedSlots: string[];
+          score: number;
+          roles: Set<string>;
+          members: Map<string, {
+            uid: string;
+            name: string;
+            kind: string;
+            filePath: string;
+            role: string;
+            score: number;
+            startLine?: number;
+            endLine?: number;
+            hit_rank?: number;
+          }>;
+          gapSignals: {
+            total: number;
+            deterministic: number;
+            pattern: number;
+            heuristic: number;
+            high: number;
+            medium: number;
+            low: number;
+          };
+        }>();
+
+        for (const row of sliceRows) {
+          const sliceId = String(row.sliceId ?? row[0] ?? '').trim();
+          if (!sliceId) continue;
+
+          const anchorId = String(row.anchorId ?? row[3] ?? '').trim();
+          let entry = bySliceId.get(sliceId);
+          if (!entry) {
+            entry = {
+              id: sliceId,
+              label: String(row.sliceLabel ?? row[1] ?? '').trim(),
+              heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
+              anchorId,
+              anchorName: String(row.anchorName ?? row[4] ?? '').trim(),
+              sliceType: String(row.sliceType ?? row[5] ?? '').trim(),
+              closureScore: Number(row.closureScore ?? row[6] ?? 0) || 0,
+              closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+              closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+              score: 0,
+              roles: new Set<string>(),
+              members: new Map(),
+              gapSignals: {
+                total: 0,
+                deterministic: 0,
+                pattern: 0,
+                heuristic: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+              },
+            };
+            if (anchorId && exactHitNodeIds.has(anchorId)) entry.score += 1.5;
+            bySliceId.set(sliceId, entry);
+          }
+
+          const memberId = String(row.memberId ?? row[9] ?? '').trim();
+          if (!memberId) continue;
+          const memberName = String(row.memberName ?? row[10] ?? '').trim();
+          const memberFilePath = String(row.memberFilePath ?? row[12] ?? '').trim();
+          const memberRole = parseRoleFromSliceReason(String(row.memberRoleReason ?? row[15] ?? '').trim());
+          const memberKind = pickPrimaryLabel(row.memberKind ?? row[11]);
+          const hit = hitMeta.get(memberId);
+
+          let memberScore = 0.05;
+          if (hit) memberScore += hit.score;
+          if (exactHitNodeIds.has(memberId)) memberScore += 1;
+          if (processSymbolIdSet.has(memberId)) memberScore += 0.15;
+          if (definitionIdSet.has(memberId)) memberScore += 0.1;
+          if (memberId === entry.anchorId) memberScore += 0.2;
+
+          entry.score += memberScore;
+          if (memberRole) entry.roles.add(memberRole);
+
+          const existingMember = entry.members.get(memberId);
+          if (existingMember && existingMember.score >= memberScore) continue;
+
+          const startLine = Number(row.memberStartLine ?? row[13]);
+          const endLine = Number(row.memberEndLine ?? row[14]);
+          entry.members.set(memberId, {
+            uid: memberId,
+            name: memberName,
+            kind: memberKind,
+            filePath: memberFilePath,
+            role: memberRole,
+            score: memberScore,
+            ...(Number.isFinite(startLine) ? { startLine } : {}),
+            ...(Number.isFinite(endLine) ? { endLine } : {}),
+            ...(hit ? { hit_rank: hit.rank } : {}),
+          });
+        }
+
+        const sliceIds = Array.from(bySliceId.keys());
+        if (sliceIds.length > 0) {
+          const escapedSliceIds = sliceIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+          const sliceIdsCypher = `[${escapedSliceIds}]`;
+
+          let gapRows: any[] = [];
+          try {
+            gapRows = await executeQuery(repo.id, `
+              MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+              WHERE s.id IN ${sliceIdsCypher}
+              RETURN s.id AS sliceId, g.absenceTier AS absenceTier, g.severity AS severity
+              LIMIT 2000
+            `);
+          } catch {
+            gapRows = [];
+          }
+
+          for (const row of gapRows) {
+            const sliceId = String(row.sliceId ?? row[0] ?? '').trim();
+            const absenceTier = String(row.absenceTier ?? row[1] ?? '').trim();
+            const severity = String(row.severity ?? row[2] ?? '').trim();
+            const entry = bySliceId.get(sliceId);
+            if (!entry) continue;
+
+            entry.gapSignals.total += 1;
+            if (absenceTier === 'deterministic_missing') entry.gapSignals.deterministic += 1;
+            else if (absenceTier === 'pattern_missing') entry.gapSignals.pattern += 1;
+            else if (absenceTier === 'heuristic_suspicion') entry.gapSignals.heuristic += 1;
+
+            if (severity === 'high') entry.gapSignals.high += 1;
+            else if (severity === 'medium') entry.gapSignals.medium += 1;
+            else if (severity === 'low') entry.gapSignals.low += 1;
+          }
+
+          const rankedSlices = Array.from(bySliceId.values())
+            .sort((left, right) => {
+              if (right.score !== left.score) return right.score - left.score;
+              if (right.closureScore !== left.closureScore) return right.closureScore - left.closureScore;
+              return left.id.localeCompare(right.id);
+            })
+            .slice(0, limitSlices);
+
+          let evidenceByNodeId = new Map<string, any>();
+          let evidenceGeneratedAt = '';
+          if (includeEvidenceSpans && rankedSlices.length > 0) {
+            try {
+              const evidenceSnapshot = await loadEvidenceSpanSnapshot(repo.storagePath);
+              evidenceGeneratedAt = String(evidenceSnapshot.generatedAt || '');
+              evidenceByNodeId = new Map(
+                (Array.isArray(evidenceSnapshot.nodes) ? evidenceSnapshot.nodes : [])
+                  .map(node => [String(node?.nodeId || '').trim(), node] as const)
+                  .filter(([id]) => id),
+              );
+            } catch {
+              evidenceByNodeId = new Map();
+            }
+          }
+
+          let remainingEvidence = limitEvidence;
+          for (const slice of rankedSlices) {
+            const matchedMembers = Array.from(slice.members.values())
+              .sort((left, right) => {
+                if (right.score !== left.score) return right.score - left.score;
+                return left.uid.localeCompare(right.uid);
+              })
+              .slice(0, 8)
+              .map(member => ({
+                uid: member.uid,
+                name: member.name,
+                kind: member.kind,
+                filePath: member.filePath,
+                role: member.role,
+                score: Number(member.score.toFixed(3)),
+                ...(member.startLine !== undefined ? { startLine: member.startLine } : {}),
+                ...(member.endLine !== undefined ? { endLine: member.endLine } : {}),
+                ...(member.hit_rank !== undefined ? { hit_rank: member.hit_rank } : {}),
+              }));
+
+            let proof_spans: any = undefined;
+            if (includeEvidenceSpans) {
+              const evidenceSymbols: any[] = [];
+              const candidateEvidenceIds = Array.from(new Set([
+                String(slice.anchorId || '').trim(),
+                ...matchedMembers.map(member => String(member.uid || '').trim()),
+              ].filter(Boolean)));
+
+              for (const nodeId of candidateEvidenceIds) {
+                if (remainingEvidence <= 0) break;
+                const evidence = evidenceByNodeId.get(nodeId);
+                if (!evidence) continue;
+
+                evidenceSymbols.push({
+                  uid: nodeId,
+                  name: String(evidence.nodeName || ''),
+                  kind: String(evidence.nodeLabel || ''),
+                  primary_span: evidence.primarySpan || null,
+                  witness_spans: Array.isArray(evidence.witnessSpans) ? evidence.witnessSpans : [],
+                  proof_spans: Array.isArray(evidence.proofSpans) ? evidence.proofSpans : [],
+                });
+                remainingEvidence -= 1;
+              }
+
+              const witnessSpanCount = evidenceSymbols.reduce((sum, item) => sum + item.witness_spans.length, 0);
+              const proofSpanCount = evidenceSymbols.reduce((sum, item) => sum + item.proof_spans.length, 0);
+              proof_spans = {
+                updated_at: evidenceGeneratedAt,
+                summary: {
+                  symbol_spans: evidenceSymbols.length,
+                  witness_spans: witnessSpanCount,
+                  proof_spans: proofSpanCount,
+                },
+                symbols: evidenceSymbols,
+              };
+            }
+
+            slice_cards.push({
+              uid: slice.id,
+              label: slice.label || slice.heuristicLabel || slice.id,
+              slice_type: slice.sliceType,
+              anchor_id: slice.anchorId,
+              anchor_name: slice.anchorName,
+              closure_score: Number(slice.closureScore.toFixed(3)),
+              closure_slots: slice.closureSlots,
+              closed_slots: slice.closedSlots,
+              member_count: slice.members.size,
+              roles: Array.from(slice.roles).sort(),
+              score: Number(slice.score.toFixed(3)),
+              gap_signals: slice.gapSignals,
+              matched_members: matchedMembers,
+              ...(includeEvidenceSpans ? { proof_spans } : {}),
+            });
+          }
+        }
+      }
+    }
+
+    const query_plan = {
+      intent: queryIntent,
+      exact_lookup: {
+        hits: exactResults.length,
+        used: exactResults.length > 0,
+      },
+      retrieval: {
+        bm25_hits: bm25Results.length,
+        semantic_hits: semanticResults.length,
+        semantic_attempted: shouldTrySemantic,
+        semantic_used: semanticResults.length > 0,
+        path_scoped: pathPrefixes.length > 0,
+      },
+      slices: {
+        enabled: includeSliceCards,
+        returned: slice_cards.length,
+        limit: limitSlices,
+        include_evidence_spans: includeEvidenceSpans,
+      },
+    };
+
     return {
       processes,
       process_symbols: processSymbols,
       definitions: inScopeDefinitions.slice(0, 20), // cap standalone definitions
+      slice_cards,
+      query_plan,
       ...(episodeOverlayInfo ? { episode_overlay: episodeOverlayInfo } : {}),
+      _query: {
+        knobs: {
+          include_slice_cards: includeSliceCards,
+          limit_slices: limitSlices,
+          include_evidence_spans: includeEvidenceSpans,
+          limit_evidence: limitEvidence,
+        },
+      },
+    };
+  }
+
+  private async queryMode(repo: RepoHandle, params: {
+    query?: string;
+    task_context?: string;
+    goal?: string;
+    path_prefixes?: string[];
+    limit_processes?: number;
+    max_symbols?: number;
+    limit_slices?: number;
+    limit_precedents?: number;
+    limit_hops?: number;
+    include_precedents?: boolean;
+    include_action_hints?: boolean;
+  }): Promise<any> {
+    const queryText = String(params.query || '').trim();
+    if (!queryText) {
+      return { error: 'query parameter is required and cannot be empty.' };
+    }
+
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
+    const limitProcesses = Math.max(1, Math.min(10, params.limit_processes ?? 4));
+    const maxSymbols = Math.max(1, Math.min(40, params.max_symbols ?? 16));
+    const limitSlices = Math.max(1, Math.min(5, params.limit_slices ?? 2));
+    const limitPrecedents = Math.max(0, Math.min(5, params.limit_precedents ?? 2));
+    const limitHops = Math.max(0, Math.min(10, params.limit_hops ?? 4));
+    const includePrecedents = params.include_precedents !== false;
+    const includeActionHints = params.include_action_hints !== false;
+
+    const queryResult = await this.query(repo, {
+      query: queryText,
+      task_context: params.task_context,
+      goal: params.goal,
+      path_prefixes: pathPrefixes,
+      limit: Math.max(5, limitProcesses),
+      max_symbols: Math.max(10, maxSymbols),
+      include_content: false,
+      include_slice_cards: true,
+      limit_slices: limitSlices,
+      include_evidence_spans: true,
+      limit_evidence: 30,
+    });
+
+    if (queryResult?.error) return queryResult;
+
+    const topSlice = Array.isArray(queryResult?.slice_cards) ? queryResult.slice_cards[0] : null;
+
+    let precedentPack: any = null;
+    if (includePrecedents && limitPrecedents > 0) {
+      try {
+        precedentPack = await this.precedents(repo, {
+          query: queryText,
+          ...(topSlice?.anchor_id ? { anchor_uid: String(topSlice.anchor_id) } : {}),
+          limit: 2,
+          examples: 3,
+          path_prefixes: pathPrefixes,
+        });
+      } catch {
+        precedentPack = null;
+      }
+    }
+
+    let actionPlanResult: any = null;
+    if (includeActionHints) {
+      try {
+        actionPlanResult = await this.actionPlan(repo, {
+          query: queryText,
+          task_context: params.task_context,
+          goal: params.goal,
+          path_prefixes: pathPrefixes,
+          limit_files: 8,
+          limit_checks: 8,
+          __skip_precedents: true,
+        });
+      } catch {
+        actionPlanResult = null;
+      }
+    }
+
+    const processSymbols = Array.isArray(queryResult?.process_symbols) ? queryResult.process_symbols : [];
+    const definitions = Array.isArray(queryResult?.definitions) ? queryResult.definitions : [];
+    const symbols = processSymbols.slice(0, maxSymbols);
+    if (symbols.length < maxSymbols) {
+      symbols.push(...definitions.slice(0, maxSymbols - symbols.length));
+    }
+
+    const hypotheses: string[] = [];
+    const topGapSignals = topSlice?.gap_signals || null;
+    if (topGapSignals && Number(topGapSignals.high || 0) > 0) {
+      hypotheses.push('Top slice includes high-severity closure gaps; confirm required slot coverage before editing.');
+    }
+    if (topGapSignals && Number(topGapSignals.deterministic || 0) > 0) {
+      hypotheses.push('Deterministic gap signals indicate concrete missing links in the top slice.');
+    }
+    if (Number(queryResult?.query_plan?.exact_lookup?.hits || 0) === 0) {
+      hypotheses.push('No exact lookup hit; tighten the anchor (symbol/route/permission/query key) to reduce ambiguity.');
+    }
+
+    const nextActions = [
+      'Open top-ranked symbols with context() to inspect incoming/outgoing references.',
+      'Use action_plan() to confirm companion files and verification checks before edits.',
+      'After edits, run review_mode(scope=unstaged) to validate semantic and closure deltas.',
+    ];
+    if (topSlice?.uid) {
+      nextActions.unshift('Compare target slice with precedents() siblings before introducing a new flow shape.');
+    }
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      query: queryText,
+      query_mode: {
+        query_plan: queryResult?.query_plan || null,
+        slices: Array.isArray(queryResult?.slice_cards) ? queryResult.slice_cards.slice(0, limitSlices) : [],
+        processes: Array.isArray(queryResult?.processes) ? queryResult.processes.slice(0, limitProcesses) : [],
+        symbols,
+        precedents: Array.isArray(precedentPack?.precedents)
+          ? precedentPack.precedents.slice(0, limitPrecedents)
+          : [],
+        action_hints: includeActionHints
+          ? {
+              files: Array.isArray(actionPlanResult?.files) ? actionPlanResult.files.slice(0, 8) : [],
+              checks: Array.isArray(actionPlanResult?.checks) ? actionPlanResult.checks.slice(0, 8) : [],
+              hops: Array.isArray(actionPlanResult?.hops) ? actionPlanResult.hops.slice(0, limitHops) : [],
+            }
+          : null,
+        hypotheses: Array.from(new Set(hypotheses)).slice(0, 6),
+        next_actions: nextActions,
+      },
+      _query_mode: {
+        knobs: {
+          limit_processes: limitProcesses,
+          max_symbols: maxSymbols,
+          limit_slices: limitSlices,
+          limit_precedents: limitPrecedents,
+          limit_hops: limitHops,
+          include_precedents: includePrecedents,
+          include_action_hints: includeActionHints,
+          path_prefixes: pathPrefixes,
+        },
+      },
+    };
+  }
+
+  private async implementMode(repo: RepoHandle, params: {
+    query?: string;
+    task_context?: string;
+    goal?: string;
+    path_prefixes?: string[];
+    limit_files?: number;
+    limit_checks?: number;
+    limit_write_order?: number;
+    limit_precedents?: number;
+    include_query_head?: boolean;
+    include_review_contract?: boolean;
+  }): Promise<any> {
+    const queryText = String(params.query || '').trim();
+    if (!queryText) {
+      return { error: 'query parameter is required and cannot be empty.' };
+    }
+
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
+    const limitFiles = Math.max(1, Math.min(30, params.limit_files ?? 10));
+    const limitChecks = Math.max(1, Math.min(20, params.limit_checks ?? 10));
+    const limitWriteOrder = Math.max(1, Math.min(20, params.limit_write_order ?? 10));
+    const limitPrecedents = Math.max(0, Math.min(5, params.limit_precedents ?? 3));
+    const includeQueryHead = params.include_query_head !== false;
+    const includeReviewContract = params.include_review_contract !== false;
+
+    const actionPlanResult = await this.actionPlan(repo, {
+      query: queryText,
+      task_context: params.task_context,
+      goal: params.goal,
+      path_prefixes: pathPrefixes,
+      limit_files: limitFiles,
+      limit_checks: limitChecks,
+      __skip_precedents: false,
+    });
+
+    if (actionPlanResult?.error) return actionPlanResult;
+
+    let queryModeResult: any = null;
+    if (includeQueryHead) {
+      try {
+        queryModeResult = await this.queryMode(repo, {
+          query: queryText,
+          task_context: params.task_context,
+          goal: params.goal,
+          path_prefixes: pathPrefixes,
+          limit_processes: 4,
+          max_symbols: 16,
+          limit_slices: 2,
+          limit_precedents: limitPrecedents,
+          limit_hops: 0,
+          include_precedents: true,
+          include_action_hints: false,
+        });
+      } catch {
+        queryModeResult = null;
+      }
+    }
+
+    const implementPlan = actionPlanResult?.implement_plan || {};
+    const companionFiles = Array.isArray(implementPlan?.companion_set?.files)
+      ? implementPlan.companion_set.files.slice(0, limitFiles)
+      : [];
+    const writePlan = Array.isArray(implementPlan?.write_order)
+      ? implementPlan.write_order.slice(0, limitWriteOrder)
+      : [];
+
+    const precedentsFromPlan = Array.isArray(implementPlan?.precedents)
+      ? implementPlan.precedents
+      : [];
+    const precedentsFromQuery = Array.isArray(queryModeResult?.query_mode?.precedents)
+      ? queryModeResult.query_mode.precedents
+      : [];
+    const precedents = (precedentsFromPlan.length > 0 ? precedentsFromPlan : precedentsFromQuery)
+      .slice(0, limitPrecedents);
+
+    const checks = Array.isArray(actionPlanResult?.checks)
+      ? actionPlanResult.checks.slice(0, limitChecks)
+      : [];
+    const hops = Array.isArray(actionPlanResult?.hops)
+      ? actionPlanResult.hops.slice(0, 6)
+      : [];
+    const cacheEffects = Array.isArray(actionPlanResult?.cache_effects)
+      ? actionPlanResult.cache_effects.slice(0, 4)
+      : [];
+
+    const gapSignals = implementPlan?.gap_signals || {};
+    const hypotheses: string[] = [];
+    if (Number(gapSignals?.high || 0) > 0) {
+      hypotheses.push('Top target slice has high-severity gaps; patch required slots before broad refactors.');
+    }
+    if (Number(gapSignals?.deterministic || 0) > 0) {
+      hypotheses.push('Deterministic gap signals indicate concrete missing closure links in the target slice.');
+    }
+    if (!implementPlan?.closure_template) {
+      hypotheses.push('No closure template match found; verify anatomy against sibling precedents before adding new structure.');
+    }
+    if (companionFiles.length === 0) {
+      hypotheses.push('Companion set is sparse; expand anchor query or path scope to avoid under-editing dependent surfaces.');
+    }
+
+    const postEditReviewBase = implementPlan?.post_edit_review || {
+      tool: 'review_mode',
+      params: {
+        scope: 'unstaged',
+        ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
+        include_slice_stencil: true,
+        include_evidence_spans: true,
+      },
+    };
+    const postEditReview = includeReviewContract ? postEditReviewBase : null;
+
+    const nextActions = [
+      'Open the first write-plan anchor with context() and confirm callers before editing.',
+      'Apply edits in write_plan order to preserve closure semantics.',
+      'Run impact() on the highest-risk write anchor before touching shared utilities.',
+    ];
+    if (postEditReview) {
+      nextActions.push('Run review_mode(scope=unstaged) with slice-stencil and evidence spans enabled after edits.');
+    }
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      query: queryText,
+      implement_mode: {
+        target: implementPlan?.target || null,
+        closure_template: implementPlan?.closure_template || null,
+        companion_files: companionFiles,
+        write_plan: writePlan,
+        precedents,
+        action_hints: {
+          files: Array.isArray(actionPlanResult?.files) ? actionPlanResult.files.slice(0, limitFiles) : [],
+          checks,
+          hops,
+          cache_effects: cacheEffects,
+        },
+        query_head: includeQueryHead
+          ? {
+              query_plan: queryModeResult?.query_mode?.query_plan || null,
+              slices: Array.isArray(queryModeResult?.query_mode?.slices) ? queryModeResult.query_mode.slices.slice(0, 2) : [],
+              processes: Array.isArray(queryModeResult?.query_mode?.processes) ? queryModeResult.query_mode.processes.slice(0, 4) : [],
+              symbols: Array.isArray(queryModeResult?.query_mode?.symbols) ? queryModeResult.query_mode.symbols.slice(0, 16) : [],
+            }
+          : null,
+        gap_signals: gapSignals,
+        hypotheses: Array.from(new Set(hypotheses)).slice(0, 6),
+        next_actions: nextActions,
+        post_edit_review: postEditReview,
+      },
+      _implement_mode: {
+        knobs: {
+          limit_files: limitFiles,
+          limit_checks: limitChecks,
+          limit_write_order: limitWriteOrder,
+          limit_precedents: limitPrecedents,
+          include_query_head: includeQueryHead,
+          include_review_contract: includeReviewContract,
+          path_prefixes: pathPrefixes,
+        },
+      },
+    };
+  }
+
+  private async modeRouter(repo: RepoHandle, params: {
+    mode?: 'auto' | 'query' | 'implement' | 'review' | 'debug';
+    query?: string;
+    symptom?: string;
+    failing_tests?: string[];
+    error_strings?: string[];
+    task_context?: string;
+    goal?: string;
+    path_prefixes?: string[];
+    scope?: 'unstaged' | 'staged' | 'all' | 'compare';
+    base_ref?: string;
+    include_precedents?: boolean;
+  }): Promise<any> {
+    const requestedMode = String(params.mode || 'auto').trim().toLowerCase();
+    const queryText = String(params.query || '').trim();
+    const symptomText = String(params.symptom || '').trim();
+    const failingTests = this.toStringArray(params.failing_tests);
+    const errorStrings = this.toStringArray(params.error_strings);
+    const scope = params.scope || 'unstaged';
+    const baseRef = String(params.base_ref || '').trim();
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
+
+    const supportedModes = new Set(['auto', 'query', 'implement', 'review', 'debug']);
+    if (!supportedModes.has(requestedMode)) {
+      return { error: `mode must be one of auto|query|implement|review|debug (received "${requestedMode}")` };
+    }
+
+    const implementationIntentRe = /\b(add|build|create|implement|introduce|migrate|refactor|wire|ship|rollout)\b/i;
+    const combinedIntentText = [queryText, String(params.task_context || ''), String(params.goal || '')]
+      .join(' ')
+      .trim();
+    const hasImplementationIntent = implementationIntentRe.test(combinedIntentText);
+    const hasSymptomSignal = Boolean(symptomText) || failingTests.length > 0 || errorStrings.length > 0;
+    const hasReviewSignal = Boolean(baseRef) || requestedMode === 'review';
+
+    type RoutedMode = 'query' | 'implement' | 'review' | 'debug';
+    const candidateByMode = new Map<RoutedMode, { mode: RoutedMode; score: number; reasons: string[] }>([
+      ['query', { mode: 'query', score: 0, reasons: [] }],
+      ['implement', { mode: 'implement', score: 0, reasons: [] }],
+      ['review', { mode: 'review', score: 0, reasons: [] }],
+      ['debug', { mode: 'debug', score: 0, reasons: [] }],
+    ]);
+    const addCandidateSignal = (mode: RoutedMode, score: number, reason: string) => {
+      const entry = candidateByMode.get(mode);
+      if (!entry) return;
+      entry.score += score;
+      if (reason) entry.reasons.push(reason);
+    };
+
+    if (queryText) addCandidateSignal('query', 3, 'query-anchor');
+    if (hasImplementationIntent) addCandidateSignal('implement', 4, 'implementation-intent');
+    if (queryText) addCandidateSignal('implement', 1, 'query-present');
+    if (hasReviewSignal) addCandidateSignal('review', 5, 'review-scope-signal');
+    if (!queryText && !hasSymptomSignal) addCandidateSignal('review', 2, 'no-query-fallback');
+    if (hasSymptomSignal) addCandidateSignal('debug', 6, 'symptom-signal');
+    if (failingTests.length > 0) addCandidateSignal('debug', 1, 'failing-tests');
+    if (errorStrings.length > 0) addCandidateSignal('debug', 1, 'error-strings');
+
+    let selectedMode: RoutedMode;
+    const routingSignals: string[] = [];
+    if (requestedMode !== 'auto') {
+      selectedMode = requestedMode as RoutedMode;
+      routingSignals.push(`explicit-mode:${selectedMode}`);
+    } else if (hasSymptomSignal) {
+      selectedMode = 'debug';
+      routingSignals.push('symptom-signal');
+    } else if (hasReviewSignal) {
+      selectedMode = 'review';
+      routingSignals.push('review-scope-signal');
+    } else if (hasImplementationIntent) {
+      selectedMode = 'implement';
+      routingSignals.push('implementation-intent');
+    } else {
+      selectedMode = 'review';
+      routingSignals.push('no-query-fallback');
+    }
+
+    const tiePriority: RoutedMode[] = ['debug', 'review', 'implement', 'query'];
+    if (requestedMode === 'auto') {
+      const ranked = Array.from(candidateByMode.values()).sort((left, right) => {
+        if (right.score !== left.score) return right.score - left.score;
+        return tiePriority.indexOf(left.mode) - tiePriority.indexOf(right.mode);
+      });
+      const top = ranked[0];
+      if (top && top.score > 0) {
+        selectedMode = top.mode;
+        if (!routingSignals.includes('symptom-signal') && selectedMode === 'debug') {
+          routingSignals.push('symptom-signal');
+        }
+        if (!routingSignals.includes('review-scope-signal') && selectedMode === 'review' && hasReviewSignal) {
+          routingSignals.push('review-scope-signal');
+        }
+        if (!routingSignals.includes('implementation-intent') && selectedMode === 'implement' && hasImplementationIntent) {
+          routingSignals.push('implementation-intent');
+        }
+      }
+    }
+
+    let routedResult: any;
+    if (selectedMode === 'query') {
+      if (!queryText) {
+        return { error: 'query is required when mode resolves to query.' };
+      }
+      routedResult = await this.queryMode(repo, {
+        query: queryText,
+        task_context: params.task_context,
+        goal: params.goal,
+        path_prefixes: pathPrefixes,
+        include_precedents: params.include_precedents,
+      });
+    } else if (selectedMode === 'implement') {
+      if (!queryText) {
+        return { error: 'query is required when mode resolves to implement.' };
+      }
+      routedResult = await this.implementMode(repo, {
+        query: queryText,
+        task_context: params.task_context,
+        goal: params.goal,
+        path_prefixes: pathPrefixes,
+      });
+    } else if (selectedMode === 'review') {
+      routedResult = await this.reviewMode(repo, {
+        scope,
+        ...(baseRef ? { base_ref: baseRef } : {}),
+        path_prefixes: pathPrefixes,
+        include_ui_contracts: true,
+        include_evidence_spans: true,
+        include_slice_stencil: true,
+      });
+    } else {
+      if (!queryText && !symptomText && failingTests.length === 0 && errorStrings.length === 0) {
+        return { error: 'Provide query, symptom, failing_tests, or error_strings when mode resolves to debug.' };
+      }
+      routedResult = await this.debugMode(repo, {
+        query: queryText,
+        symptom: symptomText,
+        task_context: params.task_context,
+        goal: params.goal,
+        failing_tests: failingTests,
+        error_strings: errorStrings,
+        path_prefixes: pathPrefixes,
+        include_precedents: params.include_precedents,
+      });
+    }
+
+    if (routedResult?.error) {
+      return routedResult;
+    }
+
+    const normalizeSymbol = (item: any) => {
+      const uid = String(item?.uid || item?.id || '').trim();
+      const filePath = String(item?.filePath || '').trim();
+      if (!uid && !filePath) return null;
+      return {
+        uid: uid || null,
+        name: String(item?.name || '').trim() || '',
+        kind: String(item?.kind || item?.type || '').trim() || '',
+        filePath,
+        ...(Number.isFinite(Number(item?.startLine)) ? { startLine: Number(item.startLine) } : {}),
+        ...(Number.isFinite(Number(item?.endLine)) ? { endLine: Number(item.endLine) } : {}),
+      };
+    };
+
+    const uniqueByKey = <T>(values: T[], keyFn: (value: T) => string): T[] => {
+      const out: T[] = [];
+      const seen = new Set<string>();
+      for (const value of values) {
+        const key = keyFn(value);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(value);
+      }
+      return out;
+    };
+
+    let primarySymbols: any[] = [];
+    let primaryFiles: string[] = [];
+    let topFindings: string[] = [];
+    let hypotheses: string[] = [];
+    let nextActions: string[] = [];
+    let risk: any = null;
+    let recommendedHandoff: any = null;
+
+    if (selectedMode === 'query') {
+      const qm = routedResult?.query_mode || {};
+      primarySymbols = [
+        ...(Array.isArray(qm?.symbols) ? qm.symbols : []),
+      ].map(normalizeSymbol).filter(Boolean);
+      primaryFiles = [
+        ...(Array.isArray(qm?.action_hints?.files) ? qm.action_hints.files.map((item: any) => String(item?.filePath || '').trim()) : []),
+        ...primarySymbols.map((symbol: any) => String(symbol?.filePath || '').trim()),
+      ].filter(Boolean);
+      hypotheses = Array.isArray(qm?.hypotheses) ? qm.hypotheses : [];
+      topFindings = hypotheses.slice(0, 6);
+      nextActions = Array.isArray(qm?.next_actions) ? qm.next_actions : [];
+      recommendedHandoff = queryText
+        ? {
+            tool: 'implement_mode',
+            params: {
+              query: queryText,
+              ...(params.task_context ? { task_context: params.task_context } : {}),
+              ...(params.goal ? { goal: params.goal } : {}),
+              ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
+            },
+          }
+        : null;
+    } else if (selectedMode === 'implement') {
+      const im = routedResult?.implement_mode || {};
+      primarySymbols = [
+        ...(Array.isArray(im?.write_plan) ? im.write_plan : []),
+        ...(Array.isArray(im?.query_head?.symbols) ? im.query_head.symbols : []),
+      ].map(normalizeSymbol).filter(Boolean);
+      primaryFiles = [
+        ...(Array.isArray(im?.companion_files) ? im.companion_files.map((item: any) => String(item?.filePath || '').trim()) : []),
+        ...primarySymbols.map((symbol: any) => String(symbol?.filePath || '').trim()),
+      ].filter(Boolean);
+      hypotheses = Array.isArray(im?.hypotheses) ? im.hypotheses : [];
+      topFindings = hypotheses.slice(0, 6);
+      nextActions = Array.isArray(im?.next_actions) ? im.next_actions : [];
+
+      const gapSignals = im?.gap_signals || {};
+      const high = Number(gapSignals?.high || 0);
+      const deterministic = Number(gapSignals?.deterministic || 0);
+      const score = (high * 2) + deterministic;
+      risk = {
+        level: score >= 4 ? 'high' : score >= 2 ? 'medium' : 'low',
+        score,
+      };
+      recommendedHandoff = im?.post_edit_review || {
+        tool: 'review_mode',
+        params: {
+          scope: 'unstaged',
+          ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
+          include_slice_stencil: true,
+          include_evidence_spans: true,
+        },
+      };
+    } else if (selectedMode === 'review') {
+      const reviewKernel = routedResult?.review_kernel || null;
+      primarySymbols = [
+        ...(Array.isArray(routedResult?.changed_symbols) ? routedResult.changed_symbols : []),
+      ].map(normalizeSymbol).filter(Boolean);
+      primaryFiles = [
+        ...(Array.isArray(routedResult?.changed_files) ? routedResult.changed_files.map((item: any) => String(item?.filePath || '').trim()) : []),
+        ...primarySymbols.map((symbol: any) => String(symbol?.filePath || '').trim()),
+      ].filter(Boolean);
+      topFindings = Array.isArray(reviewKernel?.top_findings) ? reviewKernel.top_findings : [];
+      hypotheses = Array.isArray(reviewKernel?.hypotheses) ? reviewKernel.hypotheses : [];
+      nextActions = Array.isArray(reviewKernel?.next_actions) ? reviewKernel.next_actions : [];
+      risk = reviewKernel?.risk || null;
+
+      const firstSymbolUid = String(primarySymbols[0]?.uid || '').trim();
+      recommendedHandoff = firstSymbolUid
+        ? { tool: 'context', params: { uid: firstSymbolUid } }
+        : null;
+    } else {
+      const debug = routedResult?.debug || {};
+      const candidates = Array.isArray(debug?.candidates) ? debug.candidates : [];
+      primarySymbols = [
+        ...(Array.isArray(debug?.anchors?.top_symbols) ? debug.anchors.top_symbols : []),
+      ].map(normalizeSymbol).filter(Boolean);
+      primaryFiles = primarySymbols.map((symbol: any) => String(symbol?.filePath || '').trim()).filter(Boolean);
+      hypotheses = Array.isArray(debug?.hypotheses) ? debug.hypotheses : [];
+      topFindings = [
+        ...hypotheses,
+        ...candidates.slice(0, 3).map((candidate: any) => String(candidate?.summary || '').trim()).filter(Boolean),
+      ];
+      nextActions = Array.isArray(debug?.next_actions) ? debug.next_actions : [];
+
+      const candidateScore = Number(candidates[0]?.score || 0);
+      risk = {
+        level: candidateScore >= 8 ? 'high' : candidateScore >= 4 ? 'medium' : 'low',
+        score: candidateScore,
+      };
+
+      const firstSymbolUid = String(primarySymbols[0]?.uid || '').trim();
+      recommendedHandoff = firstSymbolUid
+        ? { tool: 'context', params: { uid: firstSymbolUid } }
+        : null;
+    }
+
+    primarySymbols = uniqueByKey(primarySymbols, (symbol: any) => String(symbol?.uid || symbol?.filePath || ''))
+      .slice(0, 20);
+    primaryFiles = uniqueByKey(primaryFiles, (filePath: string) => String(filePath || '').trim())
+      .slice(0, 20);
+    topFindings = uniqueByKey(topFindings.filter(Boolean), (item: string) => String(item || ''))
+      .slice(0, 10);
+    hypotheses = uniqueByKey(hypotheses.filter(Boolean), (item: string) => String(item || ''))
+      .slice(0, 10);
+    nextActions = uniqueByKey(nextActions.filter(Boolean), (item: string) => String(item || ''))
+      .slice(0, 10);
+
+    const unified = {
+      primary_symbols: primarySymbols,
+      primary_files: primaryFiles,
+      top_findings: topFindings,
+      hypotheses,
+      next_actions: nextActions,
+      risk,
+      recommended_handoff: recommendedHandoff,
+    };
+
+    const routeTraceCandidates = Array.from(candidateByMode.values())
+      .sort((left, right) => {
+        if (right.score !== left.score) return right.score - left.score;
+        return tiePriority.indexOf(left.mode) - tiePriority.indexOf(right.mode);
+      })
+      .map(candidate => ({
+        mode: candidate.mode,
+        score: candidate.score,
+        reasons: uniqueByKey(candidate.reasons, item => String(item || '')).slice(0, 6),
+      }));
+
+    const fallbackApplied = requestedMode === 'auto'
+      && !queryText
+      && !hasSymptomSignal
+      && selectedMode === 'review'
+      && !hasReviewSignal;
+
+    const route_trace = {
+      requested_mode: requestedMode,
+      selected_mode: selectedMode,
+      fallback_applied: fallbackApplied,
+      candidates: routeTraceCandidates,
+    };
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      mode_router: {
+        selected_mode: selectedMode,
+        signals: routingSignals,
+        route_trace,
+        unified,
+        result: routedResult,
+      },
+      _mode_router: {
+        knobs: {
+          requested_mode: requestedMode,
+          scope,
+          base_ref: baseRef || null,
+          path_prefixes: pathPrefixes,
+        },
+      },
     };
   }
 
@@ -2556,15 +3842,19 @@ export class LocalBackend {
     path_prefixes?: string[];
     limit_files?: number;
     limit_checks?: number;
+    __skip_precedents?: boolean;
   }): Promise<any> {
     const limitFiles = Math.max(1, Math.min(50, params.limit_files ?? 10));
     const limitChecks = Math.max(1, Math.min(20, params.limit_checks ?? 10));
+    const skipPrecedents = params.__skip_precedents === true;
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
+    const isInScope = (filePath: string): boolean => filePathTouchesPrefixes(filePath, pathPrefixes);
 
     const result = await this.query(repo, {
       query: params.query,
       task_context: params.task_context,
       goal: params.goal,
-      path_prefixes: params.path_prefixes,
+      path_prefixes: pathPrefixes,
       limit: 5,
       max_symbols: 12,
       include_content: false,
@@ -3381,6 +4671,388 @@ export class LocalBackend {
       }
     } catch { /* ignore */ }
 
+    const parseSliceRole = (reason: string): string => {
+      const raw = String(reason || '').trim();
+      if (!raw) return '';
+      if (!raw.startsWith('feature-slice:')) return raw;
+      return raw.slice('feature-slice:'.length).trim();
+    };
+
+    const roleWritePriority = (role: string): number => {
+      const normalized = String(role || '').trim().toLowerCase();
+      if (normalized === 'anchor') return 0;
+      if (normalized === 'entrypoint') return 1;
+      if (normalized === 'handler') return 2;
+      if (normalized === 'authorization') return 3;
+      if (normalized === 'authorization_consumer') return 4;
+      if (normalized === 'query_consumer') return 5;
+      if (normalized === 'supporting') return 6;
+      return 10;
+    };
+
+    const sliceCards: any[] = Array.isArray(result?.slice_cards) ? result.slice_cards : [];
+    const targetSlice = sliceCards[0] || null;
+    const queryIntent = String(result?.query_plan?.intent || '').trim() || undefined;
+    const topProcesses = Array.isArray(result?.processes) ? result.processes : [];
+
+    let precedentPack: any = null;
+    if (!skipPrecedents) {
+      try {
+        precedentPack = await this.precedents(repo, {
+          query: params.query,
+          ...(targetSlice?.anchor_id ? { anchor_uid: String(targetSlice.anchor_id) } : {}),
+          limit: 2,
+          examples: 3,
+          path_prefixes: pathPrefixes,
+        });
+      } catch {
+        precedentPack = null;
+      }
+    }
+
+    const precedentItems: any[] = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
+    const implementPrecedents = precedentItems.slice(0, 3).map((item: any) => ({
+      kind: item?.kind,
+      signature: item?.signature,
+      anchor: item?.anchor,
+      examples: Array.isArray(item?.examples) ? item.examples.slice(0, 3) : [],
+    }));
+
+    const companionSignals = new Map<string, {
+      filePath: string;
+      score: number;
+      reasons: Set<string>;
+      anchors: Array<{ id?: string; name?: string; type?: string; startLine?: number; endLine?: number }>;
+    }>();
+    const companionSources = {
+      seed_files: 0,
+      slice_members: 0,
+      cochange_edges: 0,
+      shape_edges: 0,
+    };
+
+    const addCompanionSignal = (
+      filePathRaw: string,
+      score: number,
+      reason: string,
+      anchor?: { id?: string; name?: string; type?: string; startLine?: number; endLine?: number },
+    ) => {
+      const filePath = normalizeRepoRelativePath(String(filePathRaw || ''));
+      if (!filePath) return;
+      if (!isInScope(filePath)) return;
+
+      const nextScore = Number(score);
+      if (!Number.isFinite(nextScore) || nextScore <= 0) return;
+
+      let entry = companionSignals.get(filePath);
+      if (!entry) {
+        entry = { filePath, score: 0, reasons: new Set<string>(), anchors: [] };
+        companionSignals.set(filePath, entry);
+      }
+      entry.score += nextScore;
+      if (reason) entry.reasons.add(reason);
+      if (anchor) entry.anchors.push(anchor);
+    };
+
+    for (const file of files.slice(0, 10)) {
+      addCompanionSignal(String(file?.filePath || ''), Number(file?.score || 0) + 0.1, 'ranked-file');
+      companionSources.seed_files += 1;
+    }
+
+    let targetTemplate: any = null;
+    const writeOrder: any[] = [];
+    let targetSliceGapSummary = {
+      total: 0,
+      deterministic: 0,
+      pattern: 0,
+      heuristic: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+    };
+
+    if (targetSlice?.uid || targetSlice?.anchor_id) {
+      const targetSliceId = String(targetSlice.uid || '').trim();
+      if (targetSliceId) {
+        const escapedSliceId = targetSliceId.replace(/'/g, "''");
+        let memberRows: any[] = [];
+        try {
+          memberRows = await executeQuery(repo.id, `
+            MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice {id: '${escapedSliceId}'})
+            WHERE r.reason STARTS WITH 'feature-slice:'
+            RETURN n.id AS uid, n.name AS name, labels(n) AS kind, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, r.reason AS roleReason
+            LIMIT 5000
+          `);
+        } catch {
+          memberRows = [];
+        }
+
+        const memberIds: string[] = [];
+        const memberFiles = new Set<string>();
+        const seenWrite = new Set<string>();
+
+        for (const row of memberRows) {
+          const uid = String(row.uid ?? row[0] ?? '').trim();
+          const name = String(row.name ?? row[1] ?? '').trim();
+          const kindValue = row.kind ?? row[2];
+          const kind = Array.isArray(kindValue) ? String(kindValue[0] || '').trim() : String(kindValue || '').trim();
+          const filePath = normalizeRepoRelativePath(String(row.filePath ?? row[3] ?? ''));
+          const role = parseSliceRole(String(row.roleReason ?? row[6] ?? '').trim());
+          const startLine = Number(row.startLine ?? row[4]);
+          const endLine = Number(row.endLine ?? row[5]);
+
+          if (!uid || !filePath) continue;
+          if (!isInScope(filePath)) continue;
+
+          memberIds.push(uid);
+          memberFiles.add(filePath);
+
+          const key = `${uid}|${role}`;
+          if (!seenWrite.has(key)) {
+            seenWrite.add(key);
+            writeOrder.push({
+              uid,
+              name,
+              kind,
+              filePath,
+              role,
+              role_priority: roleWritePriority(role),
+              ...(Number.isFinite(startLine) ? { startLine } : {}),
+              ...(Number.isFinite(endLine) ? { endLine } : {}),
+            });
+          }
+
+          addCompanionSignal(filePath, 2.5, `slice-member:${role || 'supporting'}`, {
+            id: uid,
+            name,
+            type: kind,
+            ...(Number.isFinite(startLine) ? { startLine } : {}),
+            ...(Number.isFinite(endLine) ? { endLine } : {}),
+          });
+          companionSources.slice_members += 1;
+        }
+
+        if (memberFiles.size > 0) {
+          const fileList = Array.from(memberFiles).slice(0, 80);
+          const fileListCypher = `[${fileList.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+
+          let cochangeRows: any[] = [];
+          try {
+            cochangeRows = await executeQuery(repo.id, `
+              MATCH (a:File)-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->(b:File)
+              WHERE a.filePath IN ${fileListCypher}
+              RETURN b.filePath AS filePath, MAX(r.confidence) AS confidence
+              ORDER BY confidence DESC
+              LIMIT 120
+            `);
+          } catch {
+            cochangeRows = [];
+          }
+
+          for (const row of cochangeRows) {
+            const filePath = String(row.filePath ?? row[0] ?? '').trim();
+            const confidence = Number(row.confidence ?? row[1] ?? 0) || 0;
+            if (!filePath) continue;
+            if (fileList.includes(filePath)) continue;
+            addCompanionSignal(filePath, Math.max(0.05, confidence), 'cochange-neighbor');
+            companionSources.cochange_edges += 1;
+          }
+        }
+
+        if (memberIds.length > 0) {
+          const memberIdsCypher = `[${memberIds.slice(0, 150).map(uid => `'${uid.replace(/'/g, "''")}'`).join(', ')}]`;
+          let shapeRows: any[] = [];
+          try {
+            shapeRows = await executeQuery(repo.id, `
+              MATCH (n)-[r:CodeRelation]->(m)
+              WHERE n.id IN ${memberIdsCypher}
+                AND r.type IN ['VALIDATES_FIELD', 'SERIALIZES_FIELD', 'READS_FIELD', 'WRITES_FIELD', 'INVALIDATES_KEY', 'TESTS_SHAPE', 'DERIVES_FROM_COLUMN']
+                AND m.filePath IS NOT NULL
+              RETURN m.filePath AS filePath, r.type AS relType, COUNT(*) AS count
+              ORDER BY count DESC
+              LIMIT 200
+            `);
+          } catch {
+            shapeRows = [];
+          }
+
+          for (const row of shapeRows) {
+            const filePath = String(row.filePath ?? row[0] ?? '').trim();
+            const relType = String(row.relType ?? row[1] ?? '').trim();
+            const count = Number(row.count ?? row[2] ?? 0) || 0;
+            if (!filePath || !relType || count <= 0) continue;
+            addCompanionSignal(filePath, Math.min(3, 0.3 + (count * 0.2)), `shape-link:${relType.toLowerCase()}`);
+            companionSources.shape_edges += count;
+          }
+        }
+
+        try {
+          const gapRows = await executeQuery(repo.id, `
+            MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice {id: '${escapedSliceId}'})
+            RETURN g.absenceTier AS absenceTier, g.severity AS severity
+            LIMIT 500
+          `);
+          for (const row of gapRows) {
+            const absenceTier = String(row.absenceTier ?? row[0] ?? '').trim();
+            const severity = String(row.severity ?? row[1] ?? '').trim();
+            targetSliceGapSummary.total += 1;
+            if (absenceTier === 'deterministic_missing') targetSliceGapSummary.deterministic += 1;
+            else if (absenceTier === 'pattern_missing') targetSliceGapSummary.pattern += 1;
+            else if (absenceTier === 'heuristic_suspicion') targetSliceGapSummary.heuristic += 1;
+
+            if (severity === 'high') targetSliceGapSummary.high += 1;
+            else if (severity === 'medium') targetSliceGapSummary.medium += 1;
+            else if (severity === 'low') targetSliceGapSummary.low += 1;
+          }
+        } catch { /* ignore */ }
+
+        try {
+          const closureSnapshot = await loadClosureTemplateSnapshot(repo.storagePath);
+          const templates = (Array.isArray(closureSnapshot.templates) ? closureSnapshot.templates : [])
+            .filter(template => String(template?.sliceType || '').trim() === String(targetSlice.slice_type || '').trim());
+
+          if (templates.length > 0) {
+            const closedSlots = new Set(
+              (Array.isArray(targetSlice.closed_slots) ? targetSlice.closed_slots : [])
+                .map((slot: any) => String(slot || '').trim())
+                .filter(Boolean),
+            );
+            const targetRoles = new Set(
+              (Array.isArray(targetSlice.roles) ? targetSlice.roles : [])
+                .map((role: any) => String(role || '').trim())
+                .filter(Boolean),
+            );
+
+            let best: any = null;
+            let bestScore = -1;
+            for (const template of templates) {
+              const requiredSlots = Array.isArray(template.requiredSlots) ? template.requiredSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [];
+              const templateRoles = Array.isArray(template.roleCoverage)
+                ? template.roleCoverage.map((item: any) => String(item?.role || '').trim()).filter(Boolean)
+                : [];
+              const requiredHits = requiredSlots.filter((slot: string) => closedSlots.has(slot)).length;
+              const roleHits = templateRoles.filter((role: string) => targetRoles.has(role)).length;
+              const requiredScore = requiredSlots.length > 0 ? (requiredHits / requiredSlots.length) : 1;
+              const roleScore = templateRoles.length > 0 ? (roleHits / templateRoles.length) : 1;
+              const score = (requiredScore * 0.7) + (roleScore * 0.3);
+              if (score > bestScore) {
+                bestScore = score;
+                best = template;
+              }
+            }
+
+            if (best) {
+              const requiredSlots = Array.isArray(best.requiredSlots) ? best.requiredSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [];
+              const roleExpectations = Array.isArray(best.roleCoverage)
+                ? best.roleCoverage
+                  .map((item: any) => ({
+                    role: String(item?.role || '').trim(),
+                    coverage: Number(item?.coverage || 0) || 0,
+                    count: Number(item?.count || 0) || 0,
+                  }))
+                  .filter((item: any) => item.role)
+                : [];
+
+              targetTemplate = {
+                id: String(best.id || '').trim(),
+                template_key: String(best.templateKey || '').trim(),
+                slice_type: String(best.sliceType || '').trim(),
+                required_slots: requiredSlots,
+                optional_slots: Array.isArray(best.optionalSlots) ? best.optionalSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [],
+                role_expectations: roleExpectations,
+                avg_closure_score: Number(best.avgClosureScore || 0) || 0,
+                slice_count: Number(best.sliceCount || 0) || 0,
+                exemplar_slice_ids: Array.isArray(best.exemplarSliceIds) ? best.exemplarSliceIds.map((item: any) => String(item || '').trim()).filter(Boolean) : [],
+              };
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    }
+
+    const companionFiles = Array.from(companionSignals.values())
+      .sort((left, right) => {
+        if (right.score !== left.score) return right.score - left.score;
+        return left.filePath.localeCompare(right.filePath);
+      })
+      .slice(0, Math.min(limitFiles + 5, 15))
+      .map(entry => ({
+        filePath: entry.filePath,
+        score: Number(entry.score.toFixed(3)),
+        reasons: Array.from(entry.reasons).slice(0, 6),
+        anchors: entry.anchors.slice(0, 4),
+      }));
+
+    const orderedWriteSteps = writeOrder
+      .sort((left, right) => {
+        if (left.role_priority !== right.role_priority) return left.role_priority - right.role_priority;
+        const leftStart = Number(left.startLine ?? Number.MAX_SAFE_INTEGER);
+        const rightStart = Number(right.startLine ?? Number.MAX_SAFE_INTEGER);
+        if (leftStart !== rightStart) return leftStart - rightStart;
+        if (left.filePath !== right.filePath) return String(left.filePath).localeCompare(String(right.filePath));
+        return String(left.uid).localeCompare(String(right.uid));
+      })
+      .slice(0, 16)
+      .map(step => ({
+        uid: step.uid,
+        name: step.name,
+        kind: step.kind,
+        filePath: step.filePath,
+        role: step.role,
+        ...(step.startLine !== undefined ? { startLine: step.startLine } : {}),
+        ...(step.endLine !== undefined ? { endLine: step.endLine } : {}),
+      }));
+
+    const targetArchetype = String(
+      implementPrecedents[0]?.signature
+      || topProcesses[0]?.process_type
+      || topProcesses[0]?.summary
+      || '',
+    ).trim() || null;
+
+    const implement_plan = {
+      target: {
+        query_intent: queryIntent || null,
+        archetype: targetArchetype,
+        slice: targetSlice
+          ? {
+            uid: targetSlice.uid,
+            label: targetSlice.label,
+            slice_type: targetSlice.slice_type,
+            anchor_id: targetSlice.anchor_id,
+            anchor_name: targetSlice.anchor_name,
+            closure_score: targetSlice.closure_score,
+            closure_slots: Array.isArray(targetSlice.closure_slots) ? targetSlice.closure_slots : [],
+            closed_slots: Array.isArray(targetSlice.closed_slots) ? targetSlice.closed_slots : [],
+            roles: Array.isArray(targetSlice.roles) ? targetSlice.roles : [],
+          }
+          : null,
+      },
+      precedents: implementPrecedents,
+      closure_template: targetTemplate,
+      companion_set: {
+        files: companionFiles,
+        summary: {
+          total_files: companionFiles.length,
+          seed_files: companionSources.seed_files,
+          slice_members: companionSources.slice_members,
+          cochange_edges: companionSources.cochange_edges,
+          shape_edges: companionSources.shape_edges,
+        },
+      },
+      write_order: orderedWriteSteps,
+      gap_signals: targetSliceGapSummary,
+      post_edit_review: {
+        tool: 'review_mode',
+        params: {
+          scope: 'unstaged',
+          ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
+          include_slice_stencil: true,
+          include_evidence_spans: true,
+        },
+      },
+    };
+
     return {
       status: 'ok',
       repo: repo.name,
@@ -3390,6 +5062,7 @@ export class LocalBackend {
       top_processes: Array.isArray(result?.processes) ? result.processes.slice(0, 3) : [],
       hops,
       cache_effects,
+      implement_plan,
     };
   }
 
@@ -3811,6 +5484,10 @@ export class LocalBackend {
     min_confidence?: number;
     include_ui_contracts?: boolean;
     max_ui_contract_files?: number;
+    include_evidence_spans?: boolean;
+    limit_evidence?: number;
+    include_slice_stencil?: boolean;
+    limit_slice_stencil?: number;
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
@@ -3822,6 +5499,10 @@ export class LocalBackend {
     const minConfidence = Math.max(0, Math.min(1, params.min_confidence ?? 0.9));
     const includeUiContracts = params.include_ui_contracts !== false;
     const maxUiContractFiles = Math.max(0, Math.min(20, params.max_ui_contract_files ?? 5));
+    const includeEvidenceSpans = params.include_evidence_spans !== false;
+    const limitEvidence = Math.max(1, Math.min(200, params.limit_evidence ?? 40));
+    const includeSliceStencil = params.include_slice_stencil !== false;
+    const limitSliceStencil = Math.max(1, Math.min(25, params.limit_slice_stencil ?? 8));
 
     const normalizePath = (value: string): string => {
       return String(value || '')
@@ -3891,7 +5572,7 @@ export class LocalBackend {
         sample_edges: Array<{
           source: { uid: string; name: string; kind: string; filePath: string };
           target: { uid: string; name: string; kind: string; filePath: string };
-          edge: { type: string; reason: string; confidence: number };
+          edge: { id: string; type: string; reason: string; confidence: number; witnessPathIds: string[] };
           direction: 'incoming' | 'outgoing' | 'internal';
         }>;
       }>,
@@ -3916,12 +5597,232 @@ export class LocalBackend {
       },
     });
 
-    const buildDiffArgs = (withPatch: boolean): string[] => {
+    const buildEmptyProofPack = () => ({
+      updated_at: '',
+      summary: {
+        symbol_spans: 0,
+        edge_spans: 0,
+        witness_spans: 0,
+        proof_spans: 0,
+      },
+      symbols: [] as Array<{
+        symbol: {
+          uid: string;
+          name: string;
+          kind: string;
+          filePath: string;
+          startLine?: number;
+          endLine?: number;
+        };
+        primary_span: any;
+        witness_spans: any[];
+        proof_spans: any[];
+      }>,
+      edges: [] as Array<{
+        family: SemanticFamily;
+        source: { uid: string; name: string; kind: string; filePath: string };
+        target: { uid: string; name: string; kind: string; filePath: string };
+        edge: { id: string; type: string; reason: string; confidence: number; witness_path_ids: string[] };
+        witness_spans: any[];
+        proof_spans: any[];
+      }>,
+    });
+
+    const buildEmptySliceStencil = () => ({
+      updated_at: '',
+      summary: {
+        changed_slices: 0,
+        with_templates: 0,
+        missing_required_slot_slices: 0,
+        missing_role_slices: 0,
+        sibling_candidates: 0,
+      },
+      slices: [] as Array<{
+        slice: {
+          id: string;
+          label: string;
+          heuristicLabel: string;
+          sliceType: string;
+          anchorId: string;
+          anchorName: string;
+          closureScore: number;
+          closureSlots: string[];
+          closedSlots: string[];
+          roles: string[];
+          changed_member_count: number;
+        };
+        changed_members: Array<{
+          uid: string;
+          name: string;
+          kind: string;
+          filePath: string;
+          role: string;
+          startLine?: number;
+          endLine?: number;
+        }>;
+        template: null | {
+          id: string;
+          template_key: string;
+          slice_type: string;
+          required_slots: string[];
+          optional_slots: string[];
+          role_expectations: Array<{ role: string; coverage: number; count: number }>;
+          avg_closure_score: number;
+          slice_count: number;
+        };
+        stencil_delta: {
+          missing_required_slots: string[];
+          missing_roles: string[];
+          closure_score_delta: number;
+        };
+        sibling_precedents: Array<{
+          id: string;
+          label: string;
+          anchor_name: string;
+          closure_score: number;
+          shared_closed_slots: string[];
+          shared_roles: string[];
+        }>;
+        gap_signals: {
+          total: number;
+          deterministic: number;
+          pattern: number;
+          heuristic: number;
+          high: number;
+          medium: number;
+          low: number;
+        };
+      }>,
+    });
+
+    const buildReviewKernel = (input: {
+      changed_files: number;
+      changed_symbols: number;
+      suggested_tests: number;
+      ui_contracts: number;
+      route_files: number;
+      authz_controllers: number;
+      semantic_diffs: ReturnType<typeof buildEmptySemanticDiffs>;
+      slice_stencil: ReturnType<typeof buildEmptySliceStencil>;
+      scope: string;
+      path_prefixes: string[];
+    }) => {
+      const semanticGap = input.semantic_diffs?.gap_signals || {
+        total: 0,
+        deterministic: 0,
+        pattern: 0,
+        heuristic: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+      };
+      const authFamily = (Array.isArray(input.semantic_diffs?.families) ? input.semantic_diffs.families : [])
+        .find((family: any) => String(family?.family || '') === 'auth');
+      const missingRequiredSlotSlices = Number(input.slice_stencil?.summary?.missing_required_slot_slices || 0);
+      const missingRoleSlices = Number(input.slice_stencil?.summary?.missing_role_slices || 0);
+
+      let riskScore = 0;
+      riskScore += Math.min(4, Math.ceil(Number(input.changed_symbols || 0) / 8));
+      riskScore += Math.min(6, (Number(semanticGap.high || 0) * 2) + Number(semanticGap.deterministic || 0));
+      riskScore += Math.min(4, (missingRequiredSlotSlices * 2) + missingRoleSlices);
+      if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) riskScore += 2;
+      if (Number(input.suggested_tests || 0) === 0 && Number(input.changed_symbols || 0) > 0) riskScore += 1;
+
+      const risk_level = riskScore >= 10 ? 'high' : riskScore >= 5 ? 'medium' : 'low';
+
+      const top_findings: string[] = [];
+      if (Number(semanticGap.high || 0) > 0) {
+        top_findings.push(`High-severity gap signals detected (${Number(semanticGap.high || 0)}).`);
+      }
+      if (Number(semanticGap.deterministic || 0) > 0) {
+        top_findings.push(`Deterministic missing links detected (${Number(semanticGap.deterministic || 0)}).`);
+      }
+      if (missingRequiredSlotSlices > 0) {
+        top_findings.push(`Slices missing required closure slots (${missingRequiredSlotSlices}).`);
+      }
+      if (missingRoleSlices > 0) {
+        top_findings.push(`Slices missing expected role coverage (${missingRoleSlices}).`);
+      }
+      if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) {
+        top_findings.push('Auth-related relation deltas detected without controller auth closure checks.');
+      }
+      if (Number(input.route_files || 0) > 0) {
+        top_findings.push(`Route files changed (${Number(input.route_files || 0)}); validate controller wiring targets.`);
+      }
+      if (Number(input.ui_contracts || 0) > 0) {
+        top_findings.push(`UI contract diffs available (${Number(input.ui_contracts || 0)}).`);
+      }
+      if (top_findings.length === 0 && Number(input.changed_files || 0) === 0) {
+        top_findings.push('No changed files detected for the selected review scope.');
+      }
+
+      const hypotheses: string[] = [];
+      if (Number(semanticGap.high || 0) > 0 || Number(semanticGap.deterministic || 0) > 0) {
+        hypotheses.push('Primary risk is incomplete closure on changed feature slices.');
+      }
+      if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) {
+        hypotheses.push('Auth drift may exist between permission signals and runtime controller checks.');
+      }
+      if (Number(input.suggested_tests || 0) === 0 && Number(input.changed_symbols || 0) > 0) {
+        hypotheses.push('Changed symbols may lack direct test callers in current graph coverage.');
+      }
+      if (hypotheses.length === 0 && Number(input.changed_files || 0) > 0) {
+        hypotheses.push('Primary risk appears to be localized to changed files with bounded blast radius.');
+      }
+
+      const next_actions = [
+        'Open top changed symbols with context() to confirm ownership and dependencies.',
+        'Run impact() on the highest-risk changed symbol to validate direct dependents.',
+      ];
+      if (Number(semanticGap.total || 0) > 0 || missingRequiredSlotSlices > 0 || missingRoleSlices > 0) {
+        next_actions.push('Review slice_stencil and semantic gap signals before applying follow-up edits.');
+      }
+      if (Number(input.route_files || 0) > 0) {
+        next_actions.push('Verify route_targets controller mappings for each changed route file.');
+      }
+      if (Number(input.ui_contracts || 0) > 0) {
+        next_actions.push('Inspect ui_contract diffs to verify mutation side-effects and cache triggers.');
+      }
+      if (Number(input.suggested_tests || 0) > 0) {
+        next_actions.push('Run suggested tests first, then expand coverage only if failures indicate wider drift.');
+      }
+
+      return {
+        risk: {
+          level: risk_level,
+          score: riskScore,
+          signals: {
+            changed_files: Number(input.changed_files || 0),
+            changed_symbols: Number(input.changed_symbols || 0),
+            semantic_gap_total: Number(semanticGap.total || 0),
+            semantic_gap_high: Number(semanticGap.high || 0),
+            missing_required_slot_slices: missingRequiredSlotSlices,
+            missing_role_slices: missingRoleSlices,
+          },
+        },
+        top_findings: top_findings.slice(0, 8),
+        hypotheses: Array.from(new Set(hypotheses)).slice(0, 6),
+        next_actions: next_actions.slice(0, 8),
+        review_scope: {
+          scope: input.scope,
+          path_prefixes: input.path_prefixes,
+        },
+      };
+    };
+
+    const buildDiffArgs = (
+      withPatch: boolean,
+      scopeOverride?: 'unstaged' | 'staged' | 'all' | 'compare',
+      baseRefOverride?: string,
+    ): string[] => {
       const args = ['diff', '--no-color'];
       if (withPatch) args.push('-U0', '--patch');
       else args.push('--name-only');
 
-      switch (scope) {
+      const effectiveScope = scopeOverride || scope;
+      const effectiveBaseRef = String(baseRefOverride ?? baseRef).trim();
+
+      switch (effectiveScope) {
         case 'staged':
           args.push('--staged');
           break;
@@ -3929,9 +5830,9 @@ export class LocalBackend {
           args.push('HEAD');
           break;
         case 'compare':
-          if (!baseRef) throw new Error('base_ref is required for "compare" scope');
+          if (!effectiveBaseRef) throw new Error('base_ref is required for "compare" scope');
           // PR-style diff: merge base vs HEAD
-          args.push(`${baseRef}...HEAD`);
+          args.push(`${effectiveBaseRef}...HEAD`);
           break;
         case 'unstaged':
         default:
@@ -3942,11 +5843,29 @@ export class LocalBackend {
     };
 
     let changedFilesRaw: string[] = [];
+    let effectiveScope: 'unstaged' | 'staged' | 'all' | 'compare' = scope;
+    let diffSource = 'requested';
     try {
       const output = execFileSync('git', buildDiffArgs(false), { cwd: repo.repoPath, encoding: 'utf-8' });
       changedFilesRaw = String(output || '').trim().split('\n').map(s => s.trim()).filter(Boolean);
     } catch (err: any) {
       return { error: `Git diff failed: ${err?.message || 'unknown error'}` };
+    }
+
+    // Compare scope may be empty in detached/local-only workflows while local working tree still has real changes.
+    // Fallback to HEAD diff so review_mode remains useful instead of returning an empty review envelope.
+    if (scope === 'compare' && changedFilesRaw.length === 0) {
+      try {
+        const output = execFileSync('git', buildDiffArgs(false, 'all'), { cwd: repo.repoPath, encoding: 'utf-8' });
+        const fallbackFiles = String(output || '').trim().split('\n').map(s => s.trim()).filter(Boolean);
+        if (fallbackFiles.length > 0) {
+          changedFilesRaw = fallbackFiles;
+          effectiveScope = 'all';
+          diffSource = 'compare-empty->all';
+        }
+      } catch {
+        // keep original empty compare result if fallback also fails
+      }
     }
 
     const changedFiles = changedFilesRaw
@@ -3955,6 +5874,20 @@ export class LocalBackend {
 
     if (changedFiles.length === 0) {
       const semantic_diffs = buildEmptySemanticDiffs();
+      const proof_pack = buildEmptyProofPack();
+      const slice_stencil = buildEmptySliceStencil();
+      const review_kernel = buildReviewKernel({
+        changed_files: 0,
+        changed_symbols: 0,
+        suggested_tests: 0,
+        ui_contracts: 0,
+        route_files: 0,
+        authz_controllers: 0,
+        semantic_diffs,
+        slice_stencil,
+        scope: effectiveScope,
+        path_prefixes: pathPrefixes,
+      });
       return {
         status: 'ok',
         repo: repo.name,
@@ -3967,6 +5900,10 @@ export class LocalBackend {
           suggested_tests: 0,
           semantic_families: semantic_diffs.summary.family_count,
           semantic_gap_signals: semantic_diffs.summary.gap_signals,
+          proof_symbols: proof_pack.summary.symbol_spans,
+          proof_edges: proof_pack.summary.edge_spans,
+          stencil_slices: slice_stencil.summary.changed_slices,
+          stencil_templates: slice_stencil.summary.with_templates,
         },
         changed_files: [],
         changed_symbols: [],
@@ -3976,12 +5913,23 @@ export class LocalBackend {
         route_targets: [],
         authz: [],
         semantic_diffs,
+        proof_pack,
+        slice_stencil,
+        review_kernel,
+        _review_mode: {
+          diff: {
+            requested_scope: scope,
+            effective_scope: effectiveScope,
+            fallback_applied: diffSource !== 'requested',
+            source: diffSource,
+          },
+        },
       };
     }
 
     let patch = '';
     try {
-      patch = execFileSync('git', buildDiffArgs(true), {
+      patch = execFileSync('git', buildDiffArgs(true, effectiveScope), {
         cwd: repo.repoPath,
         encoding: 'utf-8',
         maxBuffer: 1024 * 1024 * 20, // 20MB
@@ -4205,8 +6153,38 @@ export class LocalBackend {
       .slice(0, limitSymbols);
 
     const callerFetchLimit = Math.min(200, Math.max(limitCallers, limitTests) * 6);
+    const changedSymbolIds = Array.from(new Set(
+      changedSymbols
+        .map(sym => String(sym?.uid || '').trim())
+        .filter(Boolean)
+    ));
+    const changedSymbolIdSet = new Set(changedSymbolIds);
+    const changedFilePathSet = new Set<string>();
+    for (const sym of changedSymbols) {
+      const fp = normalizePath(String(sym?.filePath || ''));
+      if (fp) changedFilePathSet.add(fp);
+    }
+    for (const file of changedFileObjs) {
+      if (file.status === 'Deleted') continue;
+      const fp = normalizePath(String(file?.filePath || ''));
+      if (fp) changedFilePathSet.add(fp);
+    }
 
     const suggestedTestsAgg = new Map<string, { score: number; reasons: string[] }>();
+    const addSuggestedTest = (filePath: string, scoreDelta: number, reason: string): void => {
+      const fp = normalizePath(filePath);
+      if (!fp) return;
+      if (!isTestFilePath(fp)) return;
+      if (pathPrefixes.length > 0 && !isInScope(fp)) return;
+
+      const current = suggestedTestsAgg.get(fp) || { score: 0, reasons: [] as string[] };
+      const safeScore = Number.isFinite(scoreDelta) ? Math.max(0.05, scoreDelta) : 0.05;
+      const reasonText = String(reason || '').trim();
+      const reasons = reasonText && !current.reasons.includes(reasonText)
+        ? [...current.reasons, reasonText].slice(0, 5)
+        : current.reasons;
+      suggestedTestsAgg.set(fp, { score: current.score + safeScore, reasons });
+    };
 
     const symbols: any[] = [];
     for (const sym of changedSymbols) {
@@ -4248,10 +6226,9 @@ export class LocalBackend {
       for (const t of testCallers) {
         const fp = String(t?.filePath || '').trim();
         if (!fp) continue;
-        const score = (suggestedTestsAgg.get(fp)?.score || 0) + 1;
-        const reasons = suggestedTestsAgg.get(fp)?.reasons || [];
-        const reason = sym?.name ? `${sym.name} called here` : 'calls changed symbol';
-        suggestedTestsAgg.set(fp, { score, reasons: [...reasons, reason].slice(0, 5) });
+        const confidence = Number(t?.edge?.confidence ?? 1.0);
+        const reason = sym?.name ? `${sym.name} direct caller` : 'direct caller of changed symbol';
+        addSuggestedTest(fp, 3 + Math.max(0, confidence), reason);
       }
 
       symbols.push({
@@ -4261,23 +6238,555 @@ export class LocalBackend {
       });
     }
 
+    // Fallback tier 1: include lower-confidence test callers if no direct high-confidence hits were found.
+    if (suggestedTestsAgg.size === 0 && changedSymbolIds.length > 0) {
+      try {
+        const changedSymbolIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        const fallbackRows = await executeQuery(repo.id, `
+          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t)
+          WHERE t.id IN ${changedSymbolIdsCypher}
+          RETURN caller.filePath AS callerFilePath, t.name AS targetName, r.confidence AS confidence, r.reason AS reason
+          ORDER BY r.confidence DESC
+          LIMIT ${Math.max(limitTests * 30, 120)}
+        `);
+        for (const row of fallbackRows) {
+          const callerFilePath = String(row.callerFilePath || row[0] || '').trim();
+          if (!callerFilePath) continue;
+          if (pathPrefixes.length > 0 && !isInScope(callerFilePath)) continue;
+          if (!isTestFilePath(callerFilePath)) continue;
+          const targetName = String(row.targetName || row[1] || '').trim();
+          const confidence = Number(row.confidence ?? row[2] ?? 0);
+          const reason = targetName
+            ? `${targetName} low-confidence caller (confidence ${confidence.toFixed(2)})`
+            : `low-confidence caller (confidence ${confidence.toFixed(2)})`;
+          addSuggestedTest(callerFilePath, 1 + Math.max(0, confidence), reason);
+        }
+      } catch {
+        // best-effort fallback
+      }
+    }
+
+    // Fallback tier 2: suggest tests that import changed files, even when no CALLS edge exists.
+    if (suggestedTestsAgg.size === 0 && changedFilePathSet.size > 0) {
+      try {
+        const changedFilesCypher = `[${Array.from(changedFilePathSet).map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+        const importRows = await executeQuery(repo.id, `
+          MATCH (caller)-[r:CodeRelation {type: 'IMPORTS'}]->(target)
+          WHERE target.filePath IN ${changedFilesCypher}
+          RETURN caller.filePath AS callerFilePath, target.filePath AS targetFilePath, r.confidence AS confidence
+          ORDER BY r.confidence DESC
+          LIMIT ${Math.max(limitTests * 40, 200)}
+        `);
+        for (const row of importRows) {
+          const callerFilePath = String(row.callerFilePath || row[0] || '').trim();
+          if (!callerFilePath) continue;
+          if (pathPrefixes.length > 0 && !isInScope(callerFilePath)) continue;
+          if (!isTestFilePath(callerFilePath)) continue;
+          const targetFilePath = normalizePath(String(row.targetFilePath || row[1] || ''));
+          const confidence = Number(row.confidence ?? row[2] ?? 0);
+          const reason = targetFilePath
+            ? `imports changed file ${targetFilePath}`
+            : 'imports changed file';
+          addSuggestedTest(callerFilePath, 0.8 + Math.max(0, confidence), reason);
+        }
+      } catch {
+        // best-effort fallback
+      }
+    }
+
+    // Fallback tier 3: lexical proximity from tracked tests as a last resort.
+    if (suggestedTestsAgg.size === 0 && changedFilePathSet.size > 0) {
+      const stopTokens = new Set([
+        'apps', 'app', 'src', 'lib', 'utils', 'shared', 'common', 'components',
+        'services', 'service', 'controllers', 'controller', 'index', 'test', 'tests',
+        'spec', 'feature', 'unit', 'backend', 'dashboard',
+      ]);
+      const tokenize = (value: string): string[] => {
+        return String(value || '')
+          .toLowerCase()
+          .split(/[^a-z0-9]+/g)
+          .map(token => token.trim())
+          .filter(token => token.length >= 3 && !stopTokens.has(token));
+      };
+
+      const changedTokens = new Set<string>();
+      for (const fp of changedFilePathSet) {
+        for (const token of tokenize(fp)) changedTokens.add(token);
+        const base = path.basename(fp, path.extname(fp));
+        for (const token of tokenize(base)) changedTokens.add(token);
+      }
+      for (const sym of changedSymbols) {
+        for (const token of tokenize(String(sym?.name || ''))) changedTokens.add(token);
+      }
+
+      if (changedTokens.size > 0) {
+        try {
+          const output = execFileSync('git', ['ls-files'], {
+            cwd: repo.repoPath,
+            encoding: 'utf-8',
+            maxBuffer: 1024 * 1024 * 10,
+          });
+          const candidates = String(output || '')
+            .trim()
+            .split('\n')
+            .map(line => normalizePath(line))
+            .filter(Boolean)
+            .filter(filePath => isTestFilePath(filePath))
+            .filter(filePath => pathPrefixes.length === 0 || isInScope(filePath));
+
+          const ranked = candidates
+            .map(filePath => {
+              const overlap = Array.from(new Set(tokenize(filePath).filter(token => changedTokens.has(token))));
+              if (overlap.length === 0) return null;
+              return {
+                filePath,
+                score: 0.3 * overlap.length,
+                reason: `filename/token proximity: ${overlap.slice(0, 4).join(', ')}`,
+              };
+            })
+            .filter((item): item is { filePath: string; score: number; reason: string } => item !== null)
+            .sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath))
+            .slice(0, limitTests);
+
+          for (const hit of ranked) {
+            addSuggestedTest(hit.filePath, hit.score, hit.reason);
+          }
+        } catch {
+          // best-effort fallback
+        }
+      }
+    }
+
     const suggested_tests = Array.from(suggestedTestsAgg.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, limitTests)
       .map(([filePath, meta]) => ({
         filePath,
-        score: meta.score,
+        score: Number(meta.score.toFixed(3)),
         reasons: meta.reasons,
       }));
 
+    const slice_stencil = buildEmptySliceStencil();
+    if (includeSliceStencil && changedSymbolIds.length > 0) {
+      try {
+        const changedSymbolIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+
+        const sliceRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+          WHERE n.id IN ${changedSymbolIdsCypher}
+            AND r.reason STARTS WITH 'feature-slice:'
+          RETURN
+            s.id AS sliceId,
+            s.label AS sliceLabel,
+            s.heuristicLabel AS heuristicLabel,
+            s.sliceType AS sliceType,
+            s.anchorId AS anchorId,
+            s.anchorName AS anchorName,
+            s.closureScore AS closureScore,
+            s.closureSlots AS closureSlots,
+            s.closedSlots AS closedSlots,
+            n.id AS memberId,
+            n.name AS memberName,
+            labels(n) AS memberKind,
+            n.filePath AS memberFilePath,
+            n.startLine AS memberStartLine,
+            n.endLine AS memberEndLine,
+            r.reason AS memberRoleReason
+          LIMIT 4000
+        `);
+
+        const parseSliceRole = (reason: string): string => {
+          const raw = String(reason || '').trim();
+          if (!raw) return '';
+          if (!raw.startsWith('feature-slice:')) return raw;
+          return raw.slice('feature-slice:'.length).trim();
+        };
+
+        const toPrimaryLabel = (value: any): string => {
+          if (Array.isArray(value)) return String(value[0] || '').trim();
+          return String(value || '').trim();
+        };
+
+        const changedSliceMap = new Map<string, {
+          id: string;
+          label: string;
+          heuristicLabel: string;
+          sliceType: string;
+          anchorId: string;
+          anchorName: string;
+          closureScore: number;
+          closureSlots: string[];
+          closedSlots: string[];
+          roles: Set<string>;
+          changedMembers: Array<{
+            uid: string;
+            name: string;
+            kind: string;
+            filePath: string;
+            role: string;
+            startLine?: number;
+            endLine?: number;
+          }>;
+          gapSignals: {
+            total: number;
+            deterministic: number;
+            pattern: number;
+            heuristic: number;
+            high: number;
+            medium: number;
+            low: number;
+          };
+          template: null | {
+            id: string;
+            template_key: string;
+            slice_type: string;
+            required_slots: string[];
+            optional_slots: string[];
+            role_expectations: Array<{ role: string; coverage: number; count: number }>;
+            avg_closure_score: number;
+            slice_count: number;
+            exemplar_slice_ids: string[];
+          };
+          stencilDelta: {
+            missing_required_slots: string[];
+            missing_roles: string[];
+            closure_score_delta: number;
+          };
+          siblingPrecedents: Array<{
+            id: string;
+            label: string;
+            anchor_name: string;
+            closure_score: number;
+            shared_closed_slots: string[];
+            shared_roles: string[];
+          }>;
+        }>();
+
+        for (const row of sliceRows) {
+          const sliceId = String(row.sliceId ?? row[0] ?? '').trim();
+          if (!sliceId) continue;
+
+          let entry = changedSliceMap.get(sliceId);
+          if (!entry) {
+            entry = {
+              id: sliceId,
+              label: String(row.sliceLabel ?? row[1] ?? '').trim(),
+              heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
+              sliceType: String(row.sliceType ?? row[3] ?? '').trim(),
+              anchorId: String(row.anchorId ?? row[4] ?? '').trim(),
+              anchorName: String(row.anchorName ?? row[5] ?? '').trim(),
+              closureScore: Number(row.closureScore ?? row[6] ?? 0) || 0,
+              closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+              closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+              roles: new Set<string>(),
+              changedMembers: [],
+              gapSignals: {
+                total: 0,
+                deterministic: 0,
+                pattern: 0,
+                heuristic: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+              },
+              template: null,
+              stencilDelta: {
+                missing_required_slots: [],
+                missing_roles: [],
+                closure_score_delta: 0,
+              },
+              siblingPrecedents: [],
+            };
+            changedSliceMap.set(sliceId, entry);
+          }
+
+          const role = parseSliceRole(String(row.memberRoleReason ?? row[15] ?? '').trim());
+          if (role) entry.roles.add(role);
+          const memberId = String(row.memberId ?? row[9] ?? '').trim();
+          if (!memberId) continue;
+          const startLine = Number(row.memberStartLine ?? row[13]);
+          const endLine = Number(row.memberEndLine ?? row[14]);
+
+          entry.changedMembers.push({
+            uid: memberId,
+            name: String(row.memberName ?? row[10] ?? '').trim(),
+            kind: toPrimaryLabel(row.memberKind ?? row[11]),
+            filePath: String(row.memberFilePath ?? row[12] ?? '').trim(),
+            role,
+            ...(Number.isFinite(startLine) ? { startLine } : {}),
+            ...(Number.isFinite(endLine) ? { endLine } : {}),
+          });
+        }
+
+        const changedSliceIds = Array.from(changedSliceMap.keys()).slice(0, limitSliceStencil);
+        if (changedSliceIds.length > 0) {
+          const changedSliceIdsCypher = `[${changedSliceIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+
+          const sliceRoleRows = await executeQuery(repo.id, `
+            MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+            WHERE s.id IN ${changedSliceIdsCypher}
+              AND r.reason STARTS WITH 'feature-slice:'
+            RETURN s.id AS sliceId, n.id AS memberId, r.reason AS memberRoleReason
+            LIMIT 5000
+          `);
+
+          const memberIdSets = new Map<string, Set<string>>();
+          for (const row of sliceRoleRows) {
+            const sliceId = String(row.sliceId ?? row[0] ?? '').trim();
+            if (!sliceId) continue;
+            const memberId = String(row.memberId ?? row[1] ?? '').trim();
+            const role = parseSliceRole(String(row.memberRoleReason ?? row[2] ?? '').trim());
+            const entry = changedSliceMap.get(sliceId);
+            if (!entry) continue;
+            if (role) entry.roles.add(role);
+            if (!memberId) continue;
+            const memberSet = memberIdSets.get(sliceId) || new Set<string>();
+            memberSet.add(memberId);
+            memberIdSets.set(sliceId, memberSet);
+          }
+
+          const gapRows = await executeQuery(repo.id, `
+            MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+            WHERE s.id IN ${changedSliceIdsCypher}
+            RETURN s.id AS sliceId, g.absenceTier AS absenceTier, g.severity AS severity
+            LIMIT 2000
+          `);
+
+          for (const row of gapRows) {
+            const sliceId = String(row.sliceId ?? row[0] ?? '').trim();
+            const absenceTier = String(row.absenceTier ?? row[1] ?? '').trim();
+            const severity = String(row.severity ?? row[2] ?? '').trim();
+            const entry = changedSliceMap.get(sliceId);
+            if (!entry) continue;
+
+            entry.gapSignals.total += 1;
+            if (absenceTier === 'deterministic_missing') entry.gapSignals.deterministic += 1;
+            else if (absenceTier === 'pattern_missing') entry.gapSignals.pattern += 1;
+            else if (absenceTier === 'heuristic_suspicion') entry.gapSignals.heuristic += 1;
+
+            if (severity === 'high') entry.gapSignals.high += 1;
+            else if (severity === 'medium') entry.gapSignals.medium += 1;
+            else if (severity === 'low') entry.gapSignals.low += 1;
+          }
+
+          const closureSnapshot = await loadClosureTemplateSnapshot(repo.storagePath);
+          const templatesBySliceType = new Map<string, Array<typeof closureSnapshot.templates[number]>>();
+          for (const template of Array.isArray(closureSnapshot.templates) ? closureSnapshot.templates : []) {
+            const key = String(template?.sliceType || '').trim();
+            if (!key) continue;
+            const list = templatesBySliceType.get(key) || [];
+            list.push(template);
+            templatesBySliceType.set(key, list);
+          }
+
+          const candidateSiblingIds = new Set<string>();
+          for (const sliceId of changedSliceIds) {
+            const entry = changedSliceMap.get(sliceId);
+            if (!entry) continue;
+
+            const templates = templatesBySliceType.get(entry.sliceType) || [];
+            const closedSlotSet = new Set(entry.closedSlots);
+            const roleSet = new Set(Array.from(entry.roles));
+
+            let bestTemplate: any = null;
+            let bestScore = -1;
+            for (const template of templates) {
+              const requiredSlots = Array.isArray(template.requiredSlots) ? template.requiredSlots.map((value: any) => String(value || '').trim()).filter(Boolean) : [];
+              const roleExpectations = Array.isArray(template.roleCoverage) ? template.roleCoverage : [];
+              const templateRoles = roleExpectations.map((role: any) => String(role?.role || '').trim()).filter(Boolean);
+              const requiredHits = requiredSlots.filter(slot => closedSlotSet.has(slot)).length;
+              const roleHits = templateRoles.filter(role => roleSet.has(role)).length;
+
+              const requiredScore = requiredSlots.length > 0 ? (requiredHits / requiredSlots.length) : 1;
+              const roleScore = templateRoles.length > 0 ? (roleHits / templateRoles.length) : 1;
+              const score = (requiredScore * 0.7) + (roleScore * 0.3) + ((Number(template.sliceCount || 0) || 0) * 0.0001);
+              if (score > bestScore) {
+                bestScore = score;
+                bestTemplate = template;
+              }
+            }
+
+            if (!bestTemplate) continue;
+
+            const requiredSlots = Array.isArray(bestTemplate.requiredSlots)
+              ? bestTemplate.requiredSlots.map((value: any) => String(value || '').trim()).filter(Boolean)
+              : [];
+            const optionalSlots = Array.isArray(bestTemplate.optionalSlots)
+              ? bestTemplate.optionalSlots.map((value: any) => String(value || '').trim()).filter(Boolean)
+              : [];
+            const roleExpectations = Array.isArray(bestTemplate.roleCoverage)
+              ? bestTemplate.roleCoverage
+                .map((item: any) => ({
+                  role: String(item?.role || '').trim(),
+                  coverage: Number(item?.coverage || 0) || 0,
+                  count: Number(item?.count || 0) || 0,
+                }))
+                .filter((item: any) => item.role)
+              : [];
+            const expectedRoles = roleExpectations
+              .filter((item: any) => item.coverage >= 0.5)
+              .map((item: any) => item.role);
+            const exemplarSliceIds = Array.isArray(bestTemplate.exemplarSliceIds)
+              ? bestTemplate.exemplarSliceIds.map((value: any) => String(value || '').trim()).filter(Boolean)
+              : [];
+
+            entry.template = {
+              id: String(bestTemplate.id || '').trim(),
+              template_key: String(bestTemplate.templateKey || '').trim(),
+              slice_type: String(bestTemplate.sliceType || '').trim(),
+              required_slots: requiredSlots,
+              optional_slots: optionalSlots,
+              role_expectations: roleExpectations,
+              avg_closure_score: Number(bestTemplate.avgClosureScore || 0) || 0,
+              slice_count: Number(bestTemplate.sliceCount || 0) || 0,
+              exemplar_slice_ids: exemplarSliceIds,
+            };
+
+            entry.stencilDelta = {
+              missing_required_slots: requiredSlots.filter(slot => !closedSlotSet.has(slot)),
+              missing_roles: expectedRoles.filter(role => !roleSet.has(role)),
+              closure_score_delta: Number(((Number(bestTemplate.avgClosureScore || 0) || 0) - entry.closureScore).toFixed(3)),
+            };
+
+            for (const siblingId of exemplarSliceIds) {
+              if (!siblingId || siblingId === entry.id) continue;
+              candidateSiblingIds.add(siblingId);
+            }
+          }
+
+          const siblingList = Array.from(candidateSiblingIds);
+          const siblingDetailsById = new Map<string, {
+            id: string;
+            label: string;
+            heuristicLabel: string;
+            anchorName: string;
+            closureScore: number;
+            closedSlots: string[];
+            roles: Set<string>;
+          }>();
+
+          if (siblingList.length > 0) {
+            const siblingIdsCypher = `[${siblingList.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+
+            const siblingRows = await executeQuery(repo.id, `
+              MATCH (s:FeatureSlice)
+              WHERE s.id IN ${siblingIdsCypher}
+              RETURN s.id AS id, s.label AS label, s.heuristicLabel AS heuristicLabel, s.anchorName AS anchorName, s.closureScore AS closureScore, s.closedSlots AS closedSlots
+              LIMIT 1000
+            `);
+
+            for (const row of siblingRows) {
+              const siblingId = String(row.id ?? row[0] ?? '').trim();
+              if (!siblingId) continue;
+              siblingDetailsById.set(siblingId, {
+                id: siblingId,
+                label: String(row.label ?? row[1] ?? '').trim(),
+                heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
+                anchorName: String(row.anchorName ?? row[3] ?? '').trim(),
+                closureScore: Number(row.closureScore ?? row[4] ?? 0) || 0,
+                closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+                roles: new Set<string>(),
+              });
+            }
+
+            const siblingRoleRows = await executeQuery(repo.id, `
+              MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
+              WHERE s.id IN ${siblingIdsCypher}
+                AND r.reason STARTS WITH 'feature-slice:'
+              RETURN s.id AS sliceId, r.reason AS memberRoleReason
+              LIMIT 4000
+            `);
+
+            for (const row of siblingRoleRows) {
+              const siblingId = String(row.sliceId ?? row[0] ?? '').trim();
+              const role = parseSliceRole(String(row.memberRoleReason ?? row[1] ?? '').trim());
+              const sibling = siblingDetailsById.get(siblingId);
+              if (!sibling || !role) continue;
+              sibling.roles.add(role);
+            }
+          }
+
+          const rankedSlices = changedSliceIds
+            .map(sliceId => changedSliceMap.get(sliceId))
+            .filter((entry): entry is NonNullable<typeof entry> => !!entry)
+            .sort((left, right) => {
+              if (right.gapSignals.high !== left.gapSignals.high) return right.gapSignals.high - left.gapSignals.high;
+              if (right.stencilDelta.missing_required_slots.length !== left.stencilDelta.missing_required_slots.length) {
+                return right.stencilDelta.missing_required_slots.length - left.stencilDelta.missing_required_slots.length;
+              }
+              return left.id.localeCompare(right.id);
+            })
+            .slice(0, limitSliceStencil);
+
+          for (const entry of rankedSlices) {
+            const closedSlotSet = new Set(entry.closedSlots);
+            const roleSet = new Set(Array.from(entry.roles));
+            const siblingCandidates = entry.template
+              ? entry.template.exemplar_slice_ids
+              : [];
+
+            const sibling_precedents = siblingCandidates
+              .map((siblingId: string) => siblingDetailsById.get(String(siblingId || '').trim()))
+              .filter((item): item is NonNullable<typeof item> => !!item)
+              .map(sibling => {
+                const sharedClosedSlots = sibling.closedSlots.filter(slot => closedSlotSet.has(slot));
+                const siblingRoles = Array.from(sibling.roles);
+                const sharedRoles = siblingRoles.filter(role => roleSet.has(role));
+                return {
+                  id: sibling.id,
+                  label: sibling.label || sibling.heuristicLabel || sibling.id,
+                  anchor_name: sibling.anchorName,
+                  closure_score: Number(sibling.closureScore.toFixed(3)),
+                  shared_closed_slots: sharedClosedSlots.slice(0, 8),
+                  shared_roles: sharedRoles.slice(0, 8),
+                  __rank: sharedClosedSlots.length + sharedRoles.length + sibling.closureScore,
+                };
+              })
+              .sort((left, right) => right.__rank - left.__rank)
+              .slice(0, 3)
+              .map(({ __rank, ...rest }) => rest);
+
+            entry.siblingPrecedents = sibling_precedents;
+
+            slice_stencil.slices.push({
+              slice: {
+                id: entry.id,
+                label: entry.label || entry.heuristicLabel || entry.id,
+                heuristicLabel: entry.heuristicLabel,
+                sliceType: entry.sliceType,
+                anchorId: entry.anchorId,
+                anchorName: entry.anchorName,
+                closureScore: Number(entry.closureScore.toFixed(3)),
+                closureSlots: entry.closureSlots,
+                closedSlots: entry.closedSlots,
+                roles: Array.from(entry.roles).sort(),
+                changed_member_count: (memberIdSets.get(entry.id)?.size || entry.changedMembers.length),
+              },
+              changed_members: entry.changedMembers.slice(0, 12),
+              template: entry.template,
+              stencil_delta: entry.stencilDelta,
+              sibling_precedents,
+              gap_signals: entry.gapSignals,
+            });
+          }
+
+          slice_stencil.updated_at = String(closureSnapshot.generatedAt || '');
+          slice_stencil.summary = {
+            changed_slices: slice_stencil.slices.length,
+            with_templates: slice_stencil.slices.filter(item => !!item.template).length,
+            missing_required_slot_slices: slice_stencil.slices.filter(item => item.stencil_delta.missing_required_slots.length > 0).length,
+            missing_role_slices: slice_stencil.slices.filter(item => item.stencil_delta.missing_roles.length > 0).length,
+            sibling_candidates: slice_stencil.slices.reduce((sum, item) => sum + item.sibling_precedents.length, 0),
+          };
+        }
+      } catch {
+        // best-effort slice stencil enrichment
+      }
+    }
+
     const semanticFamilyOrder: SemanticFamily[] = ['auth', 'shape', 'cache', 'test', 'event', 'template'];
     const semantic_diffs = buildEmptySemanticDiffs();
-    const changedSymbolIds = Array.from(new Set(
-      changedSymbols
-        .map(sym => String(sym?.uid || '').trim())
-        .filter(Boolean)
-    ));
-    const changedSymbolIdSet = new Set(changedSymbolIds);
+    let proof_pack = buildEmptyProofPack();
 
     if (changedSymbolIds.length > 0) {
       const pickPrimaryLabel = (value: any): string => {
@@ -4357,7 +6866,9 @@ export class LocalBackend {
             b.filePath AS targetFilePath,
             r.type AS relType,
             r.reason AS reason,
-            r.confidence AS confidence
+            r.confidence AS confidence,
+            r.id AS edgeId,
+            r.witnessPathIds AS witnessPathIds
           LIMIT 3000
         `);
 
@@ -4371,7 +6882,7 @@ export class LocalBackend {
         sample_edges: Array<{
           source: { uid: string; name: string; kind: string; filePath: string };
           target: { uid: string; name: string; kind: string; filePath: string };
-          edge: { type: string; reason: string; confidence: number };
+          edge: { id: string; type: string; reason: string; confidence: number; witnessPathIds: string[] };
           direction: 'incoming' | 'outgoing' | 'internal';
         }>;
       }>();
@@ -4388,6 +6899,8 @@ export class LocalBackend {
         const sourceFilePath = String(raw.sourceFilePath ?? raw[3] ?? '').trim();
         const targetFilePath = String(raw.targetFilePath ?? raw[7] ?? '').trim();
         const confidence = Number(raw.confidence ?? raw[10] ?? 1);
+        const edgeId = String(raw.edgeId ?? raw[11] ?? '').trim();
+        const witnessPathIds = parseWitnessPathIds(raw.witnessPathIds ?? raw[12]);
 
         const family = classifySemanticFamily({
           type: relType,
@@ -4445,9 +6958,11 @@ export class LocalBackend {
               filePath: targetFilePath,
             },
             edge: {
+              id: edgeId,
               type: relType,
               reason,
               confidence: Number.isFinite(confidence) ? confidence : 1,
+              witnessPathIds,
             },
             direction,
           });
@@ -4516,6 +7031,100 @@ export class LocalBackend {
         };
       } catch {
         // best-effort enrichment
+      }
+    }
+
+    if (includeEvidenceSpans) {
+      try {
+        const snapshot = await loadEvidenceSpanSnapshot(repo.storagePath);
+        const nodeEvidenceById = new Map(
+          (Array.isArray(snapshot.nodes) ? snapshot.nodes : [])
+            .map(node => [String(node?.nodeId || '').trim(), node] as const)
+            .filter(([id]) => id),
+        );
+        const edgeEvidenceById = new Map(
+          (Array.isArray(snapshot.edges) ? snapshot.edges : [])
+            .map(edge => [String(edge?.edgeId || '').trim(), edge] as const)
+            .filter(([id]) => id),
+        );
+
+        const symbols = changedSymbols
+          .map(sym => {
+            const uid = String(sym?.uid || '').trim();
+            if (!uid) return null;
+            const evidence = nodeEvidenceById.get(uid);
+            if (!evidence) return null;
+            return {
+              symbol: {
+                uid,
+                name: String(sym?.name || ''),
+                kind: String(sym?.kind || ''),
+                filePath: String(sym?.filePath || ''),
+                ...(Number.isFinite(sym?.startLine) ? { startLine: Number(sym.startLine) } : {}),
+                ...(Number.isFinite(sym?.endLine) ? { endLine: Number(sym.endLine) } : {}),
+              },
+              primary_span: evidence.primarySpan || null,
+              witness_spans: Array.isArray(evidence.witnessSpans) ? evidence.witnessSpans : [],
+              proof_spans: Array.isArray(evidence.proofSpans) ? evidence.proofSpans : [],
+            };
+          })
+          .filter((item): item is NonNullable<typeof item> => !!item)
+          .slice(0, limitEvidence);
+
+        const semanticEdgeRefs = semantic_diffs.families.flatMap(family => (
+          family.sample_edges.map(sample => ({
+            family: family.family,
+            source: sample.source,
+            target: sample.target,
+            edge: sample.edge,
+          }))
+        ));
+
+        const seenEdgeIds = new Set<string>();
+        const edges: typeof proof_pack.edges = [];
+        for (const ref of semanticEdgeRefs) {
+          const edgeId = String(ref?.edge?.id || '').trim();
+          if (!edgeId || seenEdgeIds.has(edgeId)) continue;
+          seenEdgeIds.add(edgeId);
+          const evidence = edgeEvidenceById.get(edgeId);
+          if (!evidence) continue;
+
+          edges.push({
+            family: ref.family,
+            source: ref.source,
+            target: ref.target,
+            edge: {
+              id: edgeId,
+              type: String(ref.edge?.type || ''),
+              reason: String(ref.edge?.reason || ''),
+              confidence: Number(ref.edge?.confidence ?? 1) || 1,
+              witness_path_ids: Array.isArray(ref.edge?.witnessPathIds) ? ref.edge.witnessPathIds : [],
+            },
+            witness_spans: Array.isArray(evidence.witnessSpans) ? evidence.witnessSpans : [],
+            proof_spans: Array.isArray(evidence.proofSpans) ? evidence.proofSpans : [],
+          });
+
+          if (edges.length >= limitEvidence) break;
+        }
+
+        const witnessSpans = symbols.reduce((sum, item) => sum + item.witness_spans.length, 0)
+          + edges.reduce((sum, item) => sum + item.witness_spans.length, 0);
+        const proofSpans = symbols.reduce((sum, item) => sum + item.proof_spans.length, 0)
+          + edges.reduce((sum, item) => sum + item.proof_spans.length, 0);
+
+        proof_pack = {
+          updated_at: String(snapshot.generatedAt || ''),
+          summary: {
+            symbol_spans: symbols.length,
+            edge_spans: edges.length,
+            witness_spans: witnessSpans,
+            proof_spans: proofSpans,
+          },
+          symbols,
+          edges,
+        };
+      } catch {
+        proof_pack = buildEmptyProofPack();
       }
     }
 
@@ -4696,6 +7305,19 @@ export class LocalBackend {
       });
     }
 
+    const review_kernel = buildReviewKernel({
+      changed_files: changedFileObjs.length,
+      changed_symbols: changedSymbols.length,
+      suggested_tests: suggested_tests.length,
+      ui_contracts: ui_contracts.length,
+      route_files: route_targets.length,
+      authz_controllers: authz.length,
+      semantic_diffs,
+      slice_stencil,
+        scope: effectiveScope,
+        path_prefixes: pathPrefixes,
+      });
+
     return {
       status: 'ok',
       repo: repo.name,
@@ -4711,6 +7333,10 @@ export class LocalBackend {
         authz_controllers: authz.length,
         semantic_families: semantic_diffs.summary.family_count,
         semantic_gap_signals: semantic_diffs.summary.gap_signals,
+        proof_symbols: proof_pack.summary.symbol_spans,
+        proof_edges: proof_pack.summary.edge_spans,
+        stencil_slices: slice_stencil.summary.changed_slices,
+        stencil_templates: slice_stencil.summary.with_templates,
       },
       changed_files: changedFileObjs.map(f => ({
         filePath: normalizePath(f.filePath),
@@ -4726,7 +7352,16 @@ export class LocalBackend {
       route_targets,
       authz,
       semantic_diffs,
+      proof_pack,
+      slice_stencil,
+      review_kernel,
       _review_mode: {
+        diff: {
+          requested_scope: scope,
+          effective_scope: effectiveScope,
+          fallback_applied: diffSource !== 'requested',
+          source: diffSource,
+        },
         knobs: {
           limit_symbols: limitSymbols,
           limit_callers: limitCallers,
@@ -4734,6 +7369,318 @@ export class LocalBackend {
           min_confidence: minConfidence,
           include_ui_contracts: includeUiContracts,
           max_ui_contract_files: maxUiContractFiles,
+          include_evidence_spans: includeEvidenceSpans,
+          limit_evidence: limitEvidence,
+          include_slice_stencil: includeSliceStencil,
+          limit_slice_stencil: limitSliceStencil,
+        },
+      },
+    };
+  }
+
+  private async debugMode(repo: RepoHandle, params: {
+    query?: string;
+    symptom?: string;
+    task_context?: string;
+    goal?: string;
+    failing_tests?: string[];
+    error_strings?: string[];
+    path_prefixes?: string[];
+    limit_candidates?: number;
+    limit_hops?: number;
+    include_precedents?: boolean;
+  }): Promise<any> {
+    const queryText = String(params.query || '').trim();
+    const symptomText = String(params.symptom || '').trim();
+    const failingTests = this.toStringArray(params.failing_tests);
+    const errorStrings = this.toStringArray(params.error_strings);
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
+    const limitCandidates = Math.max(1, Math.min(30, params.limit_candidates ?? 8));
+    const limitHops = Math.max(1, Math.min(20, params.limit_hops ?? 6));
+    const includePrecedents = params.include_precedents !== false;
+
+    const seedQuery = queryText || symptomText || failingTests[0] || errorStrings[0] || '';
+    if (!seedQuery.trim()) {
+      return { error: 'Provide at least one of query, symptom, failing_tests, or error_strings.' };
+    }
+
+    const classifySymptom = (value: string): {
+      family: 'auth' | 'cache' | 'shape' | 'routing' | 'event' | 'unknown';
+      normalized: string;
+      matched_tokens: string[];
+    } => {
+      const normalized = String(value || '').trim().toLowerCase();
+      const tokenMap: Array<{ family: 'auth' | 'cache' | 'shape' | 'routing' | 'event'; tokens: string[] }> = [
+        { family: 'auth', tokens: ['403', 'forbidden', 'unauthorized', 'permission', 'authorize', 'auth', 'policy', 'can('] },
+        { family: 'cache', tokens: ['stale', 'cache', 'invalidate', 'refetch', 'query key', 'setquerydata', 'missing update'] },
+        { family: 'shape', tokens: ['field', 'payload', 'serialize', 'validation', 'null', 'undefined', 'wrong field'] },
+        { family: 'routing', tokens: ['route', '404', 'endpoint', 'controller', 'path', 'url', 'method not allowed'] },
+        { family: 'event', tokens: ['queue', 'event', 'listener', 'job', 'broadcast'] },
+      ];
+
+      for (const entry of tokenMap) {
+        const matched = entry.tokens.filter(token => normalized.includes(token));
+        if (matched.length > 0) {
+          return { family: entry.family, normalized, matched_tokens: matched.slice(0, 8) };
+        }
+      }
+
+      return { family: 'unknown', normalized, matched_tokens: [] };
+    };
+
+    const symptomSignal = classifySymptom([
+      symptomText,
+      ...failingTests,
+      ...errorStrings,
+      queryText,
+    ].join(' '));
+
+    const queryResult = await this.query(repo, {
+      query: seedQuery,
+      task_context: params.task_context,
+      goal: params.goal,
+      path_prefixes: pathPrefixes,
+      limit: 5,
+      max_symbols: 12,
+      include_content: false,
+      include_slice_cards: true,
+      limit_slices: 2,
+      include_evidence_spans: true,
+      limit_evidence: 20,
+    });
+
+    const actionPlanResult = await this.actionPlan(repo, {
+      query: seedQuery,
+      task_context: params.task_context,
+      goal: params.goal,
+      path_prefixes: pathPrefixes,
+      limit_files: 12,
+      limit_checks: 10,
+      __skip_precedents: true,
+    });
+
+    const targetSlice = Array.isArray(queryResult?.slice_cards) ? queryResult.slice_cards[0] : null;
+    let precedentPack: any = null;
+    if (includePrecedents) {
+      try {
+        precedentPack = await this.precedents(repo, {
+          query: seedQuery,
+          ...(targetSlice?.anchor_id ? { anchor_uid: String(targetSlice.anchor_id) } : {}),
+          limit: 2,
+          examples: 3,
+          path_prefixes: pathPrefixes,
+        });
+      } catch {
+        precedentPack = null;
+      }
+    }
+
+    const candidateLoops: Array<{
+      kind: 'http_loop' | 'cache_loop' | 'slice_gap';
+      score: number;
+      symptom_fit: number;
+      confidence: number;
+      summary: string;
+      findings: string[];
+      evidence: any;
+    }> = [];
+
+    const hops = Array.isArray(actionPlanResult?.hops) ? actionPlanResult.hops.slice(0, limitHops) : [];
+    for (const hop of hops) {
+      const findings: string[] = [];
+      let score = 1;
+      let symptomFit = 0;
+      const permissions = Array.isArray(hop?.permissions) ? hop.permissions : [];
+
+      if (!hop?.endpoint?.uid) {
+        findings.push('missing-endpoint-link');
+        score += 2;
+      }
+      if (!hop?.controller?.uid) {
+        findings.push('missing-controller-link');
+        score += 2;
+      }
+
+      if (permissions.length === 0) {
+        findings.push('missing-permission-closure');
+        score += 3;
+      } else {
+        const grantsWithoutRoles = permissions.filter((grant: any) => !Array.isArray(grant?.roles) || grant.roles.length === 0);
+        if (grantsWithoutRoles.length > 0) {
+          findings.push('no-role-grants');
+          score += 3;
+        }
+      }
+
+      const httpConfidence = Number(hop?.http?.confidence ?? 1) || 1;
+      const wiringConfidence = Number(hop?.endpoint_wiring?.confidence ?? 1) || 1;
+      if (httpConfidence < 0.9 || wiringConfidence < 0.9) {
+        findings.push('low-confidence-http-wiring');
+        score += 1;
+      }
+
+      if (symptomSignal.family === 'auth' && (findings.includes('missing-permission-closure') || findings.includes('no-role-grants'))) {
+        symptomFit += 3;
+      }
+      if (symptomSignal.family === 'routing' && (findings.includes('missing-endpoint-link') || findings.includes('missing-controller-link'))) {
+        symptomFit += 3;
+      }
+
+      const finalScore = score + symptomFit;
+      candidateLoops.push({
+        kind: 'http_loop',
+        score: finalScore,
+        symptom_fit: symptomFit,
+        confidence: Number(Math.max(0, Math.min(1, (httpConfidence + wiringConfidence) / 2)).toFixed(3)),
+        summary: `${String(hop?.http?.reason || 'http-loop')} -> ${String(hop?.controller?.name || 'unknown-controller')}`,
+        findings,
+        evidence: {
+          hop: {
+            http: hop?.http || null,
+            endpoint: hop?.endpoint || null,
+            controller: hop?.controller || null,
+            endpoint_wiring: hop?.endpoint_wiring || null,
+          },
+          permissions,
+        },
+      });
+    }
+
+    const cacheEffects = Array.isArray(actionPlanResult?.cache_effects) ? actionPlanResult.cache_effects : [];
+    for (const effect of cacheEffects.slice(0, limitCandidates)) {
+      const gaps = Array.isArray(effect?.coverage_gaps) ? effect.coverage_gaps : [];
+      if (gaps.length === 0) continue;
+
+      const symptomFit = symptomSignal.family === 'cache' ? 3 : 0;
+      candidateLoops.push({
+        kind: 'cache_loop',
+        score: 2 + (gaps.length * 0.5) + symptomFit,
+        symptom_fit: symptomFit,
+        confidence: 0.7,
+        summary: `${String(effect?.filePath || 'cache-surface')} has ${gaps.length} cache coverage gaps`,
+        findings: ['missing-cache-coverage'],
+        evidence: {
+          filePath: effect?.filePath || '',
+          coverage_gaps: gaps.slice(0, 8),
+          summary: effect?.summary || null,
+        },
+      });
+    }
+
+    if (targetSlice?.gap_signals) {
+      const gapSignals = targetSlice.gap_signals;
+      const severeGapCount = Number(gapSignals?.high || 0) + Number(gapSignals?.deterministic || 0);
+      if (severeGapCount > 0) {
+        const symptomFit = symptomSignal.family === 'shape' ? 2 : 0;
+        candidateLoops.push({
+          kind: 'slice_gap',
+          score: 2 + severeGapCount + symptomFit,
+          symptom_fit: symptomFit,
+          confidence: 0.75,
+          summary: `Target slice ${String(targetSlice?.label || targetSlice?.uid || '')} has closure gap signals`,
+          findings: ['slice-closure-gaps'],
+          evidence: {
+            slice: targetSlice,
+            gap_signals: gapSignals,
+          },
+        });
+      }
+    }
+
+    const rankedCandidates = candidateLoops
+      .sort((left, right) => {
+        if (right.score !== left.score) return right.score - left.score;
+        if (right.symptom_fit !== left.symptom_fit) return right.symptom_fit - left.symptom_fit;
+        return left.summary.localeCompare(right.summary);
+      })
+      .slice(0, limitCandidates);
+
+    const siblingDiff = (() => {
+      const precedents = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
+      const slicePrecedent = precedents.find((entry: any) => entry?.kind === 'slice' && entry?.anchor);
+      if (!slicePrecedent || !targetSlice) return null;
+
+      const example = Array.isArray(slicePrecedent.examples) ? slicePrecedent.examples[0] : null;
+      if (!example) return null;
+
+      const targetClosedSlots = new Set((Array.isArray(targetSlice.closed_slots) ? targetSlice.closed_slots : []).map((slot: any) => String(slot || '').trim()).filter(Boolean));
+      const targetRoles = new Set((Array.isArray(targetSlice.roles) ? targetSlice.roles : []).map((role: any) => String(role || '').trim()).filter(Boolean));
+      const exampleClosedSlots = (Array.isArray(example.closed_slots) ? example.closed_slots : []).map((slot: any) => String(slot || '').trim()).filter(Boolean);
+      const exampleRoles = (Array.isArray(example.roles) ? example.roles : []).map((role: any) => String(role || '').trim()).filter(Boolean);
+
+      return {
+        signature: String(slicePrecedent.signature || ''),
+        target_slice: {
+          uid: targetSlice.uid,
+          label: targetSlice.label,
+          slice_type: targetSlice.slice_type,
+          closure_score: targetSlice.closure_score,
+        },
+        precedent_anchor: slicePrecedent.anchor,
+        precedent_example: example,
+        slot_diff: {
+          missing_from_target: exampleClosedSlots.filter((slot: string) => !targetClosedSlots.has(slot)),
+        },
+        role_diff: {
+          missing_from_target: exampleRoles.filter((role: string) => !targetRoles.has(role)),
+        },
+      };
+    })();
+
+    const hypotheses: string[] = [];
+    for (const candidate of rankedCandidates.slice(0, 5)) {
+      if (candidate.findings.includes('no-role-grants')) {
+        hypotheses.push('Permission slug resolves, but no role grant closure exists for the affected endpoint.');
+      } else if (candidate.findings.includes('missing-permission-closure')) {
+        hypotheses.push('Controller flow may bypass expected permission closure.');
+      } else if (candidate.findings.includes('missing-cache-coverage')) {
+        hypotheses.push('Mutation path appears to miss invalidation/writeback for one or more active queries.');
+      } else if (candidate.findings.includes('slice-closure-gaps')) {
+        hypotheses.push('Feature slice closure is below sibling expectations; missing companions likely drive symptom.');
+      } else if (candidate.findings.includes('missing-endpoint-link') || candidate.findings.includes('missing-controller-link')) {
+        hypotheses.push('Routing chain has a missing/ambiguous hop between UI endpoint call and backend controller.');
+      }
+    }
+
+    const nextActions = [
+      'Open candidate evidence spans with context() on top-ranked symbols.',
+      'Run impact() on the first broken-loop symbol to map direct dependents.',
+      'Compare target slice vs sibling precedent before editing shared utilities.',
+      'After edits, run review_mode(scope=unstaged) with include_slice_stencil=true.',
+    ];
+    if (failingTests.length > 0) {
+      nextActions.push('Re-run failing tests after applying the highest-confidence loop fix.');
+    }
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      query: seedQuery,
+      symptom: symptomText || undefined,
+      debug: {
+        classification: symptomSignal,
+        anchors: {
+          query_plan: queryResult?.query_plan || null,
+          target_slice: targetSlice || null,
+          top_processes: Array.isArray(queryResult?.processes) ? queryResult.processes.slice(0, 3) : [],
+          top_symbols: [
+            ...(Array.isArray(queryResult?.process_symbols) ? queryResult.process_symbols.slice(0, 12) : []),
+            ...(Array.isArray(queryResult?.definitions) ? queryResult.definitions.slice(0, 6) : []),
+          ],
+          hops: hops.slice(0, limitHops),
+          cache_effects: cacheEffects.slice(0, 5),
+        },
+        candidates: rankedCandidates,
+        sibling_diff: siblingDiff,
+        hypotheses: Array.from(new Set(hypotheses)).slice(0, 8),
+        next_actions: nextActions.slice(0, 8),
+      },
+      _debug_mode: {
+        knobs: {
+          limit_candidates: limitCandidates,
+          limit_hops: limitHops,
+          include_precedents: includePrecedents,
+          path_prefixes: pathPrefixes,
         },
       },
     };

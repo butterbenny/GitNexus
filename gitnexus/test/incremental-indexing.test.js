@@ -291,3 +291,88 @@ test('Incremental indexing: --incremental-recompute-processes updates Process no
   const recompute = await mkRepo(tmpRecompute, true);
   assert.ok(recompute.updatedProcessCount > 0);
 });
+
+test('Incremental indexing: metadata-only fast path when no indexable files changed', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-meta-fastpath-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, '.scratch'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'src', 'a.ts'),
+    [
+      'export const keep = () => 1;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(path.join(repoPath, '.scratch', 'notes.md'), 'initial\n', 'utf-8');
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const first = runAnalyze(repoPath, env);
+  assert.match(first, /Repository indexed successfully/i);
+
+  // Commit only a non-indexable hidden-path change.
+  await fs.writeFile(path.join(repoPath, '.scratch', 'notes.md'), 'updated\n', 'utf-8');
+  runGit(repoPath, ['add', '.scratch/notes.md']);
+  runGit(repoPath, ['commit', '-m', 'docs']);
+
+  const second = runAnalyze(repoPath, env);
+  assert.match(second, /Repository already indexed \(no indexable changes\)/i);
+
+  const headCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoPath, encoding: 'utf-8' }).trim();
+  const metaRaw = await fs.readFile(path.join(repoPath, '.gitnexus', 'meta.json'), 'utf-8');
+  const meta = JSON.parse(metaRaw);
+  assert.equal(meta.lastCommit, headCommit);
+});
+
+test('Incremental indexing: fast derived mode is accepted and reported', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-inc-fast-derived-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'src', 'a.ts'),
+    [
+      'export const alpha = () => {',
+      '  return 1;',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const first = runAnalyze(repoPath, env);
+  assert.match(first, /Repository indexed successfully/i);
+
+  await fs.writeFile(
+    path.join(repoPath, 'src', 'a.ts'),
+    [
+      'export const alpha = () => {',
+      '  return 2;',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+  runGit(repoPath, ['add', 'src/a.ts']);
+  runGit(repoPath, ['commit', '-m', 'change']);
+
+  const second = runAnalyzeWithArgs(repoPath, ['--incremental-derived', 'fast'], env);
+  assert.match(second, /Repository updated incrementally/i);
+  assert.match(second, /Incremental derived mode: fast/i);
+});

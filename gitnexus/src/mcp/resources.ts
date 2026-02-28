@@ -90,6 +90,18 @@ export function getResourceTemplates(): ResourceTemplate[] {
       mimeType: 'text/yaml',
     },
     {
+      uriTemplate: 'gitnexus://repo/{name}/summaries',
+      name: 'Structured Summaries',
+      description: 'Structured overlay summaries by symbol/file/slice/community/process/archetype',
+      mimeType: 'text/yaml',
+    },
+    {
+      uriTemplate: 'gitnexus://repo/{name}/closure-templates',
+      name: 'Closure Templates',
+      description: 'Derived closure-template overlays for feature-slice families',
+      mimeType: 'text/yaml',
+    },
+    {
       uriTemplate: 'gitnexus://repo/{name}/cluster/{clusterName}',
       name: 'Module Detail',
       description: 'Deep dive into a specific functional area',
@@ -148,6 +160,9 @@ export async function readResource(uri: string, backend: LocalBackend): Promise<
   }
 
   const repoName = parsed.repoName;
+  if (repoName) {
+    await backend.refreshRepoMetaForResource(repoName);
+  }
 
   switch (parsed.resourceType) {
     case 'context':
@@ -164,6 +179,10 @@ export async function readResource(uri: string, backend: LocalBackend): Promise<
       return getEpisodeResource(backend, repoName);
     case 'evidence':
       return getEvidenceResource(backend, repoName);
+    case 'summaries':
+      return getSummariesResource(backend, repoName);
+    case 'closure-templates':
+      return getClosureTemplatesResource(backend, repoName);
     case 'cluster':
       return getClusterDetailResource(parsed.param!, backend, repoName);
     case 'process':
@@ -241,6 +260,9 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('');
   lines.push('tools_available:');
   lines.push('  - query: Process-grouped code intelligence (execution flows related to a concept)');
+  lines.push('  - mode_router: Auto-router for query/implement/review/debug kernels');
+  lines.push('  - query_mode: Query-head planner (top slices, symbols, precedents, action hints)');
+  lines.push('  - implement_mode: Implementation planner (target slice, companions, write order, review handoff)');
   lines.push('  - archetypes: Derived flow signatures + exemplar processes (pattern heat map)');
   lines.push('  - context: 360-degree symbol view (categorized refs, process participation)');
   lines.push('  - impact: Blast radius analysis (what breaks if you change a symbol)');
@@ -248,6 +270,8 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('  - episode_state: Read EpisodeGraph sidecar working memory');
   lines.push('  - episode_update: Update EpisodeGraph sidecar with hypotheses/tests/errors');
   lines.push('  - evidence_spans: Read EvidenceSpan sidecar line-level proof/witness ranges');
+  lines.push('  - summary_overlay: Read structured hierarchical summary overlays');
+  lines.push('  - closure_templates: Read closure-template overlays for slice families');
   lines.push('  - rename: Multi-file coordinated rename with confidence tags');
   lines.push('  - cypher: Raw graph queries');
   lines.push('  - list_repos: Discover all indexed repositories');
@@ -267,6 +291,8 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push(`  - gitnexus://repo/${context.projectName}/schema: Graph schema for Cypher`);
   lines.push(`  - gitnexus://repo/${context.projectName}/episode: EpisodeGraph sidecar state`);
   lines.push(`  - gitnexus://repo/${context.projectName}/evidence: EvidenceSpan sidecar summary`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/summaries: Structured summary overlays`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/closure-templates: Closure-template overlays`);
   lines.push(`  - gitnexus://repo/${context.projectName}/cluster/{name}: Module details`);
   lines.push(`  - gitnexus://repo/${context.projectName}/process/{name}: Process trace`);
   
@@ -385,6 +411,85 @@ async function getEvidenceResource(backend: LocalBackend, repoName?: string): Pr
     return lines.join('\n');
   } catch (err: any) {
     return `error: ${String(err?.message || err || 'failed to read evidence spans')}`;
+  }
+}
+
+async function getSummariesResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  try {
+    const result = await backend.callTool('summary_overlay', { repo: repoName, limit: 12 });
+    const summaries = result?.summaries || {};
+    const stats = summaries?.stats || {};
+    const levels = summaries?.levels || {};
+    const lines: string[] = [];
+
+    lines.push(`status: "${String(result?.status || 'ok').replace(/"/g, '\\"')}"`);
+    lines.push(`repo: "${String(result?.repo || repoName || '').replace(/"/g, '\\"')}"`);
+    lines.push(`updated_at: "${String(summaries?.updated_at || '').replace(/"/g, '\\"')}"`);
+    lines.push('stats:');
+    lines.push(`  symbol_count: ${Number(stats.symbolCount || 0)}`);
+    lines.push(`  file_count: ${Number(stats.fileCount || 0)}`);
+    lines.push(`  slice_count: ${Number(stats.sliceCount || 0)}`);
+    lines.push(`  community_count: ${Number(stats.communityCount || 0)}`);
+    lines.push(`  process_count: ${Number(stats.processCount || 0)}`);
+    lines.push(`  archetype_count: ${Number(stats.archetypeCount || 0)}`);
+    lines.push(`  truncated_symbols: ${Boolean(stats?.truncated?.symbols)}`);
+    lines.push(`  truncated_files: ${Boolean(stats?.truncated?.files)}`);
+    lines.push(`  truncated_slices: ${Boolean(stats?.truncated?.slices)}`);
+    lines.push(`  truncated_communities: ${Boolean(stats?.truncated?.communities)}`);
+    lines.push(`  truncated_processes: ${Boolean(stats?.truncated?.processes)}`);
+    lines.push(`  truncated_archetypes: ${Boolean(stats?.truncated?.archetypes)}`);
+
+    const levelNames = ['symbol', 'file', 'slice', 'community', 'process', 'archetype'];
+    for (const levelName of levelNames) {
+      const entries = Array.isArray(levels?.[levelName]) ? levels[levelName] : [];
+      lines.push(`${levelName}s:`);
+      for (const entry of entries.slice(0, 12)) {
+        lines.push(`  - entityId: "${String(entry.entityId || '').replace(/"/g, '\\"')}"`);
+        lines.push(`    name: "${String(entry.name || '').replace(/"/g, '\\"')}"`);
+        lines.push(`    filePath: "${String(entry.filePath || '').replace(/"/g, '\\"')}"`);
+        lines.push(`    responsibilities: ${Array.isArray(entry.responsibilities) ? entry.responsibilities.length : 0}`);
+        lines.push(`    inbound: ${Array.isArray(entry.inboundCallers) ? entry.inboundCallers.length : 0}`);
+        lines.push(`    downstream: ${Array.isArray(entry.downstreamEffects) ? entry.downstreamEffects.length : 0}`);
+      }
+    }
+
+    return lines.join('\n');
+  } catch (err: any) {
+    return `error: ${String(err?.message || err || 'failed to read summary overlays')}`;
+  }
+}
+
+async function getClosureTemplatesResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  try {
+    const result = await backend.callTool('closure_templates', { repo: repoName, limit: 20 });
+    const templates = result?.templates || {};
+    const stats = templates?.stats || {};
+    const rows = Array.isArray(templates?.templates) ? templates.templates : [];
+    const lines: string[] = [];
+
+    lines.push(`status: "${String(result?.status || 'ok').replace(/"/g, '\\"')}"`);
+    lines.push(`repo: "${String(result?.repo || repoName || '').replace(/"/g, '\\"')}"`);
+    lines.push(`updated_at: "${String(templates?.updated_at || '').replace(/"/g, '\\"')}"`);
+    lines.push('stats:');
+    lines.push(`  total_templates: ${Number(stats.totalTemplates || 0)}`);
+    lines.push(`  total_slices: ${Number(stats.totalSlices || 0)}`);
+    lines.push(`  total_covered_slots: ${Number(stats.totalCoveredSlots || 0)}`);
+    lines.push(`  total_role_expectations: ${Number(stats.totalRoleExpectations || 0)}`);
+    lines.push('templates:');
+    for (const template of rows.slice(0, 20)) {
+      lines.push(`  - id: "${String(template.id || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    templateKey: "${String(template.templateKey || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    sliceType: "${String(template.sliceType || '').replace(/"/g, '\\"')}"`);
+      lines.push(`    requiredSlots: ${Array.isArray(template.requiredSlots) ? template.requiredSlots.length : 0}`);
+      lines.push(`    optionalSlots: ${Array.isArray(template.optionalSlots) ? template.optionalSlots.length : 0}`);
+      lines.push(`    roleCoverage: ${Array.isArray(template.roleCoverage) ? template.roleCoverage.length : 0}`);
+      lines.push(`    sliceCount: ${Number(template.sliceCount || 0)}`);
+      lines.push(`    avgClosureScore: ${Number(template.avgClosureScore || 0)}`);
+    }
+
+    return lines.join('\n');
+  } catch (err: any) {
+    return `error: ${String(err?.message || err || 'failed to read closure templates')}`;
   }
 }
 
@@ -528,6 +633,8 @@ nodes:
   - ContractShape: Field/payload contract container
   - ContractField: Field-level contract node
   - CacheKey: Query/cache key contract node
+  - DBTable: Storage table contract node
+  - DBColumn: Storage column contract node
   - ValueNode: Literal/value contract node (permission/endpoint/route/cache signals)
   - TestCase: Static test case node linked to shape coverage
 
@@ -541,7 +648,7 @@ relationships:
   - IMPORTS: Module imports
   - EXTENDS: Class inheritance
   - IMPLEMENTS: Interface implementation
-  - MEMBER_OF: Symbol/group membership (Community, FeatureSlice, ContractShape) and Gap nodes attach to slices
+  - MEMBER_OF: Symbol/group membership (Community, FeatureSlice, ContractShape, DBTable) and Gap nodes attach to slices
   - STEP_IN_PROCESS: Symbol is step N in process
   - VALIDATES_FIELD: Validator/source defines field validation contract
   - SERIALIZES_FIELD: Resource/source serializes a contract field
@@ -552,11 +659,13 @@ relationships:
   - INVALIDATES_KEY: Mutation/invalidation source invalidates cache key
   - TESTS_SHAPE: Test case asserts contract shape behavior
 
-relationship_table: "All relationships use a single CodeRelation table with a 'type' property. Properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)"
+relationship_table: "All relationships use a single CodeRelation table with a 'type' property. Properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32), certaintyTier (STRING), provenanceFamily (STRING), absenceSemantics (STRING), witnessPathIds (STRING)"
 provenance_reason_prefixes: "precision-overlay:* marks stack-graph/SCIP/LSP-derived relation overlays; value-graph:* marks literal/value graph overlays; provenance:* marks generated/derived artifact ancestry edges; native parser/framework edges keep existing reason families."
 sidecars:
   - EpisodeGraph: "gitnexus://repo/{name}/episode (working-memory overlay)"
   - EvidenceSpan: "gitnexus://repo/{name}/evidence (line-level primary/witness/proof spans)"
+  - SummaryOverlay: "gitnexus://repo/{name}/summaries (structured hierarchical overlays)"
+  - ClosureTemplate: "gitnexus://repo/{name}/closure-templates (slice-family closure expectations)"
 
 example_queries:
   find_callers: |
@@ -683,6 +792,8 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '| `impact` | Symbol blast radius — what breaks at depth 1/2/3 with confidence |',
       '| `detect_changes` | Git-diff impact — what do your current changes affect |',
       '| `evidence_spans` | Read EvidenceSpan sidecar line-level proof/witness ranges |',
+      '| `summary_overlay` | Read structured hierarchical summary overlays |',
+      '| `closure_templates` | Read closure-template overlays for slice families |',
       '| `rename` | Multi-file coordinated rename with confidence-tagged edits |',
       '| `cypher` | Raw graph queries |',
       '| `list_repos` | Discover indexed repos |',
@@ -697,6 +808,8 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       `- \`gitnexus://repo/${repo.name}/archetypes\` — Derived flow signatures + exemplar processes`,
       `- \`gitnexus://repo/${repo.name}/schema\` — Graph schema for Cypher`,
       `- \`gitnexus://repo/${repo.name}/evidence\` — EvidenceSpan sidecar summary`,
+      `- \`gitnexus://repo/${repo.name}/summaries\` — Structured summary overlays`,
+      `- \`gitnexus://repo/${repo.name}/closure-templates\` — Closure-template overlays`,
     ];
     sections.push(lines.join('\n'));
   }

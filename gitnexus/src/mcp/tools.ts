@@ -110,6 +110,47 @@ AFTER THIS: Open the returned file:line spans, then continue with context()/impa
     },
   },
   {
+    name: 'summary_overlay',
+    description: `Read structured hierarchical summary overlays for symbols/files/slices/communities/processes/archetypes.
+
+Returns compact structured fields (responsibilities, inbound callers, downstream effects, auth/cache/shape contracts, companions, sibling precedents) without re-reading raw source.
+
+WHEN TO USE: When you need high-signal overview context before deep code reads, or to compare related entities quickly.
+AFTER THIS: Open evidence spans and context for the selected entity IDs.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        level: { type: 'string', description: 'Optional level filter: symbol|file|slice|community|process|archetype.', enum: ['symbol', 'file', 'slice', 'community', 'process', 'archetype'] },
+        entity_id: { type: 'string', description: 'Optional entity ID filter (exact entity id or summary id).' },
+        file_path: { type: 'string', description: 'Optional repo-relative file path filter.' },
+        query: { type: 'string', description: 'Optional substring query across summary fields.' },
+        limit: { type: 'number', description: 'Max entries per level (default: 20).', default: 20 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'closure_templates',
+    description: `Read closure-template overlays derived from feature-slice families.
+
+Returns per-family template expectations (required/optional slots, role coverage, exemplar slices) to compare slices against expected closure anatomy.
+
+WHEN TO USE: During implement/review/debug when you need to verify a slice matches sibling closure patterns.
+AFTER THIS: Use query/context/review_mode on exemplar slice IDs and evidence spans for exact lines.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        slice_type: { type: 'string', description: 'Optional slice type filter (e.g. endpoint, permission, query_key).' },
+        template_key: { type: 'string', description: 'Optional template key or template id filter.' },
+        query: { type: 'string', description: 'Optional substring query across slots/roles/template fields.' },
+        limit: { type: 'number', description: 'Max templates to return (default: 20).', default: 20 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'query',
     description: `Query the code knowledge graph for execution flows related to a concept.
 Returns processes (call chains) ranked by relevance, each with its symbols and file locations.
@@ -121,6 +162,8 @@ Returns results grouped by process (execution flow):
 - processes: ranked execution flows with relevance priority
 - process_symbols: all symbols in those flows with file locations
 - definitions: standalone types/interfaces not in any process
+- slice_cards: top feature slices (closure + gap signals + matched members)
+- query_plan: retrieval diagnostics (intent, exact lookup, search-mode summary)
 
 Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.`,
     inputSchema: {
@@ -132,6 +175,10 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
         limit: { type: 'number', description: 'Max processes to return (default: 5)', default: 5 },
         max_symbols: { type: 'number', description: 'Max symbols per process (default: 10)', default: 10 },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
+        include_slice_cards: { type: 'boolean', description: 'Include top FeatureSlice cards (default: true).', default: true },
+        limit_slices: { type: 'number', description: 'Max slice cards to return (default: 2, max: 5).', default: 2 },
+        include_evidence_spans: { type: 'boolean', description: 'Attach EvidenceSpan proof spans to slice cards (default: true).', default: true },
+        limit_evidence: { type: 'number', description: 'Max evidence symbol spans across returned slice cards (default: 20).', default: 20 },
         path_prefixes: {
           type: 'array',
           description: 'Optional list of repo-relative (or absolute) path prefixes to scope results (e.g. ["apps/backend/", "apps/dashboard/"]).',
@@ -143,9 +190,116 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
     },
   },
   {
+    name: 'query_mode',
+    description: `Query-mode planner: symptom/intent-aware retrieval head that packages top slices, proof symbols, sibling precedents, and action hints.
+
+Builds on query/precedents/action_plan to return:
+- query intent + retrieval diagnostics
+- top feature slices with closure/gap signals
+- compact symbol/process anchors for follow-up
+- optional sibling precedents and deterministic action hints
+
+WHEN TO USE: First pass for “where should I look?” in implementation or investigation tasks.
+AFTER THIS: Open anchors with context()/impact(), then use action_plan/review_mode as needed.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language or keyword search query.' },
+        task_context: { type: 'string', description: 'Optional task context to help ranking.' },
+        goal: { type: 'string', description: 'Optional goal to help ranking.' },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope query-mode analysis.',
+          items: { type: 'string' },
+        },
+        limit_processes: { type: 'number', description: 'Max process summaries to return (default: 4).', default: 4 },
+        max_symbols: { type: 'number', description: 'Max anchor symbols to return (default: 16).', default: 16 },
+        limit_slices: { type: 'number', description: 'Max slice cards to return (default: 2).', default: 2 },
+        limit_precedents: { type: 'number', description: 'Max precedents to include (default: 2).', default: 2 },
+        limit_hops: { type: 'number', description: 'Max action-hint hops to include (default: 4).', default: 4 },
+        include_precedents: { type: 'boolean', description: 'Include sibling precedents when available (default: true).', default: true },
+        include_action_hints: { type: 'boolean', description: 'Include compact action-plan hints (default: true).', default: true },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'mode_router',
+    description: `Auto-routing planner that dispatches to query/implement/review/debug kernels based on explicit mode or intent signals.
+
+Routes to one of:
+- query_mode (exploration-first)
+- implement_mode (edit-plan-first)
+- review_mode (diff-risk-first)
+- debug_mode (symptom-first)
+- unified envelope (primary symbols/files, findings, hypotheses, next actions, handoff)
+- route trace (candidate scores/reasons + selected mode + fallback signal)
+
+WHEN TO USE: When you want one entrypoint that chooses the right planner mode.
+AFTER THIS: Use the routed result payload directly (or force a specific mode if needed).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', description: 'Routing mode: auto (default), query, implement, review, or debug.', enum: ['auto', 'query', 'implement', 'review', 'debug'], default: 'auto' },
+        query: { type: 'string', description: 'Anchor query used by query/implement/debug modes.' },
+        symptom: { type: 'string', description: 'Observed symptom summary for debug routing.' },
+        failing_tests: { type: 'array', description: 'Optional failing test identifiers/messages.', items: { type: 'string' } },
+        error_strings: { type: 'array', description: 'Optional error strings/stack snippets.', items: { type: 'string' } },
+        task_context: { type: 'string', description: 'Optional task context to help ranking.' },
+        goal: { type: 'string', description: 'Optional goal to help ranking.' },
+        scope: { type: 'string', description: 'Review scope when mode resolves to review (default: unstaged).', enum: ['unstaged', 'staged', 'all', 'compare'], default: 'unstaged' },
+        base_ref: { type: 'string', description: 'Base ref for compare review scope.' },
+        include_precedents: { type: 'boolean', description: 'Include precedents in routed modes that support them (default: true).', default: true },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope routed analysis.',
+          items: { type: 'string' },
+        },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'implement_mode',
+    description: `Implementation-mode planner: packages target slice anatomy, companion files, write order, precedents, and post-edit review contract.
+
+Builds on action_plan (+ optional query_mode head) to return:
+- implement target (intent/archetype/slice)
+- closure template + gap signals
+- ranked companion files and ordered write anchors
+- compact verification hints + post-edit review invocation
+
+WHEN TO USE: Before making multi-file changes where you need a deterministic edit plan.
+AFTER THIS: Edit in write-plan order, then run review_mode using post_edit_review params.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language or keyword search query.' },
+        task_context: { type: 'string', description: 'Optional task context to help ranking.' },
+        goal: { type: 'string', description: 'Optional implementation goal to help ranking.' },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope implementation planning.',
+          items: { type: 'string' },
+        },
+        limit_files: { type: 'number', description: 'Max companion/action files to include (default: 10).', default: 10 },
+        limit_checks: { type: 'number', description: 'Max verification checks to include (default: 10).', default: 10 },
+        limit_write_order: { type: 'number', description: 'Max ordered write anchors to include (default: 10).', default: 10 },
+        limit_precedents: { type: 'number', description: 'Max precedents to include (default: 3).', default: 3 },
+        include_query_head: { type: 'boolean', description: 'Include compact query-mode head output (default: true).', default: true },
+        include_review_contract: { type: 'boolean', description: 'Include post_edit_review handoff contract (default: true).', default: true },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'action_plan',
     description: `Decision-ready summary for a goal/query.
 Returns a compact file list + verification checklist derived from high-confidence graph signals.
+Also includes an implement-oriented kernel plan (target archetype/slice, precedents, companion files, write order, and post-edit review invocation).
 
 WHEN TO USE: When you want “what should I open/change/verify?” with minimal scrolling.
 AFTER THIS: Use context() on the top-ranked anchors, then impact() on the change point.`,
@@ -265,11 +419,11 @@ WHEN TO USE: Complex structural queries that search/explore can't answer. READ g
 AFTER THIS: Use context() on result symbols for deeper context.
 
 SCHEMA:
-- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, FeatureSlice, Gap, ContractShape, ContractField, CacheKey, ValueNode, TestCase
+- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, FeatureSlice, Gap, ContractShape, ContractField, CacheKey, DBTable, DBColumn, ValueNode, TestCase
 - Multi-language nodes (use backticks): \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`, etc.
 - All edges via single CodeRelation table with 'type' property
 - Edge types: CONTAINS, CO_CHANGES_WITH, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, MEMBER_OF, STEP_IN_PROCESS, VALIDATES_FIELD, SERIALIZES_FIELD, READS_FIELD, WRITES_FIELD, DERIVES_FROM, DERIVES_FROM_COLUMN, INVALIDATES_KEY, TESTS_SHAPE
-- Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)
+- Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32), certaintyTier (STRING), provenanceFamily (STRING), absenceSemantics (STRING), witnessPathIds (STRING)
 
 EXAMPLES:
 • Find callers of a function:
@@ -345,6 +499,9 @@ Builds on detect_changes-style diffing, then surfaces:
 - upstream callers + suggested tests (confidence-first)
 - contract signals (UI contract diffs, Laravel route targets, controller auth checks)
 - semantic relation-family deltas (auth/shape/cache/test/event/template) + slice-linked gap signals
+- proof pack evidence spans for changed symbols and sampled semantic edges
+- slice stencil deltas (changed slices, closure-template fit, missing slots/roles, sibling precedents)
+- review kernel summary (risk level, top findings, hypotheses, and next actions)
 
 WHEN TO USE: PR review, behavior/contract audits, “what should I verify?” after a change.
 AFTER THIS: Use context()/impact() on the highest-risk changed symbols or route/controller anchors.`,
@@ -364,6 +521,44 @@ AFTER THIS: Use context()/impact() on the highest-risk changed symbols or route/
         min_confidence: { type: 'number', description: 'Minimum confidence for edges (default: 0.9)', default: 0.9 },
         include_ui_contracts: { type: 'boolean', description: 'Include UI contract diffs for changed TS/TSX/JSX files (default: true)', default: true },
         max_ui_contract_files: { type: 'number', description: 'Max UI contract files to analyze (default: 5)', default: 5 },
+        include_evidence_spans: { type: 'boolean', description: 'Include proof-pack evidence spans from the EvidenceSpan sidecar (default: true)', default: true },
+        limit_evidence: { type: 'number', description: 'Max proof-pack symbol/edge evidence entries (default: 40)', default: 40 },
+        include_slice_stencil: { type: 'boolean', description: 'Include slice-stencil comparison output (default: true)', default: true },
+        limit_slice_stencil: { type: 'number', description: 'Max changed slices to include in stencil output (default: 8)', default: 8 },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'debug_mode',
+    description: `Symptom-first debug planner: localize likely broken loops using graph anchors, slice closure signals, and sibling precedent diffs.
+
+Builds on query/action_plan/precedents to surface:
+- symptom classification (auth/cache/shape/routing/event)
+- anchored loop candidates (HTTP chain, cache coverage, slice closure gaps)
+- ranked findings with confidence/symptom fit
+- sibling slice diff (when available) and concrete next actions
+
+WHEN TO USE: “Why is this failing?” investigations (stale UI, 403, null/field mismatch, routing misses, queue/event drift).
+AFTER THIS: Open top candidate anchors with context()/impact(), patch, then run review_mode.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Anchor query (symbol/endpoint/feature) to seed debug search.' },
+        symptom: { type: 'string', description: 'Observed symptom summary (e.g., "403 on account notifications").' },
+        failing_tests: { type: 'array', description: 'Optional failing test identifiers/messages.', items: { type: 'string' } },
+        error_strings: { type: 'array', description: 'Optional error strings/stack snippets.', items: { type: 'string' } },
+        task_context: { type: 'string', description: 'Optional task context to help ranking.' },
+        goal: { type: 'string', description: 'Optional investigation goal to help ranking.' },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope debug analysis.',
+          items: { type: 'string' },
+        },
+        limit_candidates: { type: 'number', description: 'Max ranked broken-loop candidates to return (default: 8).', default: 8 },
+        limit_hops: { type: 'number', description: 'Max anchored HTTP hops to include (default: 6).', default: 6 },
+        include_precedents: { type: 'boolean', description: 'Include sibling precedent diff when available (default: true).', default: true },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],

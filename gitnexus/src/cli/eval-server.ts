@@ -26,11 +26,29 @@
 
 import http from 'http';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { GITNEXUS_TOOLS } from '../mcp/tools.js';
 import { safeStringify } from '../lib/safe-json.js';
 
 export interface EvalServerOptions {
   port?: string;
   idleTimeout?: string;
+}
+
+export const EVAL_SERVER_TOOL_NAMES = Array.from(
+  new Set(GITNEXUS_TOOLS.map(tool => tool.name)),
+);
+
+const EVAL_SERVER_TOOL_NAME_SET = new Set(EVAL_SERVER_TOOL_NAMES);
+
+export function resolveEvalToolName(toolName: string): string {
+  const name = String(toolName || '').trim();
+  if (!name) {
+    throw new Error('Missing tool name');
+  }
+  if (!EVAL_SERVER_TOOL_NAME_SET.has(name)) {
+    throw new Error(`Unknown tool: ${name}`);
+  }
+  return name;
 }
 
 // ─── Text Formatters ──────────────────────────────────────────────────
@@ -239,6 +257,204 @@ function formatDetectChangesResult(result: any): string {
   return lines.join('\n').trim();
 }
 
+function formatQueryModeResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+
+  const payload = result.query_mode || {};
+  const plan = payload.query_plan || {};
+  const slices = Array.isArray(payload.slices) ? payload.slices : [];
+  const symbols = Array.isArray(payload.symbols) ? payload.symbols : [];
+  const precedents = Array.isArray(payload.precedents) ? payload.precedents : [];
+  const checks = Array.isArray(payload?.action_hints?.checks) ? payload.action_hints.checks : [];
+
+  const lines: string[] = [];
+  lines.push(`Query kernel for: ${result.query || '(no query)'}`);
+  lines.push(`Intent: ${plan?.intent?.kind || 'unknown'} | Retrieval: ${plan?.retrieval?.mode || 'hybrid'}`);
+  lines.push(`Slices: ${slices.length} | Symbols: ${symbols.length} | Precedents: ${precedents.length}`);
+  lines.push('');
+
+  if (slices.length > 0) {
+    lines.push('Top slices:');
+    for (const slice of slices.slice(0, 3)) {
+      const label = slice?.label || slice?.uid || 'slice';
+      const closure = Number(slice?.closure_score ?? 0);
+      const gaps = Number(slice?.gap_signals?.high || 0) + Number(slice?.gap_signals?.deterministic || 0);
+      lines.push(`  • ${label} (closure=${closure.toFixed(2)}, severe_gaps=${gaps})`);
+    }
+    lines.push('');
+  }
+
+  if (symbols.length > 0) {
+    lines.push('Top symbols:');
+    for (const symbol of symbols.slice(0, 8)) {
+      lines.push(`  • ${symbol?.kind || symbol?.type || 'Symbol'} ${symbol?.name || '?'} → ${symbol?.filePath || '?'}`);
+    }
+    lines.push('');
+  }
+
+  if (checks.length > 0) {
+    lines.push('Action checks:');
+    for (const check of checks.slice(0, 6)) lines.push(`  • ${check}`);
+  }
+
+  return lines.join('\n').trim();
+}
+
+function formatImplementModeResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+
+  const payload = result.implement_mode || {};
+  const target = payload.target || {};
+  const companionFiles = Array.isArray(payload.companion_files) ? payload.companion_files : [];
+  const writePlan = Array.isArray(payload.write_plan) ? payload.write_plan : [];
+  const hypotheses = Array.isArray(payload.hypotheses) ? payload.hypotheses : [];
+  const reviewHandoff = payload.post_edit_review || null;
+
+  const lines: string[] = [];
+  lines.push(`Implement kernel for: ${result.query || '(no query)'}`);
+  lines.push(`Target: ${target?.slice_label || target?.anchor_name || target?.slice_uid || 'unknown'}`);
+  lines.push(`Companions: ${companionFiles.length} | Write anchors: ${writePlan.length}`);
+  lines.push('');
+
+  if (companionFiles.length > 0) {
+    lines.push('Companion files:');
+    for (const item of companionFiles.slice(0, 8)) {
+      lines.push(`  • ${item?.filePath || '?'} (score=${Number(item?.score ?? 0).toFixed(2)})`);
+    }
+    lines.push('');
+  }
+
+  if (writePlan.length > 0) {
+    lines.push('Write order:');
+    for (const anchor of writePlan.slice(0, 8)) {
+      lines.push(`  • ${anchor?.name || anchor?.uid || '?'} → ${anchor?.filePath || '?'}`);
+    }
+    lines.push('');
+  }
+
+  if (hypotheses.length > 0) {
+    lines.push('Hypotheses:');
+    for (const hypothesis of hypotheses.slice(0, 5)) lines.push(`  • ${hypothesis}`);
+    lines.push('');
+  }
+
+  if (reviewHandoff?.tool) {
+    lines.push(`Post-edit handoff: ${reviewHandoff.tool}`);
+  }
+
+  return lines.join('\n').trim();
+}
+
+function formatReviewModeResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+
+  const summary = result.summary || {};
+  const kernel = result.review_kernel || {};
+  const findings = Array.isArray(kernel.top_findings) ? kernel.top_findings : [];
+  const nextActions = Array.isArray(kernel.next_actions) ? kernel.next_actions : [];
+  const suggestedTests = Array.isArray(result.suggested_tests) ? result.suggested_tests : [];
+
+  const lines: string[] = [];
+  lines.push(`Review kernel (${result.scope || 'unstaged'})`);
+  lines.push(`Changed files: ${summary.changed_files || 0} | Changed symbols: ${summary.changed_symbols || 0}`);
+  lines.push(`Risk: ${kernel?.risk?.level || 'unknown'} (score=${Number(kernel?.risk?.score || 0).toFixed(2)})`);
+  lines.push('');
+
+  if (findings.length > 0) {
+    lines.push('Top findings:');
+    for (const finding of findings.slice(0, 6)) lines.push(`  • ${finding}`);
+    lines.push('');
+  }
+
+  if (suggestedTests.length > 0) {
+    lines.push('Suggested tests:');
+    for (const testCase of suggestedTests.slice(0, 6)) lines.push(`  • ${testCase?.name || testCase?.test || '?'}`);
+    lines.push('');
+  }
+
+  if (nextActions.length > 0) {
+    lines.push('Next actions:');
+    for (const action of nextActions.slice(0, 6)) lines.push(`  • ${action}`);
+  }
+
+  return lines.join('\n').trim();
+}
+
+function formatDebugModeResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+
+  const payload = result.debug || {};
+  const classification = payload.classification || {};
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+  const hypotheses = Array.isArray(payload.hypotheses) ? payload.hypotheses : [];
+  const nextActions = Array.isArray(payload.next_actions) ? payload.next_actions : [];
+
+  const lines: string[] = [];
+  lines.push(`Debug kernel for: ${result.query || '(no query)'}`);
+  lines.push(`Symptom family: ${classification.family || 'unknown'} | confidence=${Number(classification.confidence || 0).toFixed(2)}`);
+  lines.push(`Candidates: ${candidates.length}`);
+  lines.push('');
+
+  if (candidates.length > 0) {
+    lines.push('Top broken loops:');
+    for (const candidate of candidates.slice(0, 6)) {
+      lines.push(`  • [${candidate?.kind || 'candidate'}] score=${Number(candidate?.score || 0).toFixed(2)} — ${candidate?.summary || ''}`);
+    }
+    lines.push('');
+  }
+
+  if (hypotheses.length > 0) {
+    lines.push('Hypotheses:');
+    for (const hypothesis of hypotheses.slice(0, 6)) lines.push(`  • ${hypothesis}`);
+    lines.push('');
+  }
+
+  if (nextActions.length > 0) {
+    lines.push('Next actions:');
+    for (const action of nextActions.slice(0, 6)) lines.push(`  • ${action}`);
+  }
+
+  return lines.join('\n').trim();
+}
+
+function formatModeRouterResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+
+  const payload = result.mode_router || {};
+  const trace = payload.route_trace || {};
+  const unified = payload.unified || {};
+  const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
+  const findings = Array.isArray(unified.top_findings) ? unified.top_findings : [];
+  const nextActions = Array.isArray(unified.next_actions) ? unified.next_actions : [];
+
+  const lines: string[] = [];
+  lines.push(`Mode router selected: ${payload.selected_mode || 'unknown'}`);
+  lines.push(`Requested mode: ${trace.requested_mode || 'auto'} | Fallback applied: ${trace.fallback_applied === true ? 'yes' : 'no'}`);
+  lines.push('');
+
+  if (candidates.length > 0) {
+    lines.push('Route candidates:');
+    for (const candidate of candidates.slice(0, 4)) {
+      const reasons = Array.isArray(candidate?.reasons) ? candidate.reasons.slice(0, 2).join('; ') : '';
+      lines.push(`  • ${candidate?.mode || '?'} score=${Number(candidate?.score || 0).toFixed(2)}${reasons ? ` — ${reasons}` : ''}`);
+    }
+    lines.push('');
+  }
+
+  if (findings.length > 0) {
+    lines.push('Unified findings:');
+    for (const finding of findings.slice(0, 6)) lines.push(`  • ${finding}`);
+    lines.push('');
+  }
+
+  if (nextActions.length > 0) {
+    lines.push('Unified next actions:');
+    for (const action of nextActions.slice(0, 6)) lines.push(`  • ${action}`);
+  }
+
+  return lines.join('\n').trim();
+}
+
 function formatListReposResult(result: any): string {
   if (!Array.isArray(result) || result.length === 0) {
     return 'No indexed repositories.';
@@ -257,9 +473,14 @@ function formatListReposResult(result: any): string {
 /**
  * Format a tool result as compact, LLM-friendly text.
  */
-function formatToolResult(toolName: string, result: any): string {
+export function formatToolResult(toolName: string, result: any): string {
   switch (toolName) {
     case 'query': return formatQueryResult(result);
+    case 'query_mode': return formatQueryModeResult(result);
+    case 'implement_mode': return formatImplementModeResult(result);
+    case 'review_mode': return formatReviewModeResult(result);
+    case 'debug_mode': return formatDebugModeResult(result);
+    case 'mode_router': return formatModeRouterResult(result);
     case 'context': return formatContextResult(result);
     case 'impact': return formatImpactResult(result);
     case 'cypher': return formatCypherResult(result);
@@ -273,10 +494,25 @@ function formatToolResult(toolName: string, result: any): string {
 // Guide the agent to the logical next tool call.
 // Critical for tool chaining: query → context → impact → fix.
 
-function getNextStepHint(toolName: string): string {
+export function getNextStepHint(toolName: string): string {
   switch (toolName) {
     case 'query':
       return '\n---\nNext: Pick a symbol above and run gitnexus-context "<name>" to see all its callers, callees, and execution flows.';
+
+    case 'query_mode':
+      return '\n---\nNext: Move to implement_mode with the same query, then apply edits in write_plan order.';
+
+    case 'implement_mode':
+      return '\n---\nNext: Apply the first write anchor, then run review_mode(scope=unstaged) to validate semantic deltas.';
+
+    case 'review_mode':
+      return '\n---\nNext: Open top changed symbols with context(), then use impact() on high-risk anchors before patching.';
+
+    case 'debug_mode':
+      return '\n---\nNext: Open top broken-loop anchors with context()/impact(), patch the highest-confidence issue, then run review_mode.';
+
+    case 'mode_router':
+      return '\n---\nNext: Follow the selected mode output; if confidence is low, force an explicit mode and compare.';
 
     case 'context':
       return '\n---\nNext: To check what breaks if you change this, run gitnexus-impact "<name>" upstream';
@@ -336,6 +572,13 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         return;
       }
 
+      if (req.method === 'GET' && req.url === '/tools') {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(200);
+        res.end(JSON.stringify({ tools: EVAL_SERVER_TOOL_NAMES }));
+        return;
+      }
+
       // Shutdown
       if (req.method === 'POST' && req.url === '/shutdown') {
         res.setHeader('Content-Type', 'application/json');
@@ -352,7 +595,15 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       // Tool calls: POST /tool/:name
       const toolMatch = req.url?.match(/^\/tool\/(\w+)$/);
       if (req.method === 'POST' && toolMatch) {
-        const toolName = toolMatch[1];
+        let toolName = '';
+        try {
+          toolName = resolveEvalToolName(toolMatch[1]);
+        } catch (err: any) {
+          res.setHeader('Content-Type', 'text/plain');
+          res.writeHead(400);
+          res.end(`Error: ${String(err?.message || err || 'Invalid tool name')}`);
+          return;
+        }
 
         const body = await readBody(req);
         let args: Record<string, any> = {};
@@ -381,7 +632,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       // 404
       res.setHeader('Content-Type', 'text/plain');
       res.writeHead(404);
-      res.end('Not found. Use POST /tool/:name or GET /health');
+      res.end('Not found. Use POST /tool/:name, GET /tools, or GET /health');
 
     } catch (err: any) {
       res.setHeader('Content-Type', 'text/plain');
@@ -393,9 +644,15 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   server.listen(port, '127.0.0.1', () => {
     console.error(`GitNexus eval-server: listening on http://127.0.0.1:${port}`);
     console.error(`  POST /tool/query    — search execution flows`);
+    console.error(`  POST /tool/query_mode — query kernel head`);
+    console.error(`  POST /tool/implement_mode — implement kernel head`);
+    console.error(`  POST /tool/review_mode — review kernel head`);
+    console.error(`  POST /tool/debug_mode — debug kernel head`);
+    console.error(`  POST /tool/mode_router — auto-router kernel head`);
     console.error(`  POST /tool/context  — 360-degree symbol view`);
     console.error(`  POST /tool/impact   — blast radius analysis`);
     console.error(`  POST /tool/cypher   — raw Cypher query`);
+    console.error(`  GET  /tools         — list available tools`);
     console.error(`  GET  /health        — health check`);
     console.error(`  POST /shutdown      — graceful shutdown`);
     if (idleTimeoutSec > 0) {

@@ -9,14 +9,48 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { findRepo, loadMeta } from '../storage/repo-manager.js';
+import { LocalBackend } from '../mcp/local/local-backend.js';
 import { initKuzu, executeQuery } from '../core/kuzu/kuzu-adapter.js';
 import { NODE_TABLES } from '../core/kuzu/schema.js';
 import { GraphNode, GraphRelationship } from '../core/graph/types.js';
+import { enrichRelationshipMetadata, parseWitnessPathIds } from '../core/graph/edge-metadata.js';
 import { searchFTSFromKuzu } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 import { semanticSearch } from '../core/embeddings/embedding-pipeline.js';
 import { isEmbedderReady } from '../core/embeddings/embedder.js';
 import { loadEvidenceSpanSnapshot } from '../core/ingestion/evidence-span-store.js';
+import { loadClosureTemplateSnapshot } from '../core/ingestion/closure-template-store.js';
+import { loadStructuredSummarySnapshot } from '../core/ingestion/summary-overlay-store.js';
+import { GITNEXUS_TOOLS } from '../mcp/tools.js';
+
+export const HTTP_API_TOOL_NAMES = Array.from(
+  new Set(GITNEXUS_TOOLS.map(tool => tool.name)),
+);
+const HTTP_API_TOOL_NAME_SET = new Set(HTTP_API_TOOL_NAMES);
+
+export async function callHttpApiTool(
+  backend: LocalBackend,
+  toolName: string,
+  args: unknown,
+  defaultRepoPath?: string,
+): Promise<any> {
+  const name = String(toolName || '').trim();
+  if (!name) {
+    throw new Error('Missing tool name');
+  }
+  if (!HTTP_API_TOOL_NAME_SET.has(name)) {
+    throw new Error(`Unknown tool: ${name}`);
+  }
+
+  const payload = (args && typeof args === 'object' && !Array.isArray(args))
+    ? { ...(args as Record<string, any>) }
+    : {};
+  if (!payload.repo && defaultRepoPath) {
+    payload.repo = defaultRepoPath;
+  }
+
+  return backend.callTool(name, payload);
+}
 
 const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
@@ -41,6 +75,10 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
         query = `MATCH (n:ContractField) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.fieldName AS fieldName, n.shapeId AS shapeId, n.shapeType AS shapeType`;
       } else if (table === 'CacheKey') {
         query = `MATCH (n:CacheKey) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.keyName AS keyName, n.keyType AS keyType, n.sourceNodeId AS sourceNodeId`;
+      } else if (table === 'DBTable') {
+        query = `MATCH (n:DBTable) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.tableName AS tableName, n.sourceFilePath AS sourceFilePath`;
+      } else if (table === 'DBColumn') {
+        query = `MATCH (n:DBColumn) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.columnName AS columnName, n.tableId AS tableId, n.tableName AS tableName, n.sourceFilePath AS sourceFilePath`;
       } else if (table === 'ValueNode') {
         query = `MATCH (n:ValueNode) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.valueType AS valueType, n.valueKey AS valueKey, n.valueRaw AS valueRaw`;
       } else {
@@ -85,6 +123,9 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
             shapeId: row.shapeId,
             keyName: row.keyName,
             keyType: row.keyType,
+            tableName: row.tableName,
+            columnName: row.columnName,
+            tableId: row.tableId,
             valueType: row.valueType,
             valueKey: row.valueKey,
             valueRaw: row.valueRaw,
@@ -98,10 +139,10 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
 
   const relationships: GraphRelationship[] = [];
   const relRows = await executeQuery(
-    `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`
+    `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step, r.certaintyTier AS certaintyTier, r.provenanceFamily AS provenanceFamily, r.absenceSemantics AS absenceSemantics, r.witnessPathIds AS witnessPathIds`
   );
   for (const row of relRows) {
-    relationships.push({
+    relationships.push(enrichRelationshipMetadata({
       id: `${row.sourceId}_${row.type}_${row.targetId}`,
       type: row.type,
       sourceId: row.sourceId,
@@ -109,7 +150,11 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
       confidence: row.confidence,
       reason: row.reason,
       step: row.step,
-    });
+      certaintyTier: row.certaintyTier,
+      provenanceFamily: row.provenanceFamily,
+      absenceSemantics: row.absenceSemantics,
+      witnessPathIds: parseWitnessPathIds(row.witnessPathIds),
+    }));
   }
 
   return { nodes, relationships };
@@ -119,6 +164,27 @@ export const createServer = async (port: number) => {
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '10mb' }));
+  const backend = new LocalBackend();
+  await backend.init();
+
+  app.get('/api/tools', async (_req, res) => {
+    res.json({ tools: HTTP_API_TOOL_NAMES });
+  });
+
+  app.post('/api/tool/:name', async (req, res) => {
+    const toolName = String(req.params.name || '').trim();
+    if (!toolName) {
+      res.status(400).json({ error: 'Missing tool name' });
+      return;
+    }
+    try {
+      const cwdRepo = await findRepo(process.cwd());
+      const result = await callHttpApiTool(backend, toolName, req.body, cwdRepo?.repoPath);
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: String(err?.message || err || 'Invalid tool request') });
+    }
+  });
 
   // Get repo info
   app.get('/api/repo', async (_req, res) => {
@@ -170,6 +236,28 @@ export const createServer = async (port: number) => {
     res.json(evidence);
   });
 
+  app.get('/api/summaries', async (_req, res) => {
+    const repo = await findRepo(process.cwd());
+    if (!repo) {
+      res.status(404).json({ error: 'Repository not indexed' });
+      return;
+    }
+
+    const summaries = await loadStructuredSummarySnapshot(repo.storagePath);
+    res.json(summaries);
+  });
+
+  app.get('/api/closure-templates', async (_req, res) => {
+    const repo = await findRepo(process.cwd());
+    if (!repo) {
+      res.status(404).json({ error: 'Repository not indexed' });
+      return;
+    }
+
+    const templates = await loadClosureTemplateSnapshot(repo.storagePath);
+    res.json(templates);
+  });
+
   // Search
   app.post('/api/search', async (req, res) => {
     const repo = await findRepo(process.cwd());
@@ -210,7 +298,15 @@ export const createServer = async (port: number) => {
     res.json({ content });
   });
 
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     console.log(`GitNexus server running on http://localhost:${port}`);
+    console.log('  GET  /api/tools');
+    console.log('  POST /api/tool/:name');
   });
+
+  server.on('close', () => {
+    void backend.disconnect();
+  });
+
+  return server;
 };

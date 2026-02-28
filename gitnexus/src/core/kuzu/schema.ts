@@ -14,7 +14,7 @@
 // ============================================================================
 export const NODE_TABLES = [
   'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process', 'FeatureSlice', 'Gap',
-  'ContractShape', 'ContractField', 'CacheKey', 'ValueNode', 'TestCase',
+  'ContractShape', 'ContractField', 'CacheKey', 'DBTable', 'DBColumn', 'ValueNode', 'TestCase',
   // Multi-language support
   'Struct', 'Enum', 'Macro', 'Typedef', 'Union', 'Namespace', 'Trait', 'Impl',
   'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module'
@@ -28,7 +28,7 @@ export const REL_TABLE_NAME = 'CodeRelation';
 
 // Increment when Kuzu schema changes (node/rel table definitions).
 // Used to force full re-index when upgrading existing indexes.
-export const KUZU_SCHEMA_VERSION = 8;
+export const KUZU_SCHEMA_VERSION = 10;
 
 // Valid relation types
 export const REL_TYPES = [
@@ -231,6 +231,28 @@ CREATE NODE TABLE CacheKey (
   keyName STRING,
   keyType STRING,
   sourceNodeId STRING,
+  PRIMARY KEY (id)
+)`;
+
+export const DB_TABLE_SCHEMA = `
+CREATE NODE TABLE DBTable (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  tableName STRING,
+  sourceFilePath STRING,
+  PRIMARY KEY (id)
+)`;
+
+export const DB_COLUMN_SCHEMA = `
+CREATE NODE TABLE DBColumn (
+  id STRING,
+  label STRING,
+  heuristicLabel STRING,
+  columnName STRING,
+  tableId STRING,
+  tableName STRING,
+  sourceFilePath STRING,
   PRIMARY KEY (id)
 )`;
 
@@ -494,8 +516,11 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Method TO ContractField,
   FROM Function TO ContractField,
   FROM ContractField TO ContractShape,
+  FROM ContractField TO DBColumn,
   FROM File TO CacheKey,
+  FROM File TO DBTable,
   FROM File TO ValueNode,
+  FROM DBColumn TO DBTable,
   FROM Function TO CacheKey,
   FROM Function TO ValueNode,
   FROM Method TO CacheKey,
@@ -511,7 +536,11 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   type STRING,
   confidence DOUBLE,
   reason STRING,
-  step INT32
+  step INT32,
+  certaintyTier STRING,
+  provenanceFamily STRING,
+  absenceSemantics STRING,
+  witnessPathIds STRING
 )`;
 
 // ============================================================================
@@ -554,6 +583,8 @@ export const NODE_SCHEMA_QUERIES = [
   CONTRACT_SHAPE_SCHEMA,
   CONTRACT_FIELD_SCHEMA,
   CACHE_KEY_SCHEMA,
+  DB_TABLE_SCHEMA,
+  DB_COLUMN_SCHEMA,
   VALUE_NODE_SCHEMA,
   TEST_CASE_SCHEMA,
   // Multi-language support

@@ -37,6 +37,10 @@ import { processMicroDataflow } from '../core/ingestion/micro-dataflow-processor
 import { processPrecisionOverlay } from '../core/ingestion/precision-overlay-processor.js';
 import { PrecisionOverlayMode, normalizePrecisionOverlayMode } from '../core/ingestion/precision-overlay-producer.js';
 import { processProvenanceEdges } from '../core/ingestion/provenance-processor.js';
+import { processClosureTemplates } from '../core/ingestion/closure-template-processor.js';
+import { saveClosureTemplateSnapshot } from '../core/ingestion/closure-template-store.js';
+import { processStructuredSummaryOverlay } from '../core/ingestion/summary-overlay-processor.js';
+import { saveStructuredSummarySnapshot } from '../core/ingestion/summary-overlay-store.js';
 import { processValueGraph } from '../core/ingestion/value-graph-processor.js';
 import { createWorkerPool, WorkerPool } from '../core/ingestion/workers/worker-pool.js';
 import { processLaravelRoutes, ROUTE_FILE_PATH_RE } from '../core/ingestion/laravel-route-processor.js';
@@ -79,7 +83,16 @@ export interface AnalyzeOptions {
   precisionOverlayPath?: string;
   precisionOverlayForce?: boolean;
   graphExpectationPath?: string;
+  incrementalDerivedMode?: string;
 }
+
+type IncrementalDerivedMode = 'full' | 'fast';
+
+const normalizeIncrementalDerivedMode = (value?: string): IncrementalDerivedMode => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'fast') return 'fast';
+  return 'full';
+};
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
 const EMBEDDING_NODE_LIMIT = 50_000;
@@ -99,7 +112,9 @@ const PHASE_LABELS: Record<string, string> = {
   microflow: 'Materializing targeted micro-dataflow',
   values: 'Materializing value graph',
   provenance: 'Materializing provenance edges',
+  closuretemplates: 'Materializing closure templates',
   evidence: 'Materializing evidence spans',
+  summaries: 'Materializing structured summaries',
   communities: 'Detecting communities',
   processes: 'Detecting processes',
   slices: 'Materializing feature slices',
@@ -143,6 +158,9 @@ export const analyzeCommand = async (
   const existingSchemaVersion = existingMeta?.kuzuSchemaVersion ?? 1;
   const schemaMismatch = existingMeta !== null && existingSchemaVersion !== KUZU_SCHEMA_VERSION;
   const precisionOverlayMode = normalizePrecisionOverlayMode(options?.precisionOverlay);
+  const incrementalDerivedMode = normalizeIncrementalDerivedMode(
+    options?.incrementalDerivedMode ?? (options as any)?.incrementalDerived,
+  );
 
   const rawChanges = existingMeta && !options?.force
     ? mergeGitFileChanges(
@@ -325,6 +343,19 @@ export const analyzeCommand = async (
       endpointValues: number;
       routeNameValues: number;
       cacheKeyValues: number;
+      roleValues: number;
+      featureFlagValues: number;
+      configKeyValues: number;
+      envVarValues: number;
+      queueNameValues: number;
+      broadcastChannelValues: number;
+      eventNameValues: number;
+      commandNameValues: number;
+      i18nKeyValues: number;
+      queryKeyFamilyValues: number;
+      routeSegmentValues: number;
+      tableNameValues: number;
+      tableColumnValues: number;
       skippedDuplicates: number;
       skippedMalformed: number;
     };
@@ -346,6 +377,24 @@ export const analyzeCommand = async (
       witnessSpanCount: number;
       proofSpanCount: number;
     };
+    summaries?: {
+      symbolCount: number;
+      fileCount: number;
+      sliceCount: number;
+      communityCount: number;
+      processCount: number;
+      archetypeCount: number;
+    };
+    closureTemplates?: {
+      totalTemplates: number;
+      totalSlices: number;
+      totalCoveredSlots: number;
+      totalRoleExpectations: number;
+    };
+    derived: {
+      mode: IncrementalDerivedMode;
+      skippedPasses: string[];
+    };
   }> => {
     const debugEnabled = process.env.GITNEXUS_DEBUG_INCREMENTAL === '1';
     const debug = (msg: string) => {
@@ -356,6 +405,7 @@ export const analyzeCommand = async (
 
     bar.update(1, { phase: 'Incremental: scanning repo files...' });
     debug('start');
+    const skippedDerivedPasses: string[] = [];
 
     // Validate index exists on disk
     try {
@@ -526,21 +576,36 @@ export const analyzeCommand = async (
     }
 
     // Templates (Blade/MJML): template→PHP CALLS edges are "stringy" and get removed when PHP
-    // nodes are rebuilt (DETACH DELETE), so refresh templates whenever we rebuild any PHP file.
+    // nodes are rebuilt (DETACH DELETE). Prefer targeted refresh (upstream templates that already
+    // call changed PHP) to avoid broad template rescans on every backend change.
     const hasPhpRebuild = rebuildFiles.some(fp => fp.endsWith('.php'));
     if (hasPhpRebuild) {
-      const templateFiles = allRepoFiles.filter(fp => fp.endsWith('.blade.php') || fp.endsWith('.mjml'));
-      const MAX_TEMPLATE_REFRESH = 2000;
+      const templateUpstreamFiles = upstreamFiles.filter(fp => fp.endsWith('.blade.php') || fp.endsWith('.mjml'));
+      for (const fp of templateUpstreamFiles) {
+        if (impactedSet.has(fp)) continue;
+        if (!allRepoFileSet.has(fp)) continue;
+        if (shouldIgnorePath(fp)) continue;
+        refreshEdgeFiles.add(fp);
+      }
 
-      if (templateFiles.length <= MAX_TEMPLATE_REFRESH) {
-        debug(`refreshing ${templateFiles.length} template file(s) due to PHP rebuild(s)`);
-        for (const fp of templateFiles) {
-          if (impactedSet.has(fp)) continue;
-          if (shouldIgnorePath(fp)) continue;
-          refreshEdgeFiles.add(fp);
+      const phpTemplateRefreshMode = String(process.env.GITNEXUS_INCREMENTAL_PHP_TEMPLATE_REFRESH_MODE || 'targeted')
+        .trim()
+        .toLowerCase();
+
+      // Optional fallback for compatibility/debugging.
+      if (phpTemplateRefreshMode === 'broad' && templateUpstreamFiles.length === 0) {
+        const templateFiles = allRepoFiles.filter(fp => fp.endsWith('.blade.php') || fp.endsWith('.mjml'));
+        const MAX_TEMPLATE_REFRESH = 2000;
+        if (templateFiles.length <= MAX_TEMPLATE_REFRESH) {
+          debug(`fallback broad template refresh: ${templateFiles.length} template file(s)`);
+          for (const fp of templateFiles) {
+            if (impactedSet.has(fp)) continue;
+            if (shouldIgnorePath(fp)) continue;
+            refreshEdgeFiles.add(fp);
+          }
+        } else {
+          debug(`skipping broad template fallback: too many template files (${templateFiles.length})`);
         }
-      } else {
-        debug(`skipping template refresh: too many template files (${templateFiles.length})`);
       }
     }
 
@@ -644,6 +709,25 @@ export const analyzeCommand = async (
 
     const contentByPath = new Map<string, string>();
     for (const entry of processedEntries) contentByPath.set(entry.path, entry.content);
+
+    const JS_TS_FILE_RE = /\.(c|m)?(t|j)sx?$/i;
+    const TEST_FILE_RE = /(^|\/)(__tests__|tests?|testing|spec)(\/|$)|(\.test\.|\.spec\.)|(_test\.)|(^test_)/i;
+    const SHAPE_SIGNAL_RE = /\bqueryKeys\.|invalidateQueries\s*\(|refetchQueries\s*\(|setQueryData\s*\(|removeQueries\s*\(/;
+    const isShapeCriticalPath = (filePath: string): boolean => {
+      const normalized = filePath.replace(/\\/g, '/');
+      if (normalized.includes('/Http/Requests/')) return true;
+      if (normalized.includes('/Http/Resources/')) return true;
+      if (TEST_FILE_RE.test(normalized)) return true;
+      if (/(^|\/)database\/migrations\/.+\.php$/i.test(normalized)) return true;
+      return false;
+    };
+    const shapeSignalsTouched = impactedFiles.some(filePath => {
+      if (isShapeCriticalPath(filePath)) return true;
+      if (!JS_TS_FILE_RE.test(filePath)) return false;
+      if (deletedFiles.has(filePath)) return true;
+      const content = contentByPath.get(filePath) || '';
+      return SHAPE_SIGNAL_RE.test(content);
+    });
 
     // Upsert File nodes with updated content for rebuild files (keeps existing edges)
     bar.update(43, { phase: 'Incremental: updating File nodes...' });
@@ -895,6 +979,19 @@ export const analyzeCommand = async (
       endpointValues: number;
       routeNameValues: number;
       cacheKeyValues: number;
+      roleValues: number;
+      featureFlagValues: number;
+      configKeyValues: number;
+      envVarValues: number;
+      queueNameValues: number;
+      broadcastChannelValues: number;
+      eventNameValues: number;
+      commandNameValues: number;
+      i18nKeyValues: number;
+      queryKeyFamilyValues: number;
+      routeSegmentValues: number;
+      tableNameValues: number;
+      tableColumnValues: number;
       skippedDuplicates: number;
       skippedMalformed: number;
     } | undefined;
@@ -915,6 +1012,20 @@ export const analyzeCommand = async (
       primarySpanCount: number;
       witnessSpanCount: number;
       proofSpanCount: number;
+    } | undefined;
+    let summaryOverlaySummary: {
+      symbolCount: number;
+      fileCount: number;
+      sliceCount: number;
+      communityCount: number;
+      processCount: number;
+      archetypeCount: number;
+    } | undefined;
+    let closureTemplateSummary: {
+      totalTemplates: number;
+      totalSlices: number;
+      totalCoveredSlots: number;
+      totalRoleExpectations: number;
     } | undefined;
     const flowNodeLabels = [
       'File',
@@ -1668,154 +1779,189 @@ export const analyzeCommand = async (
       kuzuWarnings.push(`Incremental: unable to recompute gap graph (${msg.slice(0, 120)})`);
     }
 
-    bar.update(89, { phase: 'Incremental: recomputing shape graph...' });
-    try {
-      const isJsTsFile = (filePath: string): boolean => /\.(c|m)?(t|j)sx?$/i.test(filePath);
-      const isTestFile = (filePath: string): boolean => /(^|\/)(__tests__|tests?|testing|spec)(\/|$)|(\.test\.|\.spec\.)|(_test\.)|(^test_)/i.test(filePath);
-      const shapeFilePaths = allRepoFiles.filter(filePath => {
-        const normalized = filePath.replace(/\\/g, '/');
-        if (normalized.includes('/Http/Requests/')) return true;
-        if (normalized.includes('/Http/Resources/')) return true;
-        if (isTestFile(normalized)) return true;
-        if (isJsTsFile(normalized) && !normalized.endsWith('.d.ts')) return true;
-        return false;
-      });
-
-      const shapeInputGraph = createKnowledgeGraph();
-      for (const filePath of shapeFilePaths) {
-        shapeInputGraph.addNode({
-          id: `File:${filePath}`,
-          label: 'File',
-          properties: {
-            name: path.posix.basename(filePath),
-            filePath,
-          },
+    const shouldRecomputeShapeGraph = incrementalDerivedMode === 'full' || shapeSignalsTouched;
+    if (!shouldRecomputeShapeGraph) {
+      skippedDerivedPasses.push('shape-graph');
+    } else {
+      bar.update(89, { phase: 'Incremental: recomputing shape graph...' });
+      try {
+        const shapeFilePaths = allRepoFiles.filter(filePath => {
+          const normalized = filePath.replace(/\\/g, '/');
+          if (normalized.includes('/Http/Requests/')) return true;
+          if (normalized.includes('/Http/Resources/')) return true;
+          if (TEST_FILE_RE.test(normalized)) return true;
+          if (JS_TS_FILE_RE.test(normalized) && !normalized.endsWith('.d.ts')) return true;
+          return false;
         });
-      }
 
-      const classRows = await executeQuery(`
-        MATCH (c:Class)
-        WHERE c.filePath CONTAINS '/Http/Requests/' OR c.filePath CONTAINS '/Http/Resources/'
-        RETURN c.id AS id, c.name AS name, c.filePath AS filePath
-      `);
-      for (const row of classRows) {
-        const id = String(row.id ?? row[0] ?? '').trim();
-        if (!id) continue;
-        shapeInputGraph.addNode({
-          id,
-          label: 'Class',
-          properties: {
-            name: String(row.name ?? row[1] ?? '').trim(),
-            filePath: String(row.filePath ?? row[2] ?? '').trim(),
-          },
+        const shapeInputGraph = createKnowledgeGraph();
+        for (const filePath of shapeFilePaths) {
+          shapeInputGraph.addNode({
+            id: `File:${filePath}`,
+            label: 'File',
+            properties: {
+              name: path.posix.basename(filePath),
+              filePath,
+            },
+          });
+        }
+
+        const classRows = await executeQuery(`
+          MATCH (c:Class)
+          WHERE c.filePath CONTAINS '/Http/Requests/' OR c.filePath CONTAINS '/Http/Resources/'
+          RETURN c.id AS id, c.name AS name, c.filePath AS filePath
+        `);
+        for (const row of classRows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          shapeInputGraph.addNode({
+            id,
+            label: 'Class',
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+            },
+          });
+        }
+
+        const functionRows = await executeQuery(`
+          MATCH (f:Function)
+          WHERE LOWER(f.name) CONTAINS 'querykeys.'
+          RETURN f.id AS id, f.name AS name, f.filePath AS filePath
+        `);
+        for (const row of functionRows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          shapeInputGraph.addNode({
+            id,
+            label: 'Function',
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+            },
+          });
+        }
+
+        const shapeFiles = await readRepositoryFiles(repoPath, shapeFilePaths);
+        const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Shapes: ${message}` });
         });
-      }
 
-      const functionRows = await executeQuery(`
-        MATCH (f:Function)
-        WHERE LOWER(f.name) CONTAINS 'querykeys.'
-        RETURN f.id AS id, f.name AS name, f.filePath AS filePath
-      `);
-      for (const row of functionRows) {
-        const id = String(row.id ?? row[0] ?? '').trim();
-        if (!id) continue;
-        shapeInputGraph.addNode({
-          id,
-          label: 'Function',
-          properties: {
-            name: String(row.name ?? row[1] ?? '').trim(),
-            filePath: String(row.filePath ?? row[2] ?? '').trim(),
-          },
+        await executeQuery(`MATCH (f:ContractField) DETACH DELETE f`);
+        await executeQuery(`MATCH (s:ContractShape) DETACH DELETE s`);
+        await executeQuery(`MATCH (k:CacheKey) DETACH DELETE k`);
+        await executeQuery(`MATCH (c:DBColumn) DETACH DELETE c`);
+        await executeQuery(`MATCH (t:DBTable) DETACH DELETE t`);
+        await executeQuery(`MATCH (t:TestCase) DETACH DELETE t`);
+
+        const shapeInsertGraph = createKnowledgeGraph();
+        for (const shape of shapeResult.shapes) {
+          shapeInsertGraph.addNode({
+            id: shape.id,
+            label: 'ContractShape',
+            properties: {
+              name: shape.label,
+              filePath: '',
+              heuristicLabel: shape.heuristicLabel,
+              shapeType: shape.shapeType,
+              sourceNodeId: shape.sourceNodeId,
+              sourceFilePath: shape.sourceFilePath,
+            },
+          });
+        }
+
+        for (const field of shapeResult.fields) {
+          shapeInsertGraph.addNode({
+            id: field.id,
+            label: 'ContractField',
+            properties: {
+              name: field.label,
+              filePath: '',
+              heuristicLabel: field.heuristicLabel,
+              fieldName: field.fieldName,
+              shapeId: field.shapeId,
+              shapeType: field.shapeType,
+            },
+          });
+        }
+
+        for (const cacheKey of shapeResult.cacheKeys) {
+          shapeInsertGraph.addNode({
+            id: cacheKey.id,
+            label: 'CacheKey',
+            properties: {
+              name: cacheKey.label,
+              filePath: '',
+              heuristicLabel: cacheKey.heuristicLabel,
+              keyName: cacheKey.keyName,
+              keyType: cacheKey.keyType,
+              sourceNodeId: cacheKey.sourceNodeId,
+            },
+          });
+        }
+
+        for (const dbTable of shapeResult.dbTables) {
+          shapeInsertGraph.addNode({
+            id: dbTable.id,
+            label: 'DBTable',
+            properties: {
+              name: dbTable.label,
+              filePath: dbTable.sourceFilePath,
+              heuristicLabel: dbTable.heuristicLabel,
+              tableName: dbTable.tableName,
+              sourceFilePath: dbTable.sourceFilePath,
+            },
+          });
+        }
+
+        for (const dbColumn of shapeResult.dbColumns) {
+          shapeInsertGraph.addNode({
+            id: dbColumn.id,
+            label: 'DBColumn',
+            properties: {
+              name: dbColumn.label,
+              filePath: dbColumn.sourceFilePath,
+              heuristicLabel: dbColumn.heuristicLabel,
+              columnName: dbColumn.columnName,
+              tableId: dbColumn.tableId,
+              tableName: dbColumn.tableName,
+              sourceFilePath: dbColumn.sourceFilePath,
+            },
+          });
+        }
+
+        for (const testCase of shapeResult.testCases) {
+          shapeInsertGraph.addNode({
+            id: testCase.id,
+            label: 'TestCase',
+            properties: {
+              name: testCase.name,
+              filePath: testCase.filePath,
+              startLine: testCase.startLine,
+              endLine: testCase.endLine,
+            },
+          });
+        }
+
+        for (const edge of shapeResult.edges) {
+          shapeInsertGraph.addRelationship({
+            id: edge.id,
+            type: edge.type,
+            sourceId: edge.sourceId,
+            targetId: edge.targetId,
+            confidence: edge.confidence,
+            reason: edge.reason,
+          });
+        }
+
+        await loadGraphToKuzu(shapeInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
         });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to recompute shape graph (${msg.slice(0, 120)})`);
       }
-
-      const shapeFiles = await readRepositoryFiles(repoPath, shapeFilePaths);
-      const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
-        if (progress % 20 !== 0 && progress !== 100) return;
-        bar.update(89, { phase: `Shapes: ${message}` });
-      });
-
-      await executeQuery(`MATCH (f:ContractField) DETACH DELETE f`);
-      await executeQuery(`MATCH (s:ContractShape) DETACH DELETE s`);
-      await executeQuery(`MATCH (k:CacheKey) DETACH DELETE k`);
-      await executeQuery(`MATCH (t:TestCase) DETACH DELETE t`);
-
-      const shapeInsertGraph = createKnowledgeGraph();
-      for (const shape of shapeResult.shapes) {
-        shapeInsertGraph.addNode({
-          id: shape.id,
-          label: 'ContractShape',
-          properties: {
-            name: shape.label,
-            filePath: '',
-            heuristicLabel: shape.heuristicLabel,
-            shapeType: shape.shapeType,
-            sourceNodeId: shape.sourceNodeId,
-            sourceFilePath: shape.sourceFilePath,
-          },
-        });
-      }
-
-      for (const field of shapeResult.fields) {
-        shapeInsertGraph.addNode({
-          id: field.id,
-          label: 'ContractField',
-          properties: {
-            name: field.label,
-            filePath: '',
-            heuristicLabel: field.heuristicLabel,
-            fieldName: field.fieldName,
-            shapeId: field.shapeId,
-            shapeType: field.shapeType,
-          },
-        });
-      }
-
-      for (const cacheKey of shapeResult.cacheKeys) {
-        shapeInsertGraph.addNode({
-          id: cacheKey.id,
-          label: 'CacheKey',
-          properties: {
-            name: cacheKey.label,
-            filePath: '',
-            heuristicLabel: cacheKey.heuristicLabel,
-            keyName: cacheKey.keyName,
-            keyType: cacheKey.keyType,
-            sourceNodeId: cacheKey.sourceNodeId,
-          },
-        });
-      }
-
-      for (const testCase of shapeResult.testCases) {
-        shapeInsertGraph.addNode({
-          id: testCase.id,
-          label: 'TestCase',
-          properties: {
-            name: testCase.name,
-            filePath: testCase.filePath,
-            startLine: testCase.startLine,
-            endLine: testCase.endLine,
-          },
-        });
-      }
-
-      for (const edge of shapeResult.edges) {
-        shapeInsertGraph.addRelationship({
-          id: edge.id,
-          type: edge.type,
-          sourceId: edge.sourceId,
-          targetId: edge.targetId,
-          confidence: edge.confidence,
-          reason: edge.reason,
-        });
-      }
-
-      await loadGraphToKuzu(shapeInsertGraph, new Map(), storagePath, (msg) => {
-        bar.update(89, { phase: msg });
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to recompute shape graph (${msg.slice(0, 120)})`);
     }
 
     bar.update(89, { phase: 'Incremental: refreshing value graph...' });
@@ -1829,7 +1975,7 @@ export const analyzeCommand = async (
 
       const valueGraphInput = createKnowledgeGraph();
       const valueGraphNodeIds = new Set<string>();
-      const valueGraphNodeLabels = ['File', ...flowNodeLabels, 'CacheKey'] as const;
+      const valueGraphNodeLabels = ['File', ...flowNodeLabels, 'CacheKey', 'DBTable', 'DBColumn'] as const;
 
       for (const label of valueGraphNodeLabels) {
         const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
@@ -1839,7 +1985,9 @@ export const analyzeCommand = async (
                  n.name AS name,
                  n.label AS label,
                  n.filePath AS filePath,
-                 n.keyName AS keyName
+                 n.keyName AS keyName,
+                 n.tableName AS tableName,
+                 n.columnName AS columnName
         `);
 
         for (const row of rows) {
@@ -1853,6 +2001,8 @@ export const analyzeCommand = async (
               name: String(row.name ?? row.label ?? row[1] ?? '').trim(),
               filePath: String(row.filePath ?? row[3] ?? '').trim(),
               keyName: String(row.keyName ?? row[4] ?? '').trim(),
+              tableName: String(row.tableName ?? row[5] ?? '').trim(),
+              columnName: String(row.columnName ?? row[6] ?? '').trim(),
             },
           });
           valueGraphNodeIds.add(id);
@@ -1898,6 +2048,19 @@ export const analyzeCommand = async (
         endpointValues: valueGraphResult.stats.endpointValues,
         routeNameValues: valueGraphResult.stats.routeNameValues,
         cacheKeyValues: valueGraphResult.stats.cacheKeyValues,
+        roleValues: valueGraphResult.stats.roleValues,
+        featureFlagValues: valueGraphResult.stats.featureFlagValues,
+        configKeyValues: valueGraphResult.stats.configKeyValues,
+        envVarValues: valueGraphResult.stats.envVarValues,
+        queueNameValues: valueGraphResult.stats.queueNameValues,
+        broadcastChannelValues: valueGraphResult.stats.broadcastChannelValues,
+        eventNameValues: valueGraphResult.stats.eventNameValues,
+        commandNameValues: valueGraphResult.stats.commandNameValues,
+        i18nKeyValues: valueGraphResult.stats.i18nKeyValues,
+        queryKeyFamilyValues: valueGraphResult.stats.queryKeyFamilyValues,
+        routeSegmentValues: valueGraphResult.stats.routeSegmentValues,
+        tableNameValues: valueGraphResult.stats.tableNameValues,
+        tableColumnValues: valueGraphResult.stats.tableColumnValues,
         skippedDuplicates: valueGraphResult.stats.skippedDuplicates,
         skippedMalformed: valueGraphResult.stats.skippedMalformed,
       };
@@ -2033,109 +2196,280 @@ export const analyzeCommand = async (
       kuzuWarnings.push(`Incremental: unable to refresh provenance edges (${msg.slice(0, 120)})`);
     }
 
-    bar.update(89, { phase: 'Incremental: recomputing git-history cochange graph...' });
-    try {
-      const cochangeResult = await processGitHistoryCochange(repoPath, allRepoFiles, (message, progress) => {
-        if (progress % 20 !== 0 && progress !== 100) return;
-        bar.update(89, { phase: `Cochange: ${message}` });
-      });
+    const shouldRecomputeCochange = incrementalDerivedMode === 'full' || fileChangesTotal >= 200;
+    if (!shouldRecomputeCochange) {
+      skippedDerivedPasses.push('cochange');
+    } else {
+      bar.update(89, { phase: 'Incremental: recomputing git-history cochange graph...' });
+      try {
+        const cochangeResult = await processGitHistoryCochange(repoPath, allRepoFiles, (message, progress) => {
+          if (progress % 20 !== 0 && progress !== 100) return;
+          bar.update(89, { phase: `Cochange: ${message}` });
+        });
 
-      await executeQuery(`MATCH ()-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->() DELETE r`);
+        await executeQuery(`MATCH ()-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->() DELETE r`);
 
-      const cochangeInsertGraph = createKnowledgeGraph();
-      for (const edge of cochangeResult.edges) {
-        cochangeInsertGraph.addRelationship(edge);
+        const cochangeInsertGraph = createKnowledgeGraph();
+        for (const edge of cochangeResult.edges) {
+          cochangeInsertGraph.addRelationship(edge);
+        }
+
+        await loadGraphToKuzu(cochangeInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to recompute cochange graph (${msg.slice(0, 120)})`);
       }
-
-      await loadGraphToKuzu(cochangeInsertGraph, new Map(), storagePath, (msg) => {
-        bar.update(89, { phase: msg });
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to recompute cochange graph (${msg.slice(0, 120)})`);
     }
 
-    bar.update(89, { phase: 'Incremental: refreshing evidence spans...' });
-    try {
-      const evidenceGraph = createKnowledgeGraph();
-      const evidenceNodeIds = new Set<string>();
-      const evidenceNodeLabels = ['File', ...flowNodeLabels, 'TestCase'] as const;
-
-      for (const label of evidenceNodeLabels) {
+    if (incrementalDerivedMode === 'fast') {
+      skippedDerivedPasses.push('evidence-spans', 'structured-summaries', 'closure-templates');
+    } else {
+      const postDerivedNodeRows = new Map<string, any[]>();
+      const loadPostDerivedNodeRows = async (label: string): Promise<any[]> => {
+        const cached = postDerivedNodeRows.get(label);
+        if (cached) return cached;
         const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
-        const rows = await executeQuery(`
-          MATCH (n:${cypherLabel})
-          RETURN n.id AS id,
-                 n.name AS name,
-                 n.filePath AS filePath,
-                 n.startLine AS startLine,
-                 n.endLine AS endLine
-        `);
-
-        for (const row of rows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-
-          evidenceGraph.addNode({
-            id,
-            label: label as NodeLabel,
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
-              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
-            },
-          });
-          evidenceNodeIds.add(id);
+        let rows: any[] = [];
+        if (label === 'FeatureSlice') {
+          rows = await executeQuery(`
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.heuristicLabel AS heuristicLabel,
+                   n.filePath AS filePath,
+                   n.sliceType AS sliceType,
+                   n.closureSlots AS closureSlots,
+                   n.closedSlots AS closedSlots
+          `);
+        } else if (label === 'Process') {
+          rows = await executeQuery(`
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.heuristicLabel AS heuristicLabel,
+                   n.filePath AS filePath,
+                   n.processType AS processType,
+                   n.stepCount AS stepCount
+          `);
+        } else if (label === 'Community' || label === 'Gap' || label === 'ContractShape' || label === 'ContractField' || label === 'CacheKey' || label === 'DBTable' || label === 'DBColumn' || label === 'ValueNode') {
+          rows = await executeQuery(`
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.heuristicLabel AS heuristicLabel,
+                   n.filePath AS filePath
+          `);
+        } else if (label === 'File') {
+          rows = await executeQuery(`
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.filePath AS filePath
+          `);
+        } else {
+          rows = await executeQuery(`
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.filePath AS filePath,
+                   n.startLine AS startLine,
+                   n.endLine AS endLine
+          `);
         }
-      }
-
-      const relationshipRows = await executeQuery(`
-        MATCH (a)-[r:CodeRelation]->(b)
-        RETURN a.id AS sourceId,
-               b.id AS targetId,
-               r.type AS type,
-               r.confidence AS confidence,
-               r.reason AS reason
-      `);
-
-      for (const row of relationshipRows) {
-        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-        const targetId = String(row.targetId ?? row[1] ?? '').trim();
-        const type = String(row.type ?? row[2] ?? '').trim();
-        if (!sourceId || !targetId || !type) continue;
-        if (!evidenceNodeIds.has(sourceId) && !evidenceNodeIds.has(targetId)) continue;
-
-        evidenceGraph.addRelationship({
-          id: `inc_evidence_${type}_${sourceId}->${targetId}`,
-          type: type as RelationshipType,
-          sourceId,
-          targetId,
-          confidence: Number(row.confidence ?? row[3] ?? 1.0) || 1.0,
-          reason: String(row.reason ?? row[4] ?? ''),
-        });
-      }
-
-      const evidenceSnapshot = await processEvidenceSpans(
-        evidenceGraph,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(89, { phase: `Evidence spans: ${message}` });
-        },
-      );
-
-      await saveEvidenceSpanSnapshot(storagePath, evidenceSnapshot);
-      evidenceSpanSummary = {
-        nodeEvidenceCount: evidenceSnapshot.stats.nodeEvidenceCount,
-        edgeEvidenceCount: evidenceSnapshot.stats.edgeEvidenceCount,
-        uniqueFiles: evidenceSnapshot.stats.uniqueFiles,
-        primarySpanCount: evidenceSnapshot.stats.primarySpanCount,
-        witnessSpanCount: evidenceSnapshot.stats.witnessSpanCount,
-        proofSpanCount: evidenceSnapshot.stats.proofSpanCount,
+        postDerivedNodeRows.set(label, rows);
+        return rows;
       };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to refresh evidence spans (${msg.slice(0, 120)})`);
+      let postDerivedRelationRows: any[] | null = null;
+      const loadPostDerivedRelationRows = async (): Promise<any[]> => {
+        if (postDerivedRelationRows) return postDerivedRelationRows;
+        postDerivedRelationRows = await executeQuery(`
+          MATCH (a)-[r:CodeRelation]->(b)
+          RETURN a.id AS sourceId,
+                 b.id AS targetId,
+                 r.type AS type,
+                 r.confidence AS confidence,
+                 r.reason AS reason,
+                 r.step AS step
+        `);
+        return postDerivedRelationRows;
+      };
+
+      bar.update(89, { phase: 'Incremental: refreshing evidence spans...' });
+      try {
+        const evidenceGraph = createKnowledgeGraph();
+        const evidenceNodeIds = new Set<string>();
+        const evidenceNodeLabels = ['File', ...flowNodeLabels, 'TestCase'] as const;
+
+        for (const label of evidenceNodeLabels) {
+          const rows = await loadPostDerivedNodeRows(String(label));
+
+          for (const row of rows) {
+            const id = String(row.id ?? '').trim();
+            if (!id) continue;
+
+            evidenceGraph.addNode({
+              id,
+              label: label as NodeLabel,
+              properties: {
+                name: String(row.name ?? '').trim(),
+                filePath: String(row.filePath ?? '').trim(),
+                startLine: Number(row.startLine ?? 0) || undefined,
+                endLine: Number(row.endLine ?? 0) || undefined,
+              },
+            });
+            evidenceNodeIds.add(id);
+          }
+        }
+
+        const relationshipRows = await loadPostDerivedRelationRows();
+        for (const row of relationshipRows) {
+          const sourceId = String(row.sourceId ?? '').trim();
+          const targetId = String(row.targetId ?? '').trim();
+          const type = String(row.type ?? '').trim();
+          if (!sourceId || !targetId || !type) continue;
+          if (!evidenceNodeIds.has(sourceId) && !evidenceNodeIds.has(targetId)) continue;
+
+          evidenceGraph.addRelationship({
+            id: `inc_evidence_${type}_${sourceId}->${targetId}`,
+            type: type as RelationshipType,
+            sourceId,
+            targetId,
+            confidence: Number(row.confidence ?? 1.0) || 1.0,
+            reason: String(row.reason ?? ''),
+            step: Number(row.step ?? 0) || undefined,
+          });
+        }
+
+        const evidenceSnapshot = await processEvidenceSpans(
+          evidenceGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Evidence spans: ${message}` });
+          },
+        );
+
+        await saveEvidenceSpanSnapshot(storagePath, evidenceSnapshot);
+        evidenceSpanSummary = {
+          nodeEvidenceCount: evidenceSnapshot.stats.nodeEvidenceCount,
+          edgeEvidenceCount: evidenceSnapshot.stats.edgeEvidenceCount,
+          uniqueFiles: evidenceSnapshot.stats.uniqueFiles,
+          primarySpanCount: evidenceSnapshot.stats.primarySpanCount,
+          witnessSpanCount: evidenceSnapshot.stats.witnessSpanCount,
+          proofSpanCount: evidenceSnapshot.stats.proofSpanCount,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to refresh evidence spans (${msg.slice(0, 120)})`);
+      }
+
+      bar.update(89, { phase: 'Incremental: refreshing structured summaries...' });
+      try {
+        const summaryGraph = createKnowledgeGraph();
+        const summaryNodeIds = new Set<string>();
+        const summaryNodeLabels = [
+          'File',
+          ...flowNodeLabels,
+          'FeatureSlice',
+          'Community',
+          'Process',
+          'Gap',
+          'ContractShape',
+          'ContractField',
+          'CacheKey',
+          'DBTable',
+          'DBColumn',
+          'ValueNode',
+          'TestCase',
+        ] as const;
+
+        for (const label of summaryNodeLabels) {
+          const rows = await loadPostDerivedNodeRows(String(label));
+
+          for (const row of rows) {
+            const id = String(row.id ?? '').trim();
+            if (!id) continue;
+            const processType = String(row.processType ?? '').trim();
+            const normalizedProcessType = processType === 'intra_community' || processType === 'cross_community'
+              ? processType
+              : undefined;
+
+            summaryGraph.addNode({
+              id,
+              label: label as NodeLabel,
+              properties: {
+                name: String(row.name ?? '').trim(),
+                heuristicLabel: String(row.heuristicLabel ?? '').trim(),
+                filePath: String(row.filePath ?? '').trim(),
+                startLine: Number(row.startLine ?? 0) || undefined,
+                endLine: Number(row.endLine ?? 0) || undefined,
+                sliceType: String(row.sliceType ?? '').trim(),
+                processType: normalizedProcessType,
+                closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots : [],
+                closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots : [],
+                stepCount: Number(row.stepCount ?? 0) || undefined,
+              },
+            });
+            summaryNodeIds.add(id);
+          }
+        }
+
+        const relationshipRows = await loadPostDerivedRelationRows();
+        for (const row of relationshipRows) {
+          const sourceId = String(row.sourceId ?? '').trim();
+          const targetId = String(row.targetId ?? '').trim();
+          const type = String(row.type ?? '').trim();
+          if (!sourceId || !targetId || !type) continue;
+          if (!summaryNodeIds.has(sourceId) && !summaryNodeIds.has(targetId)) continue;
+
+          summaryGraph.addRelationship({
+            id: `inc_summary_${type}_${sourceId}->${targetId}`,
+            type: type as RelationshipType,
+            sourceId,
+            targetId,
+            confidence: Number(row.confidence ?? 1.0) || 1.0,
+            reason: String(row.reason ?? ''),
+            step: Number(row.step ?? 0) || undefined,
+          });
+        }
+
+        const summarySnapshot = await processStructuredSummaryOverlay(
+          summaryGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Summaries: ${message}` });
+          },
+        );
+
+        await saveStructuredSummarySnapshot(storagePath, summarySnapshot);
+        summaryOverlaySummary = {
+          symbolCount: summarySnapshot.stats.symbolCount,
+          fileCount: summarySnapshot.stats.fileCount,
+          sliceCount: summarySnapshot.stats.sliceCount,
+          communityCount: summarySnapshot.stats.communityCount,
+          processCount: summarySnapshot.stats.processCount,
+          archetypeCount: summarySnapshot.stats.archetypeCount,
+        };
+
+        const closureTemplateSnapshot = await processClosureTemplates(
+          summaryGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Closure templates: ${message}` });
+          },
+        );
+        await saveClosureTemplateSnapshot(storagePath, closureTemplateSnapshot);
+        closureTemplateSummary = {
+          totalTemplates: closureTemplateSnapshot.stats.totalTemplates,
+          totalSlices: closureTemplateSnapshot.stats.totalSlices,
+          totalCoveredSlots: closureTemplateSnapshot.stats.totalCoveredSlots,
+          totalRoleExpectations: closureTemplateSnapshot.stats.totalRoleExpectations,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to refresh structured summaries (${msg.slice(0, 120)})`);
+      }
     }
 
     // Embeddings (incremental, skip cached)
@@ -2189,33 +2523,26 @@ export const analyzeCommand = async (
       valueGraph: valueGraphSummary,
       provenance: provenanceSummary,
       evidenceSpans: evidenceSpanSummary,
+      summaries: summaryOverlaySummary,
+      closureTemplates: closureTemplateSummary,
+      derived: {
+        mode: incrementalDerivedMode,
+        skippedPasses: skippedDerivedPasses,
+      },
     };
   };
 
-  // ── Fast path: if commit changed but tree is identical, update meta only ──
+  // ── Fast path: if commit changed but indexable tree is identical, update meta only ──
   if (existingMeta && !options?.force && !schemaMismatch && !hasAnyFileChanges) {
     bar.update(98, { phase: 'Saving metadata...' });
-    const stats = await (async () => {
-      try {
-        await initKuzu(kuzuPath);
-        return await getKuzuStats();
-      } catch {
-        return { nodes: 0, edges: 0 };
-      } finally {
-        try { await closeKuzu(); } catch {}
-      }
-    })();
 
     const meta = {
       ...existingMeta,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       kuzuSchemaVersion: KUZU_SCHEMA_VERSION,
-      stats: {
-        ...(existingMeta.stats || {}),
-        nodes: stats.nodes,
-        edges: stats.edges,
-      },
+      // No indexable files changed, so graph stats remain valid.
+      stats: existingMeta.stats || undefined,
     };
 
     await saveMeta(storagePath, meta);
@@ -2229,7 +2556,7 @@ export const analyzeCommand = async (
 
     bar.update(100, { phase: 'Done' });
     bar.stop();
-    console.log('\n  Repository already indexed (tree unchanged)\n');
+    console.log('\n  Repository already indexed (no indexable changes)\n');
     return;
   }
 
@@ -2309,7 +2636,7 @@ export const analyzeCommand = async (
       }
       if (inc.valueGraph) {
         console.log(
-          `  Value graph: ${inc.valueGraph.valueCount} values / ${inc.valueGraph.edgeCount} edges (permission ${inc.valueGraph.permissionValues}, endpoint ${inc.valueGraph.endpointValues}, route ${inc.valueGraph.routeNameValues}, cache ${inc.valueGraph.cacheKeyValues})`,
+          `  Value graph: ${inc.valueGraph.valueCount} values / ${inc.valueGraph.edgeCount} edges (permission ${inc.valueGraph.permissionValues}, endpoint ${inc.valueGraph.endpointValues}, role ${inc.valueGraph.roleValues}, feature-flag ${inc.valueGraph.featureFlagValues}, config ${inc.valueGraph.configKeyValues}, env ${inc.valueGraph.envVarValues}, queue ${inc.valueGraph.queueNameValues}, broadcast ${inc.valueGraph.broadcastChannelValues}, event ${inc.valueGraph.eventNameValues}, command ${inc.valueGraph.commandNameValues}, i18n ${inc.valueGraph.i18nKeyValues}, route ${inc.valueGraph.routeNameValues}, route-segment ${inc.valueGraph.routeSegmentValues}, cache ${inc.valueGraph.cacheKeyValues}, query-family ${inc.valueGraph.queryKeyFamilyValues}, table ${inc.valueGraph.tableNameValues}, table-column ${inc.valueGraph.tableColumnValues})`,
         );
       }
       if (inc.provenance) {
@@ -2322,6 +2649,16 @@ export const analyzeCommand = async (
           `  Evidence spans: ${inc.evidenceSpans.nodeEvidenceCount} nodes / ${inc.evidenceSpans.edgeEvidenceCount} edges (${inc.evidenceSpans.witnessSpanCount} witness, ${inc.evidenceSpans.proofSpanCount} proof)`,
         );
       }
+      if (inc.summaries) {
+        console.log(
+          `  Summaries: symbol ${inc.summaries.symbolCount}, file ${inc.summaries.fileCount}, slice ${inc.summaries.sliceCount}, community ${inc.summaries.communityCount}, process ${inc.summaries.processCount}, archetype ${inc.summaries.archetypeCount}`,
+        );
+      }
+      if (inc.closureTemplates) {
+        console.log(
+          `  Closure templates: ${inc.closureTemplates.totalTemplates} templates from ${inc.closureTemplates.totalSlices} slices (${inc.closureTemplates.totalCoveredSlots} slot signals, ${inc.closureTemplates.totalRoleExpectations} role signals)`,
+        );
+      }
       console.log(`  ${repoPath}`);
       const derivedParts: string[] = [];
       if (options?.incrementalRecomputeCommunities) derivedParts.push('communities');
@@ -2332,6 +2669,13 @@ export const analyzeCommand = async (
         console.log(`  Incremental note: communities/processes recomputed.`);
       } else {
         console.log(`  Incremental note: recomputed ${derivedParts.join(' + ')} (use the other --incremental-recompute-* flag, or --force).`);
+      }
+      if (inc.derived.mode === 'fast') {
+        if (inc.derived.skippedPasses.length > 0) {
+          console.log(`  Incremental derived mode: fast (skipped ${inc.derived.skippedPasses.join(', ')})`);
+        } else {
+          console.log('  Incremental derived mode: fast');
+        }
       }
 
       if (aiContext.files.length > 0) {
@@ -2400,6 +2744,20 @@ export const analyzeCommand = async (
     witnessSpanCount: number;
     proofSpanCount: number;
   } | undefined;
+  let fullSummaryOverlaySummary: {
+    symbolCount: number;
+    fileCount: number;
+    sliceCount: number;
+    communityCount: number;
+    processCount: number;
+    archetypeCount: number;
+  } | undefined;
+  let fullClosureTemplateSummary: {
+    totalTemplates: number;
+    totalSlices: number;
+    totalCoveredSlots: number;
+    totalRoleExpectations: number;
+  } | undefined;
 
   // ── Phase 2: KuzuDB (60–85%) ──────────────────────────────────────
   bar.update(60, { phase: 'Loading into KuzuDB...' });
@@ -2442,6 +2800,44 @@ export const analyzeCommand = async (
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     kuzuWarnings.push(`Unable to refresh evidence spans (${msg.slice(0, 120)})`);
+  }
+
+  try {
+    bar.update(84, { phase: 'Materializing structured summaries...' });
+    const summarySnapshot = await processStructuredSummaryOverlay(
+      pipelineResult.graph,
+      (message, progress) => {
+        if (progress % 20 !== 0 && progress !== 100) return;
+        bar.update(84, { phase: `Summaries: ${message}` });
+      },
+    );
+    await saveStructuredSummarySnapshot(storagePath, summarySnapshot);
+    fullSummaryOverlaySummary = {
+      symbolCount: summarySnapshot.stats.symbolCount,
+      fileCount: summarySnapshot.stats.fileCount,
+      sliceCount: summarySnapshot.stats.sliceCount,
+      communityCount: summarySnapshot.stats.communityCount,
+      processCount: summarySnapshot.stats.processCount,
+      archetypeCount: summarySnapshot.stats.archetypeCount,
+    };
+
+    const closureTemplateSnapshot = await processClosureTemplates(
+      pipelineResult.graph,
+      (message, progress) => {
+        if (progress % 20 !== 0 && progress !== 100) return;
+        bar.update(84, { phase: `Closure templates: ${message}` });
+      },
+    );
+    await saveClosureTemplateSnapshot(storagePath, closureTemplateSnapshot);
+    fullClosureTemplateSummary = {
+      totalTemplates: closureTemplateSnapshot.stats.totalTemplates,
+      totalSlices: closureTemplateSnapshot.stats.totalSlices,
+      totalCoveredSlots: closureTemplateSnapshot.stats.totalCoveredSlots,
+      totalRoleExpectations: closureTemplateSnapshot.stats.totalRoleExpectations,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    kuzuWarnings.push(`Unable to refresh structured summaries (${msg.slice(0, 120)})`);
   }
 
   // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
@@ -2604,7 +3000,7 @@ export const analyzeCommand = async (
   if (pipelineResult.valueGraphResult) {
     const valueGraph = pipelineResult.valueGraphResult.stats;
     console.log(
-      `  Value graph: ${valueGraph.valueCount} values / ${valueGraph.edgeCount} edges (permission ${valueGraph.permissionValues}, endpoint ${valueGraph.endpointValues}, route ${valueGraph.routeNameValues}, cache ${valueGraph.cacheKeyValues})`,
+      `  Value graph: ${valueGraph.valueCount} values / ${valueGraph.edgeCount} edges (permission ${valueGraph.permissionValues}, endpoint ${valueGraph.endpointValues}, role ${valueGraph.roleValues}, feature-flag ${valueGraph.featureFlagValues}, config ${valueGraph.configKeyValues}, env ${valueGraph.envVarValues}, queue ${valueGraph.queueNameValues}, broadcast ${valueGraph.broadcastChannelValues}, event ${valueGraph.eventNameValues}, command ${valueGraph.commandNameValues}, i18n ${valueGraph.i18nKeyValues}, route ${valueGraph.routeNameValues}, route-segment ${valueGraph.routeSegmentValues}, cache ${valueGraph.cacheKeyValues}, query-family ${valueGraph.queryKeyFamilyValues}, table ${valueGraph.tableNameValues}, table-column ${valueGraph.tableColumnValues})`,
     );
   }
   if (pipelineResult.provenanceResult) {
@@ -2616,6 +3012,16 @@ export const analyzeCommand = async (
   if (fullEvidenceSpanSummary) {
     console.log(
       `  Evidence spans: ${fullEvidenceSpanSummary.nodeEvidenceCount} nodes / ${fullEvidenceSpanSummary.edgeEvidenceCount} edges (${fullEvidenceSpanSummary.witnessSpanCount} witness, ${fullEvidenceSpanSummary.proofSpanCount} proof)`,
+    );
+  }
+  if (fullSummaryOverlaySummary) {
+    console.log(
+      `  Summaries: symbol ${fullSummaryOverlaySummary.symbolCount}, file ${fullSummaryOverlaySummary.fileCount}, slice ${fullSummaryOverlaySummary.sliceCount}, community ${fullSummaryOverlaySummary.communityCount}, process ${fullSummaryOverlaySummary.processCount}, archetype ${fullSummaryOverlaySummary.archetypeCount}`,
+    );
+  }
+  if (fullClosureTemplateSummary) {
+    console.log(
+      `  Closure templates: ${fullClosureTemplateSummary.totalTemplates} templates from ${fullClosureTemplateSummary.totalSlices} slices (${fullClosureTemplateSummary.totalCoveredSlots} slot signals, ${fullClosureTemplateSummary.totalRoleExpectations} role signals)`,
     );
   }
   console.log(`  ${repoPath}`);
