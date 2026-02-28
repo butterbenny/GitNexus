@@ -324,8 +324,11 @@ const isBladeTemplateFile = (filePath: string): boolean => {
     || filePath.includes('/resources/views/');
 };
 
+const isMjmlTemplateFile = (filePath: string): boolean => filePath.endsWith('.mjml');
+
 const isRouteHelperRelevantFile = (filePath: string, content: string): boolean => {
   if (isBladeTemplateFile(filePath)) return /\b(?:route|to_route)\s*\(/.test(content);
+  if (isMjmlTemplateFile(filePath)) return /\b(?:route|to_route)\s*\(/.test(content);
 
   const lang = getLanguageFromFilename(filePath);
   if (lang === SupportedLanguages.PHP) return /\b(?:route|to_route)\s*\(/.test(content) || /->\s*route\s*\(/.test(content);
@@ -366,6 +369,35 @@ export const processLaravelRouteNameWiring = async (
         id: relId,
         type: 'CALLS',
         sourceId: templateId,
+        targetId: target.methodNodeId,
+        confidence: target.confidence,
+        reason,
+      });
+      edgesAdded++;
+    }
+  }
+
+  // 1b) MJML templates: route('name') → controller method
+  // MJML email templates commonly embed Blade `{{ route('...') }}` snippets.
+  for (const file of files) {
+    if (!isMjmlTemplateFile(file.path)) continue;
+    if (!isRouteHelperRelevantFile(file.path, file.content)) continue;
+
+    const sourceId = generateId('File', file.path);
+    const routeNames = extractBladeRouteNames(file.content);
+    if (routeNames.length === 0) continue;
+
+    for (const routeName of routeNames) {
+      const matches = routeNameIndex.get(routeName) || [];
+      if (matches.length !== 1) continue;
+
+      const target = matches[0];
+      const reason = `route-name:${routeName}:${target.reason}`;
+      const relId = generateId('CALLS', `${sourceId}:${reason}->${target.methodNodeId}`);
+      graph.addRelationship({
+        id: relId,
+        type: 'CALLS',
+        sourceId,
         targetId: target.methodNodeId,
         confidence: target.confidence,
         reason,

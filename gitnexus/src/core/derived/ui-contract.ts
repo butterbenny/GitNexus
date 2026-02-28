@@ -27,6 +27,7 @@ export type UiContractGate = {
 };
 
 export type UiContractInteraction = {
+  scope?: string;
   event: string;
   element: string;
   handler: { kind: 'inline' | 'identifier' | 'member' | 'unknown'; name: string; line: number };
@@ -55,6 +56,7 @@ export type UiContractCard = {
   interactions: UiContractInteraction[];
   queries: UiQueryContract[];
   cacheLinks: UiCacheLink[];
+  cacheCoverage?: UiCacheCoverage[];
   effectsSummary: Record<UiContractEffectKind, number>;
   smells: UiContractSmell[];
 };
@@ -102,6 +104,7 @@ export type UiQueryCacheWriteTrigger = {
 };
 
 export type UiQueryContract = {
+  scope?: string;
   hook: string;
   queryKey: string;
   queryKeyParts?: string[];
@@ -114,6 +117,21 @@ export type UiQueryContract = {
   refetchInterval?: string;
   gcTime?: string;
   line: number;
+  confidence: number;
+};
+
+export type UiCacheCoverage = {
+  scope: string;
+  interaction: {
+    event: string;
+    element: string;
+    handler: { kind: 'inline' | 'identifier' | 'member' | 'unknown'; name: string; line: number };
+    line: number;
+  };
+  mutations: Array<{ callee: string; line: number; confidence: number }>;
+  operations: UiCacheOperation[];
+  links: UiCacheLink[];
+  missing_queries: Array<{ hook: string; queryKey: string; line: number; confidence: number }>;
   confidence: number;
 };
 
@@ -342,6 +360,50 @@ const getFunctionBodyNode = (fnNode: Parser.SyntaxNode): Parser.SyntaxNode | nul
   // tree-sitter-typescript uses statement_block for many function bodies.
   const block = fnNode.namedChildren.find(c => c.type === 'statement_block') || null;
   return block;
+};
+
+const getEnclosingScopeKey = (node: Parser.SyntaxNode | null): string => {
+  let current: Parser.SyntaxNode | null = node;
+  while (current) {
+    if (current.type === 'function_declaration') {
+      const nameNode = (current as any).childForFieldName?.('name') as Parser.SyntaxNode | null;
+      const name = String((nameNode as any)?.text || '').trim();
+      const line = getNodeLine(current);
+      return name ? `fn:${name}@${line}` : `fn:@${line}`;
+    }
+
+    if (current.type === 'method_definition') {
+      const nameNode = (current as any).childForFieldName?.('name') as Parser.SyntaxNode | null;
+      const name = String((nameNode as any)?.text || '').trim();
+      const line = getNodeLine(current);
+      return name ? `method:${name}@${line}` : `method:@${line}`;
+    }
+
+    if (current.type === 'arrow_function' || current.type === 'function_expression') {
+      const line = getNodeLine(current);
+
+      const parent = current.parent;
+      if (parent?.type === 'variable_declarator') {
+        const nameNode = (parent as any).childForFieldName?.('name') as Parser.SyntaxNode | null;
+        const name = nameNode?.type === 'identifier' ? String((nameNode as any).text || '').trim() : '';
+        return name ? `fn:${name}@${line}` : `fn:@${line}`;
+      }
+
+      if (parent?.type === 'pair') {
+        const keyNode = parent.namedChildren?.[0] || null;
+        const key = (keyNode?.type === 'property_identifier' || keyNode?.type === 'identifier')
+          ? String((keyNode as any).text || '').trim()
+          : '';
+        return key ? `fn:${key}@${line}` : `fn:@${line}`;
+      }
+
+      return `fn:@${line}`;
+    }
+
+    current = current.parent;
+  }
+
+  return '';
 };
 
 const analyzeEffects = (
@@ -959,6 +1021,7 @@ const extractQueryContracts = (root: Parser.SyntaxNode): UiQueryContract[] => {
     if (!queryKey) return;
 
     const contract: UiQueryContract = {
+      scope: getEnclosingScopeKey(node),
       hook,
       queryKey,
       queryKeyParts: extractArrayLiteralParts(queryKeyNode),
@@ -979,6 +1042,115 @@ const extractQueryContracts = (root: Parser.SyntaxNode): UiQueryContract[] => {
   });
 
   return queries;
+};
+
+const buildCacheCoverage = (opts: {
+  interactions: UiContractInteraction[];
+  queries: UiQueryContract[];
+  cacheOperations: UiCacheOperation[];
+  cacheLinks: UiCacheLink[];
+}): UiCacheCoverage[] => {
+  const { interactions, queries, cacheOperations, cacheLinks } = opts;
+  if (!interactions || interactions.length === 0) return [];
+  if (!queries || queries.length === 0) return [];
+  if (!cacheOperations || cacheOperations.length === 0) return [];
+  if (!cacheLinks || cacheLinks.length === 0) return [];
+
+  const opsByLine = new Map<number, UiCacheOperation[]>();
+  for (const op of cacheOperations) {
+    const line = op?.line;
+    if (!line || !Number.isFinite(line)) continue;
+    const existing = opsByLine.get(line) || [];
+    existing.push(op);
+    opsByLine.set(line, existing);
+  }
+
+  const linksByOpKey = new Map<string, UiCacheLink>();
+  for (const link of cacheLinks) {
+    const op = link?.operation;
+    if (!op) continue;
+    const key = `${op.method}|${op.queryKey}|${op.line}`;
+    if (!key) continue;
+    linksByOpKey.set(key, link);
+  }
+
+  const coverages: UiCacheCoverage[] = [];
+
+  for (const interaction of interactions) {
+    const scope = String(interaction?.scope || '').trim();
+    if (!scope) continue;
+
+    const mutations = (interaction.effects || [])
+      .filter(e => e.kind === 'mutation')
+      .map(e => ({ callee: e.callee, line: e.line, confidence: e.confidence }))
+      .filter(m => m.callee);
+    if (mutations.length === 0) continue;
+
+    const queriesInScope = queries.filter(q => String(q?.scope || '').trim() === scope);
+    if (queriesInScope.length === 0) continue;
+
+    const invalidateLines = Array.from(new Set((interaction.effects || [])
+      .filter(e => e.kind === 'invalidate')
+      .map(e => e.line)
+      .filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
+    ));
+
+    const operations: UiCacheOperation[] = [];
+    for (const line of invalidateLines) {
+      const ops = opsByLine.get(line) || [];
+      operations.push(...ops);
+    }
+
+    const opSeen = new Set<string>();
+    const dedupedOps = operations.filter(op => {
+      const key = `${op.method}|${op.queryKey}|${op.line}`;
+      if (!key || opSeen.has(key)) return false;
+      opSeen.add(key);
+      return true;
+    });
+
+    if (dedupedOps.length === 0) continue;
+
+    const scopeQueryLines = new Set<number>(queriesInScope.map(q => q.line).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)));
+
+    const links: UiCacheLink[] = [];
+    for (const op of dedupedOps) {
+      const key = `${op.method}|${op.queryKey}|${op.line}`;
+      const link = linksByOpKey.get(key);
+      if (!link) continue;
+      const matches = (link.matches || []).filter(m => scopeQueryLines.has(m.line));
+      links.push({ operation: link.operation, matches });
+    }
+
+    const matchedQueryLines = new Set<number>();
+    for (const link of links) {
+      for (const match of link.matches || []) matchedQueryLines.add(match.line);
+    }
+
+    const missingQueries = queriesInScope
+      .filter(q => !matchedQueryLines.has(q.line))
+      .map(q => ({ hook: q.hook, queryKey: q.queryKey, line: q.line, confidence: q.confidence }));
+
+    const hasAnyMatch = Array.from(matchedQueryLines).length > 0;
+    const confidence = hasAnyMatch ? 0.35 : 0.4;
+
+    coverages.push({
+      scope,
+      interaction: {
+        event: interaction.event,
+        element: interaction.element,
+        handler: interaction.handler,
+        line: interaction.handler.line,
+      },
+      mutations: mutations.slice(0, 5),
+      operations: dedupedOps.slice(0, 12),
+      links: links.slice(0, 12),
+      missing_queries: missingQueries.slice(0, 12),
+      confidence,
+    });
+  }
+
+  return coverages;
 };
 
 const buildInteractionSmells = (interaction: {
@@ -1208,6 +1380,7 @@ export const extractUiContractCard = async (filePath: string, content: string): 
     });
 
     interactions.push({
+      scope: getEnclosingScopeKey(node),
       event,
       element,
       handler: { kind: handlerKind, name: handlerName, line: handlerLine },
@@ -1216,6 +1389,43 @@ export const extractUiContractCard = async (filePath: string, content: string): 
       smells,
     });
   });
+
+  const cacheCoverage = buildCacheCoverage({
+    interactions,
+    queries,
+    cacheOperations,
+    cacheLinks,
+  });
+
+  const cacheCoverageByHandlerLine = new Map<number, UiCacheCoverage[]>();
+  for (const item of cacheCoverage) {
+    const line = item?.interaction?.handler?.line;
+    if (typeof line !== 'number' || !Number.isFinite(line)) continue;
+    const existing = cacheCoverageByHandlerLine.get(line) || [];
+    existing.push(item);
+    cacheCoverageByHandlerLine.set(line, existing);
+  }
+
+  for (const interaction of interactions) {
+    const items = cacheCoverageByHandlerLine.get(interaction.handler.line) || [];
+    if (items.length === 0) continue;
+
+    // Conservative lint: only warn when a small surface has queries that are not matched by
+    // any invalidate/setQueryData/remove operation triggered in this interaction.
+    const missingCount = items.reduce((sum, i) => sum + ((i?.missing_queries || []).length || 0), 0);
+    if (missingCount === 0) continue;
+
+    const scopeQueries = queries.filter(q => String(q?.scope || '').trim() === String(interaction.scope || '').trim());
+    if (scopeQueries.length > 8) continue;
+
+    const example = items.flatMap(i => i.missing_queries || [])[0]?.queryKey || '';
+    interaction.smells.push({
+      kind: 'cache-coverage-gap',
+      message: `Cache coverage check: ${missingCount} queryKey(s) in this surface have no matching invalidate/setQueryData/remove operation. Example: ${compactText(example, 80)}`,
+      line: interaction.handler.line,
+      confidence: Math.min(...items.map(i => i.confidence || 0.35)),
+    });
+  }
 
   const effectsSummary: Record<UiContractEffectKind, number> = {
     'state-update': 0,
@@ -1238,6 +1448,7 @@ export const extractUiContractCard = async (filePath: string, content: string): 
     interactions,
     queries,
     cacheLinks,
+    cacheCoverage,
     effectsSummary,
     smells,
   };

@@ -31,6 +31,7 @@ export async function archetypesCommand(options?: {
   repo?: string;
   limit?: string;
   examples?: string;
+  pathPrefix?: string[];
   minHttpConfidence?: string;
 }): Promise<void> {
   const backend = await getBackend();
@@ -43,8 +44,8 @@ export async function archetypesCommand(options?: {
     limit,
     examplesPerSignature,
     minHttpConfidence,
+    path_prefixes: options?.pathPrefix,
   });
 
   output(result);
 }
-

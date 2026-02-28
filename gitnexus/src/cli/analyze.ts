@@ -31,6 +31,7 @@ import { createWorkerPool, WorkerPool } from '../core/ingestion/workers/worker-p
 import { processLaravelRoutes, ROUTE_FILE_PATH_RE } from '../core/ingestion/laravel-route-processor.js';
 import { processLaravelHttpWiring } from '../core/ingestion/laravel-http-processor.js';
 import { processLaravelRouteNameWiring } from '../core/ingestion/laravel-route-name-processor.js';
+import { processTemplateMethodCallWiring } from '../core/ingestion/template-method-call-processor.js';
 import { processLaravelSemanticEdges } from '../core/ingestion/laravel-semantic-processor.js';
 import { processLaravelAuthorization } from '../core/ingestion/laravel-auth-processor.js';
 import { processLaravelPermissionsConfig } from '../core/ingestion/laravel-permissions-config-processor.js';
@@ -47,6 +48,7 @@ import { processLaravelJobDispatch } from '../core/ingestion/laravel-job-dispatc
 import { processLaravelNotifications } from '../core/ingestion/laravel-notification-processor.js';
 import { processLaravelTacticianDispatch } from '../core/ingestion/laravel-tactician-dispatch-processor.js';
 import { processBladeTemplatesIncremental } from '../core/ingestion/blade-template-processor.js';
+import { processMjmlIncludes } from '../core/ingestion/mjml-template-processor.js';
 import { getLanguageFromFilename } from '../core/ingestion/utils.js';
 
 export interface AnalyzeOptions {
@@ -446,6 +448,44 @@ export const analyzeCommand = async (
       }
     }
 
+    // Templates (Blade/MJML): template→PHP CALLS edges are "stringy" and get removed when PHP
+    // nodes are rebuilt (DETACH DELETE), so refresh templates whenever we rebuild any PHP file.
+    const hasPhpRebuild = rebuildFiles.some(fp => fp.endsWith('.php'));
+    if (hasPhpRebuild) {
+      const templateFiles = allRepoFiles.filter(fp => fp.endsWith('.blade.php') || fp.endsWith('.mjml'));
+      const MAX_TEMPLATE_REFRESH = 2000;
+
+      if (templateFiles.length <= MAX_TEMPLATE_REFRESH) {
+        debug(`refreshing ${templateFiles.length} template file(s) due to PHP rebuild(s)`);
+        for (const fp of templateFiles) {
+          if (impactedSet.has(fp)) continue;
+          if (shouldIgnorePath(fp)) continue;
+          refreshEdgeFiles.add(fp);
+        }
+      } else {
+        debug(`skipping template refresh: too many template files (${templateFiles.length})`);
+      }
+    }
+
+    // Blade and MJML templates can call route('name'), but incremental route-name wiring requires
+    // the route-file snippets to be present in the processed set (to build the named-route index).
+    // Without this, a template-only change can drop template→controller `route-name:*` edges.
+    const hasTemplateRouteNameProcessing = rebuildFiles.some(fp => fp.endsWith('.blade.php') || fp.endsWith('.mjml'))
+      || Array.from(refreshEdgeFiles).some(fp => fp.endsWith('.blade.php') || fp.endsWith('.mjml'));
+    if (hasTemplateRouteNameProcessing) {
+      for (const fp of allRepoFiles) {
+        if (!ROUTE_FILE_PATH_RE.test(fp)) continue;
+        if (shouldIgnorePath(fp)) continue;
+        if (impactedSet.has(fp)) continue;
+        refreshEdgeFiles.add(fp);
+      }
+
+      const routeProvider = allRepoFiles.find(fp => /(^|\/)app\/Providers\/RouteServiceProvider\.php$/i.test(fp));
+      if (routeProvider && !impactedSet.has(routeProvider)) {
+        refreshEdgeFiles.add(routeProvider);
+      }
+    }
+
     const processedFiles = Array.from(new Set([...rebuildFiles, ...Array.from(refreshEdgeFiles)]));
     const processedSet = new Set(processedFiles);
 
@@ -591,6 +631,7 @@ export const analyzeCommand = async (
         rebuildBladePaths: bladeRebuildPaths,
       }
     );
+    processMjmlIncludes(workGraph, processedEntries, allRepoFileSet);
 
     // Imports (fast path: uses worker-extracted imports)
     bar.update(58, { phase: 'Incremental: resolving imports...' });
@@ -655,13 +696,14 @@ export const analyzeCommand = async (
     processLaravelRoutes(workGraph, processedEntries, symbolTable, importMap, phpUseAliases);
     await processLaravelHttpWiring(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelRouteNameWiring(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
+    processTemplateMethodCallWiring(workGraph, processedEntries, symbolTable);
     await processLaravelSemanticEdges(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelEloquentRelationships(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelEloquentLoadEdges(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelResourceContracts(workGraph, processedEntries, astCache, symbolTable, importMap);
-    await processLaravelAuthorization(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelPermissionsConfig(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processPhpMatchReturnEdges(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelAuthorization(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processReactQueryKeyWiring(workGraph, processedEntries, astCache, symbolTable, importMap);
 
     // Build an insertion graph: insert nodes only for rebuild files, but edges for all processed sources.

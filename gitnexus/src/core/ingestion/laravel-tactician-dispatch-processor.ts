@@ -20,6 +20,13 @@ type HandlerTarget = {
   reason: string;
 };
 
+type MiddlewareTarget = {
+  baseName: string;
+  methodId: string;
+  confidence: number;
+  reason: string;
+};
+
 type ScopeState = {
   parent: ScopeState | null;
   handlerByBusKey: Map<string, Map<string, HandlerTarget>>;
@@ -457,6 +464,9 @@ export const processLaravelTacticianDispatch = async (
         if (methodName === 'dispatch' && busKey) {
           const commandExpr = args[0];
           const commandBaseName = inferCommandBaseNameFromExpression(commandExpr, scope);
+          const sourceId = findEnclosingPhpCallableId(node, file.path, symbolTable);
+
+          let handlerTarget: HandlerTarget | null = null;
           if (commandBaseName) {
             const localTarget = getHandlerTargetFromScope(scope, busKey, commandBaseName);
             const classKey = findEnclosingPhpClassKey(node, file.path);
@@ -466,7 +476,6 @@ export const processLaravelTacticianDispatch = async (
             const target = localTarget || ctorTarget;
 
             if (target) {
-              const sourceId = findEnclosingPhpCallableId(node, file.path, symbolTable);
               const reason = `laravel-tactician-dispatch:${commandBaseName}:${target.reason}`;
               const relId = generateId('CALLS', `${sourceId}:${reason}->${target.methodId}`);
               graph.addRelationship({
@@ -478,13 +487,14 @@ export const processLaravelTacticianDispatch = async (
                 reason,
               });
               edgesAdded++;
+              handlerTarget = target;
             }
           }
 
           const middlewareArg = args[2];
           const middlewareRefs = extractClassRefsFromArrayExpression(middlewareArg);
           if (middlewareRefs.length > 0) {
-            const sourceId = findEnclosingPhpCallableId(node, file.path, symbolTable);
+            const middlewareTargets: MiddlewareTarget[] = [];
             for (const middlewareRef of middlewareRefs) {
               const middlewareBaseName = getScopeBaseName(middlewareRef);
               const resolvedMiddleware = resolveMiddlewareTargetMethodId(middlewareRef, file.path, symbolTable, importMap, phpUseAliases);
@@ -498,6 +508,50 @@ export const processLaravelTacticianDispatch = async (
                 sourceId,
                 targetId: resolvedMiddleware.methodId,
                 confidence: resolvedMiddleware.confidence,
+                reason,
+              });
+              edgesAdded++;
+
+              middlewareTargets.push({
+                baseName: middlewareBaseName,
+                methodId: resolvedMiddleware.methodId,
+                confidence: resolvedMiddleware.confidence,
+                reason: resolvedMiddleware.reason,
+              });
+            }
+
+            // Build a coherent middleware→handler trace so process detection can surface
+            // this as a single flow rather than scattered outgoing edges.
+            if (middlewareTargets.length > 1) {
+              for (let i = 0; i < middlewareTargets.length - 1; i++) {
+                const from = middlewareTargets[i];
+                const to = middlewareTargets[i + 1];
+                if (!from?.methodId || !to?.methodId) continue;
+
+                const reason = `laravel-tactician-pipeline:${commandBaseName || 'unknown'}:middleware-order`;
+                const relId = generateId('CALLS', `${from.methodId}:${reason}->${to.methodId}`);
+                graph.addRelationship({
+                  id: relId,
+                  type: 'CALLS',
+                  sourceId: from.methodId,
+                  targetId: to.methodId,
+                  confidence: Math.min(from.confidence, to.confidence, 0.85),
+                  reason,
+                });
+                edgesAdded++;
+              }
+            }
+
+            if (handlerTarget && middlewareTargets.length > 0) {
+              const last = middlewareTargets[middlewareTargets.length - 1];
+              const reason = `laravel-tactician-pipeline:${commandBaseName || 'unknown'}:middleware-to-handler`;
+              const relId = generateId('CALLS', `${last.methodId}:${reason}->${handlerTarget.methodId}`);
+              graph.addRelationship({
+                id: relId,
+                type: 'CALLS',
+                sourceId: last.methodId,
+                targetId: handlerTarget.methodId,
+                confidence: Math.min(last.confidence, handlerTarget.confidence, 0.85),
                 reason,
               });
               edgesAdded++;

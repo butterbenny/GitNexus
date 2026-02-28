@@ -228,6 +228,37 @@ const parseAbilityExpression = (node: any): ParsedAbility | null => {
   return null;
 };
 
+const unwrapParenthesizedExpression = (node: any): any => {
+  let current = node;
+  while (current && current.type === 'parenthesized_expression') {
+    current = current.namedChildren?.at(-1) || current.childForFieldName?.('expression') || current.namedChildren?.[0] || null;
+  }
+  return current;
+};
+
+type ParsedAbilityMethodCall = {
+  receiverVar: string;
+  methodName: string;
+};
+
+const parseAbilityMethodCallExpression = (node: any): ParsedAbilityMethodCall | null => {
+  const expr = unwrapParenthesizedExpression(node);
+  if (!expr) return null;
+
+  if (expr.type !== 'member_call_expression' && expr.type !== 'nullsafe_member_call_expression') return null;
+
+  const objectNode = expr.childForFieldName?.('object');
+  const receiverVar = objectNode?.type === 'variable_name' ? String(objectNode.text || '').trim() : '';
+  if (!receiverVar) return null;
+
+  const nameNode = expr.childForFieldName?.('name');
+  const methodName = String(nameNode?.text || '').trim();
+  if (!methodName) return null;
+  if (!looksLikePhpIdentifier(methodName)) return null;
+
+  return { receiverVar, methodName };
+};
+
 const MODEL_INSTANCE_METHODS = new Set([
   'find',
   'findorfail',
@@ -299,9 +330,22 @@ const isLaravelAuthorizationRelevantFile = (filePath: string, content: string): 
 
   return (
     /\$this\s*->\s*authorize\s*\(/.test(content)
+    || /\$this\s*->\s*authorizeResource\s*\(/.test(content)
     || /\bGate\s*::\s*(authorize|allows|denies|check)\s*\(/.test(content)
     || /(?:\?->|->)\s*can\s*\(/.test(content)
   );
+};
+
+const LARAVEL_RESOURCE_ABILITY_MAP: Record<string, string> = {
+  index: 'viewAny',
+  show: 'view',
+  create: 'create',
+  store: 'create',
+  edit: 'update',
+  update: 'update',
+  destroy: 'delete',
+  restore: 'restore',
+  forceDelete: 'forceDelete',
 };
 
 const extractPolicyPairsFromProvider = (content: string): Array<{ modelRef: string; policyRef: string }> => {
@@ -426,6 +470,26 @@ export const processLaravelAuthorization = async (
 ): Promise<{ edgesAdded: number }> => {
   const parser = await loadParser();
   const policyIndex = buildLaravelPolicyIndex(files, symbolTable, importMap, phpUseAliases);
+  const permissionSlugNodeIds = new Set<string>();
+  for (const node of graph.nodes) {
+    const id = node?.id;
+    if (!id) continue;
+    if (!id.startsWith('CodeElement:permission:')) continue;
+    permissionSlugNodeIds.add(id);
+  }
+
+  const matchReturnTargetsByCallableId = new Map<string, Array<{ targetId: string; reason: string; confidence: number }>>();
+  for (const rel of graph.relationships) {
+    if (rel.type !== 'CALLS') continue;
+    if (!String(rel.reason || '').startsWith('php-match-return:')) continue;
+    const list = matchReturnTargetsByCallableId.get(rel.sourceId) || [];
+    list.push({
+      targetId: rel.targetId,
+      reason: String(rel.reason || ''),
+      confidence: typeof rel.confidence === 'number' ? rel.confidence : Number(rel.confidence ?? 1.0),
+    });
+    matchReturnTargetsByCallableId.set(rel.sourceId, list);
+  }
 
   let edgesAdded = 0;
 
@@ -461,6 +525,64 @@ export const processLaravelAuthorization = async (
     walkNodes(tree.rootNode, (node: any) => {
       if (node.type === 'method_declaration' || node.type === 'function_definition') callables.push(node);
     });
+
+    const methodsByName = new Map<string, string>();
+    for (const callable of callables) {
+      if (callable.type !== 'method_declaration') continue;
+      const name = getMethodName(callable);
+      if (!name) continue;
+      const nodeId = symbolTable.lookupExact(file.path, name)
+        || generateId('Method', `${file.path}:${name}`);
+      methodsByName.set(name, nodeId);
+    }
+
+    const authorizeResourceModels = new Map<string, ResolvedClassRef>();
+    walkNodes(tree.rootNode, (node: any) => {
+      const isAuthorizeResource = node.type === 'member_call_expression'
+        && String(node.childForFieldName?.('name')?.text || '').trim() === 'authorizeResource'
+        && String(node.childForFieldName?.('object')?.text || '').trim() === '$this';
+      if (!isAuthorizeResource) return;
+
+      const argsNode = node.childForFieldName?.('arguments');
+      const args = getCallArgumentExpressions(argsNode);
+      if (args.length === 0) return;
+
+      const subject = inferSubjectClassRef(args[0], new Map());
+      if (!subject || subject.confidence < 0.9) return;
+
+      const existing = authorizeResourceModels.get(subject.baseName);
+      if (!existing || existing.confidence < subject.confidence) {
+        authorizeResourceModels.set(subject.baseName, subject);
+      }
+    });
+
+    for (const [modelBaseName, subject] of authorizeResourceModels) {
+      const policy = policyIndex.get(modelBaseName);
+      if (!policy || policy.confidence < 0.9) continue;
+
+      for (const [controllerMethod, policyMethod] of Object.entries(LARAVEL_RESOURCE_ABILITY_MAP)) {
+        const controllerMethodId = methodsByName.get(controllerMethod);
+        if (!controllerMethodId) continue;
+
+        const policyMethodId = symbolTable.lookupExact(policy.filePath, policyMethod);
+        if (!policyMethodId) continue;
+
+        const confidence = Math.min(policy.confidence, subject.confidence);
+        if (confidence < 0.9) continue;
+
+        const reason = `laravel-authorize:resource:${modelBaseName}:${controllerMethod}->${policyMethod}`;
+        const relId = generateId('CALLS', `${controllerMethodId}:${reason}->${policyMethodId}`);
+        graph.addRelationship({
+          id: relId,
+          type: 'CALLS',
+          sourceId: controllerMethodId,
+          targetId: policyMethodId,
+          confidence,
+          reason,
+        });
+        edgesAdded++;
+      }
+    }
 
     for (const callable of callables) {
       const callableName = callable.type === 'method_declaration'
@@ -526,9 +648,7 @@ export const processLaravelAuthorization = async (
         if (args.length === 0) return;
 
         const ability = parseAbilityExpression(args[0]);
-        if (!ability) return;
-
-        if (ability.kind === 'class_const') {
+        if (ability?.kind === 'class_const') {
           const resolved = resolvePhpTypeRef(ability.classRef, file.path, symbolTable, importMap, phpUseAliases, new Set(['Enum', 'Class']));
           if (!resolved || resolved.confidence < 0.9) return;
 
@@ -550,6 +670,66 @@ export const processLaravelAuthorization = async (
           });
           edgesAdded++;
           return;
+        }
+
+        if (!ability) {
+          const derived = parseAbilityMethodCallExpression(args[0]);
+          if (!derived) return;
+
+          const receiverType = varTypes.get(derived.receiverVar);
+          if (!receiverType) return;
+
+          const resolvedReceiver = resolvePhpTypeRef(receiverType, file.path, symbolTable, importMap, phpUseAliases, new Set(['Class']));
+          if (!resolvedReceiver || resolvedReceiver.confidence < 0.9) return;
+
+          const calleeMethodId = symbolTable.lookupExact(resolvedReceiver.filePath, derived.methodName);
+          if (!calleeMethodId) return;
+
+          const targets = matchReturnTargetsByCallableId.get(calleeMethodId) || [];
+          if (targets.length === 0) return;
+
+          // If the helper method returns many possible enum cases, this becomes noisy quickly.
+          // Keep it conservative — it’s still useful for permissions-like helpers with small match arms.
+          const MAX_DERIVED_TARGETS = 10;
+          if (targets.length > MAX_DERIVED_TARGETS) return;
+
+          const uniqueTargetIds = Array.from(new Set(targets.map(t => t.targetId)));
+          for (const targetId of uniqueTargetIds) {
+            const target = targets.find(t => t.targetId === targetId) || targets[0];
+            const reason = `${reasonPrefix}derived:${resolvedReceiver.baseName}::${derived.methodName}:${target.reason}`;
+            const relId = generateId('CALLS', `${sourceId}:${reason}->${targetId}`);
+            graph.addRelationship({
+              id: relId,
+              type: 'CALLS',
+              sourceId,
+              targetId,
+              confidence: Math.min(resolvedReceiver.confidence, target.confidence, 0.9),
+              reason,
+            });
+            edgesAdded++;
+          }
+          return;
+        }
+
+        if (ability.kind === 'string') {
+          const slug = ability.name.trim();
+          if (slug.includes('.')) {
+            const slugNodeId = generateId('CodeElement', `permission:${slug}`);
+            if (permissionSlugNodeIds.has(slugNodeId)) {
+              const reason = `${reasonPrefix}${slug}`;
+              const relId = generateId('CALLS', `${sourceId}:${reason}->${slugNodeId}`);
+              graph.addRelationship({
+                id: relId,
+                type: 'CALLS',
+                sourceId,
+                targetId: slugNodeId,
+                confidence: 0.95,
+                reason,
+              });
+              edgesAdded++;
+              return;
+            }
+          }
         }
 
         // Ability is a simple string — attempt to wire to Policy::<ability>() when model is resolvable.

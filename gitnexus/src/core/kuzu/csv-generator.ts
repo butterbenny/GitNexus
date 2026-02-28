@@ -81,7 +81,8 @@ const isBinaryContent = (content: string): boolean => {
  */
 const extractContent = (
   node: GraphNode,
-  fileContents: Map<string, string>
+  fileContents: Map<string, string>,
+  fileLinesCache: Map<string, string[]>
 ): string => {
   const filePath = node.properties.filePath;
   const content = fileContents.get(filePath);
@@ -104,11 +105,22 @@ const extractContent = (
   const endLine = node.properties.endLine;
   
   if (startLine === undefined || endLine === undefined) return '';
-  
-  const lines = content.split('\n');
+
+  let lines = fileLinesCache.get(filePath);
+  if (!lines) {
+    lines = content.split('\n');
+    fileLinesCache.set(filePath, lines);
+  }
   const contextLines = 2;
   const start = Math.max(0, startLine - contextLines);
-  const end = Math.min(lines.length - 1, endLine + contextLines);
+  let end = Math.min(lines.length - 1, endLine + contextLines);
+
+  // Guardrail: avoid joining extremely large ranges (large classes/files).
+  // We still truncate by characters below, but joining thousands of lines is expensive.
+  const MAX_SNIPPET_LINES = 200;
+  if ((end - start + 1) > MAX_SNIPPET_LINES) {
+    end = Math.min(lines.length - 1, start + MAX_SNIPPET_LINES - 1);
+  }
   
   const snippet = lines.slice(start, end + 1).join('\n');
   const MAX_SNIPPET = 5000;
@@ -135,7 +147,11 @@ export interface CSVData {
  * Generate CSV for File nodes
  * Headers: id,name,filePath,content
  */
-const generateFileCSV = (nodes: GraphNode[], fileContents: Map<string, string>): string => {
+const generateFileCSV = (
+  nodes: GraphNode[],
+  fileContents: Map<string, string>,
+  fileLinesCache: Map<string, string[]>
+): string => {
   const headers = ['id', 'name', 'filePath', 'content'];
   const rows: string[] = [headers.join(',')];
   const seenIds = new Set<string>();
@@ -146,7 +162,7 @@ const generateFileCSV = (nodes: GraphNode[], fileContents: Map<string, string>):
     if (seenIds.has(node.id)) continue;
     seenIds.add(node.id);
     
-    const content = extractContent(node, fileContents);
+    const content = extractContent(node, fileContents, fileLinesCache);
     rows.push([
       escapeCSVField(node.id),
       escapeCSVField(node.properties.name || ''),
@@ -193,14 +209,15 @@ const EXPORTED_CODE_TABLES = new Set<NodeTableName>([
 const generateExportedCodeElementCSV = (
   nodes: GraphNode[],
   label: NodeTableName,
-  fileContents: Map<string, string>
+  fileContents: Map<string, string>,
+  fileLinesCache: Map<string, string[]>
 ): string => {
   const headers = ['id', 'name', 'filePath', 'startLine', 'endLine', 'isExported', 'content'];
   const rows: string[] = [headers.join(',')];
   
   for (const node of nodes) {
     if (node.label !== label) continue;
-    const content = extractContent(node, fileContents);
+    const content = extractContent(node, fileContents, fileLinesCache);
     rows.push([
       escapeCSVField(node.id),
       escapeCSVField(node.properties.name || ''),
@@ -222,14 +239,15 @@ const generateExportedCodeElementCSV = (
 const generateCodeElementBaseCSV = (
   nodes: GraphNode[],
   label: NodeTableName,
-  fileContents: Map<string, string>
+  fileContents: Map<string, string>,
+  fileLinesCache: Map<string, string[]>
 ): string => {
   const headers = ['id', 'name', 'filePath', 'startLine', 'endLine', 'content'];
   const rows: string[] = [headers.join(',')];
 
   for (const node of nodes) {
     if (node.label !== label) continue;
-    const content = extractContent(node, fileContents);
+    const content = extractContent(node, fileContents, fileLinesCache);
     rows.push([
       escapeCSVField(node.id),
       escapeCSVField(node.properties.name || ''),
@@ -341,12 +359,13 @@ export const generateAllCSVs = (
   fileContents: Map<string, string>
 ): CSVData => {
   const nodes = Array.from(graph.nodes);
+  const fileLinesCache = new Map<string, string[]>();
   
   // Generate node CSVs
   const nodeCSVs = new Map<NodeTableName, string>();
   for (const tableName of NODE_TABLES) {
     if (tableName === 'File') {
-      nodeCSVs.set(tableName, generateFileCSV(nodes, fileContents));
+      nodeCSVs.set(tableName, generateFileCSV(nodes, fileContents, fileLinesCache));
       continue;
     }
     if (tableName === 'Folder') {
@@ -363,11 +382,11 @@ export const generateAllCSVs = (
     }
 
     if (EXPORTED_CODE_TABLES.has(tableName)) {
-      nodeCSVs.set(tableName, generateExportedCodeElementCSV(nodes, tableName, fileContents));
+      nodeCSVs.set(tableName, generateExportedCodeElementCSV(nodes, tableName, fileContents, fileLinesCache));
       continue;
     }
 
-    nodeCSVs.set(tableName, generateCodeElementBaseCSV(nodes, tableName, fileContents));
+    nodeCSVs.set(tableName, generateCodeElementBaseCSV(nodes, tableName, fileContents, fileLinesCache));
   }
   
   // Generate single relation CSV

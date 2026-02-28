@@ -41,6 +41,7 @@ export async function queryCommand(queryText: string, options?: {
   context?: string;
   goal?: string;
   limit?: string;
+  pathPrefix?: string[];
   content?: boolean;
 }): Promise<void> {
   if (!queryText?.trim()) {
@@ -55,6 +56,7 @@ export async function queryCommand(queryText: string, options?: {
     goal: options?.goal,
     limit: options?.limit ? parseInt(options.limit) : undefined,
     include_content: options?.content ?? false,
+    path_prefixes: Array.isArray(options?.pathPrefix) && options.pathPrefix.length > 0 ? options.pathPrefix : undefined,
     repo: options?.repo,
   });
   output(result);
@@ -131,6 +133,7 @@ export async function precedentsCommand(queryText: string, options?: {
   uid?: string;
   limit?: string;
   examples?: string;
+  pathPrefixes?: string[];
   minHttpConfidence?: string;
 }): Promise<void> {
   if (!queryText?.trim()) {
@@ -144,6 +147,7 @@ export async function precedentsCommand(queryText: string, options?: {
     anchor_uid: options?.uid,
     limit: options?.limit ? parseInt(options.limit) : undefined,
     examples: options?.examples ? parseInt(options.examples) : undefined,
+    path_prefixes: options?.pathPrefixes,
     min_http_confidence: options?.minHttpConfidence ? parseFloat(options.minHttpConfidence) : undefined,
     repo: options?.repo,
   });

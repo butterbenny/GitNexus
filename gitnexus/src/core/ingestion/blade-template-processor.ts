@@ -82,6 +82,16 @@ const extractBladeTemplateRefs = (content: string): { extends: string[]; imports
     ...extractQuotedViewArgs(content, /@each\s*\(\s*['"]([^'"]+)['"]/g),
   );
 
+  // @includeFirst(['a', 'b']) — treat each candidate as an import edge (confidence-first: no guessing beyond literals).
+  for (const match of content.matchAll(/@includeFirst\s*\(\s*\[([\s\S]*?)\]/g)) {
+    const raw = match[1] || '';
+    for (const inner of String(raw).matchAll(/['"]([^'"]+)['"]/g)) {
+      const viewName = inner[1]?.trim();
+      if (!viewName) continue;
+      imports.push(viewName);
+    }
+  }
+
   // Anonymous component tags: <x-foo.bar> -> resources/views/components/foo/bar.blade.php
   for (const match of content.matchAll(/<x-([A-Za-z0-9_.:-]+)\b/g)) {
     const raw = match[1]?.trim();

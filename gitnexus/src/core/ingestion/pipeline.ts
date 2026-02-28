@@ -22,6 +22,8 @@ import { processLaravelJobDispatch } from './laravel-job-dispatch-processor.js';
 import { processLaravelTacticianDispatch } from './laravel-tactician-dispatch-processor.js';
 import { processLaravelNotifications } from './laravel-notification-processor.js';
 import { processBladeTemplates } from './blade-template-processor.js';
+import { processMjmlIncludes } from './mjml-template-processor.js';
+import { processTemplateMethodCallWiring } from './template-method-call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
@@ -88,9 +90,11 @@ export const runPipelineFromRepo = async (
     });
 
     const filePaths = files.map(f => f.path);
+    const allFilePathSet = new Set<string>(filePaths);
     processStructure(graph, filePaths);
 
     processBladeTemplates(graph, files);
+    processMjmlIncludes(graph, files, allFilePathSet);
 
     onProgress({
       phase: 'structure',
@@ -215,13 +219,14 @@ export const runPipelineFromRepo = async (
     processLaravelRoutes(graph, files, symbolTable, importMap, phpUseAliases);
     await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    processTemplateMethodCallWiring(graph, files, symbolTable);
     await processLaravelSemanticEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelEloquentRelationships(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelEloquentLoadEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelResourceContracts(graph, files, astCache, symbolTable, importMap);
-    await processLaravelAuthorization(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelPermissionsConfig(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processPhpMatchReturnEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+    await processLaravelAuthorization(graph, files, astCache, symbolTable, importMap, phpUseAliases);
     await processReactQueryKeyWiring(graph, files, astCache, symbolTable, importMap);
 
     onProgress({

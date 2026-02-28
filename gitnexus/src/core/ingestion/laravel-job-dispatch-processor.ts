@@ -23,6 +23,7 @@ type DispatchKind =
   | 'bus-batch'
   | 'with-chain-root'
   | 'with-chain-item'
+  | 'dispatch-chain-root'
   | 'dispatch-chain-item';
 
 type ExtractedDispatchCall = {
@@ -340,6 +341,12 @@ const extractDispatchCallsFromTree = (tree: Parser.Tree): ExtractedDispatchCall[
       if (methodName === 'chain') {
         const staticDispatch = findStaticJobDispatchCall(objectNode);
         if (staticDispatch) {
+          calls.push({
+            callNode: node,
+            kind: 'dispatch-chain-root',
+            classRef: staticDispatch.jobClassRef,
+          });
+
           const argsNode = node.childForFieldName?.('arguments');
           const args = getCallArgumentExpressions(argsNode);
           const chainExpr = args[0];
@@ -431,13 +438,34 @@ export const processLaravelJobDispatch = async (
     const dispatchCalls = extractDispatchCallsFromTree(tree);
     if (dispatchCalls.length === 0) continue;
 
+    const chainKinds = new Set<DispatchKind>([
+      'bus-chain',
+      'with-chain-root',
+      'with-chain-item',
+      'dispatch-chain-root',
+      'dispatch-chain-item',
+    ]);
+
+    const callResults: Array<{
+      call: ExtractedDispatchCall;
+      handlerMethodId: string;
+      confidence: number;
+      resolvedReason: string;
+    } | null> = [];
+
     for (const call of dispatchCalls) {
       const resolved = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap, phpUseAliases);
-      if (!resolved) continue;
+      if (!resolved) {
+        callResults.push(null);
+        continue;
+      }
 
       const handlerMethodId = symbolTable.lookupExact(resolved.filePath, 'handle')
         || symbolTable.lookupExact(resolved.filePath, '__invoke');
-      if (!handlerMethodId) continue;
+      if (!handlerMethodId) {
+        callResults.push(null);
+        continue;
+      }
 
       const sourceId = findEnclosingPhpCallableId(call.callNode, file.path, symbolTable);
       const reason = `laravel-job-dispatch-${call.kind}-${resolved.reason}`;
@@ -451,6 +479,59 @@ export const processLaravelJobDispatch = async (
         reason,
       });
       edgesAdded++;
+
+      callResults.push({
+        call,
+        handlerMethodId,
+        confidence: resolved.confidence,
+        resolvedReason: resolved.reason,
+      });
+    }
+
+    // Coherence edges: job chains should form a sequential trace so process detection can
+    // capture them as a single process (instead of one caller fanning out to N jobs).
+    const chainGroups = new Map<any, Array<{ kind: DispatchKind; result: (typeof callResults)[number] }>>();
+    for (let idx = 0; idx < dispatchCalls.length; idx++) {
+      const call = dispatchCalls[idx];
+      if (!chainKinds.has(call.kind)) continue;
+
+      const result = callResults[idx] || null;
+      const list = chainGroups.get(call.callNode) || [];
+      list.push({ kind: call.kind, result });
+      chainGroups.set(call.callNode, list);
+    }
+
+    for (const group of chainGroups.values()) {
+      if (!group || group.length < 2) continue;
+
+      const kinds = new Set(group.map(g => g.kind));
+      const groupKind = kinds.has('bus-chain')
+        ? 'bus-chain'
+        : (kinds.has('with-chain-root') || kinds.has('with-chain-item'))
+          ? 'with-chain'
+          : (kinds.has('dispatch-chain-root') || kinds.has('dispatch-chain-item'))
+            ? 'dispatch-chain'
+            : 'unknown';
+
+      const reason = `laravel-job-chain:${groupKind}`;
+
+      for (let i = 0; i < group.length - 1; i++) {
+        const from = group[i]?.result;
+        const to = group[i + 1]?.result;
+        if (!from || !to) continue;
+        if (!from.handlerMethodId || !to.handlerMethodId) continue;
+
+        const relId = generateId('CALLS', `${from.handlerMethodId}:${reason}->${to.handlerMethodId}`);
+        graph.addRelationship({
+          id: relId,
+          type: 'CALLS',
+          sourceId: from.handlerMethodId,
+          targetId: to.handlerMethodId,
+          confidence: Math.min(from.confidence, to.confidence, 0.85),
+          reason,
+        });
+        edgesAdded++;
+      }
     }
   }
 

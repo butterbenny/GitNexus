@@ -110,6 +110,9 @@ gitnexus list                    # List all indexed repositories
 gitnexus status                  # Show index status for current repo
 gitnexus clean                   # Delete index for current repo
 gitnexus clean --all --force     # Delete all indexes
+gitnexus query "<search_query>"  # Direct tool command (no MCP overhead)
+gitnexus archetypes              # Derive flow signatures + exemplar processes
+gitnexus precedents "<query>"    # Find exemplar flows with similar anatomy
 gitnexus wiki [path]             # Generate repository wiki from knowledge graph
 gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-mini)
 gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
@@ -117,17 +120,22 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 
 ### What Your AI Agent Gets
 
-**7 tools** exposed via MCP:
+**12 tools** exposed via MCP:
 
 | Tool               | What It Does                                                      | `repo` Param |
 | ------------------ | ----------------------------------------------------------------- | -------------- |
 | `list_repos`     | Discover all indexed repositories                                 | —             |
-| `query`          | Process-grouped hybrid search (BM25 + semantic + RRF)             | Optional       |
+| `query`          | Process-grouped hybrid search (BM25 + semantic + RRF); supports `path_prefixes` scoping | Optional       |
+| `action_plan`    | Decision-ready file list + verification checklist (confidence-first); supports `path_prefixes` | Optional       |
 | `context`        | 360-degree symbol view — categorized refs, process participation | Optional       |
 | `impact`         | Blast radius analysis with depth grouping and confidence          | Optional       |
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes       | Optional       |
+| `review_mode`    | Diff-aware review: changed symbols + callers + suggested tests + contract signals | Optional       |
 | `rename`         | Multi-file coordinated rename with graph + text search            | Optional       |
 | `cypher`         | Raw Cypher graph queries                                          | Optional       |
+| `ui_contract`    | UI behavior contract card (interactions → side-effects) + diff mode | Optional       |
+| `archetypes`     | Flow signatures + exemplar processes (“more than a map”)          | Optional       |
+| `precedents`     | Precedent/template finder: exemplars with similar anatomy         | Optional       |
 
 > When only one repo is indexed, the `repo` parameter is optional. With multiple repos, specify which one: `query({query: "auth", repo: "my-app"})`.
 
@@ -614,6 +622,9 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [X] **Incremental Indexing** — Only re-index changed files (note: communities/processes still require `analyze --force`)
 - [X] **Staleness-Aware Tool Responses** — Compare indexed commit vs repo HEAD and show a one-command refresh hint before returning results
 - [X] **Sandbox-Friendly Refresh** — `gitnexus analyze --no-registry --no-hooks` + `GITNEXUS_HOME` support so indexing works in sandboxed environments without escalations
+- [X] **Scoped Workflows** — `path_prefixes` scoping for `query` / `action_plan` / `review_mode` / `archetypes` / `precedents` / `ui_contract` (plus CLI `gitnexus query --path-prefix ...`)
+- [X] **Diff-Aware Review Mode** — Summarize a diff into changed symbols + upstream callers + suggested tests + contract signals (`review_mode` tool)
+- [X] **UI Contract Cards** — Interaction→side-effect contract cards with diff mode (`ui_contract` tool)
 - [X] **Contract Graph: Endpoint Nodes** — Model HTTP endpoints as first-class nodes linking frontend callers ↔ routes ↔ controller methods ↔ permissions/tests/resources
 - [X] **Eloquent Load/Resource Awareness** — Relate `with/loadMissing/...` + Resource fields to relationship names to reduce runtime guesswork (confidence-first)
 - [X] **Wiki Generation** — LLM-powered docs from knowledge graph (`gitnexus wiki`)

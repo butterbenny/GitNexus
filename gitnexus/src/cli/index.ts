@@ -88,6 +88,12 @@ program
   .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
   .option('-l, --limit <n>', 'Max signatures to return (default: 25)', '25')
   .option('-e, --examples <n>', 'Examples per signature (default: 3)', '3')
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict results to processes that touch files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
   .option('--min-http-confidence <n>', 'Minimum confidence for HTTP wiring edges (default: 0.9)', '0.9')
   .action(archetypesCommand);
 
@@ -101,6 +107,12 @@ program
   .option('-c, --context <text>', 'Task context to improve ranking')
   .option('-g, --goal <text>', 'What you want to find')
   .option('-l, --limit <n>', 'Max processes to return (default: 5)')
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict results to files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
   .option('--content', 'Include full symbol source code')
   .action(queryCommand);
 
@@ -111,12 +123,19 @@ program
   .option('-u, --uid <uid>', 'Explicit anchor symbol UID (optional)')
   .option('-l, --limit <n>', 'Max anchor processes to consider (default: 2)', '2')
   .option('-e, --examples <n>', 'Examples per anchor signature (default: 3)', '3')
+  .option(
+    '--path-prefix <prefix>',
+    'Restrict results to precedents that touch files under this path prefix (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
   .option('--min-http-confidence <n>', 'Minimum confidence for HTTP wiring edges (default: 0.9)', '0.9')
   .action((searchQuery, options) => precedentsCommand(searchQuery, {
     repo: options.repo,
     uid: options.uid,
     limit: options.limit,
     examples: options.examples,
+    pathPrefixes: options.pathPrefix,
     minHttpConfidence: options.minHttpConfidence,
   }));
 

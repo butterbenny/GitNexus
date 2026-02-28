@@ -8,10 +8,11 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'url';
 import { initKuzu, executeQuery, closeKuzu, isKuzuReady } from '../core/kuzu-adapter.js';
 import { embedQuery, getEmbeddingDims, disposeEmbedder } from '../core/embedder.js';
-import { isGitRepo, getCurrentCommit } from '../../storage/git.js';
+import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
 import {
   getGlobalRegistryPath,
   listRegisteredRepos,
@@ -39,6 +40,54 @@ function isTestFilePath(filePath: string): boolean {
     p.endsWith('_test.go') || p.endsWith('_test.py') ||
     p.includes('/test_') || p.includes('/conftest.')
   );
+}
+
+function normalizeRepoRelativePath(value: string): string {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/^\/+/, '');
+}
+
+function normalizePathPrefix(repoPath: string, value: string): string {
+  const raw = String(value || '').trim().replace(/\\/g, '/');
+  if (!raw) return '';
+
+  // Allow callers to provide absolute paths; normalize to repo-relative prefixes when possible.
+  if (path.isAbsolute(raw)) {
+    const rel = path.relative(repoPath, raw).replace(/\\/g, '/');
+    if (rel && !rel.startsWith('..')) return normalizeRepoRelativePath(rel);
+  }
+
+  return normalizeRepoRelativePath(raw);
+}
+
+function parsePathPrefixes(repoPath: string, param: unknown): string[] {
+  const raw = Array.isArray(param)
+    ? param
+    : typeof param === 'string'
+      ? [param]
+      : [];
+
+  return Array.from(new Set(
+    raw
+      .map(p => normalizePathPrefix(repoPath, String(p || '')))
+      .filter(Boolean)
+  ));
+}
+
+function filePathTouchesPrefixes(filePath: string, pathPrefixes: string[]): boolean {
+  if (pathPrefixes.length === 0) return true;
+  const fp = normalizeRepoRelativePath(filePath);
+  if (!fp) return false;
+
+  for (const prefixRaw of pathPrefixes) {
+    const prefix = prefixRaw.endsWith('/') ? prefixRaw : `${prefixRaw}/`;
+    if (fp === prefixRaw) return true;
+    if (fp.startsWith(prefix)) return true;
+  }
+  return false;
 }
 
 /** Valid KuzuDB node labels for safe Cypher query construction */
@@ -198,6 +247,57 @@ export class LocalBackend {
 
   // ─── Repo Resolution ─────────────────────────────────────────────
 
+  private tryLoadRepoFromDisk(repoParam: string): RepoHandle | null {
+    const trimmed = repoParam.trim();
+    if (!trimmed) return null;
+
+    const gitRoot = getGitRoot(trimmed);
+    const resolved = gitRoot ? path.resolve(gitRoot) : (existsSync(trimmed) ? path.resolve(trimmed) : null);
+    if (!resolved) return null;
+
+    const storagePath = path.join(resolved, '.gitnexus');
+    const metaPath = path.join(storagePath, 'meta.json');
+    if (!existsSync(metaPath)) return null;
+
+    try {
+      const raw = readFileSync(metaPath, 'utf-8');
+      const meta = JSON.parse(raw) as any;
+
+      const name = path.basename(resolved);
+      const id = this.repoId(name, resolved, this.repos);
+      const kuzuPath = path.join(storagePath, 'kuzu');
+
+      const handle: RepoHandle = {
+        id,
+        name,
+        repoPath: resolved,
+        storagePath,
+        kuzuPath,
+        indexedAt: String(meta?.indexedAt || ''),
+        lastCommit: String(meta?.lastCommit || ''),
+        stats: meta?.stats || undefined,
+      };
+
+      this.repos.set(id, handle);
+
+      const s = handle.stats || {};
+      this.contextCache.set(id, {
+        projectName: handle.name,
+        stats: {
+          fileCount: s.files || 0,
+          functionCount: s.nodes || 0,
+          communityCount: s.communities || 0,
+          processCount: s.processes || 0,
+        },
+      });
+
+      return handle;
+    } catch {
+      // If meta.json is corrupt or transiently unreadable, do not create a handle.
+      return null;
+    }
+  }
+
   /**
    * Resolve which repo to use.
    * - If repoParam is given, match by name or path
@@ -205,10 +305,6 @@ export class LocalBackend {
    * - If 0 or multiple without param, throw with helpful message
    */
   resolveRepo(repoParam?: string): RepoHandle {
-    if (this.repos.size === 0) {
-      throw new Error('No indexed repositories. Run: gitnexus analyze');
-    }
-
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
       // Match by id
@@ -222,13 +318,27 @@ export class LocalBackend {
       for (const handle of this.repos.values()) {
         if (handle.repoPath === resolved) return handle;
       }
+
+      // Worktree / sandbox-friendly mode: allow resolving a repo by absolute path
+      // even if it was indexed with --no-registry and therefore is not in ~/.gitnexus/registry.json.
+      const loaded = this.tryLoadRepoFromDisk(repoParam);
+      if (loaded) return loaded;
+
       // Match by partial name
       for (const handle of this.repos.values()) {
         if (handle.name.toLowerCase().includes(paramLower)) return handle;
       }
 
+      if (this.repos.size === 0) {
+        throw new Error('No indexed repositories. Run: gitnexus analyze');
+      }
+
       const names = [...this.repos.values()].map(h => h.name);
       throw new Error(`Repository "${repoParam}" not found. Available: ${names.join(', ')}`);
+    }
+
+    if (this.repos.size === 0) {
+      throw new Error('No indexed repositories. Run: gitnexus analyze');
     }
 
     if (this.repos.size === 1) {
@@ -427,6 +537,9 @@ export class LocalBackend {
       case 'detect_changes':
         result = await this.detectChanges(repo, params);
         break;
+      case 'review_mode':
+        result = await this.reviewMode(repo, params);
+        break;
       case 'rename':
         result = await this.rename(repo, params);
         break;
@@ -455,19 +568,29 @@ export class LocalBackend {
     limit?: number;
     examples?: number;
     min_http_confidence?: number;
+    path_prefixes?: string[];
     repo?: string;
   }): Promise<{ report: ArchetypeReport }> {
     return this.queryArchetypes(repo.id, {
       limit: params.limit,
       examplesPerSignature: params.examples,
       minHttpConfidence: params.min_http_confidence,
+      path_prefixes: params.path_prefixes,
     });
   }
 
-  private async ensureArchetypeIndex(repo: RepoHandle, minHttpConfidence = 0.9): Promise<{ byProcessId: Map<string, { signature: string; example: ArchetypeExample }>; bySignature: Map<string, ArchetypeExample[]> }> {
-    const cached = this.archetypeIndexCache.get(repo.id);
+  private async ensureArchetypeIndex(
+    repo: RepoHandle,
+    minHttpConfidence = 0.9,
+    pathPrefixesParam?: unknown
+  ): Promise<{ byProcessId: Map<string, { signature: string; example: ArchetypeExample }>; bySignature: Map<string, ArchetypeExample[]> }> {
+    const scopePrefixes = parsePathPrefixes(repo.repoPath, pathPrefixesParam);
+    const scopeKey = scopePrefixes.length > 0 ? scopePrefixes.slice().sort().join('|') : '';
+    const cacheKey = `${repo.id}::${minHttpConfidence}::${scopeKey}`;
+
+    const cached = this.archetypeIndexCache.get(cacheKey);
     const now = Date.now();
-    if (cached && cached.minHttpConfidence === minHttpConfidence && now - cached.builtAtMs < 15000) {
+    if (cached && now - cached.builtAtMs < 15000) {
       return { byProcessId: cached.byProcessId, bySignature: cached.bySignature };
     }
 
@@ -535,6 +658,9 @@ export class LocalBackend {
     const bySignature = new Map<string, ArchetypeExample[]>();
 
     for (const proc of processesById.values()) {
+      if (scopePrefixes.length > 0 && !proc.steps.some(s => filePathTouchesPrefixes(s.filePath, scopePrefixes))) {
+        continue;
+      }
       const archetype = computeProcessArchetype(proc, httpEdges, { minHttpConfidence });
       if (!archetype) continue;
 
@@ -559,7 +685,7 @@ export class LocalBackend {
       list.sort((a, b) => (b.stepCount || 0) - (a.stepCount || 0) || String(a.processId).localeCompare(String(b.processId)));
     }
 
-    this.archetypeIndexCache.set(repo.id, { builtAtMs: now, minHttpConfidence, byProcessId, bySignature });
+    this.archetypeIndexCache.set(cacheKey, { builtAtMs: now, minHttpConfidence, byProcessId, bySignature });
     return { byProcessId, bySignature };
   }
 
@@ -569,6 +695,7 @@ export class LocalBackend {
     limit?: number;
     examples?: number;
     min_http_confidence?: number;
+    path_prefixes?: string[];
     repo?: string;
   }): Promise<any> {
     const queryText = String(params.query || '').trim();
@@ -580,8 +707,19 @@ export class LocalBackend {
     const limit = Math.max(1, Math.min(5, params.limit ?? 2));
     const examplesPer = Math.max(1, Math.min(5, params.examples ?? 3));
     const minHttpConfidence = params.min_http_confidence ?? 0.9;
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
 
-    const index = await this.ensureArchetypeIndex(repo, minHttpConfidence);
+    const index = await this.ensureArchetypeIndex(repo, minHttpConfidence, pathPrefixes);
+
+    const scopeClauseUiOrController = (() => {
+      if (pathPrefixes.length === 0) return null;
+      const clauses = pathPrefixes.map(p => {
+        const esc = String(p || '').replace(/'/g, "''");
+        const pref = esc.endsWith('/') ? esc : `${esc}/`;
+        return `(ui.filePath STARTS WITH '${pref}' OR ui.filePath = '${esc}' OR c.filePath STARTS WITH '${pref}' OR c.filePath = '${esc}')`;
+      });
+      return `(${clauses.join(' OR ')})`;
+    })();
 
     const seenProcess = new Set<string>();
     const processPrecedents: any[] = [];
@@ -731,7 +869,7 @@ export class LocalBackend {
           MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
           WHERE ${whereParts.join(' AND ')}
           MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c:Method)
-          WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'
+          WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'${scopeClauseUiOrController ? ` AND ${scopeClauseUiOrController}` : ''}
           RETURN ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine,
                  e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
                  c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
@@ -978,7 +1116,7 @@ export class LocalBackend {
               AND ui.filePath STARTS WITH 'apps/'
               AND e.name STARTS WITH 'endpoint:'
             MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c:Method)
-            WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'
+            WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'${scopeClauseUiOrController ? ` AND ${scopeClauseUiOrController}` : ''}
             RETURN ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine,
                    e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
                    c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
@@ -1055,6 +1193,7 @@ export class LocalBackend {
         query: queryText,
         task_context: undefined,
         goal: undefined,
+        path_prefixes: pathPrefixes,
         limit_files: 12,
         limit_checks: 1,
       });
@@ -1075,7 +1214,17 @@ export class LocalBackend {
 
     // ─── Build precedents ─────────────────────────────────────────
 
-    const hopPrecedents = await buildHopPrecedents(anchorHops);
+    const inScopeHops = pathPrefixes.length > 0
+      ? anchorHops.filter(h => {
+        const uiPath = String(h?.ui?.filePath || '').trim();
+        const controllerPath = String(h?.controller?.filePath || '').trim();
+        if (filePathTouchesPrefixes(uiPath, pathPrefixes)) return true;
+        if (filePathTouchesPrefixes(controllerPath, pathPrefixes)) return true;
+        return false;
+      })
+      : anchorHops;
+
+    const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
     for (const pid of anchorProcessIds.slice(0, limit)) {
       addProcessPrecedent(pid);
@@ -1087,6 +1236,8 @@ export class LocalBackend {
       anchor_uid: anchorUid || undefined,
       anchor_processes: anchorProcessIds.length,
       anchor_hops: anchorHops.length,
+      scoped_hops: inScopeHops.length,
+      path_prefixes: pathPrefixes,
     };
     if (precedents.length === 0) {
       diagnostics.note = 'No precedents found (no anchor processes or deterministic HTTP hops matched this query).';
@@ -1100,6 +1251,7 @@ export class LocalBackend {
     return {
       status: 'ok',
       query: queryText || anchorUid,
+      ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
       ...(anchorUid ? { anchor_uid: anchorUid } : {}),
       precedents,
       diagnostics,
@@ -1123,6 +1275,7 @@ export class LocalBackend {
     limit?: number;
     max_symbols?: number;
     include_content?: boolean;
+    path_prefixes?: string[];
   }): Promise<any> {
     if (!params.query?.trim()) {
       return { error: 'query parameter is required and cannot be empty.' };
@@ -1134,10 +1287,57 @@ export class LocalBackend {
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
     const searchQuery = params.query.trim();
+
+    const normalizePath = (value: string): string => {
+      return String(value || '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/^\.\/+/, '')
+        .replace(/^\/+/, '');
+    };
+
+    const normalizePrefix = (value: string): string => {
+      const raw = String(value || '').trim().replace(/\\/g, '/');
+      if (!raw) return '';
+
+      // Allow callers to provide absolute paths; normalize to repo-relative prefixes when possible.
+      if (path.isAbsolute(raw)) {
+        const rel = path.relative(repo.repoPath, raw).replace(/\\/g, '/');
+        if (rel && !rel.startsWith('..')) return normalizePath(rel);
+      }
+
+      return normalizePath(raw);
+    };
+
+    const rawPrefixes = Array.isArray(params.path_prefixes)
+      ? params.path_prefixes
+      : typeof (params as any).path_prefixes === 'string'
+        ? [(params as any).path_prefixes]
+        : [];
+
+    const pathPrefixes = Array.from(new Set(rawPrefixes.map(p => normalizePrefix(String(p || ''))).filter(Boolean)));
+
+    const isInScope = (filePath: string): boolean => {
+      if (pathPrefixes.length === 0) return true;
+      const fp = normalizePath(filePath);
+      if (!fp) return false;
+
+      for (const prefixRaw of pathPrefixes) {
+        const prefix = prefixRaw.endsWith('/') ? prefixRaw : `${prefixRaw}/`;
+        if (fp === prefixRaw) return true;
+        if (fp.startsWith(prefix)) return true;
+      }
+      return false;
+    };
     
     // Step 1: Run hybrid search to get matching symbols
-    const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const bm25Results = await this.bm25Search(repo, searchQuery, searchLimit);
+    const baseSearchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
+    const searchLimit = pathPrefixes.length > 0
+      ? Math.min(300, Math.max(baseSearchLimit, baseSearchLimit * 5))
+      : baseSearchLimit;
+
+    const bm25Raw = await this.bm25Search(repo, searchQuery, searchLimit);
+    const bm25Results = pathPrefixes.length > 0 ? bm25Raw.filter(r => isInScope(r?.filePath || '')) : bm25Raw;
 
     // Semantic search is expensive (model load) and requires embeddings/indexes.
     // Prefer BM25 for identifier-like queries and only fall back to semantic when BM25 is sparse.
@@ -1145,9 +1345,12 @@ export class LocalBackend {
     const looksLikeIdentifier = isSingleToken && /^[A-Za-z_][$A-Za-z0-9_:/.-]*$/.test(searchQuery);
     const shouldTrySemantic = !looksLikeIdentifier && bm25Results.length < Math.max(5, Math.floor(searchLimit / 3));
 
-    const semanticResults = shouldTrySemantic
+    const semanticRaw = shouldTrySemantic
       ? await this.semanticSearch(repo, searchQuery, searchLimit)
       : [];
+    const semanticResults = pathPrefixes.length > 0
+      ? semanticRaw.filter(r => isInScope(r?.filePath || ''))
+      : semanticRaw;
     
     // Merge via reciprocal rank fusion (RRF)
     const scoreMap = new Map<string, { score: number; data: any }>();
@@ -1338,6 +1541,7 @@ export class LocalBackend {
         const filePath = row.filePath ?? row[2] ?? '';
         if (!filePath || typeof filePath !== 'string') continue;
         if (isTestFilePath(filePath)) continue;
+        if (!isInScope(filePath)) continue;
 
         const confidenceRaw = row.confidence ?? row[5] ?? 0;
         const confidence = typeof confidenceRaw === 'number' ? confidenceRaw : parseFloat(confidenceRaw) || 0;
@@ -1452,11 +1656,14 @@ export class LocalBackend {
         const step = row.step ?? row[includeContent ? 6 : 5];
         const stepIndex = typeof step === 'number' ? step : parseInt(step, 10);
 
+        const filePath = row.filePath ?? row[2] ?? '';
+        if (!isInScope(filePath)) continue;
+
         stepSymbols.push({
           id: nodeId,
           name: row.name ?? row[1] ?? '',
           type,
-          filePath: row.filePath ?? row[2] ?? '',
+          filePath,
           startLine: row.startLine ?? row[3],
           endLine: row.endLine ?? row[4],
           ...(includeContent ? { content: row.content ?? row[5] } : {}),
@@ -1471,14 +1678,16 @@ export class LocalBackend {
       processSymbols.push(...limitedSteps);
     }
 
-    const processes = rankedProcesses.map(p => ({
-      id: p.id,
-      summary: p.heuristicLabel || p.label,
-      priority: Math.round(p.priority * 1000) / 1000,
-      symbol_count: symbolCountByProcess.get(p.id) ?? 0,
-      process_type: p.processType,
-      step_count: p.stepCount,
-    }));
+    const processes = rankedProcesses
+      .map(p => ({
+        id: p.id,
+        summary: p.heuristicLabel || p.label,
+        priority: Math.round(p.priority * 1000) / 1000,
+        symbol_count: symbolCountByProcess.get(p.id) ?? 0,
+        process_type: p.processType,
+        step_count: p.stepCount,
+      }))
+      .filter(p => pathPrefixes.length === 0 || p.symbol_count > 0);
 
     // Deduplicate definitions by id/filePath (keep highest-ranked)
     const dedupedDefinitions: any[] = [];
@@ -1491,10 +1700,14 @@ export class LocalBackend {
       dedupedDefinitions.push(d);
     }
     
+    const inScopeDefinitions = pathPrefixes.length > 0
+      ? dedupedDefinitions.filter((d: any) => isInScope(d?.filePath || ''))
+      : dedupedDefinitions;
+
     return {
       processes,
       process_symbols: processSymbols,
-      definitions: dedupedDefinitions.slice(0, 20), // cap standalone definitions
+      definitions: inScopeDefinitions.slice(0, 20), // cap standalone definitions
     };
   }
 
@@ -1502,6 +1715,7 @@ export class LocalBackend {
     query: string;
     task_context?: string;
     goal?: string;
+    path_prefixes?: string[];
     limit_files?: number;
     limit_checks?: number;
   }): Promise<any> {
@@ -1512,6 +1726,7 @@ export class LocalBackend {
       query: params.query,
       task_context: params.task_context,
       goal: params.goal,
+      path_prefixes: params.path_prefixes,
       limit: 5,
       max_symbols: 12,
       include_content: false,
@@ -1719,7 +1934,7 @@ export class LocalBackend {
       }
 
       type PermissionCandidate = {
-        kind: 'enum_case' | 'policy_method';
+        kind: 'enum_case' | 'policy_method' | 'permission_slug';
         uid: string;
         name: string;
         type: string;
@@ -1732,6 +1947,20 @@ export class LocalBackend {
         const uid = row.uid || row[0];
         if (!uid || typeof uid !== 'string') continue;
         const type = row.type || row[2] || '';
+        if (uid.startsWith('CodeElement:permission:')) {
+          candidates.push({
+            kind: 'permission_slug',
+            uid,
+            name: row.name || row[1] || '',
+            type: 'CodeElement',
+            filePath: row.filePath || row[3] || '',
+            edge: {
+              reason: row.reason || row[4] || '',
+              confidence: Number(row.confidence ?? row[5] ?? 1.0),
+            },
+          });
+          continue;
+        }
         if (type === 'Const') {
           candidates.push({
             kind: 'enum_case',
@@ -1764,6 +1993,78 @@ export class LocalBackend {
 
       const grants: any[] = [];
       const seen = new Set<string>();
+
+      const expandSlugToGrant = async (
+        slugUid: string,
+        evidence: { controller_edge: { reason: string; confidence: number }; via_policy?: any; }
+      ): Promise<void> => {
+        const slugEsc = slugUid.replace(/'/g, "''");
+        let slugRows: any[] = [];
+        try {
+          slugRows = await executeQuery(repo.id, `
+            MATCH (s:CodeElement {id: '${slugEsc}'})
+            RETURN s.id AS uid, s.name AS name, s.filePath AS filePath
+            LIMIT 1
+          `);
+        } catch {
+          return;
+        }
+
+        const slugRow = slugRows[0] || null;
+        const slug = String(slugRow?.name || '').trim();
+        if (!slug) return;
+
+        const key = `${slugUid}:${slug}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        const slugNode = await normalizeNode(slugUid, {
+          id: slugUid,
+          name: slug,
+          type: 'CodeElement',
+          filePath: slugRow?.filePath || '',
+        });
+
+        let roleRows: any[] = [];
+        try {
+          roleRows = await executeQuery(repo.id, `
+            MATCH (role:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(s {id: '${slugEsc}'})
+            WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'laravel-role-permission-slug:'
+            RETURN role.id AS uid, role.name AS name, role.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+            ORDER BY role.name
+            LIMIT 25
+          `);
+        } catch {
+          roleRows = [];
+        }
+
+        const roles: any[] = [];
+        for (const roleRow of roleRows) {
+          const roleUid = roleRow.uid || roleRow[0];
+          if (!roleUid || typeof roleUid !== 'string') continue;
+          roles.push({
+            uid: roleUid,
+            name: roleRow.name || roleRow[1] || '',
+            filePath: roleRow.filePath || roleRow[2] || '',
+            reason: roleRow.reason || roleRow[3] || '',
+            confidence: Number(roleRow.confidence ?? roleRow[4] ?? 1.0),
+          });
+        }
+
+        grants.push({
+          permission: slugNode ? {
+            uid: slugNode.id,
+            slug: slugNode.name,
+            filePath: slugNode.filePath,
+          } : {
+            uid: slugUid,
+            slug,
+            filePath: slugRow?.filePath || '',
+          },
+          roles,
+          evidence,
+        });
+      };
 
       const expandConstToGrant = async (
         constUid: string,
@@ -1852,6 +2153,11 @@ export class LocalBackend {
       };
 
       for (const candidate of candidates) {
+        if (candidate.kind === 'permission_slug') {
+          await expandSlugToGrant(candidate.uid, { controller_edge: candidate.edge });
+          continue;
+        }
+
         if (candidate.kind === 'enum_case') {
           await expandConstToGrant(candidate.uid, { controller_edge: candidate.edge });
           continue;
@@ -2177,6 +2483,7 @@ export class LocalBackend {
         const card = await extractUiContractCard(filePath, content);
         const cacheLinks = Array.isArray((card as any)?.cacheLinks) ? (card as any).cacheLinks : [];
         const queries = Array.isArray((card as any)?.queries) ? (card as any).queries : [];
+        const cacheCoverage = Array.isArray((card as any)?.cacheCoverage) ? (card as any).cacheCoverage : [];
         if (cacheLinks.length === 0 && queries.length === 0) continue;
 
         const linkSummaries = cacheLinks
@@ -2207,6 +2514,17 @@ export class LocalBackend {
         const writeCount = linkSummaries.filter((l: any) => l.operation.kind === 'write').length;
         const removeCount = linkSummaries.filter((l: any) => l.operation.kind === 'remove').length;
 
+        const coverageGaps = cacheCoverage
+          .filter((c: any) => Array.isArray(c?.missing_queries) && c.missing_queries.length > 0)
+          .map((c: any) => ({
+            interaction: c?.interaction || null,
+            mutations: Array.isArray(c?.mutations) ? c.mutations.slice(0, 5) : [],
+            operations: Array.isArray(c?.operations) ? c.operations.slice(0, 8) : [],
+            missing_queries: Array.isArray(c?.missing_queries) ? c.missing_queries.slice(0, 8) : [],
+            confidence: c?.confidence ?? 0.35,
+          }))
+          .slice(0, 10);
+
         cache_effects.push({
           filePath,
           summary: {
@@ -2217,8 +2535,10 @@ export class LocalBackend {
             refetch_triggers: refetchCount,
             cache_writes: writeCount,
             cache_removes: removeCount,
+            coverage_gaps: coverageGaps.length,
           },
           links: matched.slice(0, 25),
+          coverage_gaps: coverageGaps,
         });
       }
     } catch { /* ignore */ }
@@ -2376,6 +2696,7 @@ export class LocalBackend {
     base_ref?: string;
     include_endpoints?: boolean;
     min_http_confidence?: number;
+    path_prefixes?: string[];
   }): Promise<any> {
     const rawPath = String(params.file_path || '').trim();
     if (!rawPath) return { error: 'file_path is required and cannot be empty.' };
@@ -2403,6 +2724,7 @@ export class LocalBackend {
 
     const includeEndpoints = params.include_endpoints !== false;
     const minHttpConfidence = params.min_http_confidence ?? 0.9;
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
 
     let endpoints: any[] = [];
     if (includeEndpoints) {
@@ -2497,6 +2819,18 @@ export class LocalBackend {
           return true;
         })
         .slice(0, 50);
+
+      if (pathPrefixes.length > 0) {
+        endpoints = endpoints.filter((e: any) => {
+          const surfacePath = String(e?.surface?.filePath || '').trim();
+          const callerPath = String(e?.http_caller?.filePath || '').trim();
+          const controllerPath = String(e?.controller?.filePath || '').trim();
+          if (filePathTouchesPrefixes(surfacePath, pathPrefixes)) return true;
+          if (filePathTouchesPrefixes(callerPath, pathPrefixes)) return true;
+          if (filePathTouchesPrefixes(controllerPath, pathPrefixes)) return true;
+          return false;
+        });
+      }
     }
 
     const baseRef = String(params.base_ref || '').trim();
@@ -2504,6 +2838,7 @@ export class LocalBackend {
       return {
         status: 'ok',
         file_path: relativePath,
+        ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
         contract: card,
         endpoints,
       };
@@ -2531,6 +2866,7 @@ export class LocalBackend {
       return {
         status: 'ok',
         file_path: relativePath,
+        ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
         contract: card,
         endpoints,
         diff: { error: `Unable to read ${relativePath} at ${baseRef} (git show failed).` },
@@ -2615,10 +2951,651 @@ export class LocalBackend {
     return {
       status: 'ok',
       file_path: relativePath,
+      ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
       contract: card,
       endpoints,
       base_contract: baseCard,
       diff,
+    };
+  }
+
+  /**
+   * Review mode — diff-aware summary for PRs and local changes.
+   * Built on git diff + graph signals (callers/tests/routes/auth/UI contract).
+   */
+  private async reviewMode(repo: RepoHandle, params: {
+    scope?: 'unstaged' | 'staged' | 'all' | 'compare';
+    base_ref?: string;
+    path_prefixes?: string[];
+    limit_symbols?: number;
+    limit_callers?: number;
+    limit_tests?: number;
+    min_confidence?: number;
+    include_ui_contracts?: boolean;
+    max_ui_contract_files?: number;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    const scope = params.scope || 'unstaged';
+    const baseRef = String(params.base_ref || '').trim();
+    const limitSymbols = Math.max(1, Math.min(500, params.limit_symbols ?? 60));
+    const limitCallers = Math.max(1, Math.min(50, params.limit_callers ?? 10));
+    const limitTests = Math.max(1, Math.min(50, params.limit_tests ?? 10));
+    const minConfidence = Math.max(0, Math.min(1, params.min_confidence ?? 0.9));
+    const includeUiContracts = params.include_ui_contracts !== false;
+    const maxUiContractFiles = Math.max(0, Math.min(20, params.max_ui_contract_files ?? 5));
+
+    const normalizePath = (value: string): string => {
+      return String(value || '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/^\.\/+/, '')
+        .replace(/^\/+/, '');
+    };
+
+    const normalizePrefix = (value: string): string => {
+      const raw = String(value || '').trim().replace(/\\/g, '/');
+      if (!raw) return '';
+
+      if (path.isAbsolute(raw)) {
+        const rel = path.relative(repo.repoPath, raw).replace(/\\/g, '/');
+        if (rel && !rel.startsWith('..')) return normalizePath(rel);
+      }
+
+      return normalizePath(raw);
+    };
+
+    const rawPrefixes = Array.isArray(params.path_prefixes)
+      ? params.path_prefixes
+      : typeof (params as any).path_prefixes === 'string'
+        ? [(params as any).path_prefixes]
+        : [];
+
+    const pathPrefixes = Array.from(new Set(rawPrefixes.map(p => normalizePrefix(String(p || ''))).filter(Boolean)));
+    const isInScope = (filePath: string): boolean => {
+      if (pathPrefixes.length === 0) return true;
+      const fp = normalizePath(filePath);
+      if (!fp) return false;
+
+      for (const prefixRaw of pathPrefixes) {
+        const prefix = prefixRaw.endsWith('/') ? prefixRaw : `${prefixRaw}/`;
+        if (fp === prefixRaw) return true;
+        if (fp.startsWith(prefix)) return true;
+      }
+      return false;
+    };
+
+    type DiffHunk = { old_start: number; old_lines: number; new_start: number; new_lines: number };
+    type DiffFile = {
+      filePath: string;
+      status: 'Modified' | 'Added' | 'Deleted' | 'Renamed' | 'Copied';
+      fromPath?: string;
+      hunks: DiffHunk[];
+      binary?: boolean;
+    };
+
+    const { execFileSync } = await import('child_process');
+
+    const buildDiffArgs = (withPatch: boolean): string[] => {
+      const args = ['diff', '--no-color'];
+      if (withPatch) args.push('-U0', '--patch');
+      else args.push('--name-only');
+
+      switch (scope) {
+        case 'staged':
+          args.push('--staged');
+          break;
+        case 'all':
+          args.push('HEAD');
+          break;
+        case 'compare':
+          if (!baseRef) throw new Error('base_ref is required for "compare" scope');
+          // PR-style diff: merge base vs HEAD
+          args.push(`${baseRef}...HEAD`);
+          break;
+        case 'unstaged':
+        default:
+          break;
+      }
+
+      return args;
+    };
+
+    let changedFilesRaw: string[] = [];
+    try {
+      const output = execFileSync('git', buildDiffArgs(false), { cwd: repo.repoPath, encoding: 'utf-8' });
+      changedFilesRaw = String(output || '').trim().split('\n').map(s => s.trim()).filter(Boolean);
+    } catch (err: any) {
+      return { error: `Git diff failed: ${err?.message || 'unknown error'}` };
+    }
+
+    const changedFiles = changedFilesRaw
+      .map(f => normalizePath(f))
+      .filter(f => isInScope(f));
+
+    if (changedFiles.length === 0) {
+      return {
+        status: 'ok',
+        repo: repo.name,
+        scope,
+        base_ref: baseRef || undefined,
+        path_prefixes: pathPrefixes,
+        summary: { changed_files: 0, changed_symbols: 0, suggested_tests: 0 },
+        changed_files: [],
+        changed_symbols: [],
+        symbols: [],
+        suggested_tests: [],
+        ui_contracts: [],
+        route_targets: [],
+        authz: [],
+      };
+    }
+
+    let patch = '';
+    try {
+      patch = execFileSync('git', buildDiffArgs(true), {
+        cwd: repo.repoPath,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024 * 20, // 20MB
+      });
+    } catch (err: any) {
+      return { error: `Git diff patch failed: ${err?.message || 'unknown error'}` };
+    }
+
+    const parsePatch = (text: string): DiffFile[] => {
+      const files: DiffFile[] = [];
+      let current: DiffFile | null = null;
+
+      const pushCurrent = () => {
+        if (!current) return;
+        current.filePath = normalizePath(current.filePath);
+        if (!current.filePath) return;
+        if (!isInScope(current.filePath)) return;
+        files.push(current);
+      };
+
+      for (const line of String(text || '').split('\n')) {
+        if (line.startsWith('diff --git ')) {
+          pushCurrent();
+
+          const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+          if (!m) {
+            current = null;
+            continue;
+          }
+
+          const aPath = m[1];
+          const bPath = m[2];
+          const isAdded = aPath === '/dev/null';
+          const isDeleted = bPath === '/dev/null';
+          const filePath = isDeleted ? aPath : bPath;
+
+          let status: DiffFile['status'] = 'Modified';
+          if (isAdded) status = 'Added';
+          if (isDeleted) status = 'Deleted';
+          if (!isAdded && !isDeleted && aPath !== bPath) status = 'Renamed';
+
+          current = {
+            filePath,
+            status,
+            ...(status === 'Renamed' ? { fromPath: aPath } : {}),
+            hunks: [],
+          };
+          continue;
+        }
+
+        if (!current) continue;
+
+        if (line.startsWith('new file mode ')) {
+          current.status = 'Added';
+          continue;
+        }
+        if (line.startsWith('deleted file mode ')) {
+          current.status = 'Deleted';
+          continue;
+        }
+
+        const renameFrom = /^rename from (.+)$/.exec(line);
+        if (renameFrom) {
+          current.status = 'Renamed';
+          current.fromPath = normalizePath(renameFrom[1] || '');
+          continue;
+        }
+        const renameTo = /^rename to (.+)$/.exec(line);
+        if (renameTo) {
+          current.status = 'Renamed';
+          current.filePath = normalizePath(renameTo[1] || current.filePath);
+          continue;
+        }
+
+        if (line.startsWith('Binary files ')) {
+          current.binary = true;
+          continue;
+        }
+
+        const h = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/.exec(line);
+        if (h) {
+          const oldStart = parseInt(h[1], 10);
+          const oldLines = h[2] ? parseInt(h[2], 10) : 1;
+          const newStart = parseInt(h[3], 10);
+          const newLines = h[4] ? parseInt(h[4], 10) : 1;
+          current.hunks.push({
+            old_start: Number.isFinite(oldStart) ? oldStart : 0,
+            old_lines: Number.isFinite(oldLines) ? oldLines : 0,
+            new_start: Number.isFinite(newStart) ? newStart : 0,
+            new_lines: Number.isFinite(newLines) ? newLines : 0,
+          });
+          continue;
+        }
+      }
+
+      pushCurrent();
+      return files;
+    };
+
+    const diffFiles = parsePatch(patch);
+
+    // Fallback: if patch parsing failed (e.g., empty patch), still return name-only list.
+    const changedFileObjs: DiffFile[] = diffFiles.length > 0
+      ? diffFiles
+      : changedFiles.map(filePath => ({ filePath, status: 'Modified', hunks: [] }));
+
+    type ChangedSymbol = {
+      uid: string;
+      name: string;
+      kind: string;
+      filePath: string;
+      startLine?: number;
+      endLine?: number;
+      evidence?: { hunks: Array<{ new_start: number; new_lines: number; old_start: number; old_lines: number }> };
+    };
+
+    const changedSymbolsById = new Map<string, ChangedSymbol>();
+    const addChangedSymbol = (sym: ChangedSymbol) => {
+      if (!sym.uid || !sym.filePath) return;
+      if (!isInScope(sym.filePath)) return;
+
+      const existing = changedSymbolsById.get(sym.uid);
+      if (existing) {
+        const existingHunks = existing.evidence?.hunks || [];
+        const nextHunks = sym.evidence?.hunks || [];
+        existing.evidence = { hunks: [...existingHunks, ...nextHunks] };
+        return;
+      }
+
+      changedSymbolsById.set(sym.uid, sym);
+    };
+
+    const loadFileNode = async (filePath: string): Promise<ChangedSymbol | null> => {
+      const escaped = filePath.replace(/'/g, "''");
+      try {
+        const rows = await executeQuery(repo.id, `
+          MATCH (f:File {filePath: '${escaped}'})
+          RETURN f.id AS id, f.name AS name, labels(f) AS type, f.filePath AS filePath
+          LIMIT 1
+        `);
+        if (rows.length === 0) return null;
+        const r = rows[0];
+        return {
+          uid: r.id || r[0],
+          name: r.name || r[1] || filePath,
+          kind: r.type || r[2] || 'File',
+          filePath: r.filePath || r[3] || filePath,
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    for (const file of changedFileObjs) {
+      const filePath = normalizePath(file.filePath);
+      if (!filePath) continue;
+      if (!isInScope(filePath)) continue;
+      if (file.status === 'Deleted') continue;
+
+      const hunks = Array.isArray(file.hunks) ? file.hunks : [];
+      if (hunks.length === 0) {
+        if (file.binary) {
+          const fileNode = await loadFileNode(filePath);
+          if (fileNode) addChangedSymbol(fileNode);
+        }
+        continue;
+      }
+
+      const ranges = hunks
+        .filter(h => Number.isFinite(h?.new_start) && Number.isFinite(h?.new_lines))
+        .map(h => {
+          // Git diff hunk line numbers are 1-based; graph node startLine/endLine are 0-based rows.
+          const start = Math.max(0, h.new_start - 1);
+          const count = Math.max(1, h.new_lines);
+          return { start, end: start + count - 1 };
+        });
+      if (ranges.length === 0) continue;
+
+      const minStart = Math.min(...ranges.map(r => r.start));
+      const maxEnd = Math.max(...ranges.map(r => r.end));
+
+      const escaped = filePath.replace(/'/g, "''");
+      let rows: any[] = [];
+      try {
+        rows = await executeQuery(repo.id, `
+          MATCH (n)
+          WHERE n.filePath = '${escaped}'
+            AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
+            AND n.startLine <= ${maxEnd} AND n.endLine >= ${minStart}
+          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+          LIMIT 200
+        `);
+      } catch {
+        rows = [];
+      }
+
+      for (const row of rows) {
+        const uid = row.id || row[0];
+        if (!uid || typeof uid !== 'string') continue;
+        const startLine = Number(row.startLine ?? row[4]);
+        const endLine = Number(row.endLine ?? row[5]);
+        const overlaps = ranges.some(r => {
+          if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) return true;
+          return startLine <= r.end && endLine >= r.start;
+        });
+        if (!overlaps) continue;
+
+        addChangedSymbol({
+          uid,
+          name: row.name || row[1] || '',
+          kind: row.type || row[2] || '',
+          filePath: row.filePath || row[3] || filePath,
+          startLine: Number.isFinite(startLine) ? startLine : undefined,
+          endLine: Number.isFinite(endLine) ? endLine : undefined,
+          evidence: { hunks },
+        });
+      }
+    }
+
+    const changedSymbols = Array.from(changedSymbolsById.values())
+      .slice(0, limitSymbols);
+
+    const callerFetchLimit = Math.min(200, Math.max(limitCallers, limitTests) * 6);
+
+    const suggestedTestsAgg = new Map<string, { score: number; reasons: string[] }>();
+
+    const symbols: any[] = [];
+    for (const sym of changedSymbols) {
+      const escaped = String(sym.uid || '').replace(/'/g, "''");
+      let rows: any[] = [];
+      try {
+        rows = await executeQuery(repo.id, `
+          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t {id: '${escaped}'})
+          WHERE r.confidence >= ${minConfidence}
+          RETURN caller.id AS uid, caller.name AS name, labels(caller) AS kind, caller.filePath AS filePath, caller.startLine AS startLine,
+                 r.confidence AS confidence, r.reason AS reason
+          ORDER BY r.confidence DESC
+          LIMIT ${callerFetchLimit}
+        `);
+      } catch {
+        rows = [];
+      }
+
+      const callersRaw = rows.map((row: any) => ({
+        uid: row.uid || row[0],
+        name: row.name || row[1],
+        kind: row.kind || row[2],
+        filePath: row.filePath || row[3],
+        startLine: row.startLine ?? row[4],
+        edge: {
+          confidence: Number(row.confidence ?? row[5] ?? 1.0),
+          reason: String(row.reason ?? row[6] ?? ''),
+        },
+      }));
+
+      const callers = pathPrefixes.length > 0
+        ? callersRaw.filter((c: any) => isInScope(String(c?.filePath || '')))
+        : callersRaw;
+
+      const testCallers = callers
+        .filter((c: any) => isTestFilePath(String(c?.filePath || '')))
+        .slice(0, limitTests);
+
+      for (const t of testCallers) {
+        const fp = String(t?.filePath || '').trim();
+        if (!fp) continue;
+        const score = (suggestedTestsAgg.get(fp)?.score || 0) + 1;
+        const reasons = suggestedTestsAgg.get(fp)?.reasons || [];
+        const reason = sym?.name ? `${sym.name} called here` : 'calls changed symbol';
+        suggestedTestsAgg.set(fp, { score, reasons: [...reasons, reason].slice(0, 5) });
+      }
+
+      symbols.push({
+        symbol: sym,
+        callers: callers.slice(0, limitCallers),
+        test_callers: testCallers,
+      });
+    }
+
+    const suggested_tests = Array.from(suggestedTestsAgg.entries())
+      .sort((a, b) => b[1].score - a[1].score)
+      .slice(0, limitTests)
+      .map(([filePath, meta]) => ({
+        filePath,
+        score: meta.score,
+        reasons: meta.reasons,
+      }));
+
+    const ui_contracts: any[] = [];
+    if (includeUiContracts && maxUiContractFiles > 0) {
+      const baseRefForUi = scope === 'compare' ? baseRef : 'HEAD';
+
+      const isUiFile = (p: string): boolean => {
+        const lower = p.toLowerCase();
+        return lower.endsWith('.tsx') || lower.endsWith('.jsx') || lower.endsWith('.ts') || lower.endsWith('.js');
+      };
+
+      const rankUiFile = (p: string): number => {
+        const lower = p.toLowerCase();
+        if (lower.endsWith('.tsx') || lower.endsWith('.jsx')) return 2;
+        if (lower.endsWith('.ts') || lower.endsWith('.js')) return 1;
+        return 0;
+      };
+
+      const uiFiles = changedFileObjs
+        .map(f => normalizePath(f.filePath))
+        .filter(Boolean)
+        .filter(fp => isInScope(fp))
+        .filter(fp => isUiFile(fp))
+        .sort((a, b) => rankUiFile(b) - rankUiFile(a))
+        .slice(0, maxUiContractFiles);
+
+      for (const filePath of uiFiles) {
+        const res = await this.uiContract(repo, {
+          file_path: filePath,
+          base_ref: baseRefForUi,
+          include_endpoints: true,
+          min_http_confidence: minConfidence,
+        });
+
+        if (res?.error) {
+          ui_contracts.push({ filePath, error: res.error });
+          continue;
+        }
+
+        ui_contracts.push({
+          filePath: res.file_path || filePath,
+          diff: res.diff || null,
+          smells: Array.isArray(res?.contract?.smells) ? res.contract.smells : [],
+          effects_summary: res?.contract?.effectsSummary || null,
+          endpoints: Array.isArray(res?.endpoints) ? res.endpoints : [],
+        });
+      }
+    }
+
+    const ROUTE_FILE_PATH_RE = /(^|\/)routes\/[^/]+\.php$/i;
+    const route_targets: any[] = [];
+    for (const file of changedFileObjs) {
+      const filePath = normalizePath(file.filePath);
+      if (!filePath) continue;
+      if (!isInScope(filePath)) continue;
+      if (file.status === 'Deleted') continue;
+      if (!ROUTE_FILE_PATH_RE.test(filePath)) continue;
+
+      const escaped = filePath.replace(/'/g, "''");
+      let rows: any[] = [];
+      try {
+        rows = await executeQuery(repo.id, `
+          MATCH (f:File {filePath: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
+          WHERE r.reason STARTS WITH 'laravel-route' AND r.confidence >= ${minConfidence}
+          OPTIONAL MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
+          RETURN m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
+                 c.name AS className,
+                 r.confidence AS confidence, r.reason AS reason
+          ORDER BY r.confidence DESC
+          LIMIT 100
+        `);
+      } catch {
+        rows = [];
+      }
+
+      const targets = rows.map((row: any) => ({
+        controller: {
+          uid: row.uid || row[0],
+          name: (() => {
+            const base = row.name || row[1] || '';
+            const cls = row.className || row[4] || '';
+            return cls && base ? `${cls}::${base}` : base;
+          })(),
+          filePath: row.filePath || row[2] || '',
+          startLine: row.startLine ?? row[3] ?? undefined,
+          kind: 'Method',
+        },
+        edge: {
+          confidence: Number(row.confidence ?? row[5] ?? 1.0),
+          reason: String(row.reason ?? row[6] ?? ''),
+        },
+      })).filter((t: any) => t?.controller?.uid && t?.edge?.reason);
+
+      route_targets.push({
+        route_file: filePath,
+        targets,
+      });
+    }
+
+    const authz: any[] = [];
+    for (const sym of changedSymbols) {
+      const kind = String(sym?.kind || '');
+      const filePath = String(sym?.filePath || '');
+      if (kind !== 'Method') continue;
+      if (!filePath.includes('/Http/Controllers/')) continue;
+      if (!filePath.toLowerCase().endsWith('.php')) continue;
+
+      const escaped = String(sym.uid || '').replace(/'/g, "''");
+      let authRows: any[] = [];
+      try {
+        authRows = await executeQuery(repo.id, `
+          MATCH (c {id: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(t)
+          WHERE r.confidence >= ${minConfidence}
+            AND (
+              r.reason STARTS WITH 'laravel-authorize:'
+              OR r.reason STARTS WITH 'laravel-gate:'
+              OR r.reason STARTS WITH 'laravel-can:'
+            )
+          RETURN t.id AS uid, t.name AS name, labels(t) AS kind, t.filePath AS filePath,
+                 r.reason AS reason, r.confidence AS confidence
+          ORDER BY r.confidence DESC
+          LIMIT 25
+        `);
+      } catch {
+        authRows = [];
+      }
+
+      const checks: any[] = [];
+      for (const row of authRows) {
+        const targetUid = row.uid || row[0];
+        if (!targetUid || typeof targetUid !== 'string') continue;
+        const targetKind = row.kind || row[2] || '';
+        const check: any = {
+          target: {
+            uid: targetUid,
+            name: row.name || row[1] || '',
+            kind: targetKind,
+            filePath: row.filePath || row[3] || '',
+          },
+          edge: {
+            reason: row.reason || row[4] || '',
+            confidence: Number(row.confidence ?? row[5] ?? 1.0),
+          },
+        };
+
+        // Expand enum const → permission slug when available
+        if (targetKind === 'Const') {
+          const constEscaped = targetUid.replace(/'/g, "''");
+          try {
+            const slugRows = await executeQuery(repo.id, `
+              MATCH (c {id: '${constEscaped}'})-[r:CodeRelation {type: 'CALLS'}]->(s:CodeElement)
+              WHERE r.reason STARTS WITH 'laravel-permission-slug:'
+              RETURN s.name AS name, s.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+              ORDER BY r.confidence DESC
+              LIMIT 3
+            `);
+            if (slugRows.length > 0) {
+              check.permission_slugs = slugRows.map((sr: any) => ({
+                name: sr.name || sr[0] || '',
+                filePath: sr.filePath || sr[1] || '',
+                edge: {
+                  reason: sr.reason || sr[2] || '',
+                  confidence: Number(sr.confidence ?? sr[3] ?? 1.0),
+                },
+              })).filter((s: any) => s.name);
+            }
+          } catch { /* ignore */ }
+        }
+
+        checks.push(check);
+      }
+
+      if (checks.length === 0) continue;
+      authz.push({
+        controller: sym,
+        checks,
+      });
+    }
+
+    return {
+      status: 'ok',
+      repo: repo.name,
+      scope,
+      base_ref: baseRef || undefined,
+      path_prefixes: pathPrefixes,
+      summary: {
+        changed_files: changedFileObjs.length,
+        changed_symbols: changedSymbols.length,
+        suggested_tests: suggested_tests.length,
+        ui_contracts: ui_contracts.length,
+        route_files: route_targets.length,
+        authz_controllers: authz.length,
+      },
+      changed_files: changedFileObjs.map(f => ({
+        filePath: normalizePath(f.filePath),
+        status: f.status,
+        ...(f.fromPath ? { fromPath: normalizePath(f.fromPath) } : {}),
+        hunks: f.hunks,
+        ...(f.binary ? { binary: true } : {}),
+      })),
+      changed_symbols: changedSymbols,
+      symbols,
+      suggested_tests,
+      ui_contracts,
+      route_targets,
+      authz,
+      _review_mode: {
+        knobs: {
+          limit_symbols: limitSymbols,
+          limit_callers: limitCallers,
+          limit_tests: limitTests,
+          min_confidence: minConfidence,
+          include_ui_contracts: includeUiContracts,
+          max_ui_contract_files: maxUiContractFiles,
+        },
+      },
     };
   }
 
@@ -3441,6 +4418,7 @@ export class LocalBackend {
     limit?: number;
     examplesPerSignature?: number;
     minHttpConfidence?: number;
+    path_prefixes?: string[];
   }): Promise<{ report: ArchetypeReport }> {
     const repo = this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
@@ -3448,6 +4426,7 @@ export class LocalBackend {
     const limit = options?.limit ?? 25;
     const examplesPerSignature = options?.examplesPerSignature ?? 3;
     const minHttpConfidence = options?.minHttpConfidence ?? 0.9;
+    const pathPrefixes = parsePathPrefixes(repo.repoPath, (options as any)?.path_prefixes);
 
     const stepRows = await executeQuery(repo.id, `
       MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -3494,6 +4473,10 @@ export class LocalBackend {
       if (!proc.stepCount) proc.stepCount = proc.steps.length;
     }
 
+    const scopedProcesses = pathPrefixes.length > 0
+      ? Array.from(processesById.values()).filter(p => p.steps.some(s => filePathTouchesPrefixes(s.filePath, pathPrefixes)))
+      : Array.from(processesById.values());
+
     const httpRows = await executeQuery(repo.id, `
       MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
       WHERE r.reason STARTS WITH 'http-' AND r.confidence >= ${minHttpConfidence}
@@ -3507,7 +4490,7 @@ export class LocalBackend {
       confidence: r.confidence || r[3] || 1.0,
     }));
 
-    const report = buildArchetypeReport(Array.from(processesById.values()), httpEdges, {
+    const report = buildArchetypeReport(scopedProcesses, httpEdges, {
       limit,
       examplesPerSignature,
       minHttpConfidence,

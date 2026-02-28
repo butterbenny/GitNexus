@@ -261,6 +261,7 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 - **Cross-stack HTTP is deterministic (monorepo-optimized)**: TS/TSX HTTP calls (fetch/Axios) connect directly to the exact Laravel controller `Method` via explicit `CALLS` edges with `reason` starting `http-...` (not `fuzzy-global`).
 - **Templates participate in the graph**: Blade and Svelte are not “dead ends”; they are at least connected as `Template`/`File` nodes with meaningful relationships.
 - **Archetypes are discoverable (“more than a map”)**: derived views group execution flows into common “flow signatures” and surface exemplars/hotspots, so agents can copy proven anatomy instead of inventing mini-architectures.
+- **Reviews are diff-aware (workflow-first)**: `review_mode` summarizes `base_ref..HEAD` diffs into changed symbols + upstream callers + suggested tests + contract-critical signals (UI contract diffs, route targets, auth checks).
 - **Confidence-first invariant**: prefer skipping uncertain dynamic edges over injecting noisy guesses (keeps `impact` and `processes` useful).
 
 > Scope note (monorepo-optimized): for cross-stack tracing, we optimize for **one-hop deterministic** “HTTP request → route → controller method” edges, rather than a single continuous call chain across languages.
@@ -276,9 +277,9 @@ Tree-sitter grammars are included for: **TypeScript**, **JavaScript**, **Python*
 - ✅ **M5**: Blade templates are indexed as `Template` nodes with template-to-template edges + PHP→Blade wiring edges.
 - ✅ **M6**: Svelte `.svelte` files participate via `<script>` extraction + TS parsing/import resolution.
 - ✅ **M7**: acceptance queries are in regular use on a large TS + Laravel monorepo.
-- ✅ **M8**: MCP ergonomics — stale DB refresh + disambiguation are live; MCP context/setup resources and packaged skills now advertise archetypes + disambiguation patterns.
+- ✅ **M8**: MCP ergonomics — stale DB refresh + disambiguation + sandbox-friendly refresh are live; `action_plan`, `ui_contract`, and `review_mode` are shipped; `query`/`action_plan`/`review_mode` support `path_prefixes` scoping to reduce cross-area noise.
 - ✅ **M9**: semantic enrichment — FormRequest/Resource, auth/permission, Eloquent relationship/load/resource, React Query key wiring, and Tactician command-bus dispatch wiring are live.
-- ✅ **M10**: derived views — flow signatures + archetype report are shipped via `gitnexus archetypes` and wired into MCP resources/skills (pattern heat map for build + review).
+- ✅ **M10**: derived views — flow signatures + archetype report are shipped via `gitnexus archetypes` + `precedents` and wired into MCP resources/skills (pattern heat map for build + review).
 
 ### Canonical Build Order (so we don’t “jump”)
 
@@ -483,47 +484,30 @@ RETURN count(DISTINCT p);
 
 ---
 
-## Post-M10 Backlog: “10/10” Agent Experience (Monorepo-Optimized)
+## Post-M10: MVP Snapshot + Stretch Goals (“10/10” Agent Experience, Monorepo-Optimized)
 
-This is a prioritized backlog distilled from real agent usage on a large **TypeScript + Laravel PHP + Blade** monorepo.
+This section is a hand-maintained checklist distilled from real agent usage on a large **TypeScript + Laravel PHP + Blade** monorepo.
 All items must preserve the **confidence-first invariant** (skip uncertain edges rather than guessing).
 
-### P0 — Trust + Reliability (makes results safe to use)
+### MVP Snapshot (as of 2026-02-27)
 
-- **Auto staleness banner on tool calls** — every `query/context/impact/cypher/...` response should compare `indexedCommit` vs `HEAD` and print a one-command refresh hint *before* returning results.
-  - Gate: when stale, tool output begins with `⚠️` + includes `gitnexus analyze <repoPath>` (and mentions `--force` for communities/processes refresh).
-- **Sandbox-friendly refresh** — allow `gitnexus analyze` to run without writing outside the repo.
-  - Implement: `gitnexus analyze --no-registry --no-hooks` (skip `~/.gitnexus/registry.json` + hook writes).
-  - Gate: in sandboxed environments, `analyze` completes without “Unable to update global registry” / hook warnings.
-- **Schema compatibility gate** — when Kuzu schema changes, force a full rebuild (avoid silent edge drops).
-  - Gate: meta records schema version; stale schema forces full indexing once.
+- ✅ **Trust guardrails**: staleness-aware tool responses + sandbox-friendly refresh commands + schema mismatch forcing full rebuild.
+- ✅ **Contract graph**: first-class `Endpoint` nodes + deterministic `http-*` edges + route/view/template wiring that keeps cross-stack hops deterministic.
+- ✅ **Decision-ready ergonomics**: `action_plan` returns files + checks + explicit hop list (UI → endpoint → controller → permission/role) + cache effects.
+- ✅ **Cache coverage lint**: for mutation-driven UI surfaces, derive “cache coverage gaps” (queries present but not refreshed by invalidate/setQueryData/remove) to catch stale UI risks early (confidence-first).
+- ✅ **Review ergonomics**: `review_mode` summarizes a diff into changed symbols + upstream callers + suggested tests + UI contract diffs (confidence-first).
+- ✅ **Scoped workflows**: `query` / `action_plan` / `review_mode` / `archetypes` / `precedents` / `ui_contract` accept `path_prefixes` so agents can constrain results to areas like `apps/backend/` or `apps/dashboard/`.
+- ✅ **UI behavior contracts**: `ui_contract` produces an interaction→side-effect contract card + diff mode + endpoint hops.
+- ✅ **Derived views**: `archetypes` + `precedents` group flows into signatures and surface exemplars/hotspots (“more than a map”); `precedents` falls back to deterministic hop-chain signatures when Process anchors are sparse.
+- ✅ **Bus/process coherence**: command-bus middleware + job chains emit sequential pipeline edges so process detection captures coherent execution flows (not just fan-out edges).
 
-### P1 — Contract Graph (turns “map” into “brain”)
+### Stretch Goals (what remains to reach “10/10”)
 
-- **First-class `Endpoint` contract nodes** — model `(verb, path[, routeName])` as nodes and connect:
-  - Frontend callers (fetch/Axios wrappers) → `Endpoint`
-  - `Endpoint` → Laravel route definition → controller method
-  - Controller method → FormRequest / Resource / Permission(s) / tests
-  - Gate: “UI → API → controller → permission/test” is ≤2 hops from any entry point.
-- **Decision-ready views** — add a compact “files-to-touch + checks-to-run” summary view for a query/goal.
-  - Gate: given a goal query, return (a) 5–10 file paths and (b) 5–10 verification bullets, derived from high-confidence edges only.
+#### S1 — Contract graph enrichment (beyond endpoints)
 
-### P2 — Laravel/Eloquent semantics (reduce runtime guesswork)
+- **Template/reference edges (expand)**: broaden “stringy surface” coverage beyond method-ish calls (route names, view names, partials, MJML component names, etc.) while clearly labeling lower-confidence edges.
+- **Auth/permissions closure (expand)**: cover more dynamic patterns (Gate::allows/can, custom helpers, policy indirections) while keeping the confidence-first invariant.
 
-- **Relationship load awareness** — parse `with/load/loadMissing/withCount` + dot-path strings and connect them to known Eloquent relationship methods.
-  - Gate: flag likely typos/mismatches (confidence-first: warnings, not edges) and show “requires relation X” for resources.
-- **Resource/serialization contracts** — link Resource fields to their dependent relations / permission checks.
-  - Gate: reviewers can answer “what must be eager-loaded / authorized for this response?” via graph traversal.
-- **Bus/middleware process coherence** — present command → handler → middleware → events as one coherent process signature.
-  - Gate: “charge flow” appears as one process/archetype rather than scattered edges.
+### Recommended crush order (next)
 
-### P3 — Workflow acceleration (less scrolling, more action)
-
-- **Precedent/template finder mode** — “find 3 existing callsites with the same control-flow/anatomy” (powered by archetypes + filters).
-  - Gate: for a goal (“add charging path”), return 3 exemplars + their key files, confidence-filtered.
-- **Inline confidence + reason UX** — always show edge confidence + why so agents know when to stop trusting the graph and open code.
-  - Shipped: `context` + `impact` include `confidence` + `reason` so high-confidence edges are distinguishable without Cypher.
-
-### Crush Order (so we don’t jump)
-
-1) P0 staleness banner → 2) P0 sandbox-friendly analyze → 3) P1 Endpoint nodes → 4) P2 Eloquent/load/resource contracts → 5) P3 precedent finder + decision-ready views
+1) S1 template/reference edges expansion → 2) S1 auth/permissions closure (edge cases)

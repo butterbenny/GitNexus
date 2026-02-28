@@ -62,6 +62,11 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
         limit: { type: 'number', description: 'Max processes to return (default: 5)', default: 5 },
         max_symbols: { type: 'number', description: 'Max symbols per process (default: 10)', default: 10 },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope results (e.g. ["apps/backend/", "apps/dashboard/"]).',
+          items: { type: 'string' },
+        },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: ['query'],
@@ -82,6 +87,11 @@ AFTER THIS: Use context() on the top-ranked anchors, then impact() on the change
         goal: { type: 'string', description: 'What you want to find (optional). Helps ranking.' },
         limit_files: { type: 'number', description: 'Max files to return (default: 10)', default: 10 },
         limit_checks: { type: 'number', description: 'Max verification bullets to return (default: 10)', default: 10 },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope results (e.g. ["apps/backend/", "apps/dashboard/"]).',
+          items: { type: 'string' },
+        },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: ['query'],
@@ -104,6 +114,11 @@ AFTER THIS: Use query/context on exemplar entry/terminal symbols, then impact on
         limit: { type: 'number', description: 'Max signatures to return (default: 25)', default: 25 },
         examples: { type: 'number', description: 'Examples per signature (default: 3)', default: 3 },
         min_http_confidence: { type: 'number', description: 'Minimum confidence for HTTP wiring edges (default: 0.9)', default: 0.9 },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope results (e.g. ["apps/backend/", "apps/dashboard/"]).',
+          items: { type: 'string' },
+        },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],
@@ -130,6 +145,11 @@ AFTER THIS: Open the anchor + exemplar files and mirror their structure; then us
         limit: { type: 'number', description: 'Max anchor processes to consider (default: 2)', default: 2 },
         examples: { type: 'number', description: 'Examples per anchor signature (default: 3)', default: 3 },
         min_http_confidence: { type: 'number', description: 'Minimum confidence for HTTP wiring edges (default: 0.9)', default: 0.9 },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope results (e.g. ["apps/backend/", "apps/dashboard/"]).',
+          items: { type: 'string' },
+        },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: ['query'],
@@ -157,6 +177,11 @@ AFTER THIS: Use context()/impact() on the high-signal symbols the contract point
         base_ref: { type: 'string', description: 'Optional git ref/commit to diff the contract against (e.g. "main").' },
         include_endpoints: { type: 'boolean', description: 'Include endpoint/controller hops via http-* edges (default: true).', default: true },
         min_http_confidence: { type: 'number', description: 'Minimum confidence for http-* edge enrichment (default: 0.9).', default: 0.9 },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope endpoint/controller enrichment (e.g. ["apps/backend/", "apps/dashboard/"]).',
+          items: { type: 'string' },
+        },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: ['file_path'],
@@ -236,6 +261,38 @@ Returns: changed symbols, affected processes, and a risk summary.`,
       properties: {
         scope: { type: 'string', description: 'What to analyze: "unstaged" (default), "staged", "all", or "compare"', enum: ['unstaged', 'staged', 'all', 'compare'], default: 'unstaged' },
         base_ref: { type: 'string', description: 'Branch/commit for "compare" scope (e.g., "main")' },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'review_mode',
+    description: `Diff-aware review mode: summarize changes vs a base ref (or local working tree) with graph-backed context.
+
+Builds on detect_changes-style diffing, then surfaces:
+- changed files + changed symbols (by diff hunk → symbol span)
+- upstream callers + suggested tests (confidence-first)
+- contract signals (UI contract diffs, Laravel route targets, controller auth checks)
+
+WHEN TO USE: PR review, behavior/contract audits, “what should I verify?” after a change.
+AFTER THIS: Use context()/impact() on the highest-risk changed symbols or route/controller anchors.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', description: 'What to analyze: "unstaged" (default), "staged", "all", or "compare"', enum: ['unstaged', 'staged', 'all', 'compare'], default: 'unstaged' },
+        base_ref: { type: 'string', description: 'Base ref/commit for "compare" scope (e.g., "origin/main"). Required when scope="compare".' },
+        path_prefixes: {
+          type: 'array',
+          description: 'Optional list of repo-relative (or absolute) path prefixes to scope the review (e.g. ["apps/backend/", "apps/dashboard/"]).',
+          items: { type: 'string' },
+        },
+        limit_symbols: { type: 'number', description: 'Max changed symbols to analyze (default: 60)', default: 60 },
+        limit_callers: { type: 'number', description: 'Max upstream callers per symbol (default: 10)', default: 10 },
+        limit_tests: { type: 'number', description: 'Max suggested tests (default: 10)', default: 10 },
+        min_confidence: { type: 'number', description: 'Minimum confidence for edges (default: 0.9)', default: 0.9 },
+        include_ui_contracts: { type: 'boolean', description: 'Include UI contract diffs for changed TS/TSX/JSX files (default: true)', default: true },
+        max_ui_contract_files: { type: 'number', description: 'Max UI contract files to analyze (default: 5)', default: 5 },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],

@@ -1272,14 +1272,47 @@ const processFileGroup = (
       const nodeName = nameNode.text;
       const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
 
+      const defCaptureByLabel: Record<string, string> = {
+        Function: 'definition.function',
+        Class: 'definition.class',
+        Interface: 'definition.interface',
+        Method: 'definition.method',
+        Struct: 'definition.struct',
+        Enum: 'definition.enum',
+        Namespace: 'definition.namespace',
+        Module: 'definition.module',
+        Trait: 'definition.trait',
+        Impl: 'definition.impl',
+        TypeAlias: 'definition.type',
+        Const: 'definition.const',
+        Static: 'definition.static',
+        Typedef: 'definition.typedef',
+        Macro: 'definition.macro',
+        Union: 'definition.union',
+        Property: 'definition.property',
+        Record: 'definition.record',
+        Delegate: 'definition.delegate',
+        Annotation: 'definition.annotation',
+        Constructor: 'definition.constructor',
+        Template: 'definition.template',
+      };
+
+      const defKey = defCaptureByLabel[nodeLabel] || '';
+      const defNode = (defKey ? captureMap[defKey] : null) as any;
+      const spanNode = defNode || nameNode;
+      const startLineRaw = spanNode?.startPosition?.row;
+      const endLineRaw = spanNode?.endPosition?.row;
+      const startLine = typeof startLineRaw === 'number' ? startLineRaw : nameNode.startPosition.row;
+      const endLine = typeof endLineRaw === 'number' ? endLineRaw : nameNode.endPosition.row;
+
       result.nodes.push({
         id: nodeId,
         label: nodeLabel,
         properties: {
           name: nodeName,
           filePath: file.path,
-          startLine: nameNode.startPosition.row,
-          endLine: nameNode.endPosition.row,
+          startLine,
+          endLine,
           language: language,
           isExported: isNodeExported(nameNode, nodeName, language),
         },
