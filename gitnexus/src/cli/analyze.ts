@@ -34,6 +34,7 @@ import { processLaravelRouteNameWiring } from '../core/ingestion/laravel-route-n
 import { processTemplateMethodCallWiring } from '../core/ingestion/template-method-call-processor.js';
 import { processLaravelSemanticEdges } from '../core/ingestion/laravel-semantic-processor.js';
 import { processLaravelAuthorization } from '../core/ingestion/laravel-auth-processor.js';
+import { processLaravelRouteMiddlewareAuthorization } from '../core/ingestion/laravel-route-middleware-auth-processor.js';
 import { processLaravelPermissionsConfig } from '../core/ingestion/laravel-permissions-config-processor.js';
 import { processPhpMatchReturnEdges } from '../core/ingestion/php-match-return-processor.js';
 import { processLaravelEloquentRelationships } from '../core/ingestion/laravel-eloquent-relationship-processor.js';
@@ -49,6 +50,7 @@ import { processLaravelNotifications } from '../core/ingestion/laravel-notificat
 import { processLaravelTacticianDispatch } from '../core/ingestion/laravel-tactician-dispatch-processor.js';
 import { processBladeTemplatesIncremental } from '../core/ingestion/blade-template-processor.js';
 import { processMjmlIncludes } from '../core/ingestion/mjml-template-processor.js';
+import { processBladeAuthorization } from '../core/ingestion/blade-auth-processor.js';
 import { getLanguageFromFilename } from '../core/ingestion/utils.js';
 
 export interface AnalyzeOptions {
@@ -702,6 +704,8 @@ export const analyzeCommand = async (
     await processLaravelEloquentLoadEdges(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelResourceContracts(workGraph, processedEntries, astCache, symbolTable, importMap);
     await processLaravelPermissionsConfig(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
+    processLaravelRouteMiddlewareAuthorization(workGraph, processedEntries, symbolTable, importMap, phpUseAliases);
+    processBladeAuthorization(workGraph, processedEntries, symbolTable);
     await processPhpMatchReturnEdges(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processLaravelAuthorization(workGraph, processedEntries, astCache, symbolTable, importMap, phpUseAliases);
     await processReactQueryKeyWiring(workGraph, processedEntries, astCache, symbolTable, importMap);

@@ -14,6 +14,8 @@ export type LaravelRouteDefinition = LaravelRouteTarget & {
   /** 0-based line number for the defining Route::* statement (best-effort). */
   sourceStartLine?: number;
   sourceEndLine?: number;
+  /** 0-based character index of the defining Route::* statement (best-effort). */
+  sourceIndex?: number;
 };
 
 type ResolvedController = {
@@ -510,7 +512,7 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
     const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
     const sourceLine = getSourceLine(match.index);
-    targets.push({ verb, path: fullPath, controllerClass, controllerMethod, sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    targets.push({ verb, path: fullPath, controllerClass, controllerMethod, sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
   }
 
   for (const match of content.matchAll(STRING_ACTION_RE)) {
@@ -530,7 +532,7 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
       const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
       const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
       const sourceLine = getSourceLine(match.index);
-      targets.push({ verb, path: fullPath, controllerClass, controllerMethod, sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+      targets.push({ verb, path: fullPath, controllerClass, controllerMethod, sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
       continue;
     }
 
@@ -539,7 +541,7 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
       const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
       const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
       const sourceLine = getSourceLine(match.index);
-      targets.push({ verb, path: fullPath, controllerClass: action, controllerMethod: '__invoke', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+      targets.push({ verb, path: fullPath, controllerClass: action, controllerMethod: '__invoke', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
     }
   }
 
@@ -553,7 +555,7 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     const groupPrefix = match.index !== undefined ? getGroupPrefixForIndex(match.index) : '';
     const fullPath = groupPrefix ? joinLaravelRoutePrefix(groupPrefix, path) : path;
     const sourceLine = getSourceLine(match.index);
-    targets.push({ verb, path: fullPath, controllerClass, controllerMethod: '__invoke', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    targets.push({ verb, path: fullPath, controllerClass, controllerMethod: '__invoke', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
   }
 
   const extractStringArgs = (value: string): string[] => {
@@ -661,14 +663,14 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     const withGroupPrefix = (p: string): string => groupPrefix ? joinLaravelRoutePrefix(groupPrefix, p) : p;
     const sourceLine = getSourceLine(match.index);
 
-    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
     if (allow('update')) {
-      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
     }
-    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
   }
 
   for (const match of content.matchAll(RESOURCE_RE)) {
@@ -709,16 +711,16 @@ export const extractLaravelRouteDefinitions = (content: string): LaravelRouteDef
     const withGroupPrefix = (p: string): string => groupPrefix ? joinLaravelRoutePrefix(groupPrefix, p) : p;
     const sourceLine = getSourceLine(match.index);
 
-    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-    if (allow('create')) targets.push({ verb: 'get', path: withGroupPrefix(createPath), controllerClass, controllerMethod: 'create', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-    if (allow('edit')) targets.push({ verb: 'get', path: withGroupPrefix(editPath), controllerClass, controllerMethod: 'edit', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('index')) targets.push({ verb: 'get', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'index', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+    if (allow('create')) targets.push({ verb: 'get', path: withGroupPrefix(createPath), controllerClass, controllerMethod: 'create', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+    if (allow('store')) targets.push({ verb: 'post', path: withGroupPrefix(collectionPath), controllerClass, controllerMethod: 'store', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+    if (allow('show')) targets.push({ verb: 'get', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'show', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+    if (allow('edit')) targets.push({ verb: 'get', path: withGroupPrefix(editPath), controllerClass, controllerMethod: 'edit', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
     if (allow('update')) {
-      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
-      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+      targets.push({ verb: 'put', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
+      targets.push({ verb: 'patch', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'update', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
     }
-    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy', sourceStartLine: sourceLine, sourceEndLine: sourceLine });
+    if (allow('destroy')) targets.push({ verb: 'delete', path: withGroupPrefix(memberPath), controllerClass, controllerMethod: 'destroy', sourceStartLine: sourceLine, sourceEndLine: sourceLine, sourceIndex: match.index });
   }
 
   return targets;
