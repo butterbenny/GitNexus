@@ -376,6 +376,8 @@ test('Incremental indexing: fast derived mode is accepted and reported', async (
   const second = runAnalyzeWithArgs(repoPath, ['--incremental-derived', 'fast'], env);
   assert.match(second, /Repository updated incrementally/i);
   assert.match(second, /Incremental derived mode: fast/i);
+  assert.match(second, /skipped .*slices/i);
+  assert.match(second, /skipped .*gaps/i);
 });
 
 test('Incremental indexing: adaptive mode skips heavy passes on low-signal changes', async () => {
@@ -407,6 +409,54 @@ test('Incremental indexing: adaptive mode skips heavy passes on low-signal chang
   await fs.writeFile(path.join(repoPath, 'README.md'), 'docs tweak\n', 'utf-8');
   runGit(repoPath, ['add', 'README.md']);
   runGit(repoPath, ['commit', '-m', 'docs']);
+
+  const second = runAnalyzeWithArgs(repoPath, ['--incremental-derived', 'adaptive'], {
+    ...env,
+    GITNEXUS_PROFILE_DERIVED: '1',
+  });
+  assert.match(second, /Repository updated incrementally/i);
+  assert.match(second, /Incremental derived mode: adaptive \(low-signal skip:/i);
+  assert.ok(!/Binder exception/i.test(second));
+});
+
+test('Incremental indexing: adaptive mode skips heavy passes on tiny source edits with low graph churn', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-inc-adaptive-tiny-source-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'src', 'a.ts'),
+    [
+      'export const alpha = () => {',
+      '  return 1;',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const first = runAnalyze(repoPath, env);
+  assert.match(first, /Repository indexed successfully/i);
+
+  await fs.writeFile(
+    path.join(repoPath, 'src', 'a.ts'),
+    [
+      'export const alpha = () => {',
+      '  return 2;',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+  runGit(repoPath, ['add', 'src/a.ts']);
+  runGit(repoPath, ['commit', '-m', 'tiny-source-change']);
 
   const second = runAnalyzeWithArgs(repoPath, ['--incremental-derived', 'adaptive'], {
     ...env,

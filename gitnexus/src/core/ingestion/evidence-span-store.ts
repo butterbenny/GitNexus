@@ -8,7 +8,12 @@ type EvidenceSnapshotCacheEntry = {
   size: number;
   snapshot: EvidenceSpanSnapshot;
 };
+type EvidenceSpanLookup = {
+  nodesById: Map<string, EvidenceSpanSnapshot['nodes'][number]>;
+  edgesById: Map<string, EvidenceSpanSnapshot['edges'][number]>;
+};
 const evidenceSnapshotCache = new Map<string, EvidenceSnapshotCacheEntry>();
+const evidenceLookupCache = new WeakMap<EvidenceSpanSnapshot, EvidenceSpanLookup>();
 
 const makeEmptySnapshot = (): EvidenceSpanSnapshot => ({
   version: 1,
@@ -169,4 +174,30 @@ export const summarizeEvidenceSpanSnapshot = (
     nodes,
     edges,
   };
+};
+
+export const getEvidenceSpanLookup = (snapshot: EvidenceSpanSnapshot): EvidenceSpanLookup => {
+  const cached = evidenceLookupCache.get(snapshot);
+  if (cached) return cached;
+
+  const nodesById = new Map<string, EvidenceSpanSnapshot['nodes'][number]>();
+  for (const node of Array.isArray(snapshot.nodes) ? snapshot.nodes : []) {
+    const nodeId = String(node?.nodeId || '').trim();
+    if (!nodeId) continue;
+    nodesById.set(nodeId, node);
+  }
+
+  const edgesById = new Map<string, EvidenceSpanSnapshot['edges'][number]>();
+  for (const edge of Array.isArray(snapshot.edges) ? snapshot.edges : []) {
+    const edgeId = String(edge?.edgeId || '').trim();
+    if (!edgeId) continue;
+    edgesById.set(edgeId, edge);
+  }
+
+  const lookup: EvidenceSpanLookup = {
+    nodesById,
+    edgesById,
+  };
+  evidenceLookupCache.set(snapshot, lookup);
+  return lookup;
 };

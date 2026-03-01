@@ -34,6 +34,7 @@ import {
 } from './episode-graph.js';
 import {
   loadEvidenceSpanSnapshot,
+  getEvidenceSpanLookup,
   summarizeEvidenceSpanSnapshot,
 } from '../../core/ingestion/evidence-span-store.js';
 import {
@@ -2714,39 +2715,56 @@ export class LocalBackend {
     const MAX_BRIDGE_TARGETS = 8;
     const bridgeTargets = new Map<string, { score: number; data: any; seedRank: number }>();
 
+    const testSeedIds = testSeedHits
+      .map(seed => String(seed.data?.nodeId || '').trim())
+      .filter(Boolean);
+    const testSeedScoreById = new Map<string, { score: number; rank: number }>();
     for (const seed of testSeedHits) {
-      const seedId = seed.data.nodeId;
-      const escapedSeed = seedId.replace(/'/g, "''");
+      const seedId = String(seed.data?.nodeId || '').trim();
+      if (!seedId) continue;
+      testSeedScoreById.set(seedId, { score: seed.score, rank: seed.mergedRank });
+    }
 
+    if (testSeedIds.length > 0) {
       let callRows: any[] = [];
       try {
         callRows = await executeQuery(repo.id, `
-          MATCH (n {id: '${escapedSeed}'})-[r:CodeRelation {type: 'CALLS'}]->(m)
-          RETURN m.id AS id, m.name AS name, m.filePath AS filePath, m.startLine AS startLine, m.endLine AS endLine,
-                 r.confidence AS confidence, r.reason AS reason
+          MATCH (seed)-[r:CodeRelation {type: 'CALLS'}]->(m)
+          WHERE seed.id IN ${buildCypherStringList(testSeedIds)}
+          RETURN seed.id AS seedId,
+                 m.id AS id,
+                 m.name AS name,
+                 m.filePath AS filePath,
+                 m.startLine AS startLine,
+                 m.endLine AS endLine,
+                 r.confidence AS confidence,
+                 r.reason AS reason
           ORDER BY r.confidence DESC
-          LIMIT ${MAX_BRIDGE_TARGETS}
+          LIMIT ${MAX_BRIDGE_TARGETS * Math.max(1, testSeedIds.length)}
         `);
       } catch { /* skip */ }
 
       for (const row of callRows) {
-        const targetId = row.id ?? row[0];
+        const targetId = row.id ?? row[1];
         if (!targetId || typeof targetId !== 'string') continue;
         if (hitMeta.has(targetId)) continue;
 
-        const filePath = row.filePath ?? row[2] ?? '';
+        const filePath = row.filePath ?? row[3] ?? '';
         if (!filePath || typeof filePath !== 'string') continue;
         if (isTestFilePath(filePath)) continue;
         if (!isInScope(filePath)) continue;
 
-        const confidenceRaw = row.confidence ?? row[5] ?? 0;
+        const confidenceRaw = row.confidence ?? row[6] ?? 0;
         const confidence = typeof confidenceRaw === 'number' ? confidenceRaw : parseFloat(confidenceRaw) || 0;
         if (confidence < BRIDGE_MIN_CONFIDENCE) continue;
 
-        const reason = row.reason ?? row[6] ?? '';
+        const reason = row.reason ?? row[7] ?? '';
         if (typeof reason === 'string' && reason === 'fuzzy-global') continue;
 
-        const bridgeScore = seed.score * 0.5 * confidence;
+        const seedId = String(row.seedId ?? row[0] ?? '').trim();
+        const seedMeta = testSeedScoreById.get(seedId);
+        if (!seedMeta) continue;
+        const bridgeScore = seedMeta.score * 0.5 * confidence;
 
         const existing = bridgeTargets.get(targetId);
         if (existing && existing.score >= bridgeScore) continue;
@@ -2756,14 +2774,14 @@ export class LocalBackend {
 
         bridgeTargets.set(targetId, {
           score: bridgeScore,
-          seedRank: seed.mergedRank,
+          seedRank: seedMeta.rank,
           data: {
             nodeId: targetId,
-            name: row.name ?? row[1] ?? '',
+            name: row.name ?? row[2] ?? '',
             type,
             filePath,
-            startLine: row.startLine ?? row[3],
-            endLine: row.endLine ?? row[4],
+            startLine: row.startLine ?? row[4],
+            endLine: row.endLine ?? row[5],
           },
         });
       }
@@ -4609,6 +4627,8 @@ export class LocalBackend {
 
       const grants: any[] = [];
       const seen = new Set<string>();
+      const roleRowsBySlugUid = new Map<string, any[]>();
+      const slugRowsByConstUid = new Map<string, any[]>();
 
       const expandSlugToGrant = async (
         slugUid: string,
@@ -4641,17 +4661,21 @@ export class LocalBackend {
           filePath: slugRow?.filePath || '',
         });
 
-        let roleRows: any[] = [];
-        try {
-          roleRows = await executeQuery(repo.id, `
-            MATCH (role:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(s {id: '${slugEsc}'})
-            WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'laravel-role-permission-slug:'
-            RETURN role.id AS uid, role.name AS name, role.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
-            ORDER BY role.name
-            LIMIT 25
-          `);
-        } catch {
+        let roleRows = roleRowsBySlugUid.get(slugUid);
+        if (!roleRows) {
           roleRows = [];
+          try {
+            roleRows = await executeQuery(repo.id, `
+              MATCH (role:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(s {id: '${slugEsc}'})
+              WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'laravel-role-permission-slug:'
+              RETURN role.id AS uid, role.name AS name, role.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+              ORDER BY role.name
+              LIMIT 25
+            `);
+          } catch {
+            roleRows = [];
+          }
+          roleRowsBySlugUid.set(slugUid, roleRows);
         }
 
         const roles: any[] = [];
@@ -4687,17 +4711,21 @@ export class LocalBackend {
         evidence: { controller_edge: { reason: string; confidence: number }; via_policy?: any; }
       ): Promise<void> => {
         const constEscaped = constUid.replace(/'/g, "''");
-        let slugRows: any[] = [];
-        try {
-          slugRows = await executeQuery(repo.id, `
-            MATCH (c {id: '${constEscaped}'})-[r:CodeRelation {type: 'CALLS'}]->(s:CodeElement)
-            WHERE r.reason STARTS WITH 'laravel-permission-slug:'
-            RETURN s.id AS uid, s.name AS name, s.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
-            ORDER BY r.confidence DESC
-            LIMIT 2
-          `);
-        } catch {
-          return;
+        let slugRows = slugRowsByConstUid.get(constUid);
+        if (!slugRows) {
+          slugRows = [];
+          try {
+            slugRows = await executeQuery(repo.id, `
+              MATCH (c {id: '${constEscaped}'})-[r:CodeRelation {type: 'CALLS'}]->(s:CodeElement)
+              WHERE r.reason STARTS WITH 'laravel-permission-slug:'
+              RETURN s.id AS uid, s.name AS name, s.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+              ORDER BY r.confidence DESC
+              LIMIT 2
+            `);
+          } catch {
+            slugRows = [];
+          }
+          slugRowsByConstUid.set(constUid, slugRows);
         }
 
         for (const slugRow of slugRows) {
@@ -4722,18 +4750,22 @@ export class LocalBackend {
             confidence: Number(slugRow.confidence ?? slugRow[4] ?? 1.0),
           };
 
-          let roleRows: any[] = [];
-          try {
-            const slugEsc = slugUid.replace(/'/g, "''");
-            roleRows = await executeQuery(repo.id, `
-              MATCH (role:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(s {id: '${slugEsc}'})
-              WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'laravel-role-permission-slug:'
-              RETURN role.id AS uid, role.name AS name, role.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
-              ORDER BY role.name
-              LIMIT 25
-            `);
-          } catch {
+          let roleRows = roleRowsBySlugUid.get(slugUid);
+          if (!roleRows) {
             roleRows = [];
+            try {
+              const slugEsc = slugUid.replace(/'/g, "''");
+              roleRows = await executeQuery(repo.id, `
+                MATCH (role:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(s {id: '${slugEsc}'})
+                WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'laravel-role-permission-slug:'
+                RETURN role.id AS uid, role.name AS name, role.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+                ORDER BY role.name
+                LIMIT 25
+              `);
+            } catch {
+              roleRows = [];
+            }
+            roleRowsBySlugUid.set(slugUid, roleRows);
           }
 
           const roles: any[] = [];
@@ -4819,6 +4851,8 @@ export class LocalBackend {
     const hops: any[] = [];
     const hopLimit = Math.max(1, Math.min(25, limitFiles * 2));
     const seenHopKey = new Set<string>();
+    const endpointWiringCache = new Map<string, { reason: string; confidence: number } | null>();
+    const controllerGrantCache = new Map<string, any[]>();
 
     const controllerCandidates = [...symbols, ...definitions]
       .filter(s => s?.type === 'Method' && String(s?.filePath || '').includes('/Http/Controllers/'))
@@ -4857,26 +4891,35 @@ export class LocalBackend {
       ]);
       if (!uiNode || !endpointNode || !controllerNode) return;
 
-      const endpointEsc = opts.endpointUid.replace(/'/g, "''");
-      const controllerEsc = opts.controllerUid.replace(/'/g, "''");
-      let endpointEdge: { reason: string; confidence: number } | null = null;
-      try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (e {id: '${endpointEsc}'})-[r:CodeRelation {type: 'CALLS'}]->(c {id: '${controllerEsc}'})
-          WHERE r.reason STARTS WITH 'laravel-endpoint:'
-          RETURN r.reason AS reason, r.confidence AS confidence
-          ORDER BY r.confidence DESC
-          LIMIT 1
-        `);
-        if (rows.length > 0) {
-          endpointEdge = {
-            reason: rows[0].reason || rows[0][0] || '',
-            confidence: Number(rows[0].confidence ?? rows[0][1] ?? 1.0),
-          };
-        }
-      } catch { /* ignore */ }
+      const endpointEdgeKey = `${opts.endpointUid}|${opts.controllerUid}`;
+      let endpointEdge = endpointWiringCache.get(endpointEdgeKey);
+      if (endpointEdge === undefined) {
+        const endpointEsc = opts.endpointUid.replace(/'/g, "''");
+        const controllerEsc = opts.controllerUid.replace(/'/g, "''");
+        let resolved: { reason: string; confidence: number } | null = null;
+        try {
+          const rows = await executeQuery(repo.id, `
+            MATCH (e {id: '${endpointEsc}'})-[r:CodeRelation {type: 'CALLS'}]->(c {id: '${controllerEsc}'})
+            WHERE r.reason STARTS WITH 'laravel-endpoint:'
+            RETURN r.reason AS reason, r.confidence AS confidence
+            ORDER BY r.confidence DESC
+            LIMIT 1
+          `);
+          if (rows.length > 0) {
+            resolved = {
+              reason: rows[0].reason || rows[0][0] || '',
+              confidence: Number(rows[0].confidence ?? rows[0][1] ?? 1.0),
+            };
+          }
+        } catch { /* ignore */ }
+        endpointWiringCache.set(endpointEdgeKey, resolved);
+        endpointEdge = resolved;
+      }
 
-      const grants = await buildPermissionGrantsForController(opts.controllerUid);
+      if (!controllerGrantCache.has(opts.controllerUid)) {
+        controllerGrantCache.set(opts.controllerUid, await buildPermissionGrantsForController(opts.controllerUid));
+      }
+      const grants = controllerGrantCache.get(opts.controllerUid) || [];
 
       hops.push({
         http: opts.http,
@@ -4913,10 +4956,17 @@ export class LocalBackend {
       let rows: any[] = [];
       try {
         rows = await executeQuery(repo.id, `
-          MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(c {id: '${escaped}'})
-          WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'http-'
-          RETURN ui.id AS uiUid, r.reason AS reason, r.confidence AS confidence
-          ORDER BY r.confidence DESC
+          MATCH (ui)-[rHttp:CodeRelation {type: 'CALLS'}]->(c {id: '${escaped}'})
+          WHERE rHttp.confidence >= 0.9 AND rHttp.reason STARTS WITH 'http-'
+          MATCH (ui)-[rEndpoint:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
+          WHERE rEndpoint.confidence >= 0.9
+            AND rEndpoint.reason = rHttp.reason
+            AND e.name STARTS WITH 'endpoint:'
+          RETURN ui.id AS uiUid,
+                 e.id AS endpointUid,
+                 rHttp.reason AS reason,
+                 CASE WHEN rHttp.confidence >= rEndpoint.confidence THEN rHttp.confidence ELSE rEndpoint.confidence END AS confidence
+          ORDER BY confidence DESC
           LIMIT 10
         `);
       } catch {
@@ -4926,26 +4976,12 @@ export class LocalBackend {
       for (const row of rows) {
         if (hops.length >= hopLimit) return;
         const uiUid = row.uiUid || row[0];
-        const reason = row.reason || row[1];
-        const confidence = Number(row.confidence ?? row[2] ?? 1.0);
+        const endpointUid = row.endpointUid || row[1];
+        const reason = row.reason || row[2];
+        const confidence = Number(row.confidence ?? row[3] ?? 1.0);
         if (!uiUid || typeof uiUid !== 'string') continue;
-        if (!reason || typeof reason !== 'string') continue;
-
-        const reasonEsc = reason.replace(/'/g, "''");
-        const uiEsc = uiUid.replace(/'/g, "''");
-        let endpointRows: any[] = [];
-        try {
-          endpointRows = await executeQuery(repo.id, `
-            MATCH (ui {id: '${uiEsc}'})-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
-            WHERE r.reason = '${reasonEsc}' AND e.name STARTS WITH 'endpoint:'
-            RETURN e.id AS uid
-            LIMIT 1
-          `);
-        } catch {
-          continue;
-        }
-        const endpointUid = endpointRows[0]?.uid || endpointRows[0]?.[0];
         if (!endpointUid || typeof endpointUid !== 'string') continue;
+        if (!reason || typeof reason !== 'string') continue;
 
         await tryAddHop({
           uiUid,
@@ -4958,52 +4994,40 @@ export class LocalBackend {
 
     const buildFromEndpoint = async (endpointUid: string): Promise<void> => {
       const escaped = endpointUid.replace(/'/g, "''");
-      let controllerRows: any[] = [];
+      let rows: any[] = [];
       try {
-        controllerRows = await executeQuery(repo.id, `
-          MATCH (e {id: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(c:Method)
-          WHERE r.reason STARTS WITH 'laravel-endpoint:' AND r.confidence >= 0.9
-          RETURN c.id AS uid
-          ORDER BY r.confidence DESC
-          LIMIT 5
+        rows = await executeQuery(repo.id, `
+          MATCH (ui)-[rHttp:CodeRelation {type: 'CALLS'}]->(e {id: '${escaped}'})
+          WHERE rHttp.confidence >= 0.9 AND rHttp.reason STARTS WITH 'http-'
+          MATCH (e)-[rEndpoint:CodeRelation {type: 'CALLS'}]->(c:Method)
+          WHERE rEndpoint.reason STARTS WITH 'laravel-endpoint:' AND rEndpoint.confidence >= 0.9
+          RETURN ui.id AS uiUid,
+                 c.id AS controllerUid,
+                 rHttp.reason AS reason,
+                 CASE WHEN rHttp.confidence >= rEndpoint.confidence THEN rHttp.confidence ELSE rEndpoint.confidence END AS confidence
+          ORDER BY confidence DESC
+          LIMIT 20
         `);
       } catch {
         return;
       }
 
-      for (const cRow of controllerRows) {
+      for (const row of rows) {
         if (hops.length >= hopLimit) return;
-        const controllerUid = cRow.uid || cRow[0];
+        const uiUid = row.uiUid || row[0];
+        const controllerUid = row.controllerUid || row[1];
+        const reason = row.reason || row[2];
+        const confidence = Number(row.confidence ?? row[3] ?? 1.0);
+        if (!uiUid || typeof uiUid !== 'string') continue;
         if (!controllerUid || typeof controllerUid !== 'string') continue;
+        if (!reason || typeof reason !== 'string') continue;
 
-        let httpRows: any[] = [];
-        try {
-          httpRows = await executeQuery(repo.id, `
-            MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(e {id: '${escaped}'})
-            WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'http-'
-            RETURN ui.id AS uiUid, r.reason AS reason, r.confidence AS confidence
-            ORDER BY r.confidence DESC
-            LIMIT 10
-          `);
-        } catch {
-          continue;
-        }
-
-        for (const httpRow of httpRows) {
-          if (hops.length >= hopLimit) return;
-          const uiUid = httpRow.uiUid || httpRow[0];
-          const reason = httpRow.reason || httpRow[1];
-          const confidence = Number(httpRow.confidence ?? httpRow[2] ?? 1.0);
-          if (!uiUid || typeof uiUid !== 'string') continue;
-          if (!reason || typeof reason !== 'string') continue;
-
-          await tryAddHop({
-            uiUid,
-            endpointUid,
-            controllerUid,
-            http: { reason, confidence },
-          });
-        }
+        await tryAddHop({
+          uiUid,
+          endpointUid,
+          controllerUid,
+          http: { reason, confidence },
+        });
       }
     };
 
@@ -5012,11 +5036,16 @@ export class LocalBackend {
       let rows: any[] = [];
       try {
         rows = await executeQuery(repo.id, `
-          MATCH (ui {id: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
-          WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'http-' AND e.name STARTS WITH 'endpoint:'
-          RETURN e.id AS endpointUid, r.reason AS reason, r.confidence AS confidence
-          ORDER BY r.confidence DESC
-          LIMIT 10
+          MATCH (ui {id: '${escaped}'})-[rHttp:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
+          WHERE rHttp.confidence >= 0.9 AND rHttp.reason STARTS WITH 'http-' AND e.name STARTS WITH 'endpoint:'
+          MATCH (e)-[rEndpoint:CodeRelation {type: 'CALLS'}]->(c:Method)
+          WHERE rEndpoint.reason STARTS WITH 'laravel-endpoint:' AND rEndpoint.confidence >= 0.9
+          RETURN e.id AS endpointUid,
+                 c.id AS controllerUid,
+                 rHttp.reason AS reason,
+                 CASE WHEN rHttp.confidence >= rEndpoint.confidence THEN rHttp.confidence ELSE rEndpoint.confidence END AS confidence
+          ORDER BY confidence DESC
+          LIMIT 20
         `);
       } catch {
         return;
@@ -5025,26 +5054,12 @@ export class LocalBackend {
       for (const row of rows) {
         if (hops.length >= hopLimit) return;
         const endpointUid = row.endpointUid || row[0];
-        const reason = row.reason || row[1];
-        const confidence = Number(row.confidence ?? row[2] ?? 1.0);
+        const controllerUid = row.controllerUid || row[1];
+        const reason = row.reason || row[2];
+        const confidence = Number(row.confidence ?? row[3] ?? 1.0);
         if (!endpointUid || typeof endpointUid !== 'string') continue;
-        if (!reason || typeof reason !== 'string') continue;
-
-        const endpointEsc = endpointUid.replace(/'/g, "''");
-        let controllerRows: any[] = [];
-        try {
-          controllerRows = await executeQuery(repo.id, `
-            MATCH (e {id: '${endpointEsc}'})-[r:CodeRelation {type: 'CALLS'}]->(c:Method)
-            WHERE r.reason STARTS WITH 'laravel-endpoint:' AND r.confidence >= 0.9
-            RETURN c.id AS uid
-            ORDER BY r.confidence DESC
-            LIMIT 3
-          `);
-        } catch {
-          continue;
-        }
-        const controllerUid = controllerRows[0]?.uid || controllerRows[0]?.[0];
         if (!controllerUid || typeof controllerUid !== 'string') continue;
+        if (!reason || typeof reason !== 'string') continue;
 
         await tryAddHop({
           uiUid,
@@ -5649,40 +5664,78 @@ export class LocalBackend {
       
       if (embResults.length === 0) return [];
       
-      const results: any[] = [];
-      
+      const orderedCandidates: Array<{ nodeId: string; label: string; distance: number }> = [];
+      const idsByLabel = new Map<string, Set<string>>();
       for (const embRow of embResults) {
-        const nodeId = embRow.nodeId ?? embRow[0];
-        const distance = embRow.distance ?? embRow[1];
-        
+        const nodeIdRaw = embRow.nodeId ?? embRow[0];
+        const nodeId = typeof nodeIdRaw === 'string' ? nodeIdRaw : String(nodeIdRaw || '');
+        if (!nodeId) continue;
+        const distanceRaw = embRow.distance ?? embRow[1];
+        const distance = typeof distanceRaw === 'number' ? distanceRaw : parseFloat(distanceRaw) || 0;
+
         const labelEndIdx = nodeId.indexOf(':');
         const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
-        
-        // Validate label against known node types to prevent Cypher injection
         if (!VALID_NODE_LABELS.has(label)) continue;
-        
-        try {
-          const escapedId = nodeId.replace(/'/g, "''");
-          const nodeQuery = label === 'File'
-            ? `MATCH (n:File {id: '${escapedId}'}) RETURN n.name AS name, n.filePath AS filePath`
-            : `MATCH (n:\`${label}\` {id: '${escapedId}'}) RETURN n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
-          
-          const nodeRows = await executeQuery(repo.id, nodeQuery);
-          if (nodeRows.length > 0) {
-            const nodeRow = nodeRows[0];
-            results.push({
-              nodeId,
-              name: nodeRow.name ?? nodeRow[0] ?? '',
-              type: label,
-              filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
-              distance,
-              startLine: label !== 'File' ? (nodeRow.startLine ?? nodeRow[2]) : undefined,
-              endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[3]) : undefined,
-            });
-          }
-        } catch {}
+
+        orderedCandidates.push({ nodeId, label, distance });
+        const ids = idsByLabel.get(label) || new Set<string>();
+        ids.add(nodeId);
+        idsByLabel.set(label, ids);
       }
-      
+      if (orderedCandidates.length === 0) return [];
+      const toCypherStringList = (values: string[]): string => {
+        const escaped = values
+          .map(value => String(value || '').trim())
+          .filter(Boolean)
+          .map(value => `'${value.replace(/'/g, "''")}'`);
+        return escaped.length > 0 ? `[${escaped.join(', ')}]` : '[]';
+      };
+
+      const rowByNodeId = new Map<string, any>();
+      for (const [label, idSet] of idsByLabel.entries()) {
+        const ids = Array.from(idSet);
+        if (ids.length === 0) continue;
+        const idList = toCypherStringList(ids);
+        const labelRef = label === 'File' ? 'File' : `\`${label}\``;
+        const projection = label === 'File'
+          ? 'n.id AS nodeId, n.name AS name, n.filePath AS filePath'
+          : 'n.id AS nodeId, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine';
+
+        let rows: any[] = [];
+        try {
+          rows = await executeQuery(repo.id, `
+            MATCH (n:${labelRef})
+            WHERE n.id IN ${idList}
+            RETURN ${projection}
+          `);
+        } catch {
+          continue;
+        }
+        for (const row of rows) {
+          const rowNodeId = String(row.nodeId ?? row[0] ?? '').trim();
+          if (!rowNodeId) continue;
+          rowByNodeId.set(rowNodeId, row);
+        }
+      }
+
+      const results: any[] = [];
+      const seen = new Set<string>();
+      for (const candidate of orderedCandidates) {
+        if (seen.has(candidate.nodeId)) continue;
+        const row = rowByNodeId.get(candidate.nodeId);
+        if (!row) continue;
+        results.push({
+          nodeId: candidate.nodeId,
+          name: row.name ?? row[1] ?? '',
+          type: candidate.label,
+          filePath: row.filePath ?? row[2] ?? '',
+          distance: candidate.distance,
+          startLine: candidate.label !== 'File' ? (row.startLine ?? row[3]) : undefined,
+          endLine: candidate.label !== 'File' ? (row.endLine ?? row[4]) : undefined,
+        });
+        seen.add(candidate.nodeId);
+      }
+
       return results;
     } catch (err: any) {
       console.error('GitNexus: Semantic search unavailable -', err.message);
@@ -6818,17 +6871,63 @@ export class LocalBackend {
       const rangedFilesCypher = `[${rangedFilePaths.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
 
       let symbolRows: any[] = [];
-      try {
-        symbolRows = await executeQuery(repo.id, `
-          MATCH (n)
-          WHERE n.filePath IN ${rangedFilesCypher}
-            AND n.startLine IS NOT NULL
-            AND n.endLine IS NOT NULL
-          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
-          LIMIT ${Math.max(500, Math.min(100000, rangedFilePaths.length * 600))}
-        `);
-      } catch {
-        symbolRows = [];
+      const rangeWindows = rangedFiles
+        .map(spec => {
+          const starts = spec.ranges
+            .map(range => Number(range?.start))
+            .filter(value => Number.isFinite(value));
+          const ends = spec.ranges
+            .map(range => Number(range?.end))
+            .filter(value => Number.isFinite(value));
+          if (starts.length === 0 || ends.length === 0) return null;
+          return {
+            filePath: spec.filePath,
+            minStart: Math.min(...starts),
+            maxEnd: Math.max(...ends),
+          };
+        })
+        .filter((item): item is { filePath: string; minStart: number; maxEnd: number } => !!item);
+
+      let usedPreciseWindowQuery = false;
+      if (rangeWindows.length > 0 && rangeWindows.length <= 120) {
+        usedPreciseWindowQuery = true;
+        const chunkSize = 30;
+        try {
+          for (let i = 0; i < rangeWindows.length; i += chunkSize) {
+            const chunk = rangeWindows.slice(i, i + chunkSize);
+            const whereClause = chunk
+              .map(window => `(n.filePath = '${window.filePath.replace(/'/g, "''")}' AND n.startLine <= ${window.maxEnd} AND n.endLine >= ${window.minStart})`)
+              .join(' OR ');
+            if (!whereClause) continue;
+            const rows = await executeQuery(repo.id, `
+              MATCH (n)
+              WHERE n.startLine IS NOT NULL
+                AND n.endLine IS NOT NULL
+                AND (${whereClause})
+              RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+              LIMIT ${Math.max(500, Math.min(50000, chunk.length * 1200))}
+            `);
+            symbolRows.push(...rows);
+          }
+        } catch {
+          symbolRows = [];
+          usedPreciseWindowQuery = false;
+        }
+      }
+
+      if (!usedPreciseWindowQuery) {
+        try {
+          symbolRows = await executeQuery(repo.id, `
+            MATCH (n)
+            WHERE n.filePath IN ${rangedFilesCypher}
+              AND n.startLine IS NOT NULL
+              AND n.endLine IS NOT NULL
+            RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+            LIMIT ${Math.max(500, Math.min(100000, rangedFilePaths.length * 600))}
+          `);
+        } catch {
+          symbolRows = [];
+        }
       }
 
       const rowsByFile = new Map<string, any[]>();
@@ -6870,6 +6969,11 @@ export class LocalBackend {
       .slice(0, limitSymbols);
 
     const callerFetchLimit = Math.min(200, Math.max(limitCallers, limitTests) * 6);
+    const escapeCypherValue = (value: string): string => String(value || '').replace(/'/g, "''");
+    const buildCypherStringList = (values: string[]): string => {
+      if (values.length === 0) return '[]';
+      return `[${values.map(value => `'${escapeCypherValue(value)}'`).join(', ')}]`;
+    };
     const changedSymbolIds = Array.from(new Set(
       changedSymbols
         .map(sym => String(sym?.uid || '').trim())
@@ -6904,9 +7008,30 @@ export class LocalBackend {
     };
 
     const callersByTargetId = new Map<string, any[]>();
+    const pushCallerRows = (rows: any[], columnOffset = 0): void => {
+      for (const row of rows) {
+        const targetId = String(row.targetId || row[columnOffset + 0] || '').trim();
+        if (!targetId) continue;
+        const entry = {
+          uid: row.uid || row[columnOffset + 1],
+          name: row.name || row[columnOffset + 2],
+          kind: row.kind || row[columnOffset + 3],
+          filePath: row.filePath || row[columnOffset + 4],
+          startLine: row.startLine ?? row[columnOffset + 5],
+          edge: {
+            confidence: Number(row.confidence ?? row[columnOffset + 6] ?? 1.0),
+            reason: String(row.reason ?? row[columnOffset + 7] ?? ''),
+          },
+        };
+        const list = callersByTargetId.get(targetId) || [];
+        list.push(entry);
+        callersByTargetId.set(targetId, list);
+      }
+    };
+
     if (changedSymbolIds.length > 0) {
       try {
-        const changedSymbolIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        const changedSymbolIdsCypher = buildCypherStringList(changedSymbolIds);
         const callerRows = await executeQuery(repo.id, `
           MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t)
           WHERE t.id IN ${changedSymbolIdsCypher}
@@ -6924,26 +7049,39 @@ export class LocalBackend {
           LIMIT ${Math.max(200, Math.min(10000, callerFetchLimit * Math.max(1, changedSymbolIds.length)))}
         `);
 
-        for (const row of callerRows) {
-          const targetId = String(row.targetId || row[0] || '').trim();
-          if (!targetId) continue;
-          const entry = {
-            uid: row.uid || row[1],
-            name: row.name || row[2],
-            kind: row.kind || row[3],
-            filePath: row.filePath || row[4],
-            startLine: row.startLine ?? row[5],
-            edge: {
-              confidence: Number(row.confidence ?? row[6] ?? 1.0),
-              reason: String(row.reason ?? row[7] ?? ''),
-            },
-          };
-          const list = callersByTargetId.get(targetId) || [];
-          list.push(entry);
-          callersByTargetId.set(targetId, list);
-        }
+        pushCallerRows(callerRows);
       } catch {
-        // fallback to per-symbol query below when batch retrieval fails
+        // best-effort: fallback query below for missing targets.
+      }
+    }
+
+    // Fallback: if some symbols did not receive callers in the primary batch (due cap/query sparsity),
+    // run one additional grouped query instead of N per-symbol queries.
+    const missingCallerTargets = changedSymbolIds.filter(id => {
+      const rows = callersByTargetId.get(id);
+      return !rows || rows.length === 0;
+    });
+    if (missingCallerTargets.length > 0) {
+      try {
+        const fallbackRows = await executeQuery(repo.id, `
+          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t)
+          WHERE t.id IN ${buildCypherStringList(missingCallerTargets)}
+            AND r.confidence >= ${minConfidence}
+          RETURN
+            t.id AS targetId,
+            caller.id AS uid,
+            caller.name AS name,
+            labels(caller) AS kind,
+            caller.filePath AS filePath,
+            caller.startLine AS startLine,
+            r.confidence AS confidence,
+            r.reason AS reason
+          ORDER BY r.confidence DESC
+          LIMIT ${Math.max(200, Math.min(12000, callerFetchLimit * Math.max(1, missingCallerTargets.length)))}
+        `);
+        pushCallerRows(fallbackRows);
+      } catch {
+        // best-effort fallback
       }
     }
 
@@ -6952,35 +7090,22 @@ export class LocalBackend {
       const targetId = String(sym?.uid || '').trim();
       let callersRaw: any[] = callersByTargetId.get(targetId) || [];
 
-      // Fallback: keep prior per-symbol behavior if batch retrieval is unavailable.
-      if (callersRaw.length === 0 && targetId) {
-        const escaped = targetId.replace(/'/g, "''");
-        let rows: any[] = [];
-        try {
-          rows = await executeQuery(repo.id, `
-            MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t {id: '${escaped}'})
-            WHERE r.confidence >= ${minConfidence}
-            RETURN caller.id AS uid, caller.name AS name, labels(caller) AS kind, caller.filePath AS filePath, caller.startLine AS startLine,
-                   r.confidence AS confidence, r.reason AS reason
-            ORDER BY r.confidence DESC
-            LIMIT ${callerFetchLimit}
-          `);
-        } catch {
-          rows = [];
-        }
-
-        callersRaw = rows.map((row: any) => ({
-          uid: row.uid || row[0],
-          name: row.name || row[1],
-          kind: row.kind || row[2],
-          filePath: row.filePath || row[3],
-          startLine: row.startLine ?? row[4],
-          edge: {
-            confidence: Number(row.confidence ?? row[5] ?? 1.0),
-            reason: String(row.reason ?? row[6] ?? ''),
-          },
-        }));
+      const dedupedByCaller = new Map<string, any>();
+      for (const caller of callersRaw) {
+        const uid = String(caller?.uid || '').trim();
+        const filePath = normalizePath(String(caller?.filePath || '').trim());
+        const key = uid || filePath;
+        if (!key) continue;
+        const prev = dedupedByCaller.get(key);
+        const nextConfidence = Number(caller?.edge?.confidence ?? 0);
+        const prevConfidence = Number(prev?.edge?.confidence ?? -1);
+        if (prev && prevConfidence >= nextConfidence) continue;
+        dedupedByCaller.set(key, {
+          ...caller,
+          filePath,
+        });
       }
+      callersRaw = Array.from(dedupedByCaller.values());
 
       callersRaw.sort((left, right) => {
         const c = Number(right?.edge?.confidence ?? 0) - Number(left?.edge?.confidence ?? 0);
@@ -7015,7 +7140,7 @@ export class LocalBackend {
     // Fallback tier 1: include lower-confidence test callers if no direct high-confidence hits were found.
     if (suggestedTestsAgg.size === 0 && changedSymbolIds.length > 0) {
       try {
-        const changedSymbolIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        const changedSymbolIdsCypher = buildCypherStringList(changedSymbolIds);
         const fallbackRows = await executeQuery(repo.id, `
           MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t)
           WHERE t.id IN ${changedSymbolIdsCypher}
@@ -7043,7 +7168,7 @@ export class LocalBackend {
     // Fallback tier 2: suggest tests that import changed files, even when no CALLS edge exists.
     if (suggestedTestsAgg.size === 0 && changedFilePathSet.size > 0) {
       try {
-        const changedFilesCypher = `[${Array.from(changedFilePathSet).map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+        const changedFilesCypher = buildCypherStringList(Array.from(changedFilePathSet));
         const importRows = await executeQuery(repo.id, `
           MATCH (caller)-[r:CodeRelation {type: 'IMPORTS'}]->(target)
           WHERE target.filePath IN ${changedFilesCypher}
@@ -7201,6 +7326,7 @@ export class LocalBackend {
       }),
     ).values());
 
+    const semanticGapSliceIds = new Set<string>();
     const slice_stencil = buildEmptySliceStencil();
     if (includeSliceStencil && changedSymbolIds.length > 0) {
       try {
@@ -7353,7 +7479,9 @@ export class LocalBackend {
           });
         }
 
-        const changedSliceIds = Array.from(changedSliceMap.keys()).slice(0, limitSliceStencil);
+        const allChangedSliceIds = Array.from(changedSliceMap.keys());
+        for (const sliceId of allChangedSliceIds) semanticGapSliceIds.add(sliceId);
+        const changedSliceIds = allChangedSliceIds.slice(0, limitSliceStencil);
         if (changedSliceIds.length > 0) {
           const changedSliceIdsCypher = `[${changedSliceIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
 
@@ -7684,28 +7812,46 @@ export class LocalBackend {
       };
 
       try {
-        const semanticIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        const semanticIdsCypher = buildCypherStringList(changedSymbolIds);
+        const semanticTypeFilter = "['CALLS','IMPORTS','TESTS_SHAPE','VALIDATES_FIELD','SERIALIZES_FIELD','READS_FIELD','WRITES_FIELD','DERIVES_FROM_COLUMN','INVALIDATES_KEY']";
+        const semanticLimit = Math.max(1200, Math.min(6000, changedSymbolIds.length * 40));
+        const loadSemanticRows = async (restrictToHighSignalTypes: boolean): Promise<any[]> => {
+          return executeQuery(repo.id, `
+            MATCH (a)-[r:CodeRelation]->(b)
+            WHERE r.confidence >= ${minConfidence}
+              AND (a.id IN ${semanticIdsCypher} OR b.id IN ${semanticIdsCypher})
+              ${restrictToHighSignalTypes ? `AND r.type IN ${semanticTypeFilter}` : ''}
+            RETURN
+              a.id AS sourceId,
+              a.name AS sourceName,
+              labels(a) AS sourceKind,
+              a.filePath AS sourceFilePath,
+              b.id AS targetId,
+              b.name AS targetName,
+              labels(b) AS targetKind,
+              b.filePath AS targetFilePath,
+              r.type AS relType,
+              r.reason AS reason,
+              r.confidence AS confidence,
+              r.id AS edgeId,
+              r.witnessPathIds AS witnessPathIds
+            LIMIT ${semanticLimit}
+          `);
+        };
 
-        const semanticRows = await executeQuery(repo.id, `
-          MATCH (a)-[r:CodeRelation]->(b)
-          WHERE r.confidence >= ${minConfidence}
-            AND (a.id IN ${semanticIdsCypher} OR b.id IN ${semanticIdsCypher})
-          RETURN
-            a.id AS sourceId,
-            a.name AS sourceName,
-            labels(a) AS sourceKind,
-            a.filePath AS sourceFilePath,
-            b.id AS targetId,
-            b.name AS targetName,
-            labels(b) AS targetKind,
-            b.filePath AS targetFilePath,
-            r.type AS relType,
-            r.reason AS reason,
-            r.confidence AS confidence,
-            r.id AS edgeId,
-            r.witnessPathIds AS witnessPathIds
-          LIMIT 3000
-        `);
+        let semanticRows: any[] = [];
+        try {
+          semanticRows = await loadSemanticRows(true);
+        } catch {
+          semanticRows = [];
+        }
+        if (semanticRows.length === 0) {
+          try {
+            semanticRows = await loadSemanticRows(false);
+          } catch {
+            semanticRows = [];
+          }
+        }
 
         const familyStats = new Map<SemanticFamily, {
         family: SemanticFamily;
@@ -7735,7 +7881,6 @@ export class LocalBackend {
         const targetFilePath = String(raw.targetFilePath ?? raw[7] ?? '').trim();
         const confidence = Number(raw.confidence ?? raw[10] ?? 1);
         const edgeId = String(raw.edgeId ?? raw[11] ?? '').trim();
-        const witnessPathIds = parseWitnessPathIds(raw.witnessPathIds ?? raw[12]);
 
         const family = classifySemanticFamily({
           type: relType,
@@ -7779,6 +7924,7 @@ export class LocalBackend {
         entry.reasonCounts.set(reasonKey, (entry.reasonCounts.get(reasonKey) || 0) + 1);
 
         if (entry.sample_edges.length < 5) {
+          const witnessPathIds = parseWitnessPathIds(raw.witnessPathIds ?? raw[12]);
           entry.sample_edges.push({
             source: {
               uid: sourceId,
@@ -7822,22 +7968,46 @@ export class LocalBackend {
           sample_edges: item.sample_edges,
           }));
 
-        const gapRows = await executeQuery(repo.id, `
-          MATCH (s)-[r:CodeRelation {type: 'MEMBER_OF'}]->(slice:FeatureSlice)
-          WHERE s.id IN ${semanticIdsCypher}
-            AND r.reason STARTS WITH 'feature-slice:'
-          MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(slice)
-          RETURN DISTINCT
-            g.id AS id,
-            g.gapType AS gapType,
-            g.absenceTier AS absenceTier,
-            g.severity AS severity,
-            g.sliceId AS sliceId,
-            g.anchorId AS anchorId,
-            g.missingSlots AS missingSlots,
-            g.evidence AS evidence
-          LIMIT 100
-        `);
+        const preferredSliceIds = Array.from(semanticGapSliceIds)
+          .map(value => String(value || '').trim())
+          .filter(Boolean)
+          .slice(0, 300);
+        const preferredSliceIdsCypher = buildCypherStringList(preferredSliceIds);
+
+        let gapRows: any[] = [];
+        if (preferredSliceIds.length > 0) {
+          gapRows = await executeQuery(repo.id, `
+            MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(slice:FeatureSlice)
+            WHERE slice.id IN ${preferredSliceIdsCypher}
+            RETURN DISTINCT
+              g.id AS id,
+              g.gapType AS gapType,
+              g.absenceTier AS absenceTier,
+              g.severity AS severity,
+              g.sliceId AS sliceId,
+              g.anchorId AS anchorId,
+              g.missingSlots AS missingSlots,
+              g.evidence AS evidence
+            LIMIT 100
+          `);
+        } else {
+          gapRows = await executeQuery(repo.id, `
+            MATCH (s)-[r:CodeRelation {type: 'MEMBER_OF'}]->(slice:FeatureSlice)
+            WHERE s.id IN ${semanticIdsCypher}
+              AND r.reason STARTS WITH 'feature-slice:'
+            MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(slice)
+            RETURN DISTINCT
+              g.id AS id,
+              g.gapType AS gapType,
+              g.absenceTier AS absenceTier,
+              g.severity AS severity,
+              g.sliceId AS sliceId,
+              g.anchorId AS anchorId,
+              g.missingSlots AS missingSlots,
+              g.evidence AS evidence
+            LIMIT 100
+          `);
+        }
 
         const gaps = gapRows.map((row: any) => ({
           id: String(row.id ?? row[0] ?? '').trim(),
@@ -7872,16 +8042,9 @@ export class LocalBackend {
     if (includeEvidenceSpans) {
       try {
         const snapshot = await loadEvidenceSpanSnapshot(repo.storagePath);
-        const nodeEvidenceById = new Map(
-          (Array.isArray(snapshot.nodes) ? snapshot.nodes : [])
-            .map(node => [String(node?.nodeId || '').trim(), node] as const)
-            .filter(([id]) => id),
-        );
-        const edgeEvidenceById = new Map(
-          (Array.isArray(snapshot.edges) ? snapshot.edges : [])
-            .map(edge => [String(edge?.edgeId || '').trim(), edge] as const)
-            .filter(([id]) => id),
-        );
+        const evidenceLookup = getEvidenceSpanLookup(snapshot);
+        const nodeEvidenceById = evidenceLookup.nodesById;
+        const edgeEvidenceById = evidenceLookup.edgesById;
 
         const symbols = changedSymbols
           .map(sym => {
@@ -7986,28 +8149,29 @@ export class LocalBackend {
         .filter(fp => isUiFile(fp))
         .sort((a, b) => rankUiFile(b) - rankUiFile(a))
         .slice(0, maxUiContractFiles);
+      const uiResults = await Promise.all(
+        uiFiles.map(async (filePath) => {
+          const res = await this.uiContract(repo, {
+            file_path: filePath,
+            base_ref: baseRefForUi,
+            include_endpoints: true,
+            min_http_confidence: minConfidence,
+          });
 
-      for (const filePath of uiFiles) {
-        const res = await this.uiContract(repo, {
-          file_path: filePath,
-          base_ref: baseRefForUi,
-          include_endpoints: true,
-          min_http_confidence: minConfidence,
-        });
+          if (res?.error) {
+            return { filePath, error: res.error };
+          }
 
-        if (res?.error) {
-          ui_contracts.push({ filePath, error: res.error });
-          continue;
-        }
-
-        ui_contracts.push({
-          filePath: res.file_path || filePath,
-          diff: res.diff || null,
-          smells: Array.isArray(res?.contract?.smells) ? res.contract.smells : [],
-          effects_summary: res?.contract?.effectsSummary || null,
-          endpoints: Array.isArray(res?.endpoints) ? res.endpoints : [],
-        });
-      }
+          return {
+            filePath: res.file_path || filePath,
+            diff: res.diff || null,
+            smells: Array.isArray(res?.contract?.smells) ? res.contract.smells : [],
+            effects_summary: res?.contract?.effectsSummary || null,
+            endpoints: Array.isArray(res?.endpoints) ? res.endpoints : [],
+          };
+        }),
+      );
+      ui_contracts.push(...uiResults);
     }
 
     const ROUTE_FILE_PATH_RE = /(^|\/)routes\/[^/]+\.php$/i;
@@ -8136,6 +8300,35 @@ export class LocalBackend {
         });
       }
     }
+    const routePatternsByMethod = new Map<string, Array<(typeof routePatterns)[number]>>();
+    for (const routePattern of routePatterns) {
+      const list = routePatternsByMethod.get(routePattern.method) || [];
+      list.push(routePattern);
+      routePatternsByMethod.set(routePattern.method, list);
+    }
+    const routeMatchCache = new Map<string, any[]>();
+    const findMatchedRoutes = (methodHint: string, observedRoute: string): any[] => {
+      const normalizedRoute = String(observedRoute || '').trim();
+      if (!normalizedRoute) return [];
+      const normalizedMethod = String(methodHint || '').trim().toUpperCase();
+      const cacheKey = `${normalizedMethod || '*'}|${normalizedRoute}`;
+      const cached = routeMatchCache.get(cacheKey);
+      if (cached) return cached;
+      const candidates = normalizedMethod
+        ? (routePatternsByMethod.get(normalizedMethod) || [])
+        : routePatterns;
+      const matches = candidates
+        .filter(routePattern => routePattern.matcher.test(normalizedRoute))
+        .map(routePattern => ({
+          route_file: routePattern.route_file,
+          pattern: routePattern.pattern,
+          confidence: routePattern.confidence,
+          controller: routePattern.controller,
+          reason: routePattern.reason,
+        }));
+      routeMatchCache.set(cacheKey, matches);
+      return matches;
+    };
 
     const runtimeSource = (
       runtimeSnapshot.request_spans.length > 0
@@ -8161,7 +8354,7 @@ export class LocalBackend {
       const observedRoute = normalizeObservedRoute(String(span.route || ''));
       if (!observedRoute) continue;
       const reasons: string[] = [];
-      const matchedRoutes: any[] = [];
+      const matchedRoutes = findMatchedRoutes(method, observedRoute);
       const fileHints = Array.isArray(span.file_path_hints)
         ? span.file_path_hints.map(item => normalizePath(item)).filter(Boolean)
         : [];
@@ -8171,17 +8364,8 @@ export class LocalBackend {
         if (runtimeChangedFilePathSet.has(fileHint)) reasons.push(`file-hint:${fileHint}`);
       }
 
-      for (const routePattern of routePatterns) {
-        if (routePattern.method !== method) continue;
-        if (!routePattern.matcher.test(observedRoute)) continue;
-        reasons.push(`route-match:${routePattern.pattern}`);
-        matchedRoutes.push({
-          route_file: routePattern.route_file,
-          pattern: routePattern.pattern,
-          confidence: routePattern.confidence,
-          controller: routePattern.controller,
-          reason: routePattern.reason,
-        });
+      for (const matchedRoute of matchedRoutes) {
+        reasons.push(`route-match:${matchedRoute.pattern}`);
       }
 
       if (reasons.length === 0) continue;
@@ -8213,7 +8397,9 @@ export class LocalBackend {
       const lockWaitMs = Number(query.lock_wait_ms || 0);
       const sql = String(query.sql || '').trim();
       const route = normalizeObservedRoute(String(query.route || ''));
+      const queryMethod = String((query as any).method || '').trim().toUpperCase();
       const reasons: string[] = [];
+      const matchedRoutes = route ? findMatchedRoutes(queryMethod, route) : [];
       const fileHints = Array.isArray(query.file_path_hints)
         ? query.file_path_hints.map(item => normalizePath(item)).filter(Boolean)
         : [];
@@ -8221,11 +8407,8 @@ export class LocalBackend {
         if (!isInScope(fileHint)) continue;
         if (runtimeChangedFilePathSet.has(fileHint)) reasons.push(`file-hint:${fileHint}`);
       }
-      if (route) {
-        for (const routePattern of routePatterns) {
-          if (!routePattern.matcher.test(route)) continue;
-          reasons.push(`route-match:${routePattern.pattern}`);
-        }
+      for (const matchedRoute of matchedRoutes) {
+        reasons.push(`route-match:${matchedRoute.pattern}`);
       }
       if (reasons.length === 0) continue;
       if (durationMs < 80 && lockWaitMs < 25) continue;
@@ -8241,6 +8424,7 @@ export class LocalBackend {
         confidence: Number(Math.min(0.93, 0.6 + (lockWaitMs >= 50 ? 0.15 : 0.05) + (sql ? 0.05 : 0)).toFixed(3)),
         evidence: {
           query,
+          matched_routes: matchedRoutes,
         },
       });
     }
@@ -8255,20 +8439,88 @@ export class LocalBackend {
     });
 
     const authz: any[] = [];
-    const controllerSymbols = changedSymbols.filter(sym => {
+    const pickPrimaryKindLabel = (value: any): string => {
+      if (Array.isArray(value)) return String(value[0] || '').trim();
+      return String(value || '').trim();
+    };
+    const controllerById = new Map<string, any>();
+    const registerController = (candidate: any): void => {
+      const uid = String(candidate?.uid || '').trim();
+      if (!uid) return;
+      const filePath = normalizePath(String(candidate?.filePath || '').trim());
+      if (!filePath || !isInScope(filePath)) return;
+      const kind = String(candidate?.kind || 'Method').trim() || 'Method';
+      const name = String(candidate?.name || '').trim();
+      const startLine = Number(candidate?.startLine);
+      const incoming: any = {
+        uid,
+        name,
+        filePath,
+        kind,
+      };
+      if (Number.isFinite(startLine)) incoming.startLine = startLine;
+      const existing = controllerById.get(uid);
+      if (!existing) {
+        controllerById.set(uid, incoming);
+        return;
+      }
+      const merged: any = {
+        ...existing,
+        ...incoming,
+      };
+      if (String(incoming.name || '').length > String(existing.name || '').length) {
+        merged.name = incoming.name;
+      } else {
+        merged.name = existing.name;
+      }
+      if (Number.isFinite(existing.startLine)) {
+        merged.startLine = existing.startLine;
+      } else if (!Number.isFinite(incoming.startLine)) {
+        delete merged.startLine;
+      }
+      controllerById.set(uid, merged);
+    };
+    for (const sym of changedSymbols) {
       const kind = String(sym?.kind || '');
       const filePath = String(sym?.filePath || '');
-      return kind === 'Method'
+      if (
+        kind === 'Method'
         && filePath.includes('/Http/Controllers/')
-        && filePath.toLowerCase().endsWith('.php');
-    });
+        && filePath.toLowerCase().endsWith('.php')
+      ) {
+        registerController(sym);
+      }
+    }
+    for (const routeEntry of route_targets) {
+      for (const target of Array.isArray(routeEntry?.targets) ? routeEntry.targets : []) {
+        registerController(target?.controller || null);
+      }
+    }
+    const endpointNamesByControllerId = new Map<string, Set<string>>();
+    const endpointRoutePatternsByName = new Map<string, Set<string>>();
+    for (const routePattern of routePatterns) {
+      const controllerUid = String(routePattern?.controller?.uid || '').trim();
+      const method = String(routePattern?.method || '').trim().toLowerCase();
+      const pattern = String(routePattern?.pattern || '').trim();
+      if (!controllerUid || !method || !pattern) continue;
+      const endpointName = `endpoint:${method}:${pattern}`;
+      const names = endpointNamesByControllerId.get(controllerUid) || new Set<string>();
+      names.add(endpointName);
+      endpointNamesByControllerId.set(controllerUid, names);
+      const patternSet = endpointRoutePatternsByName.get(endpointName) || new Set<string>();
+      patternSet.add(pattern);
+      endpointRoutePatternsByName.set(endpointName, patternSet);
+    }
+    const endpointControllersByName = new Map<string, Set<string>>();
+    for (const [controllerId, endpointNames] of endpointNamesByControllerId.entries()) {
+      for (const endpointName of endpointNames) {
+        const controllers = endpointControllersByName.get(endpointName) || new Set<string>();
+        controllers.add(controllerId);
+        endpointControllersByName.set(endpointName, controllers);
+      }
+    }
 
-    if (controllerSymbols.length > 0) {
-      const controllerById = new Map(
-        controllerSymbols
-          .map(sym => [String(sym?.uid || '').trim(), sym] as const)
-          .filter(([uid]) => !!uid),
-      );
+    if (controllerById.size > 0) {
       const controllerIds = Array.from(controllerById.keys());
       const controllerIdsCypher = `[${controllerIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
 
@@ -8282,94 +8534,173 @@ export class LocalBackend {
               r.reason STARTS WITH 'laravel-authorize:'
               OR r.reason STARTS WITH 'laravel-gate:'
               OR r.reason STARTS WITH 'laravel-can:'
+              OR r.reason STARTS WITH 'laravel-route-middleware:can:'
             )
+          OPTIONAL MATCH (t)-[slugRel:CodeRelation {type: 'CALLS'}]->(slug:CodeElement)
+          WHERE slugRel.reason STARTS WITH 'laravel-permission-slug:'
           RETURN c.id AS controllerId,
-                 t.id AS uid, t.name AS name, labels(t) AS kind, t.filePath AS filePath,
-                 r.reason AS reason, r.confidence AS confidence
-          ORDER BY c.id ASC, r.confidence DESC
-          LIMIT ${Math.max(200, Math.min(20000, controllerIds.length * 80))}
+                 t.id AS targetId, t.name AS targetName, labels(t) AS targetKind, t.filePath AS targetFilePath,
+                 r.reason AS authReason, r.confidence AS authConfidence,
+                 slug.id AS slugId, slug.name AS slugName, slug.filePath AS slugFilePath,
+                 slugRel.reason AS slugReason, slugRel.confidence AS slugConfidence
+          ORDER BY c.id ASC, r.confidence DESC, slugRel.confidence DESC
+          LIMIT ${Math.max(300, Math.min(30000, controllerIds.length * 120))}
         `);
       } catch {
         authRows = [];
       }
 
-      const authRowsByController = new Map<string, any[]>();
-      const constTargetIds = new Set<string>();
+      const checksByController = new Map<string, Map<string, any>>();
+      const seenSlugsByCheck = new Map<string, Set<string>>();
       for (const row of authRows) {
         const controllerId = String(row.controllerId || row[0] || '').trim();
         if (!controllerId) continue;
-        const list = authRowsByController.get(controllerId) || [];
-        list.push(row);
-        authRowsByController.set(controllerId, list);
-
-        const targetUid = String(row.uid || row[1] || '').trim();
-        const targetKind = row.kind || row[3] || '';
-        if (targetUid && targetKind === 'Const') constTargetIds.add(targetUid);
+        const targetUid = String(row.targetId || row[1] || '').trim();
+        if (!targetUid) continue;
+        const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
+        const authReason = String(row.authReason || row[5] || '').trim();
+        const checkKey = `${targetUid}|${authReason}`;
+        const controllerChecks = checksByController.get(controllerId) || new Map<string, any>();
+        let check = controllerChecks.get(checkKey);
+        if (!check) {
+          check = {
+            target: {
+              uid: targetUid,
+              name: row.targetName || row[2] || '',
+              kind: targetKind,
+              filePath: row.targetFilePath || row[4] || '',
+            },
+            source: {
+              kind: 'controller',
+            },
+            edge: {
+              reason: row.authReason || row[5] || '',
+              confidence: Number(row.authConfidence ?? row[6] ?? 1.0),
+            },
+          };
+          controllerChecks.set(checkKey, check);
+          checksByController.set(controllerId, controllerChecks);
+        }
+        const slugName = String(row.slugName || row[8] || '').trim();
+        if (!slugName || targetKind !== 'Const') continue;
+        const slugId = String(row.slugId || row[7] || '').trim();
+        const slugReason = String(row.slugReason || row[10] || '').trim();
+        const slugFilePath = String(row.slugFilePath || row[9] || '').trim();
+        const slugKey = `${checkKey}|${slugId}|${slugName}|${slugReason}`;
+        const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
+        if (seen.has(slugKey)) continue;
+        seen.add(slugKey);
+        seenSlugsByCheck.set(controllerId, seen);
+        if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
+        check.permission_slugs.push({
+          name: slugName,
+          filePath: slugFilePath,
+          edge: {
+            reason: slugReason,
+            confidence: Number(row.slugConfidence ?? row[11] ?? 1.0),
+          },
+        });
       }
 
-      const permissionSlugsByConstId = new Map<string, any[]>();
-      if (constTargetIds.size > 0) {
-        const constIds = Array.from(constTargetIds);
-        const constIdsCypher = `[${constIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
-        let slugRows: any[] = [];
+      const endpointNames = Array.from(endpointControllersByName.keys());
+      if (endpointNames.length > 0) {
+        let endpointRows: any[] = [];
         try {
-          slugRows = await executeQuery(repo.id, `
-            MATCH (c)-[r:CodeRelation {type: 'CALLS'}]->(s:CodeElement)
-            WHERE c.id IN ${constIdsCypher}
-              AND r.reason STARTS WITH 'laravel-permission-slug:'
-            RETURN c.id AS constId, s.name AS name, s.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
-            ORDER BY c.id ASC, r.confidence DESC
-            LIMIT ${Math.max(100, Math.min(10000, constIds.length * 10))}
+          const endpointNamesCypher = buildCypherStringList(endpointNames);
+          endpointRows = await executeQuery(repo.id, `
+            MATCH (e:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(t)
+            WHERE e.name IN ${endpointNamesCypher}
+              AND r.confidence >= ${minConfidence}
+              AND (
+                r.reason STARTS WITH 'laravel-can:endpoint-middleware:'
+                OR r.reason STARTS WITH 'laravel-route-middleware:can:'
+              )
+            OPTIONAL MATCH (t)-[slugRel:CodeRelation {type: 'CALLS'}]->(slug:CodeElement)
+            WHERE slugRel.reason STARTS WITH 'laravel-permission-slug:'
+            RETURN e.name AS endpointName,
+                   t.id AS targetId, t.name AS targetName, labels(t) AS targetKind, t.filePath AS targetFilePath,
+                   r.reason AS authReason, r.confidence AS authConfidence,
+                   slug.id AS slugId, slug.name AS slugName, slug.filePath AS slugFilePath,
+                   slugRel.reason AS slugReason, slugRel.confidence AS slugConfidence
+            ORDER BY e.name ASC, r.confidence DESC, slugRel.confidence DESC
+            LIMIT ${Math.max(200, Math.min(20000, endpointNames.length * 80))}
           `);
         } catch {
-          slugRows = [];
+          endpointRows = [];
         }
 
-        for (const row of slugRows) {
-          const constId = String(row.constId || row[0] || '').trim();
-          if (!constId) continue;
-          const list = permissionSlugsByConstId.get(constId) || [];
-          list.push({
-            name: row.name || row[1] || '',
-            filePath: row.filePath || row[2] || '',
-            edge: {
-              reason: row.reason || row[3] || '',
-              confidence: Number(row.confidence ?? row[4] ?? 1.0),
-            },
-          });
-          permissionSlugsByConstId.set(constId, list);
+        for (const row of endpointRows) {
+          const endpointName = String(row.endpointName || row[0] || '').trim();
+          if (!endpointName) continue;
+          const targetUid = String(row.targetId || row[1] || '').trim();
+          if (!targetUid) continue;
+          const controllerIds = endpointControllersByName.get(endpointName) || new Set<string>();
+          if (controllerIds.size === 0) continue;
+          const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
+          const authReason = String(row.authReason || row[5] || '').trim();
+          const routePatternsForEndpoint = Array.from(endpointRoutePatternsByName.get(endpointName) || new Set<string>());
+
+          for (const controllerId of controllerIds) {
+            const checkKey = `endpoint:${endpointName}|${targetUid}|${authReason}`;
+            const controllerChecks = checksByController.get(controllerId) || new Map<string, any>();
+            let check = controllerChecks.get(checkKey);
+            if (!check) {
+              check = {
+                target: {
+                  uid: targetUid,
+                  name: row.targetName || row[2] || '',
+                  kind: targetKind,
+                  filePath: row.targetFilePath || row[4] || '',
+                },
+                source: {
+                  kind: 'endpoint',
+                  name: endpointName,
+                  route_patterns: routePatternsForEndpoint.slice(0, 3),
+                },
+                edge: {
+                  reason: row.authReason || row[5] || '',
+                  confidence: Number(row.authConfidence ?? row[6] ?? 1.0),
+                },
+              };
+              controllerChecks.set(checkKey, check);
+              checksByController.set(controllerId, controllerChecks);
+            }
+
+            const slugName = String(row.slugName || row[8] || '').trim();
+            if (!slugName || targetKind !== 'Const') continue;
+            const slugId = String(row.slugId || row[7] || '').trim();
+            const slugReason = String(row.slugReason || row[10] || '').trim();
+            const slugFilePath = String(row.slugFilePath || row[9] || '').trim();
+            const slugKey = `${checkKey}|${slugId}|${slugName}|${slugReason}`;
+            const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
+            if (seen.has(slugKey)) continue;
+            seen.add(slugKey);
+            seenSlugsByCheck.set(controllerId, seen);
+            if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
+            check.permission_slugs.push({
+              name: slugName,
+              filePath: slugFilePath,
+              edge: {
+                reason: slugReason,
+                confidence: Number(row.slugConfidence ?? row[11] ?? 1.0),
+              },
+            });
+          }
         }
       }
 
       for (const [controllerId, controller] of controllerById.entries()) {
-        const rows = authRowsByController.get(controllerId) || [];
-        const checks = rows.map((row: any) => {
-          const targetUid = String(row.uid || row[1] || '').trim();
-          const targetKind = row.kind || row[3] || '';
-          const check: any = {
-            target: {
-              uid: targetUid,
-              name: row.name || row[2] || '',
-              kind: targetKind,
-              filePath: row.filePath || row[4] || '',
-            },
-            edge: {
-              reason: row.reason || row[5] || '',
-              confidence: Number(row.confidence ?? row[6] ?? 1.0),
-            },
-          };
-
-          if (targetUid && targetKind === 'Const') {
-            const permissionSlugs = permissionSlugsByConstId.get(targetUid) || [];
-            if (permissionSlugs.length > 0) {
-              check.permission_slugs = permissionSlugs
+        const checks = Array.from((checksByController.get(controllerId) || new Map<string, any>()).values())
+          .map((check: any) => {
+            if (!Array.isArray(check?.permission_slugs)) return check;
+            return {
+              ...check,
+              permission_slugs: check.permission_slugs
                 .filter((slug: any) => slug?.name)
-                .slice(0, 3);
-            }
-          }
-
-          return check;
-        }).filter((check: any) => check?.target?.uid);
+                .slice(0, 3),
+            };
+          })
+          .filter((check: any) => check?.target?.uid);
 
         if (checks.length === 0) continue;
         authz.push({

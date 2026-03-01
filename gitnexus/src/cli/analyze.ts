@@ -444,6 +444,12 @@ export const analyzeCommand = async (
       mode: IncrementalDerivedMode;
       skippedPasses: string[];
       adaptiveLowSignal: boolean;
+      recomputed: {
+        communities: boolean;
+        processes: boolean;
+        autoCommunities: boolean;
+        autoProcesses: boolean;
+      };
       timingsMs?: Record<string, number>;
     };
   }> => {
@@ -789,13 +795,13 @@ export const analyzeCommand = async (
       return SHAPE_SIGNAL_RE.test(content);
     });
     const sourceSignalsTouched = impactedFiles.some(filePath => Boolean(getLanguageFromFilename(filePath)));
-    const adaptiveLowSignalChangeSet = incrementalDerivedMode === 'adaptive'
+    let adaptiveLowSignalChangeSet = incrementalDerivedMode === 'adaptive'
       && !sourceSignalsTouched
       && !shapeSignalsTouched
       && !routeProviderTouched
       && !permissionsConfigPath
       && !hasTemplateRouteNameProcessing;
-    const shouldRunAdaptiveHeavyPasses = !adaptiveLowSignalChangeSet;
+    let shouldRunAdaptiveHeavyPasses = !adaptiveLowSignalChangeSet;
 
     // Upsert File nodes with updated content for rebuild files (keeps existing edges)
     bar.update(43, { phase: 'Incremental: updating File nodes...' });
@@ -986,6 +992,79 @@ export const analyzeCommand = async (
 
       insertGraph.addRelationship(rel);
     }
+
+    // Refine adaptive low-signal gating with observed incremental graph delta.
+    // This avoids expensive derived rebuilds when source edits produce minimal graph churn.
+    if (incrementalDerivedMode === 'adaptive' && shouldRunAdaptiveHeavyPasses) {
+      const insertedNodeCount = insertGraph.nodes.length;
+      const insertedRelationshipCount = insertGraph.relationships.length;
+      let highSignalDerivedEdgeCount = 0;
+      for (const rel of insertGraph.relationships) {
+        const reason = String(rel.reason || '').toLowerCase();
+        if (
+          rel.type === 'INVALIDATES_KEY'
+          || rel.type === 'VALIDATES_FIELD'
+          || rel.type === 'SERIALIZES_FIELD'
+          || rel.type === 'READS_FIELD'
+          || rel.type === 'WRITES_FIELD'
+          || rel.type === 'DERIVES_FROM'
+          || rel.type === 'DERIVES_FROM_COLUMN'
+          || rel.type === 'TESTS_SHAPE'
+          || reason.startsWith('laravel-route')
+          || reason.startsWith('laravel-endpoint:')
+          || reason.startsWith('laravel-authorize:')
+          || reason.startsWith('laravel-gate:')
+          || reason.startsWith('laravel-can:')
+          || reason.startsWith('react-query-key:')
+          || reason.startsWith('micro-dataflow:')
+          || reason.startsWith('route-name:')
+          || reason.startsWith('precision-overlay:')
+          || reason.startsWith('value-graph:')
+        ) {
+          highSignalDerivedEdgeCount++;
+          if (highSignalDerivedEdgeCount >= 32) break;
+        }
+      }
+
+      const smallChangeWindow = fileChangesTotal <= 4 && rebuildFiles.length <= 4 && deletedFiles.size === 0;
+      const boundedRefreshWindow = refreshEdgeFiles.size <= 24;
+      const lowStructuralDelta = insertedNodeCount <= 180 && insertedRelationshipCount <= 220;
+      if (
+        smallChangeWindow
+        && boundedRefreshWindow
+        && lowStructuralDelta
+        && highSignalDerivedEdgeCount <= 10
+        && !routesTouched
+        && !permissionsConfigPath
+        && !hasTemplateRouteNameProcessing
+        && !shapeSignalsTouched
+      ) {
+        adaptiveLowSignalChangeSet = true;
+        shouldRunAdaptiveHeavyPasses = false;
+      }
+    }
+
+    const recomputeCandidateWindow = fileChangesTotal <= Math.max(8, Math.min(60, incrementalMaxChanges));
+    const entrypointSignalsTouched = routesTouched || hasTemplateRouteNameProcessing || impactedFiles.some(filePath => {
+      const normalized = filePath.replace(/\\/g, '/');
+      return (
+        /(^|\/)routes\/[^/]+\.php$/i.test(normalized)
+        || normalized.includes('/Http/Controllers/')
+        || normalized.includes('/src/api/')
+        || /(^|\/)app\/Providers\/RouteServiceProvider\.php$/i.test(normalized)
+        || /(^|\/)config\/permissions\.php$/i.test(normalized)
+      );
+    });
+    const autoRecomputeCommunities = incrementalDerivedMode === 'adaptive'
+      && shouldRunAdaptiveHeavyPasses
+      && recomputeCandidateWindow
+      && (entrypointSignalsTouched || shapeSignalsTouched);
+    const autoRecomputeProcesses = incrementalDerivedMode === 'adaptive'
+      && shouldRunAdaptiveHeavyPasses
+      && recomputeCandidateWindow
+      && entrypointSignalsTouched;
+    const recomputeCommunities = options?.incrementalRecomputeCommunities || autoRecomputeCommunities;
+    const recomputeProcesses = options?.incrementalRecomputeProcesses || autoRecomputeProcesses;
 
     const insertContents = new Map<string, string>();
     for (const fp of new Set([...nodeInsertFiles, ...permissionEnumFiles])) {
@@ -1285,6 +1364,48 @@ export const analyzeCommand = async (
       `);
       return incrementalCoreRelationRows;
     };
+    const incrementalCallHeritageRelationRowsByMinConfidence = new Map<string, any[]>();
+    const loadIncrementalCallHeritageRelationRows = async (minConfidence?: number): Promise<any[]> => {
+      const min = Number.isFinite(minConfidence) ? Number(minConfidence) : null;
+      const cacheKey = min === null ? 'all' : `min:${min.toFixed(2)}`;
+      const cached = incrementalCallHeritageRelationRowsByMinConfidence.get(cacheKey);
+      if (cached) return cached;
+
+      const confidenceClause = min !== null ? `AND r.confidence >= ${min}` : '';
+      const rows = await executeQuery(`
+        MATCH (a)-[r:CodeRelation]->(b)
+        WHERE r.type IN ['CALLS', 'EXTENDS', 'IMPLEMENTS']
+          ${confidenceClause}
+        RETURN a.id AS sourceId,
+               b.id AS targetId,
+               r.type AS type,
+               r.confidence AS confidence,
+               r.reason AS reason
+      `);
+      incrementalCallHeritageRelationRowsByMinConfidence.set(cacheKey, rows);
+      return rows;
+    };
+    const incrementalProcessCodeRowsByLabel = new Map<'Function' | 'Method' | 'CodeElement', any[]>();
+    const loadIncrementalProcessCodeRows = async (label: 'Function' | 'Method' | 'CodeElement'): Promise<any[]> => {
+      const cached = incrementalProcessCodeRowsByLabel.get(label);
+      if (cached) return cached;
+
+      let rows: any[] = [];
+      if (label === 'CodeElement') {
+        rows = await executeQuery(`
+          MATCH (n:CodeElement)
+          WHERE n.name STARTS WITH 'endpoint:'
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
+        `);
+      } else {
+        rows = await executeQuery(`
+          MATCH (n:${label})
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
+        `);
+      }
+      incrementalProcessCodeRowsByLabel.set(label, rows);
+      return rows;
+    };
 
     const precisionPassStartedAt = Date.now();
     if (!shouldRunAdaptiveHeavyPasses) {
@@ -1449,12 +1570,20 @@ export const analyzeCommand = async (
     // Optional: recompute derived views in incremental mode (Communities + Processes).
     // This is disabled by default because it can be expensive on large graphs.
     let recomputedMemberships: Array<{ nodeId: string; communityId: string }> | null = null;
-    if (options?.incrementalRecomputeCommunities) {
+    if (recomputeCommunities) {
       bar.update(88, { phase: 'Incremental: recomputing communities...' });
       try {
         const communityInputGraph = createKnowledgeGraph();
+        const functionNodeIds = new Set<string>();
+        const classNodeIds = new Set<string>();
+        const methodNodeIds = new Set<string>();
+        const interfaceNodeIds = new Set<string>();
 
-        const addNodeRows = (label: 'Function' | 'Class' | 'Method' | 'Interface', rows: any[]) => {
+        const addNodeRows = (
+          label: 'Function' | 'Class' | 'Method' | 'Interface',
+          rows: any[],
+          idSet: Set<string>,
+        ) => {
           for (const row of rows) {
             const id = String(row.id ?? row[0] ?? '').trim();
             if (!id) continue;
@@ -1468,50 +1597,49 @@ export const analyzeCommand = async (
                 filePath,
               }
             });
+            idSet.add(id);
           }
         };
 
-        const addRelRows = (type: 'CALLS' | 'EXTENDS' | 'IMPLEMENTS', rows: any[]) => {
-          for (const row of rows) {
-            const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-            const targetId = String(row.targetId ?? row[1] ?? '').trim();
-            if (!sourceId || !targetId) continue;
-            communityInputGraph.addRelationship({
-              id: `inc_comm_${type}_${communityInputGraph.relationshipCount}_${sourceId}->${targetId}`,
-              type,
-              sourceId,
-              targetId,
-              confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
-              reason: String(row.reason ?? row[3] ?? ''),
-            });
-          }
+        const addRel = (type: 'CALLS' | 'EXTENDS' | 'IMPLEMENTS', row: any) => {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const targetId = String(row.targetId ?? row[1] ?? '').trim();
+          if (!sourceId || !targetId) return;
+          communityInputGraph.addRelationship({
+            id: `inc_comm_${type}_${communityInputGraph.relationshipCount}_${sourceId}->${targetId}`,
+            type,
+            sourceId,
+            targetId,
+            confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
+            reason: String(row.reason ?? row[3] ?? ''),
+          });
         };
 
-        addNodeRows('Function', await executeQuery(`MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
-        addNodeRows('Class', await executeQuery(`MATCH (n:Class) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
-        addNodeRows('Method', await executeQuery(`MATCH (n:Method) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
-        addNodeRows('Interface', await executeQuery(`MATCH (n:Interface) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`));
+        addNodeRows('Function', await loadIncrementalNodeRows('Function', 'flow'), functionNodeIds);
+        addNodeRows('Class', await loadIncrementalNodeRows('Class', 'flow'), classNodeIds);
+        addNodeRows('Method', await loadIncrementalNodeRows('Method', 'flow'), methodNodeIds);
+        addNodeRows('Interface', await loadIncrementalNodeRows('Interface', 'flow'), interfaceNodeIds);
 
-        addRelRows('CALLS', await executeQuery(`
-          MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b)
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
-        addRelRows('CALLS', await executeQuery(`
-          MATCH (a:Method)-[r:CodeRelation {type: 'CALLS'}]->(b)
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
-        addRelRows('EXTENDS', await executeQuery(`
-          MATCH (a:Class)-[r:CodeRelation {type: 'EXTENDS'}]->(b)
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
-        addRelRows('EXTENDS', await executeQuery(`
-          MATCH (a:Interface)-[r:CodeRelation {type: 'EXTENDS'}]->(b)
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
-        addRelRows('IMPLEMENTS', await executeQuery(`
-          MATCH (a:Class)-[r:CodeRelation {type: 'IMPLEMENTS'}]->(b)
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
+        const relationRows = await loadIncrementalCallHeritageRelationRows();
+        for (const row of relationRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const type = String(row.type ?? row[2] ?? '').trim();
+          if (!sourceId || !type) continue;
+          if (type === 'CALLS') {
+            if (!functionNodeIds.has(sourceId) && !methodNodeIds.has(sourceId)) continue;
+            addRel('CALLS', row);
+            continue;
+          }
+          if (type === 'EXTENDS') {
+            if (!classNodeIds.has(sourceId) && !interfaceNodeIds.has(sourceId)) continue;
+            addRel('EXTENDS', row);
+            continue;
+          }
+          if (type === 'IMPLEMENTS') {
+            if (!classNodeIds.has(sourceId)) continue;
+            addRel('IMPLEMENTS', row);
+          }
+        }
 
         const communityResult = await processCommunities(communityInputGraph, (message, progress) => {
           if (progress % 20 !== 0 && progress !== 100) return;
@@ -1555,19 +1683,26 @@ export const analyzeCommand = async (
       }
     }
 
-    if (options?.incrementalRecomputeProcesses) {
+    if (recomputeProcesses) {
       bar.update(89, { phase: 'Incremental: recomputing processes...' });
       try {
         const processInputGraph = createKnowledgeGraph();
+        const processFunctionIds = new Set<string>();
+        const processMethodIds = new Set<string>();
+        const processEndpointIds = new Set<string>();
 
-        const addCodeRows = (label: 'Function' | 'Method' | 'CodeElement', rows: any[]) => {
+        const addCodeRows = (
+          label: 'Function' | 'Method' | 'CodeElement',
+          rows: any[],
+          idSet: Set<string>,
+        ) => {
           for (const row of rows) {
             const id = String(row.id ?? row[0] ?? '').trim();
             if (!id) continue;
             const name = String(row.name ?? row[1] ?? '').trim();
             const filePath = String(row.filePath ?? row[2] ?? '').trim();
             const language = getLanguageFromFilename(filePath) ?? 'javascript';
-            const isExported = (row.isExported ?? row[3] ?? false) === true;
+            const isExported = row.isExported === true || row.isExported === 1 || row.isExported === 'true';
             processInputGraph.addNode({
               id,
               label,
@@ -1578,54 +1713,37 @@ export const analyzeCommand = async (
                 isExported,
               }
             });
+            idSet.add(id);
           }
         };
 
-        addCodeRows('Function', await executeQuery(`
-          MATCH (n:Function)
-          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
-        `));
-        addCodeRows('Method', await executeQuery(`
-          MATCH (n:Method)
-          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
-        `));
-        addCodeRows('CodeElement', await executeQuery(`
-          MATCH (n:CodeElement)
-          WHERE n.name STARTS WITH 'endpoint:'
-          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.isExported AS isExported
-        `));
+        addCodeRows('Function', await loadIncrementalProcessCodeRows('Function'), processFunctionIds);
+        addCodeRows('Method', await loadIncrementalProcessCodeRows('Method'), processMethodIds);
+        addCodeRows('CodeElement', await loadIncrementalProcessCodeRows('CodeElement'), processEndpointIds);
 
-        const addCallRows = (rows: any[]) => {
-          for (const row of rows) {
-            const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-            const targetId = String(row.targetId ?? row[1] ?? '').trim();
-            if (!sourceId || !targetId) continue;
-            processInputGraph.addRelationship({
-              id: `inc_proc_CALLS_${processInputGraph.relationshipCount}_${sourceId}->${targetId}`,
-              type: 'CALLS',
-              sourceId,
-              targetId,
-              confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
-              reason: String(row.reason ?? row[3] ?? ''),
-            });
+        const callRows = await loadIncrementalCallHeritageRelationRows(0.5);
+        for (const row of callRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const targetId = String(row.targetId ?? row[1] ?? '').trim();
+          const type = String(row.type ?? row[2] ?? '').trim();
+          const confidence = Number(row.confidence ?? row[3] ?? 1.0) || 1.0;
+          if (type !== 'CALLS' || !sourceId || !targetId) continue;
+          if (
+            !processFunctionIds.has(sourceId)
+            && !processMethodIds.has(sourceId)
+            && !processEndpointIds.has(sourceId)
+          ) {
+            continue;
           }
-        };
-
-        addCallRows(await executeQuery(`
-          MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b)
-          WHERE r.confidence >= 0.5
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
-        addCallRows(await executeQuery(`
-          MATCH (a:Method)-[r:CodeRelation {type: 'CALLS'}]->(b)
-          WHERE r.confidence >= 0.5
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
-        addCallRows(await executeQuery(`
-          MATCH (a:CodeElement)-[r:CodeRelation {type: 'CALLS'}]->(b)
-          WHERE r.confidence >= 0.5 AND a.name STARTS WITH 'endpoint:'
-          RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-        `));
+          processInputGraph.addRelationship({
+            id: `inc_proc_CALLS_${processInputGraph.relationshipCount}_${sourceId}->${targetId}`,
+            type: 'CALLS',
+            sourceId,
+            targetId,
+            confidence,
+            reason: String(row.reason ?? row[4] ?? ''),
+          });
+        }
 
         const symbolCount = processInputGraph.nodes.length;
         const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
@@ -1680,179 +1798,165 @@ export const analyzeCommand = async (
       }
     }
 
-    bar.update(89, { phase: 'Incremental: recomputing feature slices...' });
-    try {
-      const featureSliceInputGraph = createKnowledgeGraph();
-      const featureSliceNodeIds = new Set<string>();
-      const sliceLabels = [
-        'Function',
-        'Class',
-        'Interface',
-        'Method',
-        'CodeElement',
-        'Struct',
-        'Enum',
-        'Macro',
-        'Typedef',
-        'Union',
-        'Namespace',
-        'Trait',
-        'Impl',
-        'TypeAlias',
-        'Const',
-        'Static',
-        'Property',
-        'Record',
-        'Delegate',
-        'Annotation',
-        'Constructor',
-        'Template',
-        'Module',
-      ] as const;
-      const backtickLabels = new Set([
-        'Struct',
-        'Enum',
-        'Macro',
-        'Typedef',
-        'Union',
-        'Namespace',
-        'Trait',
-        'Impl',
-        'TypeAlias',
-        'Const',
-        'Static',
-        'Property',
-        'Record',
-        'Delegate',
-        'Annotation',
-        'Constructor',
-        'Template',
-        'Module',
-      ]);
+    const shouldRecomputeSlicesAndGaps = incrementalDerivedMode !== 'fast'
+      && (shouldRunAdaptiveHeavyPasses || sourceSignalsTouched || shapeSignalsTouched || entrypointSignalsTouched);
+    const featureSlicePassStartedAt = Date.now();
+    if (!shouldRecomputeSlicesAndGaps) {
+      skipDerivedPass('slices');
+    } else {
+      bar.update(89, { phase: 'Incremental: recomputing feature slices...' });
+      try {
+        const featureSliceInputGraph = createKnowledgeGraph();
+        const featureSliceNodeIds = new Set<string>();
+        const sliceLabels = [
+          'Function',
+          'Class',
+          'Interface',
+          'Method',
+          'CodeElement',
+          'Struct',
+          'Enum',
+          'Macro',
+          'Typedef',
+          'Union',
+          'Namespace',
+          'Trait',
+          'Impl',
+          'TypeAlias',
+          'Const',
+          'Static',
+          'Property',
+          'Record',
+          'Delegate',
+          'Annotation',
+          'Constructor',
+          'Template',
+          'Module',
+        ] as const;
 
-      for (const label of sliceLabels) {
-        const cypherLabel = backtickLabels.has(label) ? `\`${label}\`` : label;
-        const rows = await executeQuery(`
-          MATCH (n:${cypherLabel})
-          RETURN n.id AS id, n.name AS name, n.filePath AS filePath
-        `);
+        for (const label of sliceLabels) {
+          const rows = await loadIncrementalNodeRows(String(label), 'flow');
 
-        for (const row of rows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-          const name = String(row.name ?? row[1] ?? '').trim();
-          const filePath = String(row.filePath ?? row[2] ?? '').trim();
-          featureSliceInputGraph.addNode({
-            id,
-            label,
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            const name = String(row.name ?? row[1] ?? '').trim();
+            const filePath = String(row.filePath ?? row[2] ?? '').trim();
+            featureSliceInputGraph.addNode({
+              id,
+              label,
+              properties: {
+                name,
+                filePath,
+              },
+            });
+            featureSliceNodeIds.add(id);
+          }
+        }
+
+        const callRows = await loadIncrementalCallHeritageRelationRows(0.9);
+        for (const row of callRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const targetId = String(row.targetId ?? row[1] ?? '').trim();
+          const type = String(row.type ?? row[2] ?? '').trim();
+          const confidence = Number(row.confidence ?? row[3] ?? 1.0) || 1.0;
+          if (type !== 'CALLS') continue;
+          if (!sourceId || !targetId) continue;
+          if (!featureSliceNodeIds.has(sourceId) || !featureSliceNodeIds.has(targetId)) continue;
+          featureSliceInputGraph.addRelationship({
+            id: `inc_slice_CALLS_${featureSliceInputGraph.relationshipCount}_${sourceId}->${targetId}`,
+            type: 'CALLS',
+            sourceId,
+            targetId,
+            confidence,
+            reason: String(row.reason ?? row[4] ?? ''),
+          });
+        }
+
+        const featureSliceResult = await processFeatureSlices(
+          featureSliceInputGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Feature slices: ${message}` });
+          },
+        );
+
+        await executeQuery(`MATCH (s:FeatureSlice) DETACH DELETE s`);
+
+        const featureSliceInsertGraph = createKnowledgeGraph();
+        for (const slice of featureSliceResult.slices) {
+          featureSliceInsertGraph.addNode({
+            id: slice.id,
+            label: 'FeatureSlice',
             properties: {
-              name,
-              filePath,
+              name: slice.label,
+              filePath: '',
+              heuristicLabel: slice.heuristicLabel,
+              sliceType: slice.sliceType,
+              anchorId: slice.anchorId,
+              anchorName: slice.anchorName,
+              closureSlots: slice.closureSlots,
+              closedSlots: slice.closedSlots,
+              closureScore: slice.closureScore,
             },
           });
-          featureSliceNodeIds.add(id);
         }
-      }
 
-      const callRows = await executeQuery(`
-        MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
-        WHERE r.confidence >= 0.9
-        RETURN a.id AS sourceId, b.id AS targetId, r.confidence AS confidence, r.reason AS reason
-      `);
+        for (const membership of featureSliceResult.memberships) {
+          featureSliceInsertGraph.addRelationship({
+            id: `${membership.nodeId}_member_of_${membership.sliceId}`,
+            type: 'MEMBER_OF',
+            sourceId: membership.nodeId,
+            targetId: membership.sliceId,
+            confidence: 1.0,
+            reason: `feature-slice:${membership.role}`,
+          });
+        }
 
-      for (const row of callRows) {
-        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-        const targetId = String(row.targetId ?? row[1] ?? '').trim();
-        if (!sourceId || !targetId) continue;
-        if (!featureSliceNodeIds.has(sourceId) || !featureSliceNodeIds.has(targetId)) continue;
-        featureSliceInputGraph.addRelationship({
-          id: `inc_slice_CALLS_${featureSliceInputGraph.relationshipCount}_${sourceId}->${targetId}`,
-          type: 'CALLS',
-          sourceId,
-          targetId,
-          confidence: Number(row.confidence ?? row[2] ?? 1.0) || 1.0,
-          reason: String(row.reason ?? row[3] ?? ''),
+        await loadGraphToKuzu(featureSliceInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
         });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to recompute feature slices (${msg.slice(0, 120)})`);
       }
-
-      const featureSliceResult = await processFeatureSlices(
-        featureSliceInputGraph,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(89, { phase: `Feature slices: ${message}` });
-        },
-      );
-
-      await executeQuery(`MATCH (s:FeatureSlice) DETACH DELETE s`);
-
-      const featureSliceInsertGraph = createKnowledgeGraph();
-      for (const slice of featureSliceResult.slices) {
-        featureSliceInsertGraph.addNode({
-          id: slice.id,
-          label: 'FeatureSlice',
-          properties: {
-            name: slice.label,
-            filePath: '',
-            heuristicLabel: slice.heuristicLabel,
-            sliceType: slice.sliceType,
-            anchorId: slice.anchorId,
-            anchorName: slice.anchorName,
-            closureSlots: slice.closureSlots,
-            closedSlots: slice.closedSlots,
-            closureScore: slice.closureScore,
-          },
-        });
-      }
-
-      for (const membership of featureSliceResult.memberships) {
-        featureSliceInsertGraph.addRelationship({
-          id: `${membership.nodeId}_member_of_${membership.sliceId}`,
-          type: 'MEMBER_OF',
-          sourceId: membership.nodeId,
-          targetId: membership.sliceId,
-          confidence: 1.0,
-          reason: `feature-slice:${membership.role}`,
-        });
-      }
-
-      await loadGraphToKuzu(featureSliceInsertGraph, new Map(), storagePath, (msg) => {
-        bar.update(89, { phase: msg });
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to recompute feature slices (${msg.slice(0, 120)})`);
     }
+    markPassTiming('slices', featureSlicePassStartedAt);
 
-    bar.update(89, { phase: 'Incremental: recomputing gap graph...' });
-    try {
-      const gapInputGraph = createKnowledgeGraph();
-      const memberLabels = new Set([
-        'Function',
-        'Class',
-        'Interface',
-        'Method',
-        'CodeElement',
-        'Struct',
-        'Enum',
-        'Macro',
-        'Typedef',
-        'Union',
-        'Namespace',
-        'Trait',
-        'Impl',
-        'TypeAlias',
-        'Const',
-        'Static',
-        'Property',
-        'Record',
-        'Delegate',
-        'Annotation',
-        'Constructor',
-        'Template',
-        'Module',
-      ]);
+    const gapPassStartedAt = Date.now();
+    if (!shouldRecomputeSlicesAndGaps) {
+      skipDerivedPass('gaps');
+    } else {
+      bar.update(89, { phase: 'Incremental: recomputing gap graph...' });
+      try {
+        const gapInputGraph = createKnowledgeGraph();
+        const memberLabels = new Set([
+          'Function',
+          'Class',
+          'Interface',
+          'Method',
+          'CodeElement',
+          'Struct',
+          'Enum',
+          'Macro',
+          'Typedef',
+          'Union',
+          'Namespace',
+          'Trait',
+          'Impl',
+          'TypeAlias',
+          'Const',
+          'Static',
+          'Property',
+          'Record',
+          'Delegate',
+          'Annotation',
+          'Constructor',
+          'Template',
+          'Module',
+        ]);
 
-      const sliceRows = await executeQuery(`
+        const sliceRows = await executeQuery(`
         MATCH (s:FeatureSlice)
         RETURN
           s.id AS id,
@@ -1864,29 +1968,29 @@ export const analyzeCommand = async (
           s.closureSlots AS closureSlots,
           s.closedSlots AS closedSlots,
           s.closureScore AS closureScore
-      `);
+        `);
 
-      for (const row of sliceRows) {
-        const id = String(row.id ?? row[0] ?? '').trim();
-        if (!id) continue;
-        gapInputGraph.addNode({
-          id,
-          label: 'FeatureSlice',
-          properties: {
-            name: String(row.label ?? row[1] ?? '').trim(),
-            filePath: '',
-            heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
-            sliceType: String(row.sliceType ?? row[3] ?? '').trim(),
-            anchorId: String(row.anchorId ?? row[4] ?? '').trim(),
-            anchorName: String(row.anchorName ?? row[5] ?? '').trim(),
-            closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((slot: any) => String(slot)) : [],
-            closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((slot: any) => String(slot)) : [],
-            closureScore: Number(row.closureScore ?? row[8] ?? 0) || 0,
-          },
-        });
-      }
+        for (const row of sliceRows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          gapInputGraph.addNode({
+            id,
+            label: 'FeatureSlice',
+            properties: {
+              name: String(row.label ?? row[1] ?? '').trim(),
+              filePath: '',
+              heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
+              sliceType: String(row.sliceType ?? row[3] ?? '').trim(),
+              anchorId: String(row.anchorId ?? row[4] ?? '').trim(),
+              anchorName: String(row.anchorName ?? row[5] ?? '').trim(),
+              closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((slot: any) => String(slot)) : [],
+              closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((slot: any) => String(slot)) : [],
+              closureScore: Number(row.closureScore ?? row[8] ?? 0) || 0,
+            },
+          });
+        }
 
-      const membershipRows = await executeQuery(`
+        const membershipRows = await executeQuery(`
         MATCH (src)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
         WHERE r.reason STARTS WITH 'feature-slice:'
         RETURN
@@ -1896,90 +2000,93 @@ export const analyzeCommand = async (
           labels(src) AS sourceLabels,
           s.id AS sliceId,
           r.reason AS reason
-      `);
+        `);
 
-      for (const row of membershipRows) {
-        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-        const sliceId = String(row.sliceId ?? row[4] ?? '').trim();
-        if (!sourceId || !sliceId) continue;
+        for (const row of membershipRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const sliceId = String(row.sliceId ?? row[4] ?? '').trim();
+          if (!sourceId || !sliceId) continue;
 
-        const sourceLabels = Array.isArray(row.sourceLabels) ? row.sourceLabels.map((label: any) => String(label)) : [];
-        const primaryLabel = sourceLabels.find(label => memberLabels.has(label)) || 'CodeElement';
-        if (!memberLabels.has(primaryLabel)) continue;
+          const sourceLabels = Array.isArray(row.sourceLabels) ? row.sourceLabels.map((label: any) => String(label)) : [];
+          const primaryLabel = sourceLabels.find(label => memberLabels.has(label)) || 'CodeElement';
+          if (!memberLabels.has(primaryLabel)) continue;
 
-        gapInputGraph.addNode({
-          id: sourceId,
-          label: primaryLabel as NodeLabel,
-          properties: {
-            name: String(row.sourceName ?? row[1] ?? '').trim(),
-            filePath: String(row.sourceFilePath ?? row[2] ?? '').trim(),
+          gapInputGraph.addNode({
+            id: sourceId,
+            label: primaryLabel as NodeLabel,
+            properties: {
+              name: String(row.sourceName ?? row[1] ?? '').trim(),
+              filePath: String(row.sourceFilePath ?? row[2] ?? '').trim(),
+            },
+          });
+
+          gapInputGraph.addRelationship({
+            id: `${sourceId}_member_of_${sliceId}`,
+            type: 'MEMBER_OF',
+            sourceId,
+            targetId: sliceId,
+            confidence: 1.0,
+            reason: String(row.reason ?? row[5] ?? ''),
+          });
+        }
+
+        const gapResult = await processGaps(
+          gapInputGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Gaps: ${message}` });
           },
-        });
-
-        gapInputGraph.addRelationship({
-          id: `${sourceId}_member_of_${sliceId}`,
-          type: 'MEMBER_OF',
-          sourceId,
-          targetId: sliceId,
-          confidence: 1.0,
-          reason: String(row.reason ?? row[5] ?? ''),
-        });
-      }
-
-      const gapResult = await processGaps(
-        gapInputGraph,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(89, { phase: `Gaps: ${message}` });
-        },
-        {
-          repoPath,
-          expectationPath: options?.graphExpectationPath,
-        },
-      );
-
-      await executeQuery(`MATCH (g:Gap) DETACH DELETE g`);
-
-      const gapInsertGraph = createKnowledgeGraph();
-      for (const gap of gapResult.gaps) {
-        gapInsertGraph.addNode({
-          id: gap.id,
-          label: 'Gap',
-          properties: {
-            name: gap.label,
-            filePath: '',
-            heuristicLabel: gap.heuristicLabel,
-            gapType: gap.gapType,
-            absenceTier: gap.absenceTier,
-            severity: gap.severity,
-            sliceId: gap.sliceId,
-            anchorId: gap.anchorId,
-            missingSlots: gap.missingSlots,
-            evidence: gap.evidence,
+          {
+            repoPath,
+            expectationPath: options?.graphExpectationPath,
           },
-        });
-      }
+        );
 
-      for (const link of gapResult.links) {
-        gapInsertGraph.addRelationship({
-          id: `${link.gapId}_member_of_${link.sliceId}`,
-          type: 'MEMBER_OF',
-          sourceId: link.gapId,
-          targetId: link.sliceId,
-          confidence: 1.0,
-          reason: 'gap-membership',
-        });
-      }
+        await executeQuery(`MATCH (g:Gap) DETACH DELETE g`);
 
-      await loadGraphToKuzu(gapInsertGraph, new Map(), storagePath, (msg) => {
-        bar.update(89, { phase: msg });
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to recompute gap graph (${msg.slice(0, 120)})`);
+        const gapInsertGraph = createKnowledgeGraph();
+        for (const gap of gapResult.gaps) {
+          gapInsertGraph.addNode({
+            id: gap.id,
+            label: 'Gap',
+            properties: {
+              name: gap.label,
+              filePath: '',
+              heuristicLabel: gap.heuristicLabel,
+              gapType: gap.gapType,
+              absenceTier: gap.absenceTier,
+              severity: gap.severity,
+              sliceId: gap.sliceId,
+              anchorId: gap.anchorId,
+              missingSlots: gap.missingSlots,
+              evidence: gap.evidence,
+            },
+          });
+        }
+
+        for (const link of gapResult.links) {
+          gapInsertGraph.addRelationship({
+            id: `${link.gapId}_member_of_${link.sliceId}`,
+            type: 'MEMBER_OF',
+            sourceId: link.gapId,
+            targetId: link.sliceId,
+            confidence: 1.0,
+            reason: 'gap-membership',
+          });
+        }
+
+        await loadGraphToKuzu(gapInsertGraph, new Map(), storagePath, (msg) => {
+          bar.update(89, { phase: msg });
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to recompute gap graph (${msg.slice(0, 120)})`);
+      }
     }
+    markPassTiming('gaps', gapPassStartedAt);
 
-    const shouldRecomputeShapeGraph = incrementalDerivedMode === 'full' || shapeSignalsTouched;
+    const shouldRecomputeShapeGraph = incrementalDerivedMode === 'full'
+      || (incrementalDerivedMode === 'adaptive' && shapeSignalsTouched);
     if (!shouldRecomputeShapeGraph) {
       skipDerivedPass('shape-graph');
     } else {
@@ -2428,11 +2535,53 @@ export const analyzeCommand = async (
         }
         return loadIncrementalNodeRows(label, 'flow');
       };
-      let postDerivedRelationRows: any[] | null = null;
-      const loadPostDerivedRelationRows = async (): Promise<any[]> => {
-        if (postDerivedRelationRows) return postDerivedRelationRows;
-        postDerivedRelationRows = await executeQuery(`
+      const postDerivedRelationTypes = [
+        'CALLS',
+        'IMPORTS',
+        'EXTENDS',
+        'IMPLEMENTS',
+        'DEFINES',
+        'MEMBER_OF',
+        'STEP_IN_PROCESS',
+        'VALIDATES_FIELD',
+        'SERIALIZES_FIELD',
+        'READS_FIELD',
+        'WRITES_FIELD',
+        'DERIVES_FROM',
+        'DERIVES_FROM_COLUMN',
+        'INVALIDATES_KEY',
+        'TESTS_SHAPE',
+      ];
+      const postDerivedRelationTypesCypher = `[${postDerivedRelationTypes.map(type => `'${type}'`).join(', ')}]`;
+      const evidenceRelationLabels = ['File', ...flowNodeLabels, 'TestCase'] as const;
+      const buildNodeIdPrefixPredicate = (alias: string, labels: readonly string[]): string => (
+        labels.map(label => `${alias}.id STARTS WITH '${label}:'`).join(' OR ')
+      );
+      const evidenceSourcePredicate = buildNodeIdPrefixPredicate('a', evidenceRelationLabels);
+      const evidenceTargetPredicate = buildNodeIdPrefixPredicate('b', evidenceRelationLabels);
+      let postDerivedEvidenceRelationRows: any[] | null = null;
+      let postDerivedSummaryRelationRows: any[] | null = null;
+      const loadPostDerivedRelationRows = async (mode: 'evidence' | 'summary'): Promise<any[]> => {
+        if (mode === 'evidence') {
+          if (postDerivedEvidenceRelationRows) return postDerivedEvidenceRelationRows;
+          postDerivedEvidenceRelationRows = await executeQuery(`
+            MATCH (a)-[r:CodeRelation]->(b)
+            WHERE r.type IN ${postDerivedRelationTypesCypher}
+              AND ((${evidenceSourcePredicate}) OR (${evidenceTargetPredicate}))
+            RETURN a.id AS sourceId,
+                   b.id AS targetId,
+                   r.type AS type,
+                   r.confidence AS confidence,
+                   r.reason AS reason,
+                   r.step AS step
+          `);
+          return postDerivedEvidenceRelationRows;
+        }
+        if (postDerivedSummaryRelationRows) return postDerivedSummaryRelationRows;
+
+        const baseRows = await executeQuery(`
           MATCH (a)-[r:CodeRelation]->(b)
+          WHERE r.type IN ${postDerivedRelationTypesCypher}
           RETURN a.id AS sourceId,
                  b.id AS targetId,
                  r.type AS type,
@@ -2440,7 +2589,27 @@ export const analyzeCommand = async (
                  r.reason AS reason,
                  r.step AS step
         `);
-        return postDerivedRelationRows;
+
+        let cochangeRows: any[] = [];
+        try {
+          const cochangeLimit = Math.max(5000, Math.min(50000, allRepoFiles.length * 20));
+          cochangeRows = await executeQuery(`
+            MATCH (a:File)-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->(b:File)
+            WHERE r.confidence >= 0.5
+            RETURN a.id AS sourceId,
+                   b.id AS targetId,
+                   r.type AS type,
+                   r.confidence AS confidence,
+                   r.reason AS reason,
+                   r.step AS step
+            LIMIT ${cochangeLimit}
+          `);
+        } catch {
+          cochangeRows = [];
+        }
+
+        postDerivedSummaryRelationRows = [...baseRows, ...cochangeRows];
+        return postDerivedSummaryRelationRows;
       };
 
       const evidencePassStartedAt = Date.now();
@@ -2471,7 +2640,7 @@ export const analyzeCommand = async (
           }
         }
 
-        const relationshipRows = await loadPostDerivedRelationRows();
+        const relationshipRows = await loadPostDerivedRelationRows('evidence');
         for (const row of relationshipRows) {
           const sourceId = String(row.sourceId ?? '').trim();
           const targetId = String(row.targetId ?? '').trim();
@@ -2565,7 +2734,7 @@ export const analyzeCommand = async (
           }
         }
 
-        const relationshipRows = await loadPostDerivedRelationRows();
+        const relationshipRows = await loadPostDerivedRelationRows('summary');
         for (const row of relationshipRows) {
           const sourceId = String(row.sourceId ?? '').trim();
           const targetId = String(row.targetId ?? '').trim();
@@ -2682,6 +2851,12 @@ export const analyzeCommand = async (
         mode: incrementalDerivedMode,
         skippedPasses: skippedDerivedPasses,
         adaptiveLowSignal: adaptiveLowSignalChangeSet,
+        recomputed: {
+          communities: recomputeCommunities,
+          processes: recomputeProcesses,
+          autoCommunities: autoRecomputeCommunities && !options?.incrementalRecomputeCommunities,
+          autoProcesses: autoRecomputeProcesses && !options?.incrementalRecomputeProcesses,
+        },
         timingsMs: profileDerivedTimings ? derivedPassTimingsMs : undefined,
       },
     };
@@ -2842,14 +3017,20 @@ export const analyzeCommand = async (
         console.log(`  Brain manifest: ${brainManifestPath}`);
       }
       const derivedParts: string[] = [];
-      if (options?.incrementalRecomputeCommunities) derivedParts.push('communities');
-      if (options?.incrementalRecomputeProcesses) derivedParts.push('processes');
+      if (inc.derived.recomputed.communities) derivedParts.push('communities');
+      if (inc.derived.recomputed.processes) derivedParts.push('processes');
       if (derivedParts.length === 0) {
         console.log(`  Incremental note: communities/processes were not recomputed (use --incremental-recompute-communities / --incremental-recompute-processes, or --force).`);
       } else if (derivedParts.length === 2) {
         console.log(`  Incremental note: communities/processes recomputed.`);
       } else {
         console.log(`  Incremental note: recomputed ${derivedParts.join(' + ')} (use the other --incremental-recompute-* flag, or --force).`);
+      }
+      if (inc.derived.recomputed.autoCommunities || inc.derived.recomputed.autoProcesses) {
+        const autoParts: string[] = [];
+        if (inc.derived.recomputed.autoCommunities) autoParts.push('communities');
+        if (inc.derived.recomputed.autoProcesses) autoParts.push('processes');
+        console.log(`  Incremental adaptive note: auto-recomputed ${autoParts.join(' + ')} for entrypoint-sensitive changes.`);
       }
       if (inc.derived.skippedPasses.length > 0) {
         if (inc.derived.mode === 'adaptive' && inc.derived.adaptiveLowSignal) {
