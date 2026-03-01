@@ -12,7 +12,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 
 import {
   initWikiDb,
@@ -86,6 +86,7 @@ export type ProgressCallback = (phase: string, percent: number, detail?: string)
 
 const DEFAULT_MAX_TOKENS_PER_MODULE = 30_000;
 const WIKI_DIR = 'wiki';
+const GIT_NAME_LIST_MAX_BUFFER = 64 * 1024 * 1024; // 64MB for large change sets
 
 // ─── Generator Class ──────────────────────────────────────────────────
 
@@ -704,7 +705,7 @@ export class WikiGenerator {
 
   private getCurrentCommit(): string {
     try {
-      return execSync('git rev-parse HEAD', { cwd: this.repoPath }).toString().trim();
+      return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: this.repoPath, encoding: 'utf-8' }).trim();
     } catch {
       return '';
     }
@@ -712,10 +713,15 @@ export class WikiGenerator {
 
   private getChangedFiles(fromCommit: string, toCommit: string): string[] {
     try {
-      const output = execSync(
-        `git diff ${fromCommit}..${toCommit} --name-only`,
-        { cwd: this.repoPath },
-      ).toString().trim();
+      const output = execFileSync(
+        'git',
+        ['diff', `${fromCommit}..${toCommit}`, '--name-only'],
+        {
+          cwd: this.repoPath,
+          encoding: 'utf-8',
+          maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
+        },
+      ).trim();
       return output ? output.split('\n').filter(Boolean) : [];
     } catch {
       return [];

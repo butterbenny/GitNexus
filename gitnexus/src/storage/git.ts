@@ -1,10 +1,11 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 
 // Git utilities for repository detection, commit tracking, and diff analysis
+const GIT_NAME_LIST_MAX_BUFFER = 64 * 1024 * 1024; // 64MB for large change sets
 
 export const isGitRepo = (repoPath: string): boolean => {
   try {
-    execSync('git rev-parse --is-inside-work-tree', { cwd: repoPath, stdio: 'ignore' });
+    execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: repoPath, stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -13,7 +14,7 @@ export const isGitRepo = (repoPath: string): boolean => {
 
 export const getCurrentCommit = (repoPath: string): string => {
   try {
-    return execSync('git rev-parse HEAD', { cwd: repoPath }).toString().trim();
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoPath, encoding: 'utf-8' }).trim();
   } catch {
     return '';
   }
@@ -24,9 +25,7 @@ export const getCurrentCommit = (repoPath: string): string => {
  */
 export const getGitRoot = (fromPath: string): string | null => {
   try {
-    return execSync('git rev-parse --show-toplevel', { cwd: fromPath })
-      .toString()
-      .trim();
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: fromPath, encoding: 'utf-8' }).trim();
   } catch {
     return null;
   }
@@ -89,9 +88,11 @@ export const getCommittedFileChanges = (
 ): GitFileChanges => {
   if (!fromCommit || !toCommit || fromCommit === toCommit) return { changed: [], deleted: [] };
   try {
-    const output = execSync(`git diff --name-status -M ${fromCommit}..${toCommit}`, { cwd: repoPath })
-      .toString()
-      .trim();
+    const output = execFileSync('git', ['diff', '--name-status', '-M', `${fromCommit}..${toCommit}`], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
+    }).trim();
     if (!output) return { changed: [], deleted: [] };
     return parseNameStatus(output);
   } catch {
@@ -101,8 +102,11 @@ export const getCommittedFileChanges = (
 
 export const getWorkingTreeFileChanges = (repoPath: string): GitFileChanges => {
   try {
-    const output = execSync('git status --porcelain -z', { cwd: repoPath })
-      .toString();
+    const output = execFileSync('git', ['status', '--porcelain', '-z'], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
+    });
     if (!output) return { changed: [], deleted: [] };
 
     const changed = new Set<string>();

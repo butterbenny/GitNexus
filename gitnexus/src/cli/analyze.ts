@@ -1062,7 +1062,7 @@ export const analyzeCommand = async (
     const autoRecomputeProcesses = incrementalDerivedMode === 'adaptive'
       && shouldRunAdaptiveHeavyPasses
       && recomputeCandidateWindow
-      && entrypointSignalsTouched;
+      && (entrypointSignalsTouched || shapeSignalsTouched);
     const recomputeCommunities = options?.incrementalRecomputeCommunities || autoRecomputeCommunities;
     const recomputeProcesses = options?.incrementalRecomputeProcesses || autoRecomputeProcesses;
 

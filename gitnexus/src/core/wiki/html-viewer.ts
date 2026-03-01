@@ -81,6 +81,7 @@ function buildHTML(
   parts.push('<meta name="viewport" content="width=device-width, initial-scale=1.0">');
   parts.push('<title>' + esc(projectName) + ' — Wiki</title>');
   parts.push('<script src="https://cdn.jsdelivr.net/npm/marked@11.0.0/marked.min.js"><\/script>');
+  parts.push('<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"><\/script>');
   parts.push('<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"><\/script>');
   parts.push('<style>');
   parts.push(CSS);
@@ -210,7 +211,7 @@ const JS_APP = `
   var activePage = 'overview';
 
   document.addEventListener('DOMContentLoaded', function() {
-    mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' });
+    mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'strict' });
     renderMeta();
     renderNav();
     document.getElementById('menu-toggle').addEventListener('click', function() {
@@ -274,6 +275,18 @@ const JS_APP = `
     return d.innerHTML;
   }
 
+  function renderMarkdownSafe(md) {
+    try {
+      var rendered = marked.parse(md);
+      if (typeof DOMPurify === 'object' && DOMPurify && typeof DOMPurify.sanitize === 'function') {
+        return DOMPurify.sanitize(rendered, { USE_PROFILES: { html: true } });
+      }
+    } catch (e) {
+      // Fallback below
+    }
+    return '<pre><code>' + escH(String(md || '')) + '</code></pre>';
+  }
+
   function navigateTo(page) {
     activePage = page;
     location.hash = encodeURIComponent(page);
@@ -295,7 +308,7 @@ const JS_APP = `
       return;
     }
 
-    contentEl.innerHTML = marked.parse(md);
+    contentEl.innerHTML = renderMarkdownSafe(md);
 
     // Rewrite .md links to hash navigation
     var links = contentEl.querySelectorAll('a[href]');

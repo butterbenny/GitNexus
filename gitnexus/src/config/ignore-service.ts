@@ -93,6 +93,7 @@ export const DEFAULT_IGNORE_PATH_SEGMENTS = [
     '.circleci',
     '.gitlab',
     'fixtures',         // Test fixtures
+    'gitnexus-test-setup', // Local integration-fixture corpus
     'snapshots',        // Jest snapshots
     '__snapshots__',
 ];

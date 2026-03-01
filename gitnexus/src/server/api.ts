@@ -27,6 +27,83 @@ export const HTTP_API_TOOL_NAMES = Array.from(
   new Set(GITNEXUS_TOOLS.map(tool => tool.name)),
 );
 const HTTP_API_TOOL_NAME_SET = new Set(HTTP_API_TOOL_NAMES);
+const LOOPBACK_ORIGIN_RE = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d{1,5})?$/i;
+const SEARCH_LIMIT_DEFAULT = 10;
+const SEARCH_LIMIT_MIN = 1;
+const SEARCH_LIMIT_MAX = 200;
+const CYPHER_WRITE_KEYWORDS = [
+  'CREATE',
+  'MERGE',
+  'DELETE',
+  'DETACH',
+  'SET',
+  'REMOVE',
+  'DROP',
+  'ALTER',
+  'COPY',
+  'LOAD',
+  'INSTALL',
+  'UNINSTALL',
+  'INSERT',
+  'UPDATE',
+];
+const buildObfuscatedKeywordPattern = (keyword: string): string => keyword.split('').join('\\s*');
+const CYPHER_WRITE_KEYWORD_RE = new RegExp(
+  `\\b(?:${CYPHER_WRITE_KEYWORDS.map(buildObfuscatedKeywordPattern).join('|')})\\b`,
+);
+
+export function isReadOnlyCypherQuery(query: string): boolean {
+  const stripped = String(query || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/--.*$/gm, ' ')
+    .replace(/\/\/.*$/gm, ' ')
+    .replace(/'([^'\\]|\\.|'')*'/g, "''")
+    .replace(/"([^"\\]|\\.)*"/g, '""')
+    .toUpperCase();
+
+  const statements = stripped
+    .split(';')
+    .map(statement => statement.trim())
+    .filter(Boolean);
+  if (statements.length === 0) return false;
+
+  return statements.every(statement => !CYPHER_WRITE_KEYWORD_RE.test(statement));
+}
+
+export const resolveRepoFilePath = (
+  repoPath: string,
+  rawPath: string,
+): { relativePath: string; absolutePath: string } | null => {
+  const normalizedInput = String(rawPath || '').trim().replace(/\\/g, '/');
+  if (!normalizedInput) return null;
+
+  const absoluteCandidate = path.isAbsolute(normalizedInput)
+    ? normalizedInput
+    : path.join(repoPath, normalizedInput);
+  const relativePath = path.relative(repoPath, absoluteCandidate).replace(/\\/g, '/');
+  if (!relativePath || relativePath.startsWith('..')) return null;
+
+  return {
+    relativePath,
+    absolutePath: path.join(repoPath, relativePath),
+  };
+};
+
+export function isAllowedCorsOrigin(origin: string | undefined): boolean {
+  const normalized = String(origin || '').trim();
+  // Allow CLI/curl/same-origin requests that do not send Origin.
+  if (!normalized) return true;
+  return LOOPBACK_ORIGIN_RE.test(normalized);
+}
+
+export function normalizeSearchLimit(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return SEARCH_LIMIT_DEFAULT;
+  const normalized = Math.trunc(parsed);
+  if (normalized < SEARCH_LIMIT_MIN) return SEARCH_LIMIT_MIN;
+  if (normalized > SEARCH_LIMIT_MAX) return SEARCH_LIMIT_MAX;
+  return normalized;
+}
 
 export async function callHttpApiTool(
   backend: LocalBackend,
@@ -162,7 +239,15 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
 
 export const createServer = async (port: number) => {
   const app = express();
-  app.use(cors());
+  app.use(cors({
+    origin: (origin, callback) => {
+      if (isAllowedCorsOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error('CORS origin not allowed'));
+    },
+  }));
   app.use(express.json({ limit: '10mb' }));
   const backend = new LocalBackend();
   await backend.init();
@@ -220,8 +305,23 @@ export const createServer = async (port: number) => {
       return;
     }
     await initKuzu(repo.kuzuPath);
-    const result = await executeQuery(req.body.cypher);
-    res.json({ result });
+
+    const query = String(req.body?.cypher || '').trim();
+    if (!query) {
+      res.status(400).json({ error: 'Missing cypher query' });
+      return;
+    }
+    if (!isReadOnlyCypherQuery(query)) {
+      res.status(400).json({ error: 'Cypher write operations are disabled for safety. Use read-only queries.' });
+      return;
+    }
+
+    try {
+      const result = await executeQuery(query);
+      res.json({ result });
+    } catch (error: any) {
+      res.status(400).json({ error: String(error?.message || error || 'Query failed') });
+    }
   });
 
   // Read evidence span sidecar
@@ -267,8 +367,8 @@ export const createServer = async (port: number) => {
     }
     await initKuzu(repo.kuzuPath);
 
-    const query = req.body.query ?? '';
-    const limit = req.body.limit ?? 10;
+    const query = String(req.body?.query ?? '');
+    const limit = normalizeSearchLimit(req.body?.limit);
 
     if (isEmbedderReady()) {
       const results = await hybridSearch(query, limit, executeQuery, semanticSearch);
@@ -293,9 +393,19 @@ export const createServer = async (port: number) => {
       res.status(400).json({ error: 'Missing path' });
       return;
     }
-    const fullPath = path.join(repo.repoPath, filePath);
-    const content = await fs.readFile(fullPath, 'utf-8');
-    res.json({ content });
+
+    const resolved = resolveRepoFilePath(repo.repoPath, filePath);
+    if (!resolved) {
+      res.status(400).json({ error: 'path must resolve inside the indexed repository root' });
+      return;
+    }
+
+    try {
+      const content = await fs.readFile(resolved.absolutePath, 'utf-8');
+      res.json({ content, filePath: resolved.relativePath });
+    } catch (error: any) {
+      res.status(404).json({ error: String(error?.message || error || 'Unable to read file') });
+    }
   });
 
   const server = app.listen(port, () => {

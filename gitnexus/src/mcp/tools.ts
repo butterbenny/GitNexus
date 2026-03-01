@@ -413,9 +413,10 @@ AFTER THIS: Use context()/impact() on the high-signal symbols the contract point
   },
   {
     name: 'cypher',
-    description: `Execute Cypher query against the code knowledge graph.
+    description: `Execute a read-only Cypher query against the code knowledge graph.
 
 WHEN TO USE: Complex structural queries that search/explore can't answer. READ gitnexus://repo/{name}/schema first for the full schema.
+SAFETY: Write operations (CREATE/MERGE/DELETE/SET/etc.) are blocked in this tool.
 AFTER THIS: Use context() on result symbols for deeper context.
 
 SCHEMA:

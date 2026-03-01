@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { generateId } from '../../lib/utils.js';
 import { GraphRelationship } from '../graph/types.js';
 
@@ -233,8 +233,9 @@ export const processGitHistoryCochange = async (
   let gitLogOutput = String(options.gitLogOutput || '');
   if (!gitLogOutput) {
     try {
-      gitLogOutput = execSync(
-        `git log --name-only --pretty=format:${COMMIT_MARKER} -n ${maxCommits}`,
+      gitLogOutput = execFileSync(
+        'git',
+        ['log', '--name-only', `--pretty=format:${COMMIT_MARKER}`, '-n', String(maxCommits)],
         {
           cwd: repoPath,
           encoding: 'utf-8',

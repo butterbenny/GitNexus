@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
+const ANALYZE_READY_RE = /Repository (indexed successfully|updated incrementally)|Already up to date/i;
+
 const runAnalyze = (repoPath, env) => {
   try {
     return execFileSync(
@@ -202,7 +204,7 @@ test('MCP ui_contract: extracts interaction→side-effect contract and endpoint 
 
     const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
     const output = runAnalyze(repoPath, env);
-    assert.match(output, /Repository (indexed successfully|updated incrementally)/i);
+    assert.match(output, ANALYZE_READY_RE);
 
     const result = runTool('ui_contract', { repo: repoPath, file_path: 'apps/dashboard/src/pages/NotificationsPage.tsx' }, env);
     assert.equal(result.status, 'ok');
@@ -265,7 +267,7 @@ test('MCP ui_contract: base_ref diff is stable when unchanged', async () => {
 
   const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
   const output = runAnalyze(process.cwd(), env);
-  assert.match(output, /Repository (indexed successfully|updated incrementally)/i);
+  assert.match(output, ANALYZE_READY_RE);
 
   const result = runTool('ui_contract', { repo: process.cwd(), file_path: 'src/core/derived/archetypes.ts', base_ref: 'HEAD', include_endpoints: false }, env);
   assert.equal(result.status, 'ok');

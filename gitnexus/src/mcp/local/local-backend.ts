@@ -52,6 +52,28 @@ import { GITNEXUS_TOOLS } from '../tools.js';
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
 const MCP_TOOL_NAME_SET = new Set(GITNEXUS_TOOLS.map(tool => tool.name));
+const GIT_NAME_LIST_MAX_BUFFER = 64 * 1024 * 1024; // 64MB for large working trees/monorepos
+const GIT_PATCH_MAX_BUFFER = 128 * 1024 * 1024; // 128MB for large compare/all diffs
+const CYPHER_WRITE_KEYWORDS = [
+  'CREATE',
+  'MERGE',
+  'DELETE',
+  'DETACH',
+  'SET',
+  'REMOVE',
+  'DROP',
+  'ALTER',
+  'COPY',
+  'LOAD',
+  'INSTALL',
+  'UNINSTALL',
+  'INSERT',
+  'UPDATE',
+];
+const buildObfuscatedKeywordPattern = (keyword: string): string => keyword.split('').join('\\s*');
+const CYPHER_WRITE_KEYWORD_RE = new RegExp(
+  `\\b(?:${CYPHER_WRITE_KEYWORDS.map(buildObfuscatedKeywordPattern).join('|')})\\b`,
+);
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -78,6 +100,28 @@ function normalizeRepoRelativePath(value: string): string {
     .replace(/\\/g, '/')
     .replace(/^\.\/+/, '')
     .replace(/^\/+/, '');
+}
+
+export function resolvePathInsideRepo(
+  repoPath: string,
+  rawPath: string,
+): { relativePath: string; absolutePath: string } | null {
+  const input = String(rawPath || '').trim();
+  if (!input) return null;
+
+  const absoluteCandidate = path.isAbsolute(input)
+    ? path.resolve(input)
+    : path.resolve(repoPath, input);
+  const relativePath = path.relative(repoPath, absoluteCandidate).replace(/\\/g, '/');
+  if (!relativePath || relativePath.startsWith('..')) return null;
+
+  const normalizedRelativePath = normalizeRepoRelativePath(relativePath);
+  if (!normalizedRelativePath || normalizedRelativePath.startsWith('..')) return null;
+
+  return {
+    relativePath: normalizedRelativePath,
+    absolutePath: path.join(repoPath, normalizedRelativePath),
+  };
 }
 
 function normalizePathPrefix(repoPath: string, value: string): string {
@@ -158,6 +202,33 @@ function parseStringList(value: unknown): string[] {
   );
 }
 
+function normalizeSliceStencilToken(value: unknown): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.replace(/^['"`]+|['"`]+$/g, '').trim();
+}
+
+function normalizeSliceStencilTokens(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeSliceStencilToken(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function missingRequiredSlotSeverity(missingRequiredSlots: string[], deterministic: boolean, pattern: boolean): 'high' | 'medium' | 'low' {
+  const missing = new Set(normalizeSliceStencilTokens(missingRequiredSlots));
+  const missesCriticalSlots = missing.has('anchor') || missing.has('handler');
+  if (deterministic) return missesCriticalSlots ? 'high' : 'medium';
+  if (pattern) return missesCriticalSlots ? 'medium' : 'low';
+  return 'low';
+}
+
 function primaryNodeLabel(value: unknown): string {
   if (Array.isArray(value)) return String(value[0] ?? '').trim();
   return String(value ?? '').trim();
@@ -213,6 +284,24 @@ function clampInteger(value: unknown, fallback: number, min: number, max: number
   if (normalized < min) return min;
   if (normalized > max) return max;
   return normalized;
+}
+
+function isReadOnlyCypherQuery(query: string): boolean {
+  const stripped = String(query || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/--.*$/gm, ' ')
+    .replace(/\/\/.*$/gm, ' ')
+    .replace(/'([^'\\]|\\.|'')*'/g, "''")
+    .replace(/"([^"\\]|\\.)*"/g, '""')
+    .toUpperCase();
+
+  const statements = stripped
+    .split(';')
+    .map(statement => statement.trim())
+    .filter(Boolean);
+  if (statements.length === 0) return false;
+
+  return statements.every(statement => !CYPHER_WRITE_KEYWORD_RE.test(statement));
 }
 
 /** Valid KuzuDB node labels for safe Cypher query construction */
@@ -3166,8 +3255,8 @@ export class LocalBackend {
               anchorName: String(row.anchorName ?? row[4] ?? '').trim(),
               sliceType: String(row.sliceType ?? row[5] ?? '').trim(),
               closureScore: toFiniteNumber(row.closureScore ?? row[6], 0),
-              closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
-              closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+              closureSlots: normalizeSliceStencilTokens(parseStringList(row.closureSlots)),
+              closedSlots: normalizeSliceStencilTokens(parseStringList(row.closedSlots)),
               score: 0,
               roles: new Set<string>(),
               members: new Map(),
@@ -5236,15 +5325,16 @@ export class LocalBackend {
         .slice(0, 3);
 
       for (const filePath of tsLikeFiles) {
-        const fullPath = path.join(repo.repoPath, filePath);
+        const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
+        if (!resolved) continue;
         let content: string;
         try {
-          content = await fs.readFile(fullPath, 'utf-8');
+          content = await fs.readFile(resolved.absolutePath, 'utf-8');
         } catch {
           continue;
         }
 
-        const card = await extractUiContractCard(filePath, content);
+        const card = await extractUiContractCard(resolved.relativePath, content);
         const cacheLinks = Array.isArray((card as any)?.cacheLinks) ? (card as any).cacheLinks : [];
         const queries = Array.isArray((card as any)?.queries) ? (card as any).queries : [];
         const cacheCoverage = Array.isArray((card as any)?.cacheCoverage) ? (card as any).cacheCoverage : [];
@@ -5566,7 +5656,7 @@ export class LocalBackend {
             let best: any = null;
             let bestScore = -1;
             for (const template of templates) {
-              const requiredSlots = Array.isArray(template.requiredSlots) ? template.requiredSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [];
+              const requiredSlots = normalizeSliceStencilTokens(parseStringList(template.requiredSlots));
               const templateRoles = Array.isArray(template.roleCoverage)
                 ? template.roleCoverage.map((item: any) => String(item?.role || '').trim()).filter(Boolean)
                 : [];
@@ -5582,7 +5672,7 @@ export class LocalBackend {
             }
 
             if (best) {
-              const requiredSlots = Array.isArray(best.requiredSlots) ? best.requiredSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [];
+              const requiredSlots = normalizeSliceStencilTokens(parseStringList(best.requiredSlots));
               const roleExpectations = Array.isArray(best.roleCoverage)
                 ? best.roleCoverage
                   .map((item: any) => ({
@@ -5598,7 +5688,7 @@ export class LocalBackend {
                 template_key: String(best.templateKey || '').trim(),
                 slice_type: String(best.sliceType || '').trim(),
                 required_slots: requiredSlots,
-                optional_slots: Array.isArray(best.optionalSlots) ? best.optionalSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [],
+                optional_slots: normalizeSliceStencilTokens(parseStringList(best.optionalSlots)),
                 role_expectations: roleExpectations,
                 avg_closure_score: toFiniteNumber(best.avgClosureScore, 0),
                 slice_count: toFiniteNumber(best.sliceCount, 0),
@@ -5898,17 +5988,12 @@ export class LocalBackend {
     const rawPath = String(params.file_path || '').trim();
     if (!rawPath) return { error: 'file_path is required and cannot be empty.' };
 
-    const normalizedInput = rawPath.replace(/\\/g, '/');
-    const absPath = path.isAbsolute(normalizedInput)
-      ? normalizedInput
-      : path.join(repo.repoPath, normalizedInput);
-
-    const relativePath = path.relative(repo.repoPath, absPath).replace(/\\/g, '/');
-    if (!relativePath || relativePath.startsWith('..')) {
+    const resolvedPath = resolvePathInsideRepo(repo.repoPath, rawPath);
+    if (!resolvedPath) {
       return { error: `file_path must be inside the repo (${repo.repoPath})` };
     }
-
-    const fullPath = path.join(repo.repoPath, relativePath);
+    const relativePath = resolvedPath.relativePath;
+    const fullPath = resolvedPath.absolutePath;
 
     let content: string;
     try {
@@ -6608,7 +6693,7 @@ export class LocalBackend {
         const output = execFileSync('git', ['status', '--porcelain'], {
           cwd: repo.repoPath,
           encoding: 'utf-8',
-          maxBuffer: 1024 * 1024 * 5,
+          maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
         });
         return String(output || '')
           .split('\n')
@@ -6698,7 +6783,11 @@ export class LocalBackend {
     let effectiveScope: 'unstaged' | 'staged' | 'all' | 'compare' = scope;
     let diffSource = 'requested';
     try {
-      const output = execFileSync('git', buildDiffArgs(false), { cwd: repo.repoPath, encoding: 'utf-8' });
+      const output = execFileSync('git', buildDiffArgs(false), {
+        cwd: repo.repoPath,
+        encoding: 'utf-8',
+        maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
+      });
       changedFilesRaw = String(output || '').trim().split('\n').map(s => s.trim()).filter(Boolean);
     } catch (err: any) {
       return { error: `Git diff failed: ${err?.message || 'unknown error'}` };
@@ -6708,7 +6797,11 @@ export class LocalBackend {
     // Fallback to HEAD diff so review_mode remains useful instead of returning an empty review envelope.
     if (scope === 'compare' && changedFilesRaw.length === 0) {
       try {
-        const output = execFileSync('git', buildDiffArgs(false, 'all'), { cwd: repo.repoPath, encoding: 'utf-8' });
+        const output = execFileSync('git', buildDiffArgs(false, 'all'), {
+          cwd: repo.repoPath,
+          encoding: 'utf-8',
+          maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
+        });
         const fallbackFiles = String(output || '').trim().split('\n').map(s => s.trim()).filter(Boolean);
         if (fallbackFiles.length > 0) {
           changedFilesRaw = fallbackFiles;
@@ -6816,7 +6909,7 @@ export class LocalBackend {
       patch = execFileSync('git', buildDiffArgs(true, effectiveScope), {
         cwd: repo.repoPath,
         encoding: 'utf-8',
-        maxBuffer: 1024 * 1024 * 20, // 20MB
+        maxBuffer: GIT_PATCH_MAX_BUFFER,
       });
     } catch (err: any) {
       return { error: `Git diff patch failed: ${err?.message || 'unknown error'}` };
@@ -7671,8 +7764,8 @@ export class LocalBackend {
               anchorId: String(row.anchorId ?? row[4] ?? '').trim(),
               anchorName: String(row.anchorName ?? row[5] ?? '').trim(),
               closureScore: toFiniteNumber(row.closureScore ?? row[6], 0),
-              closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
-              closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+              closureSlots: normalizeSliceStencilTokens(parseStringList(row.closureSlots)),
+              closedSlots: normalizeSliceStencilTokens(parseStringList(row.closedSlots)),
               roles: new Set<string>(),
               changedMembers: [],
               gapSignals: {
@@ -7795,7 +7888,7 @@ export class LocalBackend {
             let bestTemplate: any = null;
             let bestScore = -1;
             for (const template of templates) {
-              const requiredSlots = Array.isArray(template.requiredSlots) ? template.requiredSlots.map((value: any) => String(value || '').trim()).filter(Boolean) : [];
+              const requiredSlots = normalizeSliceStencilTokens(parseStringList(template.requiredSlots));
               const roleExpectations = Array.isArray(template.roleCoverage) ? template.roleCoverage : [];
               const templateRoles = roleExpectations.map((role: any) => String(role?.role || '').trim()).filter(Boolean);
               const requiredHits = requiredSlots.filter(slot => closedSlotSet.has(slot)).length;
@@ -7812,12 +7905,8 @@ export class LocalBackend {
 
             if (!bestTemplate) continue;
 
-            const requiredSlots = Array.isArray(bestTemplate.requiredSlots)
-              ? bestTemplate.requiredSlots.map((value: any) => String(value || '').trim()).filter(Boolean)
-              : [];
-            const optionalSlots = Array.isArray(bestTemplate.optionalSlots)
-              ? bestTemplate.optionalSlots.map((value: any) => String(value || '').trim()).filter(Boolean)
-              : [];
+            const requiredSlots = normalizeSliceStencilTokens(parseStringList(bestTemplate.requiredSlots));
+            const optionalSlots = normalizeSliceStencilTokens(parseStringList(bestTemplate.optionalSlots));
             const roleExpectations = Array.isArray(bestTemplate.roleCoverage)
               ? bestTemplate.roleCoverage
                 .map((item: any) => ({
@@ -7896,7 +7985,7 @@ export class LocalBackend {
                 heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
                 anchorName: String(row.anchorName ?? row[3] ?? '').trim(),
                 closureScore: toFiniteNumber(row.closureScore ?? row[4], 0),
-                closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
+                closedSlots: normalizeSliceStencilTokens(parseStringList(row.closedSlots)),
                 roles: new Set<string>(),
               });
               const reasons = Array.isArray(row.memberRoleReasons) ? row.memberRoleReasons : [];
@@ -8417,6 +8506,7 @@ export class LocalBackend {
 
     const ROUTE_FILE_PATH_RE = /(^|\/)routes\/[^/]+\.php$/i;
     const route_targets: any[] = [];
+    const routeFilesWithEndpointSurfaces = new Set<string>();
     const routeFiles = changedFileObjs
       .map(file => normalizePath(file.filePath))
       .filter(filePath => !!filePath)
@@ -8430,10 +8520,9 @@ export class LocalBackend {
       let routeRows: any[] = [];
       try {
         routeRows = await executeQuery(repo.id, `
-          MATCH (f:File)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
+          MATCH (f)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
           WHERE f.filePath IN ${routeFilesCypher}
-            AND r.reason STARTS WITH 'laravel-route'
-            AND r.confidence >= ${minConfidence}
+            AND r.reason CONTAINS 'laravel-route'
           OPTIONAL MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
           RETURN f.filePath AS routeFilePath,
                  m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
@@ -8444,6 +8533,22 @@ export class LocalBackend {
         `);
       } catch {
         routeRows = [];
+      }
+
+      try {
+        const routeEndpointRows = await executeQuery(repo.id, `
+          MATCH (c:CodeElement)
+          WHERE c.filePath IN ${routeFilesCypher}
+            AND c.name STARTS WITH 'endpoint:'
+          RETURN DISTINCT c.filePath AS routeFilePath
+          LIMIT ${Math.max(40, Math.min(2000, routeFiles.length * 20))}
+        `);
+        for (const row of routeEndpointRows) {
+          const routeFilePath = normalizePath(String(row.routeFilePath || row[0] || ''));
+          if (routeFilePath) routeFilesWithEndpointSurfaces.add(routeFilePath);
+        }
+      } catch {
+        // best-effort endpoint-surface hint
       }
 
       const rowsByRouteFile = new Map<string, any[]>();
@@ -9193,16 +9298,22 @@ export class LocalBackend {
       if (missingRequiredSlots.length > 0) {
         const deterministic = toFiniteNumber(sliceEntry?.gap_signals?.deterministic, 0) > 0;
         const pattern = toFiniteNumber(sliceEntry?.gap_signals?.pattern, 0) > 0;
+        const severity = missingRequiredSlotSeverity(missingRequiredSlots, deterministic, pattern);
+        const confidence = severity === 'high'
+          ? 0.95
+          : severity === 'medium'
+            ? (deterministic ? 0.9 : 0.82)
+            : 0.75;
         addReviewFinding(reviewFindings, {
           code: 'slice-missing-required-slots',
-          severity: deterministic ? 'high' : 'medium',
+          severity,
           summary: `Slice ${String(sliceEntry?.slice?.label || sliceEntry?.slice?.heuristicLabel || sliceEntry?.slice?.id || '').trim() || '<unknown>'} is missing required slots: ${missingRequiredSlots.join(', ')}.`,
           reason: deterministic
             ? 'slice-stencil:deterministic-missing-required-slots'
             : pattern
               ? 'slice-stencil:pattern-missing-required-slots'
               : 'slice-stencil:heuristic-missing-required-slots',
-          confidence: deterministic ? 0.95 : pattern ? 0.9 : 0.8,
+          confidence,
           evidence: {
             filePath,
             symbol: changedMember
@@ -9244,12 +9355,17 @@ export class LocalBackend {
       if (!routeFile) continue;
       const firstTarget = Array.isArray(route?.targets) ? route.targets[0] : null;
       if (!firstTarget) {
+        const hasEndpointSurface = routeFilesWithEndpointSurfaces.has(routeFile);
         addReviewFinding(reviewFindings, {
-          code: 'route-target-missing',
-          severity: 'high',
-          summary: `Route file changed without resolved controller target: ${routeFile}.`,
-          reason: 'route-file-without-controller-wiring',
-          confidence: 0.92,
+          code: hasEndpointSurface ? 'route-target-unresolved' : 'route-target-missing',
+          severity: hasEndpointSurface ? 'medium' : 'high',
+          summary: hasEndpointSurface
+            ? `Route file changed with endpoint surfaces but without resolved controller target: ${routeFile}.`
+            : `Route file changed without resolved controller target: ${routeFile}.`,
+          reason: hasEndpointSurface
+            ? 'route-file-endpoint-surface-without-controller-wiring'
+            : 'route-file-without-controller-wiring',
+          confidence: hasEndpointSurface ? 0.82 : 0.92,
           evidence: { filePath: routeFile },
         }, findingDedupe);
         continue;
@@ -10205,10 +10321,11 @@ export class LocalBackend {
     const scanTargets = Array.from(scanFileSet).slice(0, 10);
     const scanContents = await Promise.all(
       scanTargets.map(async (filePath) => {
-        const fullPath = path.join(repo.repoPath, filePath);
+        const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
+        if (!resolved) return null;
         try {
-          const content = await fs.readFile(fullPath, 'utf-8');
-          return { filePath, content };
+          const content = await fs.readFile(resolved.absolutePath, 'utf-8');
+          return { filePath: resolved.relativePath, content };
         } catch {
           return null;
         }
@@ -10575,9 +10692,19 @@ export class LocalBackend {
     if (!isKuzuReady(repo.id)) {
       return { error: 'KuzuDB not ready. Index may be corrupted.' };
     }
+
+    const query = String(params.query || '').trim();
+    if (!query) {
+      return { error: 'query parameter is required and cannot be empty.' };
+    }
+    if (!isReadOnlyCypherQuery(query)) {
+      return {
+        error: 'Cypher write operations are disabled for safety. Use read-only queries.',
+      };
+    }
     
     try {
-      const result = await executeQuery(repo.id, params.query);
+      const result = await executeQuery(repo.id, query);
       return result;
     } catch (err: any) {
       return { error: err.message || 'Query failed' };
@@ -10977,6 +11104,7 @@ export class LocalBackend {
       const output = execFileSync('git', buildDiffArgs(), {
         cwd: repo.repoPath,
         encoding: 'utf-8',
+        maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
       });
       for (const filePath of parseLines(output)) {
         changedFileStatus.set(filePath, 'Modified');
@@ -10991,6 +11119,7 @@ export class LocalBackend {
         const statusOutput = execFileSync('git', ['status', '--porcelain'], {
           cwd: repo.repoPath,
           encoding: 'utf-8',
+          maxBuffer: GIT_NAME_LIST_MAX_BUFFER,
         });
         for (const line of String(statusOutput || '').split('\n')) {
           if (!line.startsWith('?? ')) continue;
@@ -11186,11 +11315,13 @@ export class LocalBackend {
     // The definition itself
     if (sym.filePath && sym.startLine) {
       try {
-        const content = await fs.readFile(path.join(repo.repoPath, sym.filePath), 'utf-8');
+        const resolved = resolvePathInsideRepo(repo.repoPath, sym.filePath);
+        if (!resolved) throw new Error('symbol file path resolved outside repo');
+        const content = await fs.readFile(resolved.absolutePath, 'utf-8');
         const lines = content.split('\n');
         const lineIdx = sym.startLine - 1;
         if (lineIdx >= 0 && lineIdx < lines.length && lines[lineIdx].includes(oldName)) {
-          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(makeWordRegex(true), new_name).trim(), 'graph');
+          addEdit(resolved.relativePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(makeWordRegex(true), new_name).trim(), 'graph');
         }
       } catch { /* skip */ }
     }
@@ -11204,15 +11335,23 @@ export class LocalBackend {
     ];
     
     let graphEdits = changes.size > 0 ? 1 : 0; // count definition edit
+    const graphFiles = new Set<string>();
+    if (sym.filePath) {
+      const resolved = resolvePathInsideRepo(repo.repoPath, sym.filePath);
+      if (resolved) graphFiles.add(resolved.relativePath);
+    }
     
     for (const ref of allIncoming) {
       if (!ref.filePath) continue;
       try {
-        const content = await fs.readFile(path.join(repo.repoPath, ref.filePath), 'utf-8');
+        const resolved = resolvePathInsideRepo(repo.repoPath, ref.filePath);
+        if (!resolved) continue;
+        graphFiles.add(resolved.relativePath);
+        const content = await fs.readFile(resolved.absolutePath, 'utf-8');
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].includes(oldName)) {
-            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(makeWordRegex(true), new_name).trim(), 'graph');
+            addEdit(resolved.relativePath, i + 1, lines[i].trim(), lines[i].replace(makeWordRegex(true), new_name).trim(), 'graph');
             graphEdits++;
             break; // one edit per file from graph refs
           }
@@ -11222,7 +11361,6 @@ export class LocalBackend {
     
     // Step 3: Text search for refs the graph might have missed
     let astSearchEdits = 0;
-    const graphFiles = new Set([sym.filePath, ...allIncoming.map(r => r.filePath)].filter(Boolean));
     
     // Simple text search across the repo for the old name (in files not already covered by graph)
     try {
@@ -11239,15 +11377,17 @@ export class LocalBackend {
       
       for (const file of files) {
         const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
-        if (graphFiles.has(normalizedFile)) continue; // already covered by graph
+        const resolved = resolvePathInsideRepo(repo.repoPath, normalizedFile);
+        if (!resolved) continue;
+        if (graphFiles.has(resolved.relativePath)) continue; // already covered by graph
         
         try {
-          const content = await fs.readFile(path.join(repo.repoPath, normalizedFile), 'utf-8');
+          const content = await fs.readFile(resolved.absolutePath, 'utf-8');
           const lines = content.split('\n');
           const searchRegex = makeWordRegex(false);
           for (let i = 0; i < lines.length; i++) {
             if (searchRegex.test(lines[i])) {
-              addEdit(normalizedFile, i + 1, lines[i].trim(), lines[i].replace(makeWordRegex(true), new_name).trim(), 'text_search');
+              addEdit(resolved.relativePath, i + 1, lines[i].trim(), lines[i].replace(makeWordRegex(true), new_name).trim(), 'text_search');
               astSearchEdits++;
             }
           }
@@ -11263,11 +11403,12 @@ export class LocalBackend {
       // Apply edits to files
       for (const change of allChanges) {
         try {
-          const fullPath = path.join(repo.repoPath, change.file_path);
-          let content = await fs.readFile(fullPath, 'utf-8');
+          const resolved = resolvePathInsideRepo(repo.repoPath, change.file_path);
+          if (!resolved) continue;
+          let content = await fs.readFile(resolved.absolutePath, 'utf-8');
           const regex = makeWordRegex(true);
           content = content.replace(regex, new_name);
-          await fs.writeFile(fullPath, content, 'utf-8');
+          await fs.writeFile(resolved.absolutePath, content, 'utf-8');
         } catch { /* skip failed files */ }
       }
     }
@@ -11701,3 +11842,10 @@ export class LocalBackend {
     this.initializedRepos.clear();
   }
 }
+
+export const __reviewModeInternals = {
+  parseStringList,
+  normalizeSliceStencilToken,
+  normalizeSliceStencilTokens,
+  missingRequiredSlotSeverity,
+};
