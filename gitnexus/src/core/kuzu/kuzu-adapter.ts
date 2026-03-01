@@ -16,6 +16,7 @@ import type { RefreshLockLease } from '../../storage/refresh-lock.js';
 let db: kuzu.Database | null = null;
 let conn: kuzu.Connection | null = null;
 let refreshLockLease: RefreshLockLease | null = null;
+let ftsExtensionLoadAttempted = false;
 
 const REFRESH_LOCK_TIMEOUT_MS = Math.max(1_000, Number(process.env.GITNEXUS_REFRESH_LOCK_TIMEOUT_MS ?? 180_000));
 const REFRESH_LOCK_POLL_MS = Math.max(100, Number(process.env.GITNEXUS_REFRESH_LOCK_POLL_MS ?? 1_000));
@@ -115,6 +116,7 @@ export const initKuzu = async (dbPath: string) => {
     try { await db?.close(); } catch {}
     conn = null;
     db = null;
+    ftsExtensionLoadAttempted = false;
     if (refreshLockLease) {
       try { await refreshLockLease.release(); } catch {}
       refreshLockLease = null;
@@ -640,6 +642,7 @@ export const closeKuzu = async (): Promise<void> => {
     } catch {}
     refreshLockLease = null;
   }
+  ftsExtensionLoadAttempted = false;
 };
 
 export const isKuzuReady = (): boolean => conn !== null && db !== null;
@@ -848,9 +851,15 @@ export const loadFTSExtension = async (): Promise<void> => {
   if (!conn) {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');
   }
+  if (ftsExtensionLoadAttempted) return;
+  ftsExtensionLoadAttempted = true;
   try {
     const installResult = await conn.query('INSTALL fts');
     await closeQueryResults(installResult);
+  } catch {
+    // Extension may already be installed
+  }
+  try {
     const loadResult = await conn.query('LOAD EXTENSION fts');
     await closeQueryResults(loadResult);
   } catch {

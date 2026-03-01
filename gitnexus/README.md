@@ -142,7 +142,8 @@ gitnexus setup                    # Configure MCP for your editors (one-time)
 gitnexus analyze [path]           # Index a repository (or update stale index)
 gitnexus analyze --force          # Force full re-index
 gitnexus analyze --skip-embeddings  # Skip embedding generation (faster)
-gitnexus analyze --incremental-derived fast  # Faster incremental refresh (skips expensive derived passes)
+gitnexus analyze --incremental-derived adaptive  # Default: skips heavy derived passes only on low-signal changes
+gitnexus analyze --incremental-derived fast  # Fastest incremental refresh (skips expensive derived passes)
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start HTTP server for web UI
 gitnexus list                    # List all indexed repositories

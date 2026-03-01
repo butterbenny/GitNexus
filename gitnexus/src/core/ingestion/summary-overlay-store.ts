@@ -7,6 +7,12 @@ import {
 } from './summary-overlay-processor.js';
 
 const SUMMARY_OVERLAY_FILE_NAME = 'summary-overlays.json';
+type StructuredSummaryCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  snapshot: StructuredSummaryOverlaySnapshot;
+};
+const structuredSummaryCache = new Map<string, StructuredSummaryCacheEntry>();
 
 const SUMMARY_LEVELS: StructuredSummaryLevel[] = [
   'symbol',
@@ -139,10 +145,23 @@ export const loadStructuredSummarySnapshot = async (
 ): Promise<StructuredSummaryOverlaySnapshot> => {
   const filePath = getStructuredSummarySnapshotPath(storagePath);
   try {
+    const stat = await fs.stat(filePath);
+    const cached = structuredSummaryCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.snapshot;
+    }
+
     const raw = await fs.readFile(filePath, 'utf-8');
     const parsed = JSON.parse(raw);
-    return sanitizeSnapshot(parsed);
+    const snapshot = sanitizeSnapshot(parsed);
+    structuredSummaryCache.set(filePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      snapshot,
+    });
+    return snapshot;
   } catch {
+    structuredSummaryCache.delete(filePath);
     return makeEmptySnapshot();
   }
 };

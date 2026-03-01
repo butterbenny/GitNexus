@@ -68,6 +68,7 @@ import { processBladeTemplatesIncremental } from '../core/ingestion/blade-templa
 import { processMjmlIncludes } from '../core/ingestion/mjml-template-processor.js';
 import { processBladeAuthorization } from '../core/ingestion/blade-auth-processor.js';
 import { getLanguageFromFilename } from '../core/ingestion/utils.js';
+import { BrainKernel } from '../core/brain/kernel.js';
 
 export interface AnalyzeOptions {
   force?: boolean;
@@ -86,11 +87,12 @@ export interface AnalyzeOptions {
   incrementalDerivedMode?: string;
 }
 
-type IncrementalDerivedMode = 'full' | 'fast';
+type IncrementalDerivedMode = 'full' | 'adaptive' | 'fast';
 
 const normalizeIncrementalDerivedMode = (value?: string): IncrementalDerivedMode => {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'fast') return 'fast';
+  if (normalized === 'adaptive') return 'adaptive';
   return 'full';
 };
 
@@ -99,6 +101,15 @@ const EMBEDDING_NODE_LIMIT = 50_000;
 const INCREMENTAL_MAX_CHANGES_DEFAULT = 500;
 const INCREMENTAL_MAX_CHANGES_CAP = 5_000;
 const INCREMENTAL_MAX_CHANGES_FRACTION_OF_FILES = 0.2;
+const FTS_INDEX_TARGETS: Array<{ table: string; index: string; properties: string[] }> = [
+  { table: 'File', index: 'file_fts', properties: ['name', 'content'] },
+  { table: 'Function', index: 'function_fts', properties: ['name', 'content'] },
+  { table: 'Class', index: 'class_fts', properties: ['name', 'content'] },
+  { table: 'Method', index: 'method_fts', properties: ['name', 'content'] },
+  { table: 'Interface', index: 'interface_fts', properties: ['name', 'content'] },
+  { table: 'CodeElement', index: 'codeelement_fts', properties: ['name', 'content'] },
+  { table: 'Const', index: 'const_fts', properties: ['name', 'content'] },
+];
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -157,10 +168,48 @@ export const analyzeCommand = async (
   const existingMeta = await loadMeta(storagePath);
   const existingSchemaVersion = existingMeta?.kuzuSchemaVersion ?? 1;
   const schemaMismatch = existingMeta !== null && existingSchemaVersion !== KUZU_SCHEMA_VERSION;
+  const ftsSchemaVersion = Number(existingMeta?.ftsSchemaVersion || 0);
+  const shouldEnsureFtsIndexes = !existingMeta || schemaMismatch || ftsSchemaVersion !== KUZU_SCHEMA_VERSION;
   const precisionOverlayMode = normalizePrecisionOverlayMode(options?.precisionOverlay);
   const incrementalDerivedMode = normalizeIncrementalDerivedMode(
     options?.incrementalDerivedMode ?? (options as any)?.incrementalDerived,
   );
+
+  const ensureFtsIndexes = async (): Promise<string> => {
+    const t0Fts = Date.now();
+    try {
+      for (const target of FTS_INDEX_TARGETS) {
+        await createFTSIndex(target.table, target.index, target.properties);
+      }
+    } catch {
+      // Best effort: FTS is optional for successful indexing.
+    }
+    return ((Date.now() - t0Fts) / 1000).toFixed(1);
+  };
+
+  const runBrainKernelTick = async (
+    metaForTick: { lastCommit?: string },
+    warnings: string[],
+    changedPaths: string[] = [],
+  ): Promise<string | null> => {
+    try {
+      const kernel = new BrainKernel();
+      const tickResult = await kernel.tick({
+        reason: 'analyze',
+        repoPath,
+        storagePath,
+        repoFingerprint: String(metaForTick.lastCommit || currentCommit || 'HEAD'),
+        graphVersion: String(KUZU_SCHEMA_VERSION),
+        plannerPolicyVersion: 'rule-baseline-v1',
+        changedPaths,
+      });
+      return tickResult.manifestPath;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      warnings.push(`BrainKernel tick skipped (${message.slice(0, 120)})`);
+      return null;
+    }
+  };
 
   const rawChanges = existingMeta && !options?.force
     ? mergeGitFileChanges(
@@ -394,6 +443,8 @@ export const analyzeCommand = async (
     derived: {
       mode: IncrementalDerivedMode;
       skippedPasses: string[];
+      adaptiveLowSignal: boolean;
+      timingsMs?: Record<string, number>;
     };
   }> => {
     const debugEnabled = process.env.GITNEXUS_DEBUG_INCREMENTAL === '1';
@@ -406,6 +457,15 @@ export const analyzeCommand = async (
     bar.update(1, { phase: 'Incremental: scanning repo files...' });
     debug('start');
     const skippedDerivedPasses: string[] = [];
+    const profileDerivedTimings = process.env.GITNEXUS_PROFILE_DERIVED === '1';
+    const derivedPassTimingsMs: Record<string, number> = {};
+    const markPassTiming = (passName: string, startedAtMs: number): void => {
+      if (!profileDerivedTimings) return;
+      derivedPassTimingsMs[passName] = Math.max(0, Date.now() - startedAtMs);
+    };
+    const skipDerivedPass = (passName: string): void => {
+      if (!skippedDerivedPasses.includes(passName)) skippedDerivedPasses.push(passName);
+    };
 
     // Validate index exists on disk
     try {
@@ -728,6 +788,14 @@ export const analyzeCommand = async (
       const content = contentByPath.get(filePath) || '';
       return SHAPE_SIGNAL_RE.test(content);
     });
+    const sourceSignalsTouched = impactedFiles.some(filePath => Boolean(getLanguageFromFilename(filePath)));
+    const adaptiveLowSignalChangeSet = incrementalDerivedMode === 'adaptive'
+      && !sourceSignalsTouched
+      && !shapeSignalsTouched
+      && !routeProviderTouched
+      && !permissionsConfigPath
+      && !hasTemplateRouteNameProcessing;
+    const shouldRunAdaptiveHeavyPasses = !adaptiveLowSignalChangeSet;
 
     // Upsert File nodes with updated content for rebuild files (keeps existing edges)
     bar.update(43, { phase: 'Incremental: updating File nodes...' });
@@ -934,20 +1002,8 @@ export const analyzeCommand = async (
     });
     const kuzuTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
 
-    // Best-effort: ensure FTS exists (creation is idempotent)
-    const t0Fts = Date.now();
-    try {
-      await createFTSIndex('File', 'file_fts', ['name', 'content']);
-      await createFTSIndex('Function', 'function_fts', ['name', 'content']);
-      await createFTSIndex('Class', 'class_fts', ['name', 'content']);
-      await createFTSIndex('Method', 'method_fts', ['name', 'content']);
-      await createFTSIndex('Interface', 'interface_fts', ['name', 'content']);
-      await createFTSIndex('CodeElement', 'codeelement_fts', ['name', 'content']);
-      await createFTSIndex('Const', 'const_fts', ['name', 'content']);
-    } catch {
-      // best-effort
-    }
-    const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
+    // Ensure FTS only when schema/metadata indicates it is missing.
+    const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
 
     const kuzuWarnings = [...kuzuResult.warnings];
 
@@ -1073,121 +1129,152 @@ export const analyzeCommand = async (
       'Template',
       'Module',
     ]);
+    type IncrementalNodeRowVariant = 'flow' | 'value' | 'heuristic' | 'slice' | 'process';
+    const incrementalNodeRows = new Map<string, any[]>();
+    const flowNodeLabelsWithLineSpans = new Set<string>([
+      'Function',
+      'Class',
+      'Interface',
+      'Method',
+      'CodeElement',
+      'Struct',
+      'Enum',
+      'Macro',
+      'Typedef',
+      'Union',
+      'Namespace',
+      'Trait',
+      'Impl',
+      'TypeAlias',
+      'Const',
+      'Static',
+      'Property',
+      'Record',
+      'Delegate',
+      'Annotation',
+      'Constructor',
+      'Template',
+      'Module',
+      'TestCase',
+    ]);
+    const resolveCypherLabel = (label: string): string => (
+      backtickFlowNodeLabels.has(label) ? `\`${label}\`` : label
+    );
+    const loadIncrementalNodeRows = async (label: string, variant: IncrementalNodeRowVariant): Promise<any[]> => {
+      const cacheKey = `${variant}:${label}`;
+      const cached = incrementalNodeRows.get(cacheKey);
+      if (cached) return cached;
+      const cypherLabel = resolveCypherLabel(label);
+      let variantQuery = '';
 
-    bar.update(88, { phase: 'Incremental: refreshing precision overlay...' });
-    try {
-      await executeQuery(`
-        MATCH ()-[r:CodeRelation]->()
-        WHERE r.reason STARTS WITH 'precision-overlay:'
-        DELETE r
-      `);
-
-      const precisionInputGraph = createKnowledgeGraph();
-      for (const label of flowNodeLabels) {
-        const cypherLabel = backtickFlowNodeLabels.has(label) ? `\`${label}\`` : label;
-        const rows = await executeQuery(`
+      if (variant === 'flow') {
+        if (flowNodeLabelsWithLineSpans.has(label)) {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.filePath AS filePath,
+                   n.startLine AS startLine,
+                   n.endLine AS endLine
+          `;
+        } else {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.filePath AS filePath
+          `;
+        }
+      } else if (variant === 'value') {
+        if (label === 'CacheKey') {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.label AS label,
+                   '' AS filePath,
+                   n.keyName AS keyName,
+                   '' AS tableName,
+                   '' AS columnName
+          `;
+        } else if (label === 'DBTable') {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.label AS label,
+                   n.sourceFilePath AS filePath,
+                   '' AS keyName,
+                   n.tableName AS tableName,
+                   '' AS columnName
+          `;
+        } else if (label === 'DBColumn') {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.label AS label,
+                   n.sourceFilePath AS filePath,
+                   '' AS keyName,
+                   n.tableName AS tableName,
+                   n.columnName AS columnName
+          `;
+        } else {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.filePath AS filePath,
+                   '' AS keyName,
+                   '' AS tableName,
+                   '' AS columnName
+          `;
+        }
+      } else if (variant === 'slice') {
+        variantQuery = `
           MATCH (n:${cypherLabel})
           RETURN n.id AS id,
-                 n.name AS name,
-                 n.filePath AS filePath,
-                 n.startLine AS startLine,
-                 n.endLine AS endLine
-        `);
-
-        for (const row of rows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-          precisionInputGraph.addNode({
-            id,
-            label: label as NodeLabel,
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
-              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
-            },
-          });
-        }
-      }
-
-      const precisionResult = await processPrecisionOverlay(
-        repoPath,
-        precisionInputGraph,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(88, { phase: `Precision overlay: ${message}` });
-        },
-        {
-          producerMode: precisionOverlayMode,
-          producerForceRefresh: options?.precisionOverlayForce,
-          overlayPath: options?.precisionOverlayPath,
-        },
-      );
-
-      precisionSummary = {
-        mode: precisionOverlayMode,
-        provider: precisionResult.stats.provider,
-        overlayFound: precisionResult.stats.overlayFound,
-        declaredRelations: precisionResult.stats.declaredRelations,
-        emittedEdges: precisionResult.stats.emittedEdges,
-        producer: precisionResult.stats.producer,
-        producerCacheHit: precisionResult.stats.producerCacheHit,
-        producerSkipped: precisionResult.stats.producerSkipped,
-        producerSkipReason: precisionResult.stats.producerSkipReason,
-      };
-
-      if (precisionResult.edges.length > 0) {
-        const precisionInsertGraph = createKnowledgeGraph();
-        for (const edge of precisionResult.edges) {
-          precisionInsertGraph.addRelationship(edge);
-        }
-        await loadGraphToKuzu(precisionInsertGraph, new Map(), storagePath, (msg) => {
-          bar.update(88, { phase: msg });
-        });
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to refresh precision overlay (${msg.slice(0, 120)})`);
-    }
-
-    bar.update(88, { phase: 'Incremental: refreshing targeted micro-dataflow...' });
-    try {
-      await executeQuery(`
-        MATCH ()-[r:CodeRelation]->()
-        WHERE r.reason STARTS WITH 'micro-dataflow:'
-        DELETE r
-      `);
-
-      const microDataflowGraph = createKnowledgeGraph();
-
-      for (const label of flowNodeLabels) {
-        const cypherLabel = backtickFlowNodeLabels.has(label) ? `\`${label}\`` : label;
-        const rows = await executeQuery(`
+                 n.label AS name,
+                 n.heuristicLabel AS heuristicLabel,
+                 '' AS filePath,
+                 n.sliceType AS sliceType,
+                 n.closureSlots AS closureSlots,
+                 n.closedSlots AS closedSlots
+        `;
+      } else if (variant === 'process') {
+        variantQuery = `
           MATCH (n:${cypherLabel})
           RETURN n.id AS id,
-                 n.name AS name,
-                 n.filePath AS filePath,
-                 n.startLine AS startLine,
-                 n.endLine AS endLine
-        `);
-
-        for (const row of rows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-          microDataflowGraph.addNode({
-            id,
-            label: label as NodeLabel,
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
-              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
-            },
-          });
+                 n.label AS name,
+                 n.heuristicLabel AS heuristicLabel,
+                 '' AS filePath,
+                 n.processType AS processType,
+                 n.stepCount AS stepCount
+        `;
+      } else {
+        if (label === 'DBTable' || label === 'DBColumn') {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.label AS name,
+                   n.heuristicLabel AS heuristicLabel,
+                   n.sourceFilePath AS filePath
+          `;
+        } else {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.label AS name,
+                   n.heuristicLabel AS heuristicLabel,
+                   '' AS filePath
+          `;
         }
       }
-
-      const relationshipRows = await executeQuery(`
+      const rows = await executeQuery(variantQuery);
+      incrementalNodeRows.set(cacheKey, rows);
+      return rows;
+    };
+    let incrementalCoreRelationRows: any[] | null = null;
+    const loadIncrementalCoreRelationRows = async (): Promise<any[]> => {
+      if (incrementalCoreRelationRows) return incrementalCoreRelationRows;
+      incrementalCoreRelationRows = await executeQuery(`
         MATCH (a)-[r:CodeRelation]->(b)
         WHERE r.type IN ['CALLS', 'VALIDATES_FIELD', 'SERIALIZES_FIELD', 'DEFINES', 'INVALIDATES_KEY', 'READS_FIELD', 'WRITES_FIELD']
         RETURN a.id AS sourceId,
@@ -1196,55 +1283,168 @@ export const analyzeCommand = async (
                r.confidence AS confidence,
                r.reason AS reason
       `);
+      return incrementalCoreRelationRows;
+    };
 
-      for (const row of relationshipRows) {
-        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-        const targetId = String(row.targetId ?? row[1] ?? '').trim();
-        const type = String(row.type ?? row[2] ?? '').trim();
-        if (!sourceId || !targetId || !type) continue;
+    const precisionPassStartedAt = Date.now();
+    if (!shouldRunAdaptiveHeavyPasses) {
+      skipDerivedPass('precision-overlay');
+    } else {
+      bar.update(88, { phase: 'Incremental: refreshing precision overlay...' });
+      try {
+        await executeQuery(`
+          MATCH ()-[r:CodeRelation]->()
+          WHERE r.reason STARTS WITH 'precision-overlay:'
+          DELETE r
+        `);
 
-        microDataflowGraph.addRelationship({
-          id: `inc_micro_${type}_${sourceId}->${targetId}`,
-          type: type as RelationshipType,
-          sourceId,
-          targetId,
-          confidence: Number(row.confidence ?? row[3] ?? 0.8) || 0.8,
-          reason: String(row.reason ?? row[4] ?? ''),
-        });
-      }
+        const precisionInputGraph = createKnowledgeGraph();
+        for (const label of flowNodeLabels) {
+          const rows = await loadIncrementalNodeRows(String(label), 'flow');
 
-      const microDataflowResult = await processMicroDataflow(
-        microDataflowGraph,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(88, { phase: `Micro-dataflow: ${message}` });
-        },
-      );
-
-      microDataflowSummary = {
-        emittedEdges: microDataflowResult.stats.emittedEdges,
-        requestFieldReads: microDataflowResult.stats.requestFieldReads,
-        responseFieldWrites: microDataflowResult.stats.responseFieldWrites,
-        endpointRequestClosures: microDataflowResult.stats.endpointRequestClosures,
-        endpointResponseClosures: microDataflowResult.stats.endpointResponseClosures,
-        queryInvalidationClosures: microDataflowResult.stats.queryInvalidationClosures,
-        endpointEventClosures: microDataflowResult.stats.endpointEventClosures,
-        endpointPermissionClosures: microDataflowResult.stats.endpointPermissionClosures,
-      };
-
-      if (microDataflowResult.edges.length > 0) {
-        const microInsertGraph = createKnowledgeGraph();
-        for (const edge of microDataflowResult.edges) {
-          microInsertGraph.addRelationship(edge);
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            precisionInputGraph.addNode({
+              id,
+              label: label as NodeLabel,
+              properties: {
+                name: String(row.name ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[2] ?? '').trim(),
+                startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+                endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+              },
+            });
+          }
         }
-        await loadGraphToKuzu(microInsertGraph, new Map(), storagePath, (msg) => {
-          bar.update(88, { phase: msg });
-        });
+
+        const precisionResult = await processPrecisionOverlay(
+          repoPath,
+          precisionInputGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(88, { phase: `Precision overlay: ${message}` });
+          },
+          {
+            producerMode: precisionOverlayMode,
+            producerForceRefresh: options?.precisionOverlayForce,
+            overlayPath: options?.precisionOverlayPath,
+          },
+        );
+
+        precisionSummary = {
+          mode: precisionOverlayMode,
+          provider: precisionResult.stats.provider,
+          overlayFound: precisionResult.stats.overlayFound,
+          declaredRelations: precisionResult.stats.declaredRelations,
+          emittedEdges: precisionResult.stats.emittedEdges,
+          producer: precisionResult.stats.producer,
+          producerCacheHit: precisionResult.stats.producerCacheHit,
+          producerSkipped: precisionResult.stats.producerSkipped,
+          producerSkipReason: precisionResult.stats.producerSkipReason,
+        };
+
+        if (precisionResult.edges.length > 0) {
+          const precisionInsertGraph = createKnowledgeGraph();
+          for (const edge of precisionResult.edges) {
+            precisionInsertGraph.addRelationship(edge);
+          }
+          await loadGraphToKuzu(precisionInsertGraph, new Map(), storagePath, (msg) => {
+            bar.update(88, { phase: msg });
+          });
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to refresh precision overlay (${msg.slice(0, 120)})`);
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to refresh targeted micro-dataflow (${msg.slice(0, 120)})`);
     }
+    markPassTiming('precision-overlay', precisionPassStartedAt);
+
+    const microDataflowPassStartedAt = Date.now();
+    if (!shouldRunAdaptiveHeavyPasses) {
+      skipDerivedPass('micro-dataflow');
+    } else {
+      bar.update(88, { phase: 'Incremental: refreshing targeted micro-dataflow...' });
+      try {
+        await executeQuery(`
+          MATCH ()-[r:CodeRelation]->()
+          WHERE r.reason STARTS WITH 'micro-dataflow:'
+          DELETE r
+        `);
+
+        const microDataflowGraph = createKnowledgeGraph();
+
+        for (const label of flowNodeLabels) {
+          const rows = await loadIncrementalNodeRows(String(label), 'flow');
+
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            microDataflowGraph.addNode({
+              id,
+              label: label as NodeLabel,
+              properties: {
+                name: String(row.name ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[2] ?? '').trim(),
+                startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+                endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+              },
+            });
+          }
+        }
+
+        const relationshipRows = await loadIncrementalCoreRelationRows();
+
+        for (const row of relationshipRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const targetId = String(row.targetId ?? row[1] ?? '').trim();
+          const type = String(row.type ?? row[2] ?? '').trim();
+          if (!sourceId || !targetId || !type) continue;
+
+          microDataflowGraph.addRelationship({
+            id: `inc_micro_${type}_${sourceId}->${targetId}`,
+            type: type as RelationshipType,
+            sourceId,
+            targetId,
+            confidence: Number(row.confidence ?? row[3] ?? 0.8) || 0.8,
+            reason: String(row.reason ?? row[4] ?? ''),
+          });
+        }
+
+        const microDataflowResult = await processMicroDataflow(
+          microDataflowGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(88, { phase: `Micro-dataflow: ${message}` });
+          },
+        );
+
+        microDataflowSummary = {
+          emittedEdges: microDataflowResult.stats.emittedEdges,
+          requestFieldReads: microDataflowResult.stats.requestFieldReads,
+          responseFieldWrites: microDataflowResult.stats.responseFieldWrites,
+          endpointRequestClosures: microDataflowResult.stats.endpointRequestClosures,
+          endpointResponseClosures: microDataflowResult.stats.endpointResponseClosures,
+          queryInvalidationClosures: microDataflowResult.stats.queryInvalidationClosures,
+          endpointEventClosures: microDataflowResult.stats.endpointEventClosures,
+          endpointPermissionClosures: microDataflowResult.stats.endpointPermissionClosures,
+        };
+
+        if (microDataflowResult.edges.length > 0) {
+          const microInsertGraph = createKnowledgeGraph();
+          for (const edge of microDataflowResult.edges) {
+            microInsertGraph.addRelationship(edge);
+          }
+          await loadGraphToKuzu(microInsertGraph, new Map(), storagePath, (msg) => {
+            bar.update(88, { phase: msg });
+          });
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to refresh targeted micro-dataflow (${msg.slice(0, 120)})`);
+      }
+    }
+    markPassTiming('micro-dataflow', microDataflowPassStartedAt);
 
     // Optional: recompute derived views in incremental mode (Communities + Processes).
     // This is disabled by default because it can be expensive on large graphs.
@@ -1781,7 +1981,7 @@ export const analyzeCommand = async (
 
     const shouldRecomputeShapeGraph = incrementalDerivedMode === 'full' || shapeSignalsTouched;
     if (!shouldRecomputeShapeGraph) {
-      skippedDerivedPasses.push('shape-graph');
+      skipDerivedPass('shape-graph');
     } else {
       bar.update(89, { phase: 'Incremental: recomputing shape graph...' });
       try {
@@ -1964,242 +2164,233 @@ export const analyzeCommand = async (
       }
     }
 
-    bar.update(89, { phase: 'Incremental: refreshing value graph...' });
-    try {
-      await executeQuery(`
-        MATCH ()-[r:CodeRelation]->()
-        WHERE r.reason STARTS WITH 'value-graph:'
-        DELETE r
-      `);
-      await executeQuery(`MATCH (n:ValueNode) DETACH DELETE n`);
+    const valueGraphPassStartedAt = Date.now();
+    if (!shouldRunAdaptiveHeavyPasses) {
+      skipDerivedPass('value-graph');
+    } else {
+      bar.update(89, { phase: 'Incremental: refreshing value graph...' });
+      try {
+        await executeQuery(`
+          MATCH ()-[r:CodeRelation]->()
+          WHERE r.reason STARTS WITH 'value-graph:'
+          DELETE r
+        `);
+        await executeQuery(`MATCH (n:ValueNode) DETACH DELETE n`);
 
-      const valueGraphInput = createKnowledgeGraph();
-      const valueGraphNodeIds = new Set<string>();
-      const valueGraphNodeLabels = ['File', ...flowNodeLabels, 'CacheKey', 'DBTable', 'DBColumn'] as const;
+        const valueGraphInput = createKnowledgeGraph();
+        const valueGraphNodeIds = new Set<string>();
+        const valueGraphNodeLabels = ['File', ...flowNodeLabels, 'CacheKey', 'DBTable', 'DBColumn'] as const;
 
-      for (const label of valueGraphNodeLabels) {
-        const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
-        const rows = await executeQuery(`
-          MATCH (n:${cypherLabel})
-          RETURN n.id AS id,
-                 n.name AS name,
-                 n.label AS label,
-                 n.filePath AS filePath,
-                 n.keyName AS keyName,
-                 n.tableName AS tableName,
-                 n.columnName AS columnName
+        for (const label of valueGraphNodeLabels) {
+          const rows = await loadIncrementalNodeRows(String(label), 'value');
+
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+
+            valueGraphInput.addNode({
+              id,
+              label: label as NodeLabel,
+              properties: {
+                name: String(row.name ?? row.label ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[3] ?? '').trim(),
+                keyName: String(row.keyName ?? row[4] ?? '').trim(),
+                tableName: String(row.tableName ?? row[5] ?? '').trim(),
+                columnName: String(row.columnName ?? row[6] ?? '').trim(),
+              },
+            });
+            valueGraphNodeIds.add(id);
+          }
+        }
+
+        const routeNameCallRows = await executeQuery(`
+          MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          WHERE r.reason STARTS WITH 'route-name:'
+          RETURN a.id AS sourceId,
+                 b.id AS targetId,
+                 r.confidence AS confidence,
+                 r.reason AS reason
         `);
 
-        for (const row of rows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
+        for (const row of routeNameCallRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const targetId = String(row.targetId ?? row[1] ?? '').trim();
+          if (!sourceId || !targetId || !valueGraphNodeIds.has(sourceId)) continue;
 
-          valueGraphInput.addNode({
-            id,
-            label: label as NodeLabel,
-            properties: {
-              name: String(row.name ?? row.label ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[3] ?? '').trim(),
-              keyName: String(row.keyName ?? row[4] ?? '').trim(),
-              tableName: String(row.tableName ?? row[5] ?? '').trim(),
-              columnName: String(row.columnName ?? row[6] ?? '').trim(),
-            },
-          });
-          valueGraphNodeIds.add(id);
-        }
-      }
-
-      const routeNameCallRows = await executeQuery(`
-        MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
-        WHERE r.reason STARTS WITH 'route-name:'
-        RETURN a.id AS sourceId,
-               b.id AS targetId,
-               r.confidence AS confidence,
-               r.reason AS reason
-      `);
-
-      for (const row of routeNameCallRows) {
-        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-        const targetId = String(row.targetId ?? row[1] ?? '').trim();
-        if (!sourceId || !targetId || !valueGraphNodeIds.has(sourceId)) continue;
-
-        valueGraphInput.addRelationship({
-          id: `inc_value_CALLS_${sourceId}->${targetId}`,
-          type: 'CALLS',
-          sourceId,
-          targetId,
-          confidence: Number(row.confidence ?? row[2] ?? 0.9) || 0.9,
-          reason: String(row.reason ?? row[3] ?? ''),
-        });
-      }
-
-      const valueGraphResult = await processValueGraph(
-        valueGraphInput,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(89, { phase: `Value graph: ${message}` });
-        },
-      );
-
-      valueGraphSummary = {
-        valueCount: valueGraphResult.stats.valueCount,
-        edgeCount: valueGraphResult.stats.edgeCount,
-        permissionValues: valueGraphResult.stats.permissionValues,
-        endpointValues: valueGraphResult.stats.endpointValues,
-        routeNameValues: valueGraphResult.stats.routeNameValues,
-        cacheKeyValues: valueGraphResult.stats.cacheKeyValues,
-        roleValues: valueGraphResult.stats.roleValues,
-        featureFlagValues: valueGraphResult.stats.featureFlagValues,
-        configKeyValues: valueGraphResult.stats.configKeyValues,
-        envVarValues: valueGraphResult.stats.envVarValues,
-        queueNameValues: valueGraphResult.stats.queueNameValues,
-        broadcastChannelValues: valueGraphResult.stats.broadcastChannelValues,
-        eventNameValues: valueGraphResult.stats.eventNameValues,
-        commandNameValues: valueGraphResult.stats.commandNameValues,
-        i18nKeyValues: valueGraphResult.stats.i18nKeyValues,
-        queryKeyFamilyValues: valueGraphResult.stats.queryKeyFamilyValues,
-        routeSegmentValues: valueGraphResult.stats.routeSegmentValues,
-        tableNameValues: valueGraphResult.stats.tableNameValues,
-        tableColumnValues: valueGraphResult.stats.tableColumnValues,
-        skippedDuplicates: valueGraphResult.stats.skippedDuplicates,
-        skippedMalformed: valueGraphResult.stats.skippedMalformed,
-      };
-
-      if (valueGraphResult.values.length > 0 || valueGraphResult.edges.length > 0) {
-        const valueGraphInsert = createKnowledgeGraph();
-        for (const value of valueGraphResult.values) {
-          valueGraphInsert.addNode({
-            id: value.id,
-            label: 'ValueNode',
-            properties: {
-              name: value.label,
-              filePath: '',
-              heuristicLabel: value.heuristicLabel,
-              valueType: value.valueType,
-              valueKey: value.valueKey,
-              valueRaw: value.valueRaw,
-            },
+          valueGraphInput.addRelationship({
+            id: `inc_value_CALLS_${sourceId}->${targetId}`,
+            type: 'CALLS',
+            sourceId,
+            targetId,
+            confidence: Number(row.confidence ?? row[2] ?? 0.9) || 0.9,
+            reason: String(row.reason ?? row[3] ?? ''),
           });
         }
 
-        for (const edge of valueGraphResult.edges) {
-          valueGraphInsert.addRelationship(edge);
-        }
+        const valueGraphResult = await processValueGraph(
+          valueGraphInput,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Value graph: ${message}` });
+          },
+        );
 
-        await loadGraphToKuzu(valueGraphInsert, new Map(), storagePath, (msg) => {
-          bar.update(89, { phase: msg });
-        });
+        valueGraphSummary = {
+          valueCount: valueGraphResult.stats.valueCount,
+          edgeCount: valueGraphResult.stats.edgeCount,
+          permissionValues: valueGraphResult.stats.permissionValues,
+          endpointValues: valueGraphResult.stats.endpointValues,
+          routeNameValues: valueGraphResult.stats.routeNameValues,
+          cacheKeyValues: valueGraphResult.stats.cacheKeyValues,
+          roleValues: valueGraphResult.stats.roleValues,
+          featureFlagValues: valueGraphResult.stats.featureFlagValues,
+          configKeyValues: valueGraphResult.stats.configKeyValues,
+          envVarValues: valueGraphResult.stats.envVarValues,
+          queueNameValues: valueGraphResult.stats.queueNameValues,
+          broadcastChannelValues: valueGraphResult.stats.broadcastChannelValues,
+          eventNameValues: valueGraphResult.stats.eventNameValues,
+          commandNameValues: valueGraphResult.stats.commandNameValues,
+          i18nKeyValues: valueGraphResult.stats.i18nKeyValues,
+          queryKeyFamilyValues: valueGraphResult.stats.queryKeyFamilyValues,
+          routeSegmentValues: valueGraphResult.stats.routeSegmentValues,
+          tableNameValues: valueGraphResult.stats.tableNameValues,
+          tableColumnValues: valueGraphResult.stats.tableColumnValues,
+          skippedDuplicates: valueGraphResult.stats.skippedDuplicates,
+          skippedMalformed: valueGraphResult.stats.skippedMalformed,
+        };
+
+        if (valueGraphResult.values.length > 0 || valueGraphResult.edges.length > 0) {
+          const valueGraphInsert = createKnowledgeGraph();
+          for (const value of valueGraphResult.values) {
+            valueGraphInsert.addNode({
+              id: value.id,
+              label: 'ValueNode',
+              properties: {
+                name: value.label,
+                filePath: '',
+                heuristicLabel: value.heuristicLabel,
+                valueType: value.valueType,
+                valueKey: value.valueKey,
+                valueRaw: value.valueRaw,
+              },
+            });
+          }
+
+          for (const edge of valueGraphResult.edges) {
+            valueGraphInsert.addRelationship(edge);
+          }
+
+          await loadGraphToKuzu(valueGraphInsert, new Map(), storagePath, (msg) => {
+            bar.update(89, { phase: msg });
+          });
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to refresh value graph (${msg.slice(0, 120)})`);
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to refresh value graph (${msg.slice(0, 120)})`);
     }
+    markPassTiming('value-graph', valueGraphPassStartedAt);
 
-    bar.update(89, { phase: 'Incremental: refreshing provenance edges...' });
-    try {
-      await executeQuery(`
-        MATCH ()-[r:CodeRelation]->()
-        WHERE r.reason STARTS WITH 'provenance:'
-        DELETE r
-      `);
-
-      const provenanceGraph = createKnowledgeGraph();
-      const provenanceNodeIds = new Set<string>();
-      const provenanceNodeLabels = ['File', ...flowNodeLabels, 'ValueNode', 'TestCase'] as const;
-
-      for (const label of provenanceNodeLabels) {
-        const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
-        const rows = await executeQuery(`
-          MATCH (n:${cypherLabel})
-          RETURN n.id AS id,
-                 n.name AS name,
-                 n.filePath AS filePath,
-                 n.startLine AS startLine,
-                 n.endLine AS endLine
+    const provenancePassStartedAt = Date.now();
+    if (!shouldRunAdaptiveHeavyPasses) {
+      skipDerivedPass('provenance');
+    } else {
+      bar.update(89, { phase: 'Incremental: refreshing provenance edges...' });
+      try {
+        await executeQuery(`
+          MATCH ()-[r:CodeRelation]->()
+          WHERE r.reason STARTS WITH 'provenance:'
+          DELETE r
         `);
 
-        for (const row of rows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
+        const provenanceGraph = createKnowledgeGraph();
+        const provenanceNodeIds = new Set<string>();
+        const provenanceNodeLabels = ['File', ...flowNodeLabels, 'ValueNode', 'TestCase'] as const;
 
-          provenanceGraph.addNode({
-            id,
-            label: label as NodeLabel,
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-              startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
-              endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
-            },
+        for (const label of provenanceNodeLabels) {
+          const nodeVariant: IncrementalNodeRowVariant = label === 'ValueNode' ? 'heuristic' : 'flow';
+          const rows = await loadIncrementalNodeRows(String(label), nodeVariant);
+
+          for (const row of rows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+
+            provenanceGraph.addNode({
+              id,
+              label: label as NodeLabel,
+              properties: {
+                name: String(row.name ?? row.label ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[2] ?? '').trim(),
+                startLine: Number(row.startLine ?? row[3] ?? 0) || undefined,
+                endLine: Number(row.endLine ?? row[4] ?? 0) || undefined,
+              },
+            });
+            provenanceNodeIds.add(id);
+          }
+        }
+
+        const relationshipRows = (await loadIncrementalCoreRelationRows()).filter((row) => {
+          const type = String(row.type ?? row[2] ?? '').trim();
+          return type === 'CALLS' || type === 'DEFINES';
+        });
+
+        for (const row of relationshipRows) {
+          const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
+          const targetId = String(row.targetId ?? row[1] ?? '').trim();
+          const type = String(row.type ?? row[2] ?? '').trim();
+          if (!sourceId || !targetId || !type) continue;
+          if (!provenanceNodeIds.has(sourceId) && !provenanceNodeIds.has(targetId)) continue;
+
+          provenanceGraph.addRelationship({
+            id: `inc_provenance_${type}_${sourceId}->${targetId}`,
+            type: type as RelationshipType,
+            sourceId,
+            targetId,
+            confidence: Number(row.confidence ?? row[3] ?? 1.0) || 1.0,
+            reason: String(row.reason ?? row[4] ?? ''),
           });
-          provenanceNodeIds.add(id);
         }
-      }
 
-      const relationshipRows = await executeQuery(`
-        MATCH (a)-[r:CodeRelation]->(b)
-        WHERE r.type IN ['CALLS', 'DEFINES']
-        RETURN a.id AS sourceId,
-               b.id AS targetId,
-               r.type AS type,
-               r.confidence AS confidence,
-               r.reason AS reason
-      `);
+        const provenanceResult = await processProvenanceEdges(
+          provenanceGraph,
+          (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Provenance: ${message}` });
+          },
+        );
 
-      for (const row of relationshipRows) {
-        const sourceId = String(row.sourceId ?? row[0] ?? '').trim();
-        const targetId = String(row.targetId ?? row[1] ?? '').trim();
-        const type = String(row.type ?? row[2] ?? '').trim();
-        if (!sourceId || !targetId || !type) continue;
-        if (!provenanceNodeIds.has(sourceId) && !provenanceNodeIds.has(targetId)) continue;
+        provenanceSummary = {
+          emittedEdges: provenanceResult.stats.emittedEdges,
+          routeExpansionEdges: provenanceResult.stats.routeExpansionEdges,
+          enumToSlugEdges: provenanceResult.stats.enumToSlugEdges,
+          configDrivenEdges: provenanceResult.stats.configDrivenEdges,
+          compiledArtifactEdges: provenanceResult.stats.compiledArtifactEdges,
+          frameworkDerivedEdges: provenanceResult.stats.frameworkDerivedEdges,
+          skippedDuplicates: provenanceResult.stats.skippedDuplicates,
+          skippedMalformed: provenanceResult.stats.skippedMalformed,
+        };
 
-        provenanceGraph.addRelationship({
-          id: `inc_provenance_${type}_${sourceId}->${targetId}`,
-          type: type as RelationshipType,
-          sourceId,
-          targetId,
-          confidence: Number(row.confidence ?? row[3] ?? 1.0) || 1.0,
-          reason: String(row.reason ?? row[4] ?? ''),
-        });
-      }
-
-      const provenanceResult = await processProvenanceEdges(
-        provenanceGraph,
-        (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(89, { phase: `Provenance: ${message}` });
-        },
-      );
-
-      provenanceSummary = {
-        emittedEdges: provenanceResult.stats.emittedEdges,
-        routeExpansionEdges: provenanceResult.stats.routeExpansionEdges,
-        enumToSlugEdges: provenanceResult.stats.enumToSlugEdges,
-        configDrivenEdges: provenanceResult.stats.configDrivenEdges,
-        compiledArtifactEdges: provenanceResult.stats.compiledArtifactEdges,
-        frameworkDerivedEdges: provenanceResult.stats.frameworkDerivedEdges,
-        skippedDuplicates: provenanceResult.stats.skippedDuplicates,
-        skippedMalformed: provenanceResult.stats.skippedMalformed,
-      };
-
-      if (provenanceResult.edges.length > 0) {
-        const provenanceInsert = createKnowledgeGraph();
-        for (const edge of provenanceResult.edges) {
-          provenanceInsert.addRelationship(edge);
+        if (provenanceResult.edges.length > 0) {
+          const provenanceInsert = createKnowledgeGraph();
+          for (const edge of provenanceResult.edges) {
+            provenanceInsert.addRelationship(edge);
+          }
+          await loadGraphToKuzu(provenanceInsert, new Map(), storagePath, (msg) => {
+            bar.update(89, { phase: msg });
+          });
         }
-        await loadGraphToKuzu(provenanceInsert, new Map(), storagePath, (msg) => {
-          bar.update(89, { phase: msg });
-        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to refresh provenance edges (${msg.slice(0, 120)})`);
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      kuzuWarnings.push(`Incremental: unable to refresh provenance edges (${msg.slice(0, 120)})`);
     }
+    markPassTiming('provenance', provenancePassStartedAt);
 
     const shouldRecomputeCochange = incrementalDerivedMode === 'full' || fileChangesTotal >= 200;
     if (!shouldRecomputeCochange) {
-      skippedDerivedPasses.push('cochange');
+      skipDerivedPass('cochange');
     } else {
+      const cochangePassStartedAt = Date.now();
       bar.update(89, { phase: 'Incremental: recomputing git-history cochange graph...' });
       try {
         const cochangeResult = await processGitHistoryCochange(repoPath, allRepoFiles, (message, progress) => {
@@ -2221,65 +2412,21 @@ export const analyzeCommand = async (
         const msg = e instanceof Error ? e.message : String(e);
         kuzuWarnings.push(`Incremental: unable to recompute cochange graph (${msg.slice(0, 120)})`);
       }
+      markPassTiming('cochange', cochangePassStartedAt);
     }
 
-    if (incrementalDerivedMode === 'fast') {
-      skippedDerivedPasses.push('evidence-spans', 'structured-summaries', 'closure-templates');
+    if (incrementalDerivedMode === 'fast' || !shouldRunAdaptiveHeavyPasses) {
+      skipDerivedPass('evidence-spans');
+      skipDerivedPass('structured-summaries');
+      skipDerivedPass('closure-templates');
     } else {
-      const postDerivedNodeRows = new Map<string, any[]>();
       const loadPostDerivedNodeRows = async (label: string): Promise<any[]> => {
-        const cached = postDerivedNodeRows.get(label);
-        if (cached) return cached;
-        const cypherLabel = backtickFlowNodeLabels.has(String(label)) ? `\`${label}\`` : label;
-        let rows: any[] = [];
-        if (label === 'FeatureSlice') {
-          rows = await executeQuery(`
-            MATCH (n:${cypherLabel})
-            RETURN n.id AS id,
-                   n.name AS name,
-                   n.heuristicLabel AS heuristicLabel,
-                   n.filePath AS filePath,
-                   n.sliceType AS sliceType,
-                   n.closureSlots AS closureSlots,
-                   n.closedSlots AS closedSlots
-          `);
-        } else if (label === 'Process') {
-          rows = await executeQuery(`
-            MATCH (n:${cypherLabel})
-            RETURN n.id AS id,
-                   n.name AS name,
-                   n.heuristicLabel AS heuristicLabel,
-                   n.filePath AS filePath,
-                   n.processType AS processType,
-                   n.stepCount AS stepCount
-          `);
-        } else if (label === 'Community' || label === 'Gap' || label === 'ContractShape' || label === 'ContractField' || label === 'CacheKey' || label === 'DBTable' || label === 'DBColumn' || label === 'ValueNode') {
-          rows = await executeQuery(`
-            MATCH (n:${cypherLabel})
-            RETURN n.id AS id,
-                   n.name AS name,
-                   n.heuristicLabel AS heuristicLabel,
-                   n.filePath AS filePath
-          `);
-        } else if (label === 'File') {
-          rows = await executeQuery(`
-            MATCH (n:${cypherLabel})
-            RETURN n.id AS id,
-                   n.name AS name,
-                   n.filePath AS filePath
-          `);
-        } else {
-          rows = await executeQuery(`
-            MATCH (n:${cypherLabel})
-            RETURN n.id AS id,
-                   n.name AS name,
-                   n.filePath AS filePath,
-                   n.startLine AS startLine,
-                   n.endLine AS endLine
-          `);
+        if (label === 'FeatureSlice') return loadIncrementalNodeRows(label, 'slice');
+        if (label === 'Process') return loadIncrementalNodeRows(label, 'process');
+        if (label === 'Community' || label === 'Gap' || label === 'ContractShape' || label === 'ContractField' || label === 'CacheKey' || label === 'DBTable' || label === 'DBColumn' || label === 'ValueNode') {
+          return loadIncrementalNodeRows(label, 'heuristic');
         }
-        postDerivedNodeRows.set(label, rows);
-        return rows;
+        return loadIncrementalNodeRows(label, 'flow');
       };
       let postDerivedRelationRows: any[] | null = null;
       const loadPostDerivedRelationRows = async (): Promise<any[]> => {
@@ -2296,6 +2443,7 @@ export const analyzeCommand = async (
         return postDerivedRelationRows;
       };
 
+      const evidencePassStartedAt = Date.now();
       bar.update(89, { phase: 'Incremental: refreshing evidence spans...' });
       try {
         const evidenceGraph = createKnowledgeGraph();
@@ -2363,7 +2511,9 @@ export const analyzeCommand = async (
         const msg = e instanceof Error ? e.message : String(e);
         kuzuWarnings.push(`Incremental: unable to refresh evidence spans (${msg.slice(0, 120)})`);
       }
+      markPassTiming('evidence-spans', evidencePassStartedAt);
 
+      const summaryPassStartedAt = Date.now();
       bar.update(89, { phase: 'Incremental: refreshing structured summaries...' });
       try {
         const summaryGraph = createKnowledgeGraph();
@@ -2452,6 +2602,7 @@ export const analyzeCommand = async (
           archetypeCount: summarySnapshot.stats.archetypeCount,
         };
 
+        const closureTemplatePassStartedAt = Date.now();
         const closureTemplateSnapshot = await processClosureTemplates(
           summaryGraph,
           (message, progress) => {
@@ -2466,10 +2617,12 @@ export const analyzeCommand = async (
           totalCoveredSlots: closureTemplateSnapshot.stats.totalCoveredSlots,
           totalRoleExpectations: closureTemplateSnapshot.stats.totalRoleExpectations,
         };
+        markPassTiming('closure-templates', closureTemplatePassStartedAt);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         kuzuWarnings.push(`Incremental: unable to refresh structured summaries (${msg.slice(0, 120)})`);
       }
+      markPassTiming('structured-summaries', summaryPassStartedAt);
     }
 
     // Embeddings (incremental, skip cached)
@@ -2528,6 +2681,8 @@ export const analyzeCommand = async (
       derived: {
         mode: incrementalDerivedMode,
         skippedPasses: skippedDerivedPasses,
+        adaptiveLowSignal: adaptiveLowSignalChangeSet,
+        timingsMs: profileDerivedTimings ? derivedPassTimingsMs : undefined,
       },
     };
   };
@@ -2541,6 +2696,7 @@ export const analyzeCommand = async (
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       kuzuSchemaVersion: KUZU_SCHEMA_VERSION,
+      ftsSchemaVersion: KUZU_SCHEMA_VERSION,
       // No indexable files changed, so graph stats remain valid.
       stats: existingMeta.stats || undefined,
     };
@@ -2554,9 +2710,23 @@ export const analyzeCommand = async (
       }
     }
 
+    bar.update(99, { phase: 'Running BrainKernel tick...' });
+    const fastWarnings: string[] = [];
+    const brainManifestPath = await runBrainKernelTick(meta, fastWarnings, []);
+
     bar.update(100, { phase: 'Done' });
     bar.stop();
     console.log('\n  Repository already indexed (no indexable changes)\n');
+    if (brainManifestPath) {
+      console.log(`  Brain manifest: ${brainManifestPath}`);
+    }
+    if (fastWarnings.length > 0) {
+      console.log(`\n  Warnings (${fastWarnings.length}):`);
+      for (const warning of fastWarnings) {
+        console.log(`    ${warning}`);
+      }
+    }
+    console.log('');
     return;
   }
 
@@ -2571,6 +2741,7 @@ export const analyzeCommand = async (
         lastCommit: currentCommit,
         indexedAt: new Date().toISOString(),
         kuzuSchemaVersion: KUZU_SCHEMA_VERSION,
+        ftsSchemaVersion: KUZU_SCHEMA_VERSION,
         stats: {
           files: inc.fileCount,
           nodes: inc.stats.nodes,
@@ -2605,6 +2776,13 @@ export const analyzeCommand = async (
       const aiContext = options?.writeContext
         ? await generateAIContextFiles(repoPath, storagePath, projectName, meta.stats || {})
         : { files: [] as string[] };
+
+      bar.update(99, { phase: 'Running BrainKernel tick...' });
+      const brainManifestPath = await runBrainKernelTick(
+        meta,
+        inc.kuzuWarnings,
+        [...fileChanges.changed, ...fileChanges.deleted],
+      );
 
       await closeKuzu();
       await disposeEmbedder();
@@ -2660,6 +2838,9 @@ export const analyzeCommand = async (
         );
       }
       console.log(`  ${repoPath}`);
+      if (brainManifestPath) {
+        console.log(`  Brain manifest: ${brainManifestPath}`);
+      }
       const derivedParts: string[] = [];
       if (options?.incrementalRecomputeCommunities) derivedParts.push('communities');
       if (options?.incrementalRecomputeProcesses) derivedParts.push('processes');
@@ -2670,12 +2851,20 @@ export const analyzeCommand = async (
       } else {
         console.log(`  Incremental note: recomputed ${derivedParts.join(' + ')} (use the other --incremental-recompute-* flag, or --force).`);
       }
-      if (inc.derived.mode === 'fast') {
-        if (inc.derived.skippedPasses.length > 0) {
-          console.log(`  Incremental derived mode: fast (skipped ${inc.derived.skippedPasses.join(', ')})`);
+      if (inc.derived.skippedPasses.length > 0) {
+        if (inc.derived.mode === 'adaptive' && inc.derived.adaptiveLowSignal) {
+          console.log(`  Incremental derived mode: adaptive (low-signal skip: ${inc.derived.skippedPasses.join(', ')})`);
         } else {
-          console.log('  Incremental derived mode: fast');
+          console.log(`  Incremental derived mode: ${inc.derived.mode} (skipped ${inc.derived.skippedPasses.join(', ')})`);
         }
+      } else if (inc.derived.mode !== 'full') {
+        console.log(`  Incremental derived mode: ${inc.derived.mode}`);
+      }
+      if (inc.derived.timingsMs && Object.keys(inc.derived.timingsMs).length > 0) {
+        const parts = Object.entries(inc.derived.timingsMs)
+          .sort((a, b) => b[1] - a[1])
+          .map(([name, ms]) => `${name}=${ms}ms`);
+        console.log(`  Incremental derived timings: ${parts.join(', ')}`);
       }
 
       if (aiContext.files.length > 0) {
@@ -2843,19 +3032,7 @@ export const analyzeCommand = async (
   // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
   bar.update(85, { phase: 'Creating search indexes...' });
 
-  const t0Fts = Date.now();
-  try {
-    await createFTSIndex('File', 'file_fts', ['name', 'content']);
-    await createFTSIndex('Function', 'function_fts', ['name', 'content']);
-    await createFTSIndex('Class', 'class_fts', ['name', 'content']);
-    await createFTSIndex('Method', 'method_fts', ['name', 'content']);
-    await createFTSIndex('Interface', 'interface_fts', ['name', 'content']);
-    await createFTSIndex('CodeElement', 'codeelement_fts', ['name', 'content']);
-    await createFTSIndex('Const', 'const_fts', ['name', 'content']);
-  } catch (e: any) {
-    // Non-fatal — FTS is best-effort
-  }
-  const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
+  const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
 
   // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
   if (cachedEmbeddings.length > 0) {
@@ -2912,6 +3089,7 @@ export const analyzeCommand = async (
     lastCommit: currentCommit,
     indexedAt: new Date().toISOString(),
     kuzuSchemaVersion: KUZU_SCHEMA_VERSION,
+    ftsSchemaVersion: KUZU_SCHEMA_VERSION,
     stats: {
       files: pipelineResult.fileContents.size,
       nodes: stats.nodes,
@@ -2963,6 +3141,13 @@ export const analyzeCommand = async (
       processes: pipelineResult.processResult?.stats.totalProcesses,
     })
     : { files: [] as string[] };
+
+  bar.update(99, { phase: 'Running BrainKernel tick...' });
+  const brainManifestPath = await runBrainKernelTick(
+    meta,
+    kuzuWarnings,
+    [...fileChanges.changed, ...fileChanges.deleted],
+  );
 
   await closeKuzu();
   await disposeEmbedder();
@@ -3025,6 +3210,9 @@ export const analyzeCommand = async (
     );
   }
   console.log(`  ${repoPath}`);
+  if (brainManifestPath) {
+    console.log(`  Brain manifest: ${brainManifestPath}`);
+  }
 
   if (aiContext.files.length > 0) {
     console.log(`  Context: ${aiContext.files.join(', ')}`);

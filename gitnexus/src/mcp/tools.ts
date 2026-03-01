@@ -526,6 +526,7 @@ AFTER THIS: Use context()/impact() on the highest-risk changed symbols or route/
         limit_evidence: { type: 'number', description: 'Max proof-pack symbol/edge evidence entries (default: 40)', default: 40 },
         include_slice_stencil: { type: 'boolean', description: 'Include slice-stencil comparison output (default: true)', default: true },
         limit_slice_stencil: { type: 'number', description: 'Max changed slices to include in stencil output (default: 8)', default: 8 },
+        include_runtime_probe_requests: { type: 'boolean', description: 'Include auto-generated micro runtime-probe requests when review uncertainty is high (default: true)', default: true },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],

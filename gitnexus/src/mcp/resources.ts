@@ -7,6 +7,8 @@
 
 import type { LocalBackend } from './local/local-backend.js';
 import { checkStaleness } from './staleness.js';
+import fs from 'fs/promises';
+import path from 'path';
 
 export interface ResourceDefinition {
   uri: string;
@@ -51,6 +53,12 @@ export function getResourceTemplates(): ResourceTemplate[] {
       uriTemplate: 'gitnexus://repo/{name}/context',
       name: 'Repo Overview',
       description: 'Codebase stats, staleness check, and available tools',
+      mimeType: 'text/yaml',
+    },
+    {
+      uriTemplate: 'gitnexus://repo/{name}/brain',
+      name: 'Brain Manifest',
+      description: 'BrainKernel status manifest and producer/eval/risk summaries',
       mimeType: 'text/yaml',
     },
     {
@@ -167,6 +175,8 @@ export async function readResource(uri: string, backend: LocalBackend): Promise<
   switch (parsed.resourceType) {
     case 'context':
       return getContextResource(backend, repoName);
+    case 'brain':
+      return getBrainManifestResource(backend, repoName);
     case 'clusters':
       return getClustersResource(backend, repoName);
     case 'processes':
@@ -286,6 +296,7 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('resources_available:');
   lines.push('  - gitnexus://repos: All indexed repositories');
   lines.push(`  - gitnexus://repo/${context.projectName}/clusters: All functional areas`);
+  lines.push(`  - gitnexus://repo/${context.projectName}/brain: BrainKernel manifest`);
   lines.push(`  - gitnexus://repo/${context.projectName}/processes: All execution flows`);
   lines.push(`  - gitnexus://repo/${context.projectName}/archetypes: Derived flow signatures + exemplars`);
   lines.push(`  - gitnexus://repo/${context.projectName}/schema: Graph schema for Cypher`);
@@ -297,6 +308,348 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push(`  - gitnexus://repo/${context.projectName}/process/{name}: Process trace`);
   
   return lines.join('\n');
+}
+
+async function getBrainManifestResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  try {
+    const repo = backend.resolveRepo(repoName);
+    const manifestPath = path.join(repo.storagePath, 'manifests', 'brain.json');
+    const raw = await fs.readFile(manifestPath, 'utf-8');
+    const manifest = JSON.parse(raw);
+    if (!manifest || typeof manifest !== 'object') {
+      return 'error: Invalid brain manifest payload';
+    }
+
+    const lines: string[] = [];
+    lines.push(`repo: "${String(repo.name || '').replace(/"/g, '\\"')}"`);
+    lines.push(`path: "${manifestPath.replace(/"/g, '\\"')}"`);
+    lines.push(`schema_version: ${Number(manifest.schemaVersion || 0)}`);
+    lines.push(`repo_fingerprint: "${String(manifest.repoFingerprint || '').replace(/"/g, '\\"')}"`);
+    lines.push(`graph_version: "${String(manifest.graphVersion || '').replace(/"/g, '\\"')}"`);
+    lines.push(`planner_policy_version: "${String(manifest.plannerPolicyVersion || '').replace(/"/g, '\\"')}"`);
+    lines.push(`runtime_truth_freshness: "${String(manifest.runtimeTruthFreshness || '').replace(/"/g, '\\"')}"`);
+
+    const tick = manifest.tick || {};
+    lines.push('tick:');
+    lines.push(`  reason: "${String(tick.reason || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  finished_at: "${String(tick.finishedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  duration_ms: ${Number(tick.durationMs || 0)}`);
+    lines.push(`  step_count: ${Number(tick.stepCount || 0)}`);
+    const producers = tick.producers || {};
+    lines.push('  producers:');
+    lines.push(`    total: ${Number(producers.total || 0)}`);
+    lines.push(`    succeeded: ${Number(producers.succeeded || 0)}`);
+    lines.push(`    failed: ${Number(producers.failed || 0)}`);
+    lines.push(`    skipped: ${Number(producers.skipped || 0)}`);
+
+    const planner = manifest.planner || {};
+    lines.push('planner:');
+    lines.push(`  mode: "${String(planner.mode || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  intent_class: "${String(planner.intentClass || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  context_shape: "${String(planner.contextShape || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  anchor_count: ${Number(planner.anchorCount || 0)}`);
+    lines.push(`  operator_count: ${Number(planner.operatorCount || 0)}`);
+    lines.push(`  requested_probe_count: ${Number(planner.requestedProbeCount || 0)}`);
+    lines.push(`  stop_condition_count: ${Number(planner.stopConditionCount || 0)}`);
+
+    const contextCompiler = manifest.contextCompiler || {};
+    lines.push('context_compiler:');
+    lines.push(`  packet_mode: "${String(contextCompiler.packetMode || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  packet_task: "${String(contextCompiler.packetTask || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  suggested_test_count: ${Number(contextCompiler.suggestedTestCount || 0)}`);
+    lines.push(`  unresolved_proof_count: ${Number(contextCompiler.unresolvedProofCount || 0)}`);
+    const telemetry = contextCompiler.telemetry || {};
+    lines.push('  telemetry:');
+    lines.push(`    total_runs: ${Number(telemetry.totalRuns || 0)}`);
+    lines.push(`    average_useful_ratio: ${Number(telemetry.averageUsefulRatio || 0)}`);
+    lines.push(`    average_proof_sufficiency: ${Number(telemetry.averageProofSufficiency || 0)}`);
+    lines.push(`    last_run_at: "${String(telemetry.lastRunAt || '').replace(/"/g, '\\"')}"`);
+
+    const experienceGovernor = manifest.experienceGovernor || {};
+    lines.push('experience_governor:');
+    lines.push(`  generated_at: "${String(experienceGovernor.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  card_count: ${Number(experienceGovernor.cardCount || 0)}`);
+    lines.push(`  generated_count: ${Number(experienceGovernor.generatedCount || 0)}`);
+    lines.push(`  retained_count: ${Number(experienceGovernor.retainedCount || 0)}`);
+    lines.push(`  dropped_count: ${Number(experienceGovernor.droppedCount || 0)}`);
+    lines.push(`  retrieved_count: ${Number(experienceGovernor.retrievedCount || 0)}`);
+
+    const constraintGraph = manifest.constraintGraph || {};
+    const constraintPatchGate = constraintGraph.patchGate || {};
+    const constraintSolver = constraintGraph.solver || {};
+    lines.push('constraint_graph:');
+    lines.push(`  generated_at: "${String(constraintGraph.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  rule_count: ${Number(constraintGraph.ruleCount || 0)}`);
+    lines.push(`  violation_count: ${Number(constraintGraph.violationCount || 0)}`);
+    lines.push('  patch_gate:');
+    lines.push(`    checked: ${Number(constraintPatchGate.checked || 0)}`);
+    lines.push(`    blocked: ${Number(constraintPatchGate.blocked || 0)}`);
+    lines.push(`    warned: ${Number(constraintPatchGate.warned || 0)}`);
+    lines.push(`    requested_runtime_probe: ${Number(constraintPatchGate.requestedRuntimeProbe || 0)}`);
+    lines.push(`    requested_targeted_tests: ${Number(constraintPatchGate.requestedTargetedTests || 0)}`);
+    lines.push('  solver:');
+    lines.push(`    pattern_checks: ${Number(constraintSolver.patternChecks || 0)}`);
+    lines.push(`    finite_checks: ${Number(constraintSolver.finiteChecks || 0)}`);
+    lines.push(`    cardinality_checks: ${Number(constraintSolver.cardinalityChecks || 0)}`);
+    lines.push(`    forward_chain_inferences: ${Number(constraintSolver.forwardChainInferences || 0)}`);
+    lines.push(`    contradictions: ${Number(constraintSolver.contradictions || 0)}`);
+
+    const evalGraph = manifest.evalGraph || {};
+    const evalTaskMiner = evalGraph.taskMiner || {};
+    const evalGoldContextMiner = evalGraph.goldContextMiner || {};
+    const evalCanaryHarness = evalGraph.canaryHarness || {};
+    const evalRegressionTracking = evalGraph.regressionTracking || {};
+    const evalMetrics = evalGraph.dashboardMetrics || {};
+    const evalRetrieval = evalMetrics.retrieval || {};
+    const evalNonFunctional = evalMetrics.nonFunctional || {};
+    const evalLearning = evalMetrics.learning || {};
+    const evalBaselines = evalGraph.baselines || {};
+    lines.push('eval_graph:');
+    lines.push(`  generated_at: "${String(evalGraph.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  store_path: "${String(evalGraph.storePath || '').replace(/"/g, '\\"')}"`);
+    lines.push('  task_miner:');
+    lines.push(`    mined: ${Number(evalTaskMiner.mined || 0)}`);
+    lines.push(`    total: ${Number(evalTaskMiner.total || 0)}`);
+    lines.push('  gold_context_miner:');
+    lines.push(`    mined: ${Number(evalGoldContextMiner.mined || 0)}`);
+    lines.push(`    total: ${Number(evalGoldContextMiner.total || 0)}`);
+    lines.push(`    average_gold_files: ${Number(evalGoldContextMiner.averageGoldFiles || 0)}`);
+    lines.push(`    average_required_constraints: ${Number(evalGoldContextMiner.averageRequiredConstraints || 0)}`);
+    lines.push('  canary_harness:');
+    lines.push(`    run_count: ${Number(evalCanaryHarness.runCount || 0)}`);
+    lines.push(`    last_run_at: "${String(evalCanaryHarness.lastRunAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    last_score: ${Number(evalCanaryHarness.lastScore || 0)}`);
+    lines.push(`    pass_rate: ${Number(evalCanaryHarness.passRate || 0)}`);
+    lines.push(`    regressions_detected: ${Number(evalCanaryHarness.regressionsDetected || 0)}`);
+    lines.push(`    promotion_allowed: ${Boolean(evalCanaryHarness.promotionAllowed)}`);
+    lines.push('  regression_tracking:');
+    lines.push(`    open_regressions: ${Number(evalRegressionTracking.openRegressions || 0)}`);
+    lines.push(`    new_regressions: ${Number(evalRegressionTracking.newRegressions || 0)}`);
+    lines.push(`    resolved_regressions: ${Number(evalRegressionTracking.resolvedRegressions || 0)}`);
+    lines.push('  dashboard_metrics:');
+    lines.push('    retrieval:');
+    lines.push(`      gold_context_recall: ${Number(evalRetrieval.goldContextRecall || 0)}`);
+    lines.push(`      gold_context_precision: ${Number(evalRetrieval.goldContextPrecision || 0)}`);
+    lines.push(`      proof_sufficiency: ${Number(evalRetrieval.proofSufficiency || 0)}`);
+    lines.push(`      files_opened_per_solved_task: ${Number(evalRetrieval.filesOpenedPerSolvedTask || 0)}`);
+    lines.push(`      tokens_per_useful_artifact: ${Number(evalRetrieval.tokensPerUsefulArtifact || 0)}`);
+    lines.push('    non_functional:');
+    lines.push(`      security_issue_miss_rate: ${Number(evalNonFunctional.securityIssueMissRate || 0)}`);
+    lines.push(`      perf_regression_miss_rate: ${Number(evalNonFunctional.perfRegressionMissRate || 0)}`);
+    lines.push(`      bad_dependency_decision_rate: ${Number(evalNonFunctional.badDependencyDecisionRate || 0)}`);
+    lines.push('    learning:');
+    lines.push(`      planner_uplift: ${Number(evalLearning.plannerUplift || 0)}`);
+    lines.push(`      memory_card_utility: ${Number(evalLearning.memoryCardUtility || 0)}`);
+    lines.push(`      operator_promotion_hit_rate: ${Number(evalLearning.operatorPromotionHitRate || 0)}`);
+    lines.push(`      stale_memory_decay_correctness: ${Number(evalLearning.staleMemoryDecayCorrectness || 0)}`);
+    lines.push('  baselines:');
+    lines.push(`    v1_median_tokens_per_useful_artifact: ${Number(evalBaselines.v1MedianTokensPerUsefulArtifact || 0)}`);
+    lines.push(`    source: "${String(evalBaselines.source || 'insufficient-history').replace(/"/g, '\\"')}"`);
+    lines.push(`    sample_count: ${Number(evalBaselines.sampleCount || 0)}`);
+    lines.push(`    window_size: ${Number(evalBaselines.windowSize || 0)}`);
+
+    const distillation = manifest.distillationEngine || {};
+    const distillationArtifacts = distillation.artifacts || {};
+    const distillationBandit = distillation.plannerBandit || {};
+    const distillationTestSelector = distillation.testSelector || {};
+    const distillationPrecedentRanker = distillation.precedentRanker || {};
+    const distillationRiskScorer = distillation.riskScorer || {};
+    const distillationPromotion = distillation.promotion || {};
+    lines.push('distillation_engine:');
+    lines.push(`  generated_at: "${String(distillation.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  store_path: "${String(distillation.storePath || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  run_count: ${Number(distillation.runCount || 0)}`);
+    lines.push('  artifacts:');
+    lines.push(`    rankers: ${Number(distillationArtifacts.rankers || 0)}`);
+    lines.push(`    planner_policies: ${Number(distillationArtifacts.plannerPolicies || 0)}`);
+    lines.push(`    test_selectors: ${Number(distillationArtifacts.testSelectors || 0)}`);
+    lines.push(`    precedent_rankers: ${Number(distillationArtifacts.precedentRankers || 0)}`);
+    lines.push(`    risk_scorers: ${Number(distillationArtifacts.riskScorers || 0)}`);
+    lines.push('  planner_bandit:');
+    lines.push(`    explore_rate: ${Number(distillationBandit.exploreRate || 0)}`);
+    lines.push(`    winning_policy: "${String(distillationBandit.winningPolicy || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    expected_reward: ${Number(distillationBandit.expectedReward || 0)}`);
+    lines.push(`    policy_arm_count: ${Array.isArray(distillationBandit.policyArms) ? distillationBandit.policyArms.length : 0}`);
+    lines.push('  test_selector:');
+    lines.push(`    candidate_count: ${Number(distillationTestSelector.candidateCount || 0)}`);
+    lines.push(`    selected_count: ${Array.isArray(distillationTestSelector.selected) ? distillationTestSelector.selected.length : 0}`);
+    lines.push(`    estimated_recall: ${Number(distillationTestSelector.estimatedRecall || 0)}`);
+    lines.push('  precedent_ranker:');
+    lines.push(`    candidate_count: ${Number(distillationPrecedentRanker.candidateCount || 0)}`);
+    lines.push(`    top_count: ${Array.isArray(distillationPrecedentRanker.topPrecedents) ? distillationPrecedentRanker.topPrecedents.length : 0}`);
+    lines.push(`    confidence: ${Number(distillationPrecedentRanker.confidence || 0)}`);
+    lines.push('  risk_scorer:');
+    lines.push(`    score: ${Number(distillationRiskScorer.score || 0)}`);
+    lines.push(`    level: "${String(distillationRiskScorer.level || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    driver_count: ${Array.isArray(distillationRiskScorer.drivers) ? distillationRiskScorer.drivers.length : 0}`);
+    lines.push('  promotion:');
+    lines.push(`    shadow_ready: ${Boolean(distillationPromotion.shadowReady)}`);
+    lines.push(`    canary_eligible: ${Boolean(distillationPromotion.canaryEligible)}`);
+    lines.push(`    promoted: ${Boolean(distillationPromotion.promoted)}`);
+    lines.push(`    rollback_ready: ${Boolean(distillationPromotion.rollbackReady)}`);
+
+    const toolsmith = manifest.toolsmith || {};
+    const toolsmithMiner = toolsmith.miner || {};
+    const toolsmithSynthesis = toolsmith.synthesis || {};
+    const toolsmithImplementationKinds = toolsmithSynthesis.implementationKinds || {};
+    const toolsmithSandbox = toolsmith.sandbox || {};
+    const toolsmithPromotion = toolsmith.promotion || {};
+    const toolsmithGuardrails = toolsmithPromotion.guardrails || {};
+    lines.push('toolsmith:');
+    lines.push(`  generated_at: "${String(toolsmith.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  store_path: "${String(toolsmith.storePath || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  run_count: ${Number(toolsmith.runCount || 0)}`);
+    lines.push('  miner:');
+    lines.push(`    sequence_count: ${Number(toolsmithMiner.sequenceCount || 0)}`);
+    lines.push(`    top_sequence_count: ${Array.isArray(toolsmithMiner.topSequences) ? toolsmithMiner.topSequences.length : 0}`);
+    lines.push('  synthesis:');
+    lines.push(`    candidates_generated: ${Number(toolsmithSynthesis.candidatesGenerated || 0)}`);
+    lines.push(`    artifacts_total: ${Number(toolsmithSynthesis.artifactsTotal || 0)}`);
+    lines.push(`    typed_operators: ${Number(toolsmithSynthesis.typedOperators || 0)}`);
+    lines.push('    implementation_kinds:');
+    lines.push(`      cypher: ${Number(toolsmithImplementationKinds.cypher || 0)}`);
+    lines.push(`      pipeline: ${Number(toolsmithImplementationKinds.pipeline || 0)}`);
+    lines.push(`      composite: ${Number(toolsmithImplementationKinds.composite || 0)}`);
+    lines.push('  sandbox:');
+    lines.push(`    profile: "${String(toolsmithSandbox.profile || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    approved: ${Number(toolsmithSandbox.approved || 0)}`);
+    lines.push(`    pending: ${Number(toolsmithSandbox.pending || 0)}`);
+    lines.push(`    rejected: ${Number(toolsmithSandbox.rejected || 0)}`);
+    lines.push('  promotion:');
+    lines.push(`    eligible: ${Number(toolsmithPromotion.eligible || 0)}`);
+    lines.push(`    promoted: ${Number(toolsmithPromotion.promoted || 0)}`);
+    lines.push(`    rolled_back: ${Number(toolsmithPromotion.rolledBack || 0)}`);
+    lines.push('    guardrails:');
+    lines.push(`      deterministic_tests: ${Boolean(toolsmithGuardrails.deterministicTests)}`);
+    lines.push(`      eval_canary: ${Boolean(toolsmithGuardrails.evalCanary)}`);
+    lines.push(`      security_policy: ${Boolean(toolsmithGuardrails.securityPolicy)}`);
+    lines.push(`      capability_safe: ${Boolean(toolsmithGuardrails.capabilitySafe)}`);
+    lines.push(`      proof_carrying: ${Boolean(toolsmithGuardrails.proofCarrying)}`);
+
+    const graphModelBridge = manifest.graphModelBridge || {};
+    const bridgeCoverage = graphModelBridge.coverage || {};
+    const bridgePromotion = graphModelBridge.promotion || {};
+    const bridgeLearned = graphModelBridge.learned || {};
+    lines.push('graph_model_bridge:');
+    lines.push(`  generated_at: "${String(graphModelBridge.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  store_path: "${String(graphModelBridge.storePath || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  run_count: ${Number(graphModelBridge.runCount || 0)}`);
+    lines.push(`  packet_count: ${Number(graphModelBridge.packetCount || 0)}`);
+    lines.push(`  latest_packet_count: ${Number(graphModelBridge.latestPacketCount || 0)}`);
+    lines.push('  coverage:');
+    lines.push(`    slice_backed: ${Number(bridgeCoverage.sliceBacked || 0)}`);
+    lines.push(`    proof_backed: ${Number(bridgeCoverage.proofBacked || 0)}`);
+    lines.push(`    avg_proof_hashes: ${Number(bridgeCoverage.avgProofHashes || 0)}`);
+    lines.push('  promotion:');
+    lines.push(`    symbolic_enabled: ${Boolean(bridgePromotion.symbolicEnabled)}`);
+    lines.push(`    learned_candidate_ready: ${Boolean(bridgePromotion.learnedCandidateReady)}`);
+    lines.push('  learned:');
+    lines.push(`    mode: "${String(bridgeLearned.mode || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    model_path: "${String(bridgeLearned.modelPath || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    model_version: "${String(bridgeLearned.modelVersion || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    trained_at: "${String(bridgeLearned.trainedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`    training_packet_count: ${Number(bridgeLearned.trainingPacketCount || 0)}`);
+    lines.push(`    shadow_prediction_count: ${Number(bridgeLearned.shadowPredictionCount || 0)}`);
+    lines.push(`    average_confidence: ${Number(bridgeLearned.averageConfidence || 0)}`);
+
+    const runtimeTruth = manifest.runtimeTruth || {};
+    const runtimeSnapshot = runtimeTruth.snapshot || {};
+    const runtimeCompressed = runtimeTruth.compressed || {};
+    const runtimeReconciliation = runtimeTruth.reconciliation || {};
+    lines.push('runtime_truth:');
+    lines.push(`  generated_at: "${String(runtimeTruth.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  source_file_count: ${Number(runtimeTruth.sourceFileCount || 0)}`);
+    lines.push(`  probe_count: ${Number(runtimeTruth.probeCount || 0)}`);
+    lines.push('  snapshot:');
+    lines.push(`    request_spans: ${Number(runtimeSnapshot.requestSpans || 0)}`);
+    lines.push(`    db_queries: ${Number(runtimeSnapshot.dbQueries || 0)}`);
+    lines.push(`    payload_shapes: ${Number(runtimeSnapshot.payloadShapes || 0)}`);
+    lines.push('  compressed:');
+    lines.push(`    witness_cards: ${Number(runtimeCompressed.witnessCards || 0)}`);
+    lines.push(`    observed_loops: ${Number(runtimeCompressed.observedLoops || 0)}`);
+    lines.push(`    contradiction_witnesses: ${Number(runtimeCompressed.contradictionWitnesses || 0)}`);
+    lines.push(`    coverage_witnesses: ${Number(runtimeCompressed.coverageWitnesses || 0)}`);
+    lines.push('  reconciliation:');
+    lines.push(`    supports_static_edge: ${Number(runtimeReconciliation.supportsStaticEdge || 0)}`);
+    lines.push(`    fills_static_gap: ${Number(runtimeReconciliation.fillsStaticGap || 0)}`);
+    lines.push(`    contradicts_static_expectation: ${Number(runtimeReconciliation.contradictsStaticExpectation || 0)}`);
+    lines.push(`    reveals_hidden_dynamic_branch: ${Number(runtimeReconciliation.revealsHiddenDynamicBranch || 0)}`);
+    lines.push(`    reveals_dead_static_only_path: ${Number(runtimeReconciliation.revealsDeadStaticOnlyPath || 0)}`);
+
+    const reviewRuntimeProbes = manifest.reviewRuntimeProbes || {};
+    const reviewRuntimeTriggers = Array.isArray(reviewRuntimeProbes.triggers) ? reviewRuntimeProbes.triggers : [];
+    lines.push('review_runtime_probes:');
+    lines.push(`  generated_at: "${String(reviewRuntimeProbes.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  runtime_source: "${String(reviewRuntimeProbes.runtimeSource || '').replace(/"/g, '\\"')}"`);
+    lines.push(`  request_count: ${Number(reviewRuntimeProbes.requestCount || 0)}`);
+    lines.push(`  high_priority_count: ${Number(reviewRuntimeProbes.highPriorityCount || 0)}`);
+    lines.push('  triggers:');
+    if (reviewRuntimeTriggers.length === 0) {
+      lines.push('    []');
+    } else {
+      for (const trigger of reviewRuntimeTriggers.slice(0, 12)) {
+        lines.push(`    - "${String(trigger || '').replace(/"/g, '\\"')}"`);
+      }
+    }
+
+    const v2Parity = manifest.v2Parity || {};
+    const v2Overall = v2Parity.overall || {};
+    const v2Pillars = v2Parity.pillars || {};
+    const v2Blockers = Array.isArray(v2Parity.blockers) ? v2Parity.blockers : [];
+    const pillarOrder = ['query', 'review', 'implement', 'debug', 'self_feedback'];
+    lines.push('v2_parity:');
+    lines.push(`  generated_at: "${String(v2Parity.generatedAt || '').replace(/"/g, '\\"')}"`);
+    lines.push('  overall:');
+    lines.push(`    ready: ${Boolean(v2Overall.ready)}`);
+    lines.push(`    score: ${Number(v2Overall.score || 0)}`);
+    lines.push(`    met: ${Number(v2Overall.met || 0)}`);
+    lines.push(`    partial: ${Number(v2Overall.partial || 0)}`);
+    lines.push(`    missing: ${Number(v2Overall.missing || 0)}`);
+    lines.push(`    unverified: ${Number(v2Overall.unverified || 0)}`);
+    lines.push(`    total: ${Number(v2Overall.total || 0)}`);
+    lines.push('  pillars:');
+    for (const pillarName of pillarOrder) {
+      const pillar = (v2Pillars as any)[pillarName] || {};
+      lines.push(`    ${pillarName}:`);
+      lines.push(`      score: ${Number(pillar.score || 0)}`);
+      lines.push(`      met: ${Number(pillar.met || 0)}`);
+      lines.push(`      partial: ${Number(pillar.partial || 0)}`);
+      lines.push(`      missing: ${Number(pillar.missing || 0)}`);
+      lines.push(`      unverified: ${Number(pillar.unverified || 0)}`);
+      lines.push(`      total: ${Number(pillar.total || 0)}`);
+    }
+    lines.push(`  blocker_count: ${v2Blockers.length}`);
+    lines.push('  blockers:');
+    if (v2Blockers.length === 0) {
+      lines.push('    []');
+    } else {
+      for (const blocker of v2Blockers.slice(0, 12)) {
+        lines.push(`    - "${String(blocker || '').replace(/"/g, '\\"')}"`);
+      }
+    }
+
+    lines.push('active_producer_versions:');
+    const activeProducerVersions = manifest.activeProducerVersions || {};
+    for (const [producerId, version] of Object.entries(activeProducerVersions)) {
+      lines.push(`  ${producerId}: "${String(version || '').replace(/"/g, '\\"')}"`);
+    }
+    if (Object.keys(activeProducerVersions).length === 0) {
+      lines.push('  {}');
+    }
+
+    lines.push('warnings:');
+    const warnings = Array.isArray(manifest.warnings) ? manifest.warnings : [];
+    for (const warning of warnings.slice(0, 20)) {
+      lines.push(`  - "${String(warning || '').replace(/"/g, '\\"')}"`);
+    }
+    if (warnings.length === 0) {
+      lines.push('  []');
+    }
+
+    return lines.join('\n');
+  } catch {
+    return 'error: Brain manifest not found. Run: gitnexus analyze';
+  }
 }
 
 async function getEpisodeResource(backend: LocalBackend, repoName?: string): Promise<string> {
@@ -804,6 +1157,7 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '',
       `- \`gitnexus://repo/${repo.name}/context\` — Stats, staleness check`,
       `- \`gitnexus://repo/${repo.name}/clusters\` — All functional areas`,
+      `- \`gitnexus://repo/${repo.name}/brain\` — BrainKernel manifest`,
       `- \`gitnexus://repo/${repo.name}/processes\` — All execution flows`,
       `- \`gitnexus://repo/${repo.name}/archetypes\` — Derived flow signatures + exemplar processes`,
       `- \`gitnexus://repo/${repo.name}/schema\` — Graph schema for Cypher`,

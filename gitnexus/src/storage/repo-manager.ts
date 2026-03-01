@@ -15,6 +15,7 @@ export interface RepoMeta {
   lastCommit: string;
   indexedAt: string;
   kuzuSchemaVersion?: number;
+  ftsSchemaVersion?: number;
   stats?: {
     files?: number;
     nodes?: number;

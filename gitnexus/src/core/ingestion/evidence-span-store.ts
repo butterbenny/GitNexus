@@ -3,6 +3,12 @@ import path from 'path';
 import { EvidenceSpanSnapshot } from './evidence-span-processor.js';
 
 const EVIDENCE_SPAN_FILE_NAME = 'evidence-spans.json';
+type EvidenceSnapshotCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  snapshot: EvidenceSpanSnapshot;
+};
+const evidenceSnapshotCache = new Map<string, EvidenceSnapshotCacheEntry>();
 
 const makeEmptySnapshot = (): EvidenceSpanSnapshot => ({
   version: 1,
@@ -74,10 +80,23 @@ const sanitizeSnapshot = (value: any): EvidenceSpanSnapshot => {
 export const loadEvidenceSpanSnapshot = async (storagePath: string): Promise<EvidenceSpanSnapshot> => {
   const filePath = getEvidenceSpanSnapshotPath(storagePath);
   try {
+    const stat = await fs.stat(filePath);
+    const cached = evidenceSnapshotCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.snapshot;
+    }
+
     const raw = await fs.readFile(filePath, 'utf-8');
     const parsed = JSON.parse(raw);
-    return sanitizeSnapshot(parsed);
+    const snapshot = sanitizeSnapshot(parsed);
+    evidenceSnapshotCache.set(filePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      snapshot,
+    });
+    return snapshot;
   } catch {
+    evidenceSnapshotCache.delete(filePath);
     return makeEmptySnapshot();
   }
 };

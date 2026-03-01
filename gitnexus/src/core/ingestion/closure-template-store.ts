@@ -6,6 +6,12 @@ import {
 } from './closure-template-processor.js';
 
 const CLOSURE_TEMPLATE_FILE_NAME = 'closure-templates.json';
+type ClosureTemplateCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  snapshot: ClosureTemplateSnapshot;
+};
+const closureTemplateCache = new Map<string, ClosureTemplateCacheEntry>();
 
 const makeEmptySnapshot = (): ClosureTemplateSnapshot => ({
   version: 1,
@@ -97,10 +103,23 @@ export const loadClosureTemplateSnapshot = async (
 ): Promise<ClosureTemplateSnapshot> => {
   const filePath = getClosureTemplateSnapshotPath(storagePath);
   try {
+    const stat = await fs.stat(filePath);
+    const cached = closureTemplateCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.snapshot;
+    }
+
     const raw = await fs.readFile(filePath, 'utf-8');
     const parsed = JSON.parse(raw);
-    return sanitizeSnapshot(parsed);
+    const snapshot = sanitizeSnapshot(parsed);
+    closureTemplateCache.set(filePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      snapshot,
+    });
+    return snapshot;
   } catch {
+    closureTemplateCache.delete(filePath);
     return makeEmptySnapshot();
   }
 };

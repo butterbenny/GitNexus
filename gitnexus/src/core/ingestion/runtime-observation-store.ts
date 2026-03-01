@@ -6,6 +6,12 @@ const RUNTIME_FILE_CANDIDATES = [
   'runtime-observations.snapshot.json',
   'runtime-observations.ndjson',
 ];
+type RuntimeFileCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  snapshot: RuntimeObservationSnapshot;
+};
+const runtimeFileCache = new Map<string, RuntimeFileCacheEntry>();
 
 export type RuntimeRequestSpan = {
   method?: string;
@@ -253,20 +259,27 @@ export const parseRuntimeObservationText = (raw: string, formatHint?: string): R
 
 const loadSingleRuntimeFile = async (filePath: string): Promise<RuntimeObservationSnapshot> => {
   try {
+    const stat = await fs.stat(filePath);
+    const cached = runtimeFileCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.snapshot;
+    }
+
     const raw = await fs.readFile(filePath, 'utf-8');
     const extension = path.extname(filePath).toLowerCase();
     const snapshot = parseRuntimeObservationText(raw, extension === '.ndjson' ? 'ndjson' : 'json');
     snapshot.source_files = [filePath];
     if (!snapshot.generatedAt) {
-      try {
-        const stat = await fs.stat(filePath);
-        snapshot.generatedAt = new Date(stat.mtimeMs).toISOString();
-      } catch {
-        snapshot.generatedAt = '';
-      }
+      snapshot.generatedAt = new Date(stat.mtimeMs).toISOString();
     }
+    runtimeFileCache.set(filePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      snapshot,
+    });
     return snapshot;
   } catch {
+    runtimeFileCache.delete(filePath);
     return emptyRuntimeObservationSnapshot();
   }
 };

@@ -2556,15 +2556,95 @@ export class LocalBackend {
     const processMap = new Map<string, ProcessAgg>();
     const definitions: any[] = []; // standalone symbols not in any process
 
+    const escapeCypherValue = (value: string): string => String(value || '').replace(/'/g, "''");
+    const buildCypherStringList = (values: string[]): string => {
+      if (values.length === 0) return '[]';
+      return `[${values.map(value => `'${escapeCypherValue(value)}'`).join(', ')}]`;
+    };
+
+    const mergedNodeIds = Array.from(new Set(
+      merged
+        .map(item => String(item?.data?.nodeId || '').trim())
+        .filter(Boolean),
+    ));
+    const mergedNodeIdCypherList = buildCypherStringList(mergedNodeIds);
+
+    const processRowsByNodeId = new Map<string, any[]>();
+    if (mergedNodeIds.length > 0) {
+      try {
+        const processMembershipRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE n.id IN ${mergedNodeIdCypherList}
+          RETURN n.id AS nodeId,
+                 p.id AS pid,
+                 p.label AS label,
+                 p.heuristicLabel AS heuristicLabel,
+                 p.processType AS processType,
+                 p.stepCount AS stepCount,
+                 r.step AS step
+        `);
+        for (const row of processMembershipRows) {
+          const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
+          if (!nodeId) continue;
+          const list = processRowsByNodeId.get(nodeId) || [];
+          list.push(row);
+          processRowsByNodeId.set(nodeId, list);
+        }
+      } catch {
+        // Best-effort path. Query mode continues with standalone definitions when lookup fails.
+      }
+    }
+
+    const cohesionByNodeId = new Map<string, number>();
+    if (mergedNodeIds.length > 0) {
+      try {
+        const cohesionRows = await executeQuery(repo.id, `
+          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE n.id IN ${mergedNodeIdCypherList}
+          RETURN n.id AS nodeId, max(c.cohesion) AS cohesion
+        `);
+        for (const row of cohesionRows) {
+          const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
+          if (!nodeId) continue;
+          const cohesionRaw = row?.cohesion ?? row?.[1] ?? 0;
+          const cohesion = Number(cohesionRaw);
+          cohesionByNodeId.set(nodeId, Number.isFinite(cohesion) ? cohesion : 0);
+        }
+      } catch {
+        // Keep default cohesion=0
+      }
+    }
+
+    const contentByNodeId = new Map<string, string>();
+    if (includeContent && mergedNodeIds.length > 0) {
+      try {
+        const contentRows = await executeQuery(repo.id, `
+          MATCH (n)
+          WHERE n.id IN ${mergedNodeIdCypherList}
+          RETURN n.id AS nodeId, n.content AS content
+        `);
+        for (const row of contentRows) {
+          const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
+          if (!nodeId) continue;
+          const content = row?.content ?? row?.[1];
+          if (typeof content === 'string' && content.length > 0) {
+            contentByNodeId.set(nodeId, content);
+          }
+        }
+      } catch {
+        // Keep content unset
+      }
+    }
+
     const ensureProcess = (row: any, defaultPid: string): ProcessAgg => {
-      const pid = row.pid ?? row[0] ?? defaultPid;
+      const pid = String(row?.pid ?? row?.[1] ?? row?.[0] ?? defaultPid).trim() || defaultPid;
       if (!processMap.has(pid)) {
         processMap.set(pid, {
           id: pid,
-          label: row.label ?? row[1] ?? '',
-          heuristicLabel: row.heuristicLabel ?? row[2] ?? '',
-          processType: row.processType ?? row[3] ?? '',
-          stepCount: row.stepCount ?? row[4] ?? 0,
+          label: String(row?.label ?? row?.[2] ?? row?.[1] ?? ''),
+          heuristicLabel: String(row?.heuristicLabel ?? row?.[3] ?? row?.[2] ?? ''),
+          processType: String(row?.processType ?? row?.[4] ?? row?.[3] ?? ''),
+          stepCount: Number(row?.stepCount ?? row?.[5] ?? row?.[4] ?? 0) || 0,
           totalScore: 0,
           cohesionBoost: 0,
           bestHitRank: Number.POSITIVE_INFINITY,
@@ -2586,45 +2666,13 @@ export class LocalBackend {
         continue;
       }
 
-      const escaped = sym.nodeId.replace(/'/g, "''");
+      const nodeId = String(sym.nodeId || '').trim();
       const hitRank = item.mergedRank;
       const hitScore = item.score;
 
-      // Find processes this symbol participates in
-      let processRows: any[] = [];
-      try {
-        processRows = await executeQuery(repo.id, `
-          MATCH (n {id: '${escaped}'})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `);
-      } catch { /* symbol might not be in any process */ }
-
-      // Get cluster cohesion as internal ranking signal (never exposed)
-      let cohesion = 0;
-      try {
-        const cohesionRows = await executeQuery(repo.id, `
-          MATCH (n {id: '${escaped}'})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          RETURN c.cohesion AS cohesion
-          LIMIT 1
-        `);
-        if (cohesionRows.length > 0) {
-          cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
-        }
-      } catch { /* no cluster info */ }
-
-      // Optionally fetch content
-      let content: string | undefined;
-      if (includeContent) {
-        try {
-          const contentRows = await executeQuery(repo.id, `
-            MATCH (n {id: '${escaped}'})
-            RETURN n.content AS content
-          `);
-          if (contentRows.length > 0) {
-            content = contentRows[0].content ?? contentRows[0][0];
-          }
-        } catch { /* skip */ }
-      }
+      const processRows = processRowsByNodeId.get(nodeId) || [];
+      const cohesion = cohesionByNodeId.get(nodeId) || 0;
+      const content = includeContent ? contentByNodeId.get(nodeId) : undefined;
 
       const symbolEntry = {
         id: sym.nodeId,
@@ -2721,17 +2769,36 @@ export class LocalBackend {
       }
     }
 
+    const bridgeTargetRowsByNodeId = new Map<string, any[]>();
+    const bridgeTargetIds = Array.from(bridgeTargets.keys());
+    if (bridgeTargetIds.length > 0) {
+      try {
+        const bridgeRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE n.id IN ${buildCypherStringList(bridgeTargetIds)}
+          RETURN n.id AS nodeId,
+                 p.id AS pid,
+                 p.label AS label,
+                 p.heuristicLabel AS heuristicLabel,
+                 p.processType AS processType,
+                 p.stepCount AS stepCount,
+                 r.step AS step
+        `);
+        for (const row of bridgeRows) {
+          const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
+          if (!nodeId) continue;
+          const list = bridgeTargetRowsByNodeId.get(nodeId) || [];
+          list.push(row);
+          bridgeTargetRowsByNodeId.set(nodeId, list);
+        }
+      } catch {
+        // Keep fallback behavior (target ends in definitions if no process rows found).
+      }
+    }
+
     for (const target of bridgeTargets.values()) {
       const sym = target.data;
-      const escaped = sym.nodeId.replace(/'/g, "''");
-
-      let processRows: any[] = [];
-      try {
-        processRows = await executeQuery(repo.id, `
-          MATCH (n {id: '${escaped}'})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `);
-      } catch { /* skip */ }
+      const processRows = bridgeTargetRowsByNodeId.get(String(sym.nodeId || '').trim()) || [];
 
       if (processRows.length === 0) {
         definitions.push({
@@ -2768,8 +2835,10 @@ export class LocalBackend {
     const rankedProcesses = candidates
       .map(p => ({
         ...p,
+        hitCoverage: p.hitCount / Math.max(1, p.stepCount || 1),
         priority: p.totalScore +
           (p.cohesionBoost * 0.1) +
+          (Math.min(1, p.hitCount / Math.max(1, p.stepCount || 1)) * 0.35) +
           (Number.isFinite(p.bestHitRank) ? (1 / (30 + p.bestHitRank)) : 0),
       }))
       .sort((a, b) => b.priority - a.priority)
@@ -2778,50 +2847,124 @@ export class LocalBackend {
     // Step 4: Fetch full process-step symbols (not only the direct search hits)
     const processSymbols: any[] = [];
     const symbolCountByProcess = new Map<string, number>();
+    const stepRowsByProcessId = new Map<string, any[]>();
+    const rankedProcessIds = rankedProcesses.map(proc => String(proc.id || '').trim()).filter(Boolean);
+    if (rankedProcessIds.length > 0) {
+      const contentProjection = includeContent ? ', n.content AS content' : '';
+      try {
+        const stepRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE p.id IN ${buildCypherStringList(rankedProcessIds)}
+          RETURN p.id AS processId,
+                 n.id AS id,
+                 n.name AS name,
+                 n.filePath AS filePath,
+                 n.startLine AS startLine,
+                 n.endLine AS endLine${contentProjection},
+                 r.step AS step
+          ORDER BY p.id, r.step
+        `);
+        for (const row of stepRows) {
+          const pid = String(row?.processId ?? row?.[0] ?? '').trim();
+          if (!pid) continue;
+          const list = stepRowsByProcessId.get(pid) || [];
+          list.push(row);
+          stepRowsByProcessId.set(pid, list);
+        }
+      } catch {
+        // Best-effort: keep empty process symbols if step extraction fails.
+      }
+    }
 
     for (const proc of rankedProcesses) {
-      const escapedPid = proc.id.replace(/'/g, "''");
-      const contentProjection = includeContent ? ', n.content AS content' : '';
-
-      let stepRows: any[] = [];
-      try {
-        stepRows = await executeQuery(repo.id, `
-          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escapedPid}'})
-          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${contentProjection},
-                 r.step AS step
-          ORDER BY r.step
-        `);
-      } catch { /* skip */ }
-
+      const stepRows = stepRowsByProcessId.get(String(proc.id || '').trim()) || [];
       const stepSymbols: any[] = [];
       for (const row of stepRows) {
-        const nodeId = row.id ?? row[0];
-        if (!nodeId || typeof nodeId !== 'string') continue;
+        const nodeId = String(row?.id ?? row?.[1] ?? '').trim();
+        if (!nodeId) continue;
 
         const labelEndIdx = nodeId.indexOf(':');
         const type = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
 
-        const step = row.step ?? row[includeContent ? 6 : 5];
-        const stepIndex = typeof step === 'number' ? step : parseInt(step, 10);
+        const stepRaw = row?.step ?? row?.[includeContent ? 7 : 6];
+        const stepIndex = typeof stepRaw === 'number' ? stepRaw : parseInt(String(stepRaw), 10);
 
-        const filePath = row.filePath ?? row[2] ?? '';
+        const filePath = String(row?.filePath ?? row?.[3] ?? '').trim();
         if (!isInScope(filePath)) continue;
 
         stepSymbols.push({
           id: nodeId,
-          name: row.name ?? row[1] ?? '',
+          name: String(row?.name ?? row?.[2] ?? ''),
           type,
           filePath,
-          startLine: row.startLine ?? row[3],
-          endLine: row.endLine ?? row[4],
-          ...(includeContent ? { content: row.content ?? row[5] } : {}),
+          startLine: row?.startLine ?? row?.[4],
+          endLine: row?.endLine ?? row?.[5],
+          ...(includeContent ? { content: row?.content ?? row?.[6] } : {}),
           process_id: proc.id,
-          step_index: stepIndex,
+          step_index: Number.isFinite(stepIndex) ? stepIndex : undefined,
           ...(hitMeta.has(nodeId) ? { hit_rank: hitMeta.get(nodeId)!.rank } : {}),
         });
       }
 
-      const limitedSteps = stepSymbols.slice(0, maxSymbolsPerProcess);
+      const selectedSteps = stepSymbols.slice(0, maxSymbolsPerProcess);
+      if (selectedSteps.length < maxSymbolsPerProcess) {
+        const selectedIds = new Set(selectedSteps.map(step => String(step?.id || '')));
+        const rankedMandatory = stepSymbols
+          .filter(step => hitMeta.has(String(step?.id || '')))
+          .sort((left, right) => {
+            const leftRank = Number(hitMeta.get(String(left?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
+            const rightRank = Number(hitMeta.get(String(right?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
+            if (leftRank !== rightRank) return leftRank - rightRank;
+            const leftStep = Number(left?.step_index ?? Number.POSITIVE_INFINITY);
+            const rightStep = Number(right?.step_index ?? Number.POSITIVE_INFINITY);
+            return leftStep - rightStep;
+          });
+        for (const mandatoryStep of rankedMandatory) {
+          const mandatoryId = String(mandatoryStep?.id || '');
+          if (!mandatoryId || selectedIds.has(mandatoryId)) continue;
+          selectedSteps.push(mandatoryStep);
+          selectedIds.add(mandatoryId);
+          if (selectedSteps.length >= maxSymbolsPerProcess) break;
+        }
+      } else {
+        const selectedIds = new Set(selectedSteps.map(step => String(step?.id || '')));
+        const rankedMandatory = stepSymbols
+          .filter(step => hitMeta.has(String(step?.id || '')))
+          .sort((left, right) => {
+            const leftRank = Number(hitMeta.get(String(left?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
+            const rightRank = Number(hitMeta.get(String(right?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
+            if (leftRank !== rightRank) return leftRank - rightRank;
+            const leftStep = Number(left?.step_index ?? Number.POSITIVE_INFINITY);
+            const rightStep = Number(right?.step_index ?? Number.POSITIVE_INFINITY);
+            return leftStep - rightStep;
+          });
+        for (const mandatoryStep of rankedMandatory) {
+          const mandatoryId = String(mandatoryStep?.id || '');
+          if (!mandatoryId || selectedIds.has(mandatoryId)) continue;
+          let replaceIdx = -1;
+          for (let i = selectedSteps.length - 1; i >= 0; i -= 1) {
+            const existingId = String(selectedSteps[i]?.id || '');
+            if (!hitMeta.has(existingId)) {
+              replaceIdx = i;
+              break;
+            }
+          }
+          if (replaceIdx < 0) break;
+          selectedIds.delete(String(selectedSteps[replaceIdx]?.id || ''));
+          selectedSteps[replaceIdx] = mandatoryStep;
+          selectedIds.add(mandatoryId);
+        }
+      }
+
+      const limitedSteps = selectedSteps
+        .sort((left, right) => {
+          const leftStep = Number(left?.step_index ?? Number.POSITIVE_INFINITY);
+          const rightStep = Number(right?.step_index ?? Number.POSITIVE_INFINITY);
+          if (leftStep !== rightStep) return leftStep - rightStep;
+          return String(left?.id || '').localeCompare(String(right?.id || ''));
+        })
+        .slice(0, maxSymbolsPerProcess);
+
       symbolCountByProcess.set(proc.id, limitedSteps.length);
       processSymbols.push(...limitedSteps);
     }
@@ -3365,6 +3508,9 @@ export class LocalBackend {
 
     let queryModeResult: any = null;
     if (includeQueryHead) {
+      const actionPlanHasPrecedents = Array.isArray(actionPlanResult?.implement_plan?.precedents)
+        && actionPlanResult.implement_plan.precedents.length > 0;
+      const queryHeadIncludePrecedents = !actionPlanHasPrecedents && limitPrecedents > 0;
       try {
         queryModeResult = await this.queryMode(repo, {
           query: queryText,
@@ -3376,7 +3522,7 @@ export class LocalBackend {
           limit_slices: 2,
           limit_precedents: limitPrecedents,
           limit_hops: 0,
-          include_precedents: true,
+          include_precedents: queryHeadIncludePrecedents,
           include_action_hints: false,
         });
       } catch {

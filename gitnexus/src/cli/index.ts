@@ -42,7 +42,7 @@ program
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--skip-embeddings', 'Skip embedding generation (faster)')
   .option('--incremental-max-changes <n>', 'Override incremental change limit (0 disables incremental)', (value) => parseInt(value, 10))
-  .option('--incremental-derived <mode>', 'Incremental derived refresh mode: full|fast', 'full')
+  .option('--incremental-derived <mode>', 'Incremental derived refresh mode: full|adaptive|fast', 'adaptive')
   .option('--incremental-recompute-processes', 'Recompute execution flows (Process nodes) after incremental update')
   .option('--incremental-recompute-communities', 'Recompute communities/clusters (Community nodes) after incremental update')
   .option('--precision-overlay <mode>', 'Precision overlay mode: auto|scip|shadow|lsp-probe|off', 'auto')
