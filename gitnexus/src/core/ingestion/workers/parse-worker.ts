@@ -12,7 +12,7 @@ import Rust from 'tree-sitter-rust';
 import PHP from 'tree-sitter-php';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
-import { getLanguageFromFilename, getParseableContent } from '../utils.js';
+import { getLanguageFromFilename, getParseableContent, parseWithAdaptiveBuffer } from '../utils.js';
 import { generateId } from '../../../lib/utils.js';
 
 // ============================================================================
@@ -1160,7 +1160,7 @@ const processFileGroup = (
     let tree;
     const content = getParseableContent(file.path, file.content);
     try {
-      tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
+      tree = parseWithAdaptiveBuffer(parser, content);
     } catch {
       continue;
     }

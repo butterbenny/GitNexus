@@ -121,28 +121,98 @@ function filePathTouchesPrefixes(filePath: string, pathPrefixes: string[]): bool
 }
 
 function parseStringList(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value
+  const dedupe = (items: string[]): string[] => Array.from(new Set(
+    items
       .map(item => String(item || '').trim())
-      .filter(Boolean);
+      .filter(Boolean),
+  ));
+
+  if (Array.isArray(value)) {
+    return dedupe(value as string[]);
   }
 
   const raw = String(value || '').trim();
   if (!raw) return [];
 
   if (raw.startsWith('[') && raw.endsWith(']')) {
-    const inner = raw.slice(1, -1).trim();
-    if (!inner) return [];
-    return inner
-      .split(',')
-      .map(item => item.trim().replace(/^'+|'+$/g, '').replace(/^"+|"+$/g, ''))
-      .filter(Boolean);
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return dedupe(parsed as string[]);
+      }
+    } catch {
+      const inner = raw.slice(1, -1).trim();
+      if (!inner) return [];
+      return dedupe(
+        inner
+          .split(',')
+          .map(item => item.trim().replace(/^'+|'+$/g, '').replace(/^"+|"+$/g, '')),
+      );
+    }
   }
 
-  return raw
-    .split(',')
-    .map(item => item.trim())
-    .filter(Boolean);
+  return dedupe(
+    raw
+      .split(/[\n,;]+/g)
+      .map(item => item.trim()),
+  );
+}
+
+function primaryNodeLabel(value: unknown): string {
+  if (Array.isArray(value)) return String(value[0] ?? '').trim();
+  return String(value ?? '').trim();
+}
+
+function toFiniteNumber(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toOptionalFiniteNumber(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'string' && value.trim().length === 0) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeConfidence(value: unknown, fallback = 1): number {
+  const parsed = toFiniteNumber(value, fallback);
+  if (parsed < 0) return 0;
+  if (parsed > 1) return 1;
+  return parsed;
+}
+
+function toOptionalLineNumber(value: unknown): number | undefined {
+  const parsed = toOptionalFiniteNumber(value);
+  if (parsed === undefined) return undefined;
+  const normalized = Math.trunc(parsed);
+  return normalized > 0 ? normalized : undefined;
+}
+
+function toOptionalNonNegativeInteger(value: unknown): number | undefined {
+  const parsed = toOptionalFiniteNumber(value);
+  if (parsed === undefined) return undefined;
+  const normalized = Math.trunc(parsed);
+  return normalized >= 0 ? normalized : undefined;
+}
+
+function toNonNegativeInteger(value: unknown, fallback: number): number {
+  const parsed = toOptionalNonNegativeInteger(value);
+  return parsed === undefined ? fallback : parsed;
+}
+
+function round3(value: unknown, fallback = 0): number {
+  const normalized = toFiniteNumber(value, fallback);
+  return Math.round(normalized * 1000) / 1000;
+}
+
+function clampInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  const normalized = Math.trunc(parsed);
+  if (normalized < min) return min;
+  if (normalized > max) return max;
+  return normalized;
 }
 
 /** Valid KuzuDB node labels for safe Cypher query construction */
@@ -274,10 +344,10 @@ export class LocalBackend {
       this.contextCache.set(id, {
         projectName: entry.name,
         stats: {
-          fileCount: s.files || 0,
-          functionCount: s.nodes || 0,
-          communityCount: s.communities || 0,
-          processCount: s.processes || 0,
+          fileCount: toNonNegativeInteger(s.files, 0),
+          functionCount: toNonNegativeInteger(s.nodes, 0),
+          communityCount: toNonNegativeInteger(s.communities, 0),
+          processCount: toNonNegativeInteger(s.processes, 0),
         },
       });
     }
@@ -340,10 +410,10 @@ export class LocalBackend {
       this.contextCache.set(id, {
         projectName: handle.name,
         stats: {
-          fileCount: s.files || 0,
-          functionCount: s.nodes || 0,
-          communityCount: s.communities || 0,
-          processCount: s.processes || 0,
+          fileCount: toNonNegativeInteger(s.files, 0),
+          functionCount: toNonNegativeInteger(s.nodes, 0),
+          communityCount: toNonNegativeInteger(s.communities, 0),
+          processCount: toNonNegativeInteger(s.processes, 0),
         },
       });
 
@@ -548,10 +618,10 @@ export class LocalBackend {
       this.contextCache.set(repo.id, {
         projectName: repo.name,
         stats: {
-          fileCount: s.files || 0,
-          functionCount: s.nodes || 0,
-          communityCount: s.communities || 0,
-          processCount: s.processes || 0,
+          fileCount: toNonNegativeInteger(s.files, 0),
+          functionCount: toNonNegativeInteger(s.nodes, 0),
+          communityCount: toNonNegativeInteger(s.communities, 0),
+          processCount: toNonNegativeInteger(s.processes, 0),
         },
       });
     } catch {
@@ -715,8 +785,8 @@ export class LocalBackend {
       if (!filePath) return;
       const startRaw = item?.startLine ?? item?.line ?? item?.start_line;
       const endRaw = item?.endLine ?? item?.end_line;
-      const startLine = Number.isFinite(Number(startRaw)) ? Number(startRaw) : undefined;
-      const endLine = Number.isFinite(Number(endRaw)) ? Number(endRaw) : undefined;
+      const startLine = toOptionalLineNumber(startRaw);
+      const endLine = toOptionalLineNumber(endRaw);
       openedSpans.push({
         filePath,
         ...(startLine && startLine > 0 ? { startLine } : {}),
@@ -734,8 +804,8 @@ export class LocalBackend {
         name: String(item?.name || '').trim() || undefined,
         kind: String(item?.type || item?.kind || '').trim() || undefined,
         filePath: String(item?.filePath || '').trim().replace(/\\/g, '/') || undefined,
-        startLine: Number.isFinite(Number(item?.startLine)) ? Number(item.startLine) : undefined,
-        endLine: Number.isFinite(Number(item?.endLine)) ? Number(item.endLine) : undefined,
+        startLine: toOptionalLineNumber(item?.startLine),
+        endLine: toOptionalLineNumber(item?.endLine),
         ...(processId ? { processId } : {}),
       });
       addSpan(item, symbolId, processId);
@@ -747,9 +817,7 @@ export class LocalBackend {
       openedProcesses.push({
         processId,
         name: String(item?.summary || item?.name || item?.label || '').trim() || undefined,
-        stepCount: Number.isFinite(Number(item?.step_count ?? item?.stepCount))
-          ? Number(item?.step_count ?? item?.stepCount)
-          : undefined,
+        stepCount: toOptionalNonNegativeInteger(item?.step_count ?? item?.stepCount),
       });
     };
 
@@ -1009,7 +1077,7 @@ export class LocalBackend {
     limit?: number;
     include_events?: boolean;
   }): Promise<any> {
-    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 10;
+    const limit = clampInteger(params.limit, 10, 1, 200);
     const includeEvents = params.include_events !== false;
     const state = await loadEpisodeGraphState(repo.storagePath);
     return {
@@ -1034,7 +1102,7 @@ export class LocalBackend {
     limit?: number;
     include_events?: boolean;
   }): Promise<any> {
-    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 10;
+    const limit = clampInteger(params.limit, 10, 1, 200);
     const includeEvents = params.include_events !== false;
 
     if (params.clear === true) {
@@ -1080,7 +1148,7 @@ export class LocalBackend {
     include_nodes?: boolean;
     include_edges?: boolean;
   }): Promise<any> {
-    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 20;
+    const limit = clampInteger(params.limit, 20, 1, 500);
     const snapshot = await loadEvidenceSpanSnapshot(repo.storagePath);
     const evidence = summarizeEvidenceSpanSnapshot(snapshot, {
       limit,
@@ -1104,7 +1172,7 @@ export class LocalBackend {
     file_path?: string;
     query?: string;
   }): Promise<any> {
-    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 20;
+    const limit = clampInteger(params.limit, 20, 1, 500);
     const snapshot = await loadStructuredSummarySnapshot(repo.storagePath);
     const summaries = summarizeStructuredSummarySnapshot(snapshot, {
       limit,
@@ -1127,7 +1195,7 @@ export class LocalBackend {
     template_key?: string;
     query?: string;
   }): Promise<any> {
-    const limit = Number.isFinite(Number(params.limit)) ? Number(params.limit) : 20;
+    const limit = clampInteger(params.limit, 20, 1, 500);
     const snapshot = await loadClosureTemplateSnapshot(repo.storagePath);
     const templates = summarizeClosureTemplateSnapshot(snapshot, {
       limit,
@@ -1151,9 +1219,9 @@ export class LocalBackend {
     repo?: string;
   }): Promise<{ report: ArchetypeReport }> {
     return this.queryArchetypes(repo.id, {
-      limit: params.limit,
-      examplesPerSignature: params.examples,
-      minHttpConfidence: params.min_http_confidence,
+      limit: clampInteger(params.limit, 25, 1, 100),
+      examplesPerSignature: clampInteger(params.examples, 3, 1, 10),
+      minHttpConfidence: Math.max(0, Math.min(1, toFiniteNumber(params.min_http_confidence, 0.9))),
       path_prefixes: params.path_prefixes,
     });
   }
@@ -1197,21 +1265,21 @@ export class LocalBackend {
       if (!proc) {
         proc = {
           id: processId,
-          label: row.label || row[1] || processId,
-          heuristicLabel: row.heuristicLabel || row[2] || row.label || row[1] || processId,
-          processType: row.processType || row[3] || '',
-          stepCount: row.stepCount || row[4] || 0,
+          label: String(row.label ?? row[1] ?? processId).trim(),
+          heuristicLabel: String(row.heuristicLabel ?? row[2] ?? row.label ?? row[1] ?? processId).trim(),
+          processType: String(row.processType ?? row[3] ?? '').trim(),
+          stepCount: toNonNegativeInteger(row.stepCount ?? row[4], 0),
           steps: [],
         };
         processesById.set(processId, proc);
       }
 
       proc.steps.push({
-        step: row.step || row[9] || 0,
-        nodeId: row.nodeId || row[5],
-        name: row.name || row[6] || '',
-        filePath: row.filePath || row[7] || '',
-        type: row.type || row[8] || '',
+        step: toNonNegativeInteger(row.step ?? row[9], 0),
+        nodeId: String(row.nodeId ?? row[5] ?? '').trim(),
+        name: String(row.name ?? row[6] ?? '').trim(),
+        filePath: String(row.filePath ?? row[7] ?? '').trim(),
+        type: primaryNodeLabel(row.type ?? row[8]),
       });
     }
 
@@ -1227,10 +1295,10 @@ export class LocalBackend {
     `);
 
     const httpEdges: HttpEdgeInfo[] = httpRows.map((r: any) => ({
-      sourceId: r.sourceId || r[0],
-      targetId: r.targetId || r[1],
-      reason: r.reason || r[2],
-      confidence: r.confidence || r[3] || 1.0,
+      sourceId: String(r.sourceId ?? r[0] ?? '').trim(),
+      targetId: String(r.targetId ?? r[1] ?? '').trim(),
+      reason: String(r.reason ?? r[2] ?? '').trim(),
+      confidence: toFiniteNumber(r.confidence ?? r[3], 1.0),
     }));
 
     const byProcessId = new Map<string, { signature: string; example: ArchetypeExample }>();
@@ -1283,9 +1351,9 @@ export class LocalBackend {
       return { error: 'query parameter is required and cannot be empty.' };
     }
 
-    const limit = Math.max(1, Math.min(5, params.limit ?? 2));
-    const examplesPer = Math.max(1, Math.min(5, params.examples ?? 3));
-    const minHttpConfidence = params.min_http_confidence ?? 0.9;
+    const limit = clampInteger(params.limit, 2, 1, 5);
+    const examplesPer = clampInteger(params.examples, 3, 1, 5);
+    const minHttpConfidence = Math.max(0, Math.min(1, toFiniteNumber(params.min_http_confidence, 0.9)));
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
 
     const index = await this.ensureArchetypeIndex(repo, minHttpConfidence, pathPrefixes);
@@ -1468,7 +1536,7 @@ export class LocalBackend {
           anchorName: String(row.anchorName || row[5] || '').trim(),
           closureSlots: parseStringList(row.closureSlots ?? row[6]),
           closedSlots: parseStringList(row.closedSlots ?? row[7]),
-          closureScore: Number(row.closureScore ?? row[8] ?? 0) || 0,
+          closureScore: toFiniteNumber(row.closureScore ?? row[8], 0),
           members: [],
           roles: [],
           memberFiles: [],
@@ -1566,7 +1634,7 @@ export class LocalBackend {
           if (!touchesScope) continue;
         }
 
-        const confidence = Number(row.confidence ?? row[2] ?? 0) || 0;
+        const confidence = toFiniteNumber(row.confidence ?? row[2], 0);
         const neighbors = graph.get(source) || new Map<string, number>();
         const previous = neighbors.get(target) || 0;
         if (confidence > previous) neighbors.set(target, confidence);
@@ -1607,7 +1675,7 @@ export class LocalBackend {
         slice_type: slice.sliceType,
         anchor_id: slice.anchorId,
         anchor_name: slice.anchorName,
-        closure_score: Number(slice.closureScore.toFixed(3)),
+        closure_score: round3(slice.closureScore),
         closure_slots: slice.closureSlots,
         closed_slots: slice.closedSlots,
         roles: slice.roles,
@@ -1615,7 +1683,7 @@ export class LocalBackend {
         member_files: slice.memberFiles.slice(0, 10),
       };
 
-      if (extra?.score !== undefined) out.score = Number(extra.score.toFixed(3));
+      if (extra?.score !== undefined) out.score = round3(extra.score);
       if (extra?.evidence) out.evidence = extra.evidence;
       return out;
     };
@@ -1741,31 +1809,31 @@ export class LocalBackend {
         seen.add(key);
 
         out.push({
-          http: { reason: String(reason), confidence: Number(row.confidence ?? row[13] ?? 1.0) },
+          http: { reason: String(reason), confidence: normalizeConfidence(row.confidence ?? row[13], 1.0) },
           endpoint_wiring: {
             reason: String(row.wiringReason || row[14] || ''),
-            confidence: Number(row.wiringConfidence ?? row[15] ?? 1.0),
+            confidence: normalizeConfidence(row.wiringConfidence ?? row[15], 1.0),
           },
           ui: {
             uid: String(uiUid),
             name: String(row.uiName || row[1] || ''),
             kind: String(uiUid).split(':')[0],
             filePath: String(row.uiFilePath || row[2] || ''),
-            startLine: Number(row.uiStartLine ?? row[3] ?? 0) || undefined,
+            startLine: toOptionalLineNumber(row.uiStartLine ?? row[3]),
           },
           endpoint: {
             uid: String(endpointUid),
             name: String(row.endpointName || row[5] || ''),
             kind: String(endpointUid).split(':')[0],
             filePath: String(row.endpointFilePath || row[6] || ''),
-            startLine: Number(row.endpointStartLine ?? row[7] ?? 0) || undefined,
+            startLine: toOptionalLineNumber(row.endpointStartLine ?? row[7]),
           },
           controller: {
             uid: String(controllerUid),
             name: String(row.controllerName || row[9] || ''),
             kind: String(controllerUid).split(':')[0],
             filePath: String(row.controllerFilePath || row[10] || ''),
-            startLine: Number(row.controllerStartLine ?? row[11] ?? 0) || undefined,
+            startLine: toOptionalLineNumber(row.controllerStartLine ?? row[11]),
           },
         });
 
@@ -1869,7 +1937,7 @@ export class LocalBackend {
           };
           if (cochange.pairCount > 0) {
             evidence.cochange = {
-              score: Number(cochange.score.toFixed(3)),
+              score: round3(cochange.score),
               pair_count: cochange.pairCount,
             };
           }
@@ -1902,6 +1970,49 @@ export class LocalBackend {
       return out;
     };
 
+    const escapeCypherValue = (value: string): string => String(value || '').replace(/'/g, "''");
+    const buildCypherStringList = (values: string[]): string => {
+      if (values.length === 0) return '[]';
+      return `[${values.map(value => `'${escapeCypherValue(value)}'`).join(', ')}]`;
+    };
+
+    const mapHopRow = (row: any): any | null => {
+      const uiUid = row.uiUid || row[0];
+      const endpointUid = row.endpointUid || row[4];
+      const controllerUid = row.controllerUid || row[8];
+      const reason = row.reason || row[12];
+      if (!uiUid || !endpointUid || !controllerUid || !reason) return null;
+
+      return {
+        http: { reason: String(reason), confidence: normalizeConfidence(row.confidence ?? row[13], 1.0) },
+        endpoint_wiring: {
+          reason: String(row.wiringReason || row[14] || ''),
+          confidence: normalizeConfidence(row.wiringConfidence ?? row[15], 1.0),
+        },
+        ui: {
+          uid: String(uiUid),
+          name: String(row.uiName || row[1] || ''),
+          kind: String(uiUid).split(':')[0],
+          filePath: String(row.uiFilePath || row[2] || ''),
+          startLine: toOptionalLineNumber(row.uiStartLine ?? row[3]),
+        },
+        endpoint: {
+          uid: String(endpointUid),
+          name: String(row.endpointName || row[5] || ''),
+          kind: String(endpointUid).split(':')[0],
+          filePath: String(row.endpointFilePath || row[6] || ''),
+          startLine: toOptionalLineNumber(row.endpointStartLine ?? row[7]),
+        },
+        controller: {
+          uid: String(controllerUid),
+          name: String(row.controllerName || row[9] || ''),
+          kind: String(controllerUid).split(':')[0],
+          filePath: String(row.controllerFilePath || row[10] || ''),
+          startLine: toOptionalLineNumber(row.controllerStartLine ?? row[11]),
+        },
+      };
+    };
+
     const findProcessesForUid = async (uid: string, maxCount: number): Promise<string[]> => {
       const escaped = uid.replace(/'/g, "''");
       let rows: any[] = [];
@@ -1917,21 +2028,40 @@ export class LocalBackend {
       return rows.map(r => r.pid || r[0]).filter((x: any): x is string => typeof x === 'string' && x.length > 0);
     };
 
-    const findStepNodeIdsForProcess = async (processId: string, maxCount: number): Promise<string[]> => {
-      const escaped = processId.replace(/'/g, "''");
+    const findStepNodeIdsForProcesses = async (
+      processIds: string[],
+      maxCountPerProcess: number,
+    ): Promise<Map<string, string[]>> => {
+      const ids = Array.from(new Set(processIds.map(id => String(id || '').trim()).filter(Boolean)));
+      const rowsByProcess = new Map<string, string[]>();
+      if (ids.length === 0) return rowsByProcess;
+
       let rows: any[] = [];
+      const perProcessLimit = Math.max(1, Math.min(80, maxCountPerProcess));
+      const totalLimit = Math.max(200, Math.min(20000, ids.length * perProcessLimit * 2));
       try {
         rows = await executeQuery(repo.id, `
-          MATCH (n)-[:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escaped}'})
-          RETURN DISTINCT n.id AS nodeId
-          LIMIT ${Math.max(1, Math.min(80, maxCount))}
+          MATCH (n)-[:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE p.id IN ${buildCypherStringList(ids)}
+          RETURN p.id AS processId, n.id AS nodeId
+          LIMIT ${totalLimit}
         `);
       } catch {
-        return [];
+        return rowsByProcess;
       }
-      return rows
-        .map(r => r.nodeId || r[0])
-        .filter((value: any): value is string => typeof value === 'string' && value.length > 0);
+      for (const row of rows) {
+        const processId = String(row.processId ?? row[0] ?? '').trim();
+        const nodeId = String(row.nodeId ?? row[1] ?? '').trim();
+        if (!processId || !nodeId) continue;
+        const list = rowsByProcess.get(processId) || [];
+        if (list.length >= perProcessLimit) {
+          if (!rowsByProcess.has(processId)) rowsByProcess.set(processId, list);
+          continue;
+        }
+        if (!list.includes(nodeId)) list.push(nodeId);
+        rowsByProcess.set(processId, list);
+      }
+      return rowsByProcess;
     };
 
     const findHopsForUid = async (uid: string, maxCount: number): Promise<any[]> => {
@@ -1948,91 +2078,30 @@ export class LocalBackend {
         out.push(hop);
       };
 
-      // 1) uid is UI function/method
+      const uidPredicate = `(ui.id = '${escaped}' OR e.id = '${escaped}' OR c.id = '${escaped}')`;
+      let rows: any[] = [];
       try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (ui {id: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
+        rows = await executeQuery(repo.id, `
+          MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
           WHERE r.confidence >= ${minHttpConfidence} AND r.reason STARTS WITH 'http-' AND e.name STARTS WITH 'endpoint:'
           MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c:Method)
           WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'
+            AND ${uidPredicate}
           RETURN r.reason AS reason, r.confidence AS confidence,
                  w.reason AS wiringReason, w.confidence AS wiringConfidence,
                  e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
                  c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
                  ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine
           ORDER BY r.confidence DESC
-          LIMIT ${limitSql}
+          LIMIT ${Math.max(limitSql, Math.min(100, limitSql * 4))}
         `);
-
-        for (const row of rows) {
-          push({
-            http: { reason: String(row.reason || row[0] || ''), confidence: Number(row.confidence ?? row[1] ?? 1.0) },
-            endpoint_wiring: { reason: String(row.wiringReason || row[2] || ''), confidence: Number(row.wiringConfidence ?? row[3] ?? 1.0) },
-            ui: { uid: String(row.uiUid || row[12] || ''), name: String(row.uiName || row[13] || ''), kind: String(row.uiUid || row[12] || '').split(':')[0], filePath: String(row.uiFilePath || row[14] || ''), startLine: row.uiStartLine ?? row[15] },
-            endpoint: { uid: String(row.endpointUid || row[4] || ''), name: String(row.endpointName || row[5] || ''), kind: 'CodeElement', filePath: String(row.endpointFilePath || row[6] || ''), startLine: row.endpointStartLine ?? row[7] },
-            controller: { uid: String(row.controllerUid || row[8] || ''), name: String(row.controllerName || row[9] || ''), kind: 'Method', filePath: String(row.controllerFilePath || row[10] || ''), startLine: row.controllerStartLine ?? row[11] },
-          });
-          if (out.length >= limit) return out;
-        }
       } catch { /* ignore */ }
-
-      // 2) uid is endpoint CodeElement
-      try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement {id: '${escaped}'})
-          WHERE r.confidence >= ${minHttpConfidence} AND r.reason STARTS WITH 'http-' AND e.name STARTS WITH 'endpoint:'
-          MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c:Method)
-          WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'
-          RETURN r.reason AS reason, r.confidence AS confidence,
-                 w.reason AS wiringReason, w.confidence AS wiringConfidence,
-                 e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
-                 c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
-                 ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine
-          ORDER BY r.confidence DESC
-          LIMIT ${limitSql}
-        `);
-
-        for (const row of rows) {
-          push({
-            http: { reason: String(row.reason || row[0] || ''), confidence: Number(row.confidence ?? row[1] ?? 1.0) },
-            endpoint_wiring: { reason: String(row.wiringReason || row[2] || ''), confidence: Number(row.wiringConfidence ?? row[3] ?? 1.0) },
-            ui: { uid: String(row.uiUid || row[12] || ''), name: String(row.uiName || row[13] || ''), kind: String(row.uiUid || row[12] || '').split(':')[0], filePath: String(row.uiFilePath || row[14] || ''), startLine: row.uiStartLine ?? row[15] },
-            endpoint: { uid: String(row.endpointUid || row[4] || ''), name: String(row.endpointName || row[5] || ''), kind: 'CodeElement', filePath: String(row.endpointFilePath || row[6] || ''), startLine: row.endpointStartLine ?? row[7] },
-            controller: { uid: String(row.controllerUid || row[8] || ''), name: String(row.controllerName || row[9] || ''), kind: 'Method', filePath: String(row.controllerFilePath || row[10] || ''), startLine: row.controllerStartLine ?? row[11] },
-          });
-          if (out.length >= limit) return out;
-        }
-      } catch { /* ignore */ }
-
-      // 3) uid is controller Method
-      try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(c:Method {id: '${escaped}'})
-          WHERE r.confidence >= ${minHttpConfidence} AND r.reason STARTS WITH 'http-'
-          MATCH (ui)-[x:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
-          WHERE x.reason = r.reason AND x.confidence >= ${minHttpConfidence} AND e.name STARTS WITH 'endpoint:'
-          MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c)
-          WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'
-          RETURN r.reason AS reason, r.confidence AS confidence,
-                 w.reason AS wiringReason, w.confidence AS wiringConfidence,
-                 e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
-                 c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
-                 ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine
-          ORDER BY r.confidence DESC
-          LIMIT ${limitSql}
-        `);
-
-        for (const row of rows) {
-          push({
-            http: { reason: String(row.reason || row[0] || ''), confidence: Number(row.confidence ?? row[1] ?? 1.0) },
-            endpoint_wiring: { reason: String(row.wiringReason || row[2] || ''), confidence: Number(row.wiringConfidence ?? row[3] ?? 1.0) },
-            ui: { uid: String(row.uiUid || row[12] || ''), name: String(row.uiName || row[13] || ''), kind: String(row.uiUid || row[12] || '').split(':')[0], filePath: String(row.uiFilePath || row[14] || ''), startLine: row.uiStartLine ?? row[15] },
-            endpoint: { uid: String(row.endpointUid || row[4] || ''), name: String(row.endpointName || row[5] || ''), kind: 'CodeElement', filePath: String(row.endpointFilePath || row[6] || ''), startLine: row.endpointStartLine ?? row[7] },
-            controller: { uid: String(row.controllerUid || row[8] || ''), name: String(row.controllerName || row[9] || ''), kind: 'Method', filePath: String(row.controllerFilePath || row[10] || ''), startLine: row.controllerStartLine ?? row[11] },
-          });
-          if (out.length >= limit) return out;
-        }
-      } catch { /* ignore */ }
+      for (const row of rows) {
+        const hop = mapHopRow(row);
+        if (!hop) continue;
+        push(hop);
+        if (out.length >= limit) break;
+      }
 
       return out.slice(0, limit);
     };
@@ -2056,79 +2125,45 @@ export class LocalBackend {
         .filter(t => t.length >= 4 && t.length <= 20 && /^[a-z0-9_-]+$/.test(t) && !stop.has(t))
         .slice(0, 6);
 
+      if (candidates.length === 0) return [];
+
       const out: any[] = [];
       const seen = new Set<string>();
       const limitSql = Math.max(1, Math.min(25, maxCount));
+      const tokenWhere = candidates
+        .map(token => `r.reason CONTAINS '/${escapeCypherValue(token)}'`)
+        .join(' OR ');
+      let rows: any[] = [];
+      try {
+        rows = await executeQuery(repo.id, `
+          MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
+          WHERE r.confidence >= ${minHttpConfidence}
+            AND r.reason STARTS WITH 'http-'
+            AND (${tokenWhere})
+            AND ui.filePath STARTS WITH 'apps/'
+            AND e.name STARTS WITH 'endpoint:'
+          MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c:Method)
+          WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'${scopeClauseUiOrController ? ` AND ${scopeClauseUiOrController}` : ''}
+          RETURN ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine,
+                 e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
+                 c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
+                 r.reason AS reason, r.confidence AS confidence,
+                 w.reason AS wiringReason, w.confidence AS wiringConfidence
+          ORDER BY r.confidence DESC
+          LIMIT ${Math.max(limitSql, Math.min(150, limitSql * candidates.length * 2))}
+        `);
+      } catch {
+        return [];
+      }
 
-      for (const token of candidates) {
-        const tokenEsc = token.replace(/'/g, "''");
-        let rows: any[] = [];
-        try {
-          rows = await executeQuery(repo.id, `
-            MATCH (ui)-[r:CodeRelation {type: 'CALLS'}]->(e:CodeElement)
-            WHERE r.confidence >= ${minHttpConfidence}
-              AND r.reason STARTS WITH 'http-'
-              AND r.reason CONTAINS '/${tokenEsc}'
-              AND ui.filePath STARTS WITH 'apps/'
-              AND e.name STARTS WITH 'endpoint:'
-            MATCH (e)-[w:CodeRelation {type: 'CALLS'}]->(c:Method)
-            WHERE w.confidence >= ${minHttpConfidence} AND w.reason STARTS WITH 'laravel-endpoint:'${scopeClauseUiOrController ? ` AND ${scopeClauseUiOrController}` : ''}
-            RETURN ui.id AS uiUid, ui.name AS uiName, ui.filePath AS uiFilePath, ui.startLine AS uiStartLine,
-                   e.id AS endpointUid, e.name AS endpointName, e.filePath AS endpointFilePath, e.startLine AS endpointStartLine,
-                   c.id AS controllerUid, c.name AS controllerName, c.filePath AS controllerFilePath, c.startLine AS controllerStartLine,
-                   r.reason AS reason, r.confidence AS confidence,
-                   w.reason AS wiringReason, w.confidence AS wiringConfidence
-            ORDER BY r.confidence DESC
-            LIMIT ${limitSql}
-          `);
-        } catch {
-          continue;
-        }
-
-        for (const row of rows) {
-          const uiUid = row.uiUid || row[0];
-          const endpointUid = row.endpointUid || row[4];
-          const controllerUid = row.controllerUid || row[8];
-          const reason = row.reason || row[12];
-          if (!uiUid || !endpointUid || !controllerUid || !reason) continue;
-
-          const key = `${uiUid}|${endpointUid}|${controllerUid}|${reason}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-
-          out.push({
-            http: { reason: String(reason), confidence: Number(row.confidence ?? row[13] ?? 1.0) },
-            endpoint_wiring: {
-              reason: String(row.wiringReason || row[14] || ''),
-              confidence: Number(row.wiringConfidence ?? row[15] ?? 1.0),
-            },
-            ui: {
-              uid: String(uiUid),
-              name: String(row.uiName || row[1] || ''),
-              kind: String(uiUid).split(':')[0],
-              filePath: String(row.uiFilePath || row[2] || ''),
-              startLine: Number(row.uiStartLine ?? row[3] ?? 0) || undefined,
-            },
-            endpoint: {
-              uid: String(endpointUid),
-              name: String(row.endpointName || row[5] || ''),
-              kind: String(endpointUid).split(':')[0],
-              filePath: String(row.endpointFilePath || row[6] || ''),
-              startLine: Number(row.endpointStartLine ?? row[7] ?? 0) || undefined,
-            },
-            controller: {
-              uid: String(controllerUid),
-              name: String(row.controllerName || row[9] || ''),
-              kind: String(controllerUid).split(':')[0],
-              filePath: String(row.controllerFilePath || row[10] || ''),
-              startLine: Number(row.controllerStartLine ?? row[11] ?? 0) || undefined,
-            },
-          });
-
-          if (out.length >= maxCount) return out;
-        }
-
-        if (out.length >= maxCount) return out;
+      for (const row of rows) {
+        const hop = mapHopRow(row);
+        if (!hop) continue;
+        const key = `${String(hop?.ui?.uid || '')}|${String(hop?.endpoint?.uid || '')}|${String(hop?.controller?.uid || '')}|${String(hop?.http?.reason || '')}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(hop);
+        if (out.length >= maxCount) break;
       }
 
       return out;
@@ -2220,8 +2255,10 @@ export class LocalBackend {
       addSlicesForNode(String(hop?.controller?.uid || ''), baseScore);
     }
 
-    for (const pid of anchorProcessIds.slice(0, limit * 3)) {
-      const stepNodeIds = await findStepNodeIdsForProcess(pid, 48);
+    const uniqueAnchorProcessIds = Array.from(new Set(anchorProcessIds.map(pid => String(pid || '').trim()).filter(Boolean)));
+    const stepNodeIdsByProcess = await findStepNodeIdsForProcesses(uniqueAnchorProcessIds.slice(0, limit * 3), 48);
+    for (const pid of uniqueAnchorProcessIds.slice(0, limit * 3)) {
+      const stepNodeIds = stepNodeIdsByProcess.get(pid) || [];
       for (const nodeId of stepNodeIds) {
         addSlicesForNode(nodeId, 0.75);
       }
@@ -2254,7 +2291,7 @@ export class LocalBackend {
     const slicePrecedents = buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById, cochangeMap);
     const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
-    for (const pid of anchorProcessIds.slice(0, limit)) {
+    for (const pid of uniqueAnchorProcessIds.slice(0, limit)) {
       addProcessPrecedent(pid);
     }
 
@@ -2263,7 +2300,7 @@ export class LocalBackend {
 
     const diagnostics: any = {
       anchor_uid: anchorUid || undefined,
-      anchor_processes: anchorProcessIds.length,
+      anchor_processes: uniqueAnchorProcessIds.length,
       anchor_hops: anchorHops.length,
       scoped_hops: inScopeHops.length,
       anchor_slices: anchorSliceScores.size,
@@ -2319,13 +2356,13 @@ export class LocalBackend {
     
     await this.ensureInitialized(repo.id);
     
-    const processLimit = params.limit || 5;
-    const maxSymbolsPerProcess = params.max_symbols || 10;
+    const processLimit = clampInteger(params.limit, 5, 1, 50);
+    const maxSymbolsPerProcess = clampInteger(params.max_symbols, 10, 1, 200);
     const includeContent = params.include_content ?? false;
     const includeSliceCards = params.include_slice_cards !== false;
-    const limitSlices = Math.max(1, Math.min(5, params.limit_slices ?? 2));
+    const limitSlices = clampInteger(params.limit_slices, 2, 1, 5);
     const includeEvidenceSpans = params.include_evidence_spans !== false;
-    const limitEvidence = Math.max(1, Math.min(100, params.limit_evidence ?? 20));
+    const limitEvidence = clampInteger(params.limit_evidence, 20, 1, 100);
     const searchQuery = params.query.trim();
     const escapedSearchQuery = searchQuery.replace(/'/g, "''");
 
@@ -2354,6 +2391,10 @@ export class LocalBackend {
         .replace(/\\/g, '/')
         .replace(/^\.\/+/, '')
         .replace(/^\/+/, '');
+    };
+    const toPrimaryLabel = (value: any): string => {
+      if (Array.isArray(value)) return String(value[0] || '').trim();
+      return String(value || '').trim();
     };
 
     const normalizePrefix = (value: string): string => {
@@ -2422,8 +2463,8 @@ export class LocalBackend {
         name: String(row.name ?? row[1] ?? '').trim(),
         type: pickPrimaryLabel(row.type ?? row[2]),
         filePath: String(row.filePath ?? row[3] ?? '').trim(),
-        startLine: Number.isFinite(Number(row.startLine ?? row[4])) ? Number(row.startLine ?? row[4]) : undefined,
-        endLine: Number.isFinite(Number(row.endLine ?? row[5])) ? Number(row.endLine ?? row[5]) : undefined,
+        startLine: toOptionalLineNumber(row.startLine ?? row[4]),
+        endLine: toOptionalLineNumber(row.endLine ?? row[5]),
       }))
       .filter((row: any) => row.nodeId || row.filePath);
 
@@ -2572,6 +2613,7 @@ export class LocalBackend {
 
     const processRowsByNodeId = new Map<string, any[]>();
     if (mergedNodeIds.length > 0) {
+      const membershipLimit = Math.max(400, Math.min(12000, mergedNodeIds.length * 30));
       try {
         const processMembershipRows = await executeQuery(repo.id, `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -2583,6 +2625,7 @@ export class LocalBackend {
                  p.processType AS processType,
                  p.stepCount AS stepCount,
                  r.step AS step
+          LIMIT ${membershipLimit}
         `);
         for (const row of processMembershipRows) {
           const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
@@ -2598,18 +2641,20 @@ export class LocalBackend {
 
     const cohesionByNodeId = new Map<string, number>();
     if (mergedNodeIds.length > 0) {
+      const cohesionLimit = Math.max(200, Math.min(8000, mergedNodeIds.length * 10));
       try {
         const cohesionRows = await executeQuery(repo.id, `
           MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE n.id IN ${mergedNodeIdCypherList}
           RETURN n.id AS nodeId, max(c.cohesion) AS cohesion
+          LIMIT ${cohesionLimit}
         `);
         for (const row of cohesionRows) {
           const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
           if (!nodeId) continue;
           const cohesionRaw = row?.cohesion ?? row?.[1] ?? 0;
-          const cohesion = Number(cohesionRaw);
-          cohesionByNodeId.set(nodeId, Number.isFinite(cohesion) ? cohesion : 0);
+          const cohesion = toFiniteNumber(cohesionRaw, 0);
+          cohesionByNodeId.set(nodeId, cohesion);
         }
       } catch {
         // Keep default cohesion=0
@@ -2618,11 +2663,13 @@ export class LocalBackend {
 
     const contentByNodeId = new Map<string, string>();
     if (includeContent && mergedNodeIds.length > 0) {
+      const contentLimit = Math.max(200, Math.min(8000, mergedNodeIds.length * 8));
       try {
         const contentRows = await executeQuery(repo.id, `
           MATCH (n)
           WHERE n.id IN ${mergedNodeIdCypherList}
           RETURN n.id AS nodeId, n.content AS content
+          LIMIT ${contentLimit}
         `);
         for (const row of contentRows) {
           const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
@@ -2645,7 +2692,7 @@ export class LocalBackend {
           label: String(row?.label ?? row?.[2] ?? row?.[1] ?? ''),
           heuristicLabel: String(row?.heuristicLabel ?? row?.[3] ?? row?.[2] ?? ''),
           processType: String(row?.processType ?? row?.[4] ?? row?.[3] ?? ''),
-          stepCount: Number(row?.stepCount ?? row?.[5] ?? row?.[4] ?? 0) || 0,
+          stepCount: toNonNegativeInteger(row?.stepCount ?? row?.[5] ?? row?.[4], 0),
           totalScore: 0,
           cohesionBoost: 0,
           bestHitRank: Number.POSITIVE_INFINITY,
@@ -2661,7 +2708,7 @@ export class LocalBackend {
       if (!sym.nodeId) {
         definitions.push({
           name: sym.name,
-          type: sym.type || 'File',
+          type: primaryNodeLabel(sym.type) || 'File',
           filePath: sym.filePath,
         });
         continue;
@@ -2755,7 +2802,7 @@ export class LocalBackend {
         if (!isInScope(filePath)) continue;
 
         const confidenceRaw = row.confidence ?? row[6] ?? 0;
-        const confidence = typeof confidenceRaw === 'number' ? confidenceRaw : parseFloat(confidenceRaw) || 0;
+        const confidence = normalizeConfidence(confidenceRaw, 0);
         if (confidence < BRIDGE_MIN_CONFIDENCE) continue;
 
         const reason = row.reason ?? row[7] ?? '';
@@ -2780,8 +2827,8 @@ export class LocalBackend {
             name: row.name ?? row[2] ?? '',
             type,
             filePath,
-            startLine: row.startLine ?? row[4],
-            endLine: row.endLine ?? row[5],
+            startLine: toOptionalLineNumber(row.startLine ?? row[4]),
+            endLine: toOptionalLineNumber(row.endLine ?? row[5]),
           },
         });
       }
@@ -2790,6 +2837,7 @@ export class LocalBackend {
     const bridgeTargetRowsByNodeId = new Map<string, any[]>();
     const bridgeTargetIds = Array.from(bridgeTargets.keys());
     if (bridgeTargetIds.length > 0) {
+      const bridgeMembershipLimit = Math.max(200, Math.min(6000, bridgeTargetIds.length * 20));
       try {
         const bridgeRows = await executeQuery(repo.id, `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -2801,6 +2849,7 @@ export class LocalBackend {
                  p.processType AS processType,
                  p.stepCount AS stepCount,
                  r.step AS step
+          LIMIT ${bridgeMembershipLimit}
         `);
         for (const row of bridgeRows) {
           const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
@@ -2869,6 +2918,7 @@ export class LocalBackend {
     const rankedProcessIds = rankedProcesses.map(proc => String(proc.id || '').trim()).filter(Boolean);
     if (rankedProcessIds.length > 0) {
       const contentProjection = includeContent ? ', n.content AS content' : '';
+      const stepLimit = Math.max(200, Math.min(25000, rankedProcessIds.length * maxSymbolsPerProcess * 6));
       try {
         const stepRows = await executeQuery(repo.id, `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -2881,6 +2931,7 @@ export class LocalBackend {
                  n.endLine AS endLine${contentProjection},
                  r.step AS step
           ORDER BY p.id, r.step
+          LIMIT ${stepLimit}
         `);
         for (const row of stepRows) {
           const pid = String(row?.processId ?? row?.[0] ?? '').trim();
@@ -2905,7 +2956,7 @@ export class LocalBackend {
         const type = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
 
         const stepRaw = row?.step ?? row?.[includeContent ? 7 : 6];
-        const stepIndex = typeof stepRaw === 'number' ? stepRaw : parseInt(String(stepRaw), 10);
+        const stepIndex = toOptionalNonNegativeInteger(stepRaw);
 
         const filePath = String(row?.filePath ?? row?.[3] ?? '').trim();
         if (!isInScope(filePath)) continue;
@@ -2919,7 +2970,7 @@ export class LocalBackend {
           endLine: row?.endLine ?? row?.[5],
           ...(includeContent ? { content: row?.content ?? row?.[6] } : {}),
           process_id: proc.id,
-          step_index: Number.isFinite(stepIndex) ? stepIndex : undefined,
+          step_index: stepIndex,
           ...(hitMeta.has(nodeId) ? { hit_rank: hitMeta.get(nodeId)!.rank } : {}),
         });
       }
@@ -2930,11 +2981,11 @@ export class LocalBackend {
         const rankedMandatory = stepSymbols
           .filter(step => hitMeta.has(String(step?.id || '')))
           .sort((left, right) => {
-            const leftRank = Number(hitMeta.get(String(left?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
-            const rightRank = Number(hitMeta.get(String(right?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
+            const leftRank = toFiniteNumber(hitMeta.get(String(left?.id || ''))?.rank, Number.POSITIVE_INFINITY);
+            const rightRank = toFiniteNumber(hitMeta.get(String(right?.id || ''))?.rank, Number.POSITIVE_INFINITY);
             if (leftRank !== rightRank) return leftRank - rightRank;
-            const leftStep = Number(left?.step_index ?? Number.POSITIVE_INFINITY);
-            const rightStep = Number(right?.step_index ?? Number.POSITIVE_INFINITY);
+            const leftStep = toFiniteNumber(left?.step_index, Number.POSITIVE_INFINITY);
+            const rightStep = toFiniteNumber(right?.step_index, Number.POSITIVE_INFINITY);
             return leftStep - rightStep;
           });
         for (const mandatoryStep of rankedMandatory) {
@@ -2949,11 +3000,11 @@ export class LocalBackend {
         const rankedMandatory = stepSymbols
           .filter(step => hitMeta.has(String(step?.id || '')))
           .sort((left, right) => {
-            const leftRank = Number(hitMeta.get(String(left?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
-            const rightRank = Number(hitMeta.get(String(right?.id || ''))?.rank ?? Number.POSITIVE_INFINITY);
+            const leftRank = toFiniteNumber(hitMeta.get(String(left?.id || ''))?.rank, Number.POSITIVE_INFINITY);
+            const rightRank = toFiniteNumber(hitMeta.get(String(right?.id || ''))?.rank, Number.POSITIVE_INFINITY);
             if (leftRank !== rightRank) return leftRank - rightRank;
-            const leftStep = Number(left?.step_index ?? Number.POSITIVE_INFINITY);
-            const rightStep = Number(right?.step_index ?? Number.POSITIVE_INFINITY);
+            const leftStep = toFiniteNumber(left?.step_index, Number.POSITIVE_INFINITY);
+            const rightStep = toFiniteNumber(right?.step_index, Number.POSITIVE_INFINITY);
             return leftStep - rightStep;
           });
         for (const mandatoryStep of rankedMandatory) {
@@ -2976,8 +3027,8 @@ export class LocalBackend {
 
       const limitedSteps = selectedSteps
         .sort((left, right) => {
-          const leftStep = Number(left?.step_index ?? Number.POSITIVE_INFINITY);
-          const rightStep = Number(right?.step_index ?? Number.POSITIVE_INFINITY);
+          const leftStep = toFiniteNumber(left?.step_index, Number.POSITIVE_INFINITY);
+          const rightStep = toFiniteNumber(right?.step_index, Number.POSITIVE_INFINITY);
           if (leftStep !== rightStep) return leftStep - rightStep;
           return String(left?.id || '').localeCompare(String(right?.id || ''));
         })
@@ -3114,7 +3165,7 @@ export class LocalBackend {
               anchorId,
               anchorName: String(row.anchorName ?? row[4] ?? '').trim(),
               sliceType: String(row.sliceType ?? row[5] ?? '').trim(),
-              closureScore: Number(row.closureScore ?? row[6] ?? 0) || 0,
+              closureScore: toFiniteNumber(row.closureScore ?? row[6], 0),
               closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
               closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
               score: 0,
@@ -3155,8 +3206,8 @@ export class LocalBackend {
           const existingMember = entry.members.get(memberId);
           if (existingMember && existingMember.score >= memberScore) continue;
 
-          const startLine = Number(row.memberStartLine ?? row[13]);
-          const endLine = Number(row.memberEndLine ?? row[14]);
+          const startLine = toOptionalLineNumber(row.memberStartLine ?? row[13]);
+          const endLine = toOptionalLineNumber(row.memberEndLine ?? row[14]);
           entry.members.set(memberId, {
             uid: memberId,
             name: memberName,
@@ -3164,8 +3215,8 @@ export class LocalBackend {
             filePath: memberFilePath,
             role: memberRole,
             score: memberScore,
-            ...(Number.isFinite(startLine) ? { startLine } : {}),
-            ...(Number.isFinite(endLine) ? { endLine } : {}),
+            ...(startLine !== undefined ? { startLine } : {}),
+            ...(endLine !== undefined ? { endLine } : {}),
             ...(hit ? { hit_rank: hit.rank } : {}),
           });
         }
@@ -3242,7 +3293,7 @@ export class LocalBackend {
                 kind: member.kind,
                 filePath: member.filePath,
                 role: member.role,
-                score: Number(member.score.toFixed(3)),
+                score: round3(member.score),
                 ...(member.startLine !== undefined ? { startLine: member.startLine } : {}),
                 ...(member.endLine !== undefined ? { endLine: member.endLine } : {}),
                 ...(member.hit_rank !== undefined ? { hit_rank: member.hit_rank } : {}),
@@ -3291,12 +3342,12 @@ export class LocalBackend {
               slice_type: slice.sliceType,
               anchor_id: slice.anchorId,
               anchor_name: slice.anchorName,
-              closure_score: Number(slice.closureScore.toFixed(3)),
+              closure_score: round3(slice.closureScore),
               closure_slots: slice.closureSlots,
               closed_slots: slice.closedSlots,
               member_count: slice.members.size,
               roles: Array.from(slice.roles).sort(),
-              score: Number(slice.score.toFixed(3)),
+              score: round3(slice.score),
               gap_signals: slice.gapSignals,
               matched_members: matchedMembers,
               ...(includeEvidenceSpans ? { proof_spans } : {}),
@@ -3364,11 +3415,11 @@ export class LocalBackend {
     }
 
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
-    const limitProcesses = Math.max(1, Math.min(10, params.limit_processes ?? 4));
-    const maxSymbols = Math.max(1, Math.min(40, params.max_symbols ?? 16));
-    const limitSlices = Math.max(1, Math.min(5, params.limit_slices ?? 2));
-    const limitPrecedents = Math.max(0, Math.min(5, params.limit_precedents ?? 2));
-    const limitHops = Math.max(0, Math.min(10, params.limit_hops ?? 4));
+    const limitProcesses = clampInteger(params.limit_processes, 4, 1, 10);
+    const maxSymbols = clampInteger(params.max_symbols, 16, 1, 40);
+    const limitSlices = clampInteger(params.limit_slices, 2, 1, 5);
+    const limitPrecedents = clampInteger(params.limit_precedents, 2, 0, 5);
+    const limitHops = clampInteger(params.limit_hops, 4, 0, 10);
     const includePrecedents = params.include_precedents !== false;
     const includeActionHints = params.include_action_hints !== false;
 
@@ -3396,8 +3447,8 @@ export class LocalBackend {
         precedentPack = await this.precedents(repo, {
           query: queryText,
           ...(topSlice?.anchor_id ? { anchor_uid: String(topSlice.anchor_id) } : {}),
-          limit: 2,
-          examples: 3,
+          limit: Math.max(1, Math.min(5, limitPrecedents)),
+          examples: Math.max(1, Math.min(5, Math.max(2, limitPrecedents))),
           path_prefixes: pathPrefixes,
         });
       } catch {
@@ -3431,13 +3482,16 @@ export class LocalBackend {
 
     const hypotheses: string[] = [];
     const topGapSignals = topSlice?.gap_signals || null;
-    if (topGapSignals && Number(topGapSignals.high || 0) > 0) {
+    const topGapHigh = toFiniteNumber(topGapSignals?.high, 0);
+    const topGapDeterministic = toFiniteNumber(topGapSignals?.deterministic, 0);
+    const exactLookupHits = toFiniteNumber(queryResult?.query_plan?.exact_lookup?.hits, 0);
+    if (topGapSignals && topGapHigh > 0) {
       hypotheses.push('Top slice includes high-severity closure gaps; confirm required slot coverage before editing.');
     }
-    if (topGapSignals && Number(topGapSignals.deterministic || 0) > 0) {
+    if (topGapSignals && topGapDeterministic > 0) {
       hypotheses.push('Deterministic gap signals indicate concrete missing links in the top slice.');
     }
-    if (Number(queryResult?.query_plan?.exact_lookup?.hits || 0) === 0) {
+    if (exactLookupHits === 0) {
       hypotheses.push('No exact lookup hit; tighten the anchor (symbol/route/permission/query key) to reduce ambiguity.');
     }
 
@@ -3505,10 +3559,10 @@ export class LocalBackend {
     }
 
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
-    const limitFiles = Math.max(1, Math.min(30, params.limit_files ?? 10));
-    const limitChecks = Math.max(1, Math.min(20, params.limit_checks ?? 10));
-    const limitWriteOrder = Math.max(1, Math.min(20, params.limit_write_order ?? 10));
-    const limitPrecedents = Math.max(0, Math.min(5, params.limit_precedents ?? 3));
+    const limitFiles = clampInteger(params.limit_files, 10, 1, 30);
+    const limitChecks = clampInteger(params.limit_checks, 10, 1, 20);
+    const limitWriteOrder = clampInteger(params.limit_write_order, 10, 1, 20);
+    const limitPrecedents = clampInteger(params.limit_precedents, 3, 0, 5);
     const includeQueryHead = params.include_query_head !== false;
     const includeReviewContract = params.include_review_contract !== false;
 
@@ -3552,10 +3606,11 @@ export class LocalBackend {
 
     const normalizePath = (value: unknown): string => normalizeRepoRelativePath(String(value || ''));
     const pathLayer = (filePath: string): string => deriveLayerTag(normalizePath(filePath));
-    const safeNumber = (value: unknown): number => {
-      const n = Number(value);
-      return Number.isFinite(n) ? n : 0;
+    const toPrimaryLabel = (value: any): string => {
+      if (Array.isArray(value)) return String(value[0] || '').trim();
+      return String(value || '').trim();
     };
+    const safeNumber = (value: unknown): number => toFiniteNumber(value, 0);
 
     const implementPlan = actionPlanResult?.implement_plan || {};
     const rawCompanionFiles = Array.isArray(implementPlan?.companion_set?.files)
@@ -3602,7 +3657,7 @@ export class LocalBackend {
       fallbackCompanionSeen.add(filePath);
       fallbackCompanionFiles.push({
         filePath,
-        score: safeNumber(item?.score || 0.2),
+        score: safeNumber(item?.score ?? 0.2),
         reasons: Array.isArray(item?.reasons) ? item.reasons.slice(0, 4) : ['fallback:action_plan.files'],
         anchors: Array.isArray(item?.anchors) ? item.anchors.slice(0, 4) : [],
       });
@@ -3638,14 +3693,16 @@ export class LocalBackend {
         const filePath = normalizePath(file?.filePath);
         if (!filePath) continue;
         const anchor = Array.isArray(file?.anchors) && file.anchors.length > 0 ? file.anchors[0] : null;
+        const anchorStartLine = toOptionalLineNumber(anchor?.startLine);
+        const anchorEndLine = toOptionalLineNumber(anchor?.endLine);
         steps.push({
           uid: String(anchor?.id || `file:${filePath}`),
           name: String(anchor?.name || path.basename(filePath)),
           kind: String(anchor?.type || 'File'),
           filePath,
           role: 'fallback-anchor',
-          ...(Number.isFinite(Number(anchor?.startLine)) ? { startLine: Number(anchor.startLine) } : {}),
-          ...(Number.isFinite(Number(anchor?.endLine)) ? { endLine: Number(anchor.endLine) } : {}),
+          ...(anchorStartLine !== undefined ? { startLine: anchorStartLine } : {}),
+          ...(anchorEndLine !== undefined ? { endLine: anchorEndLine } : {}),
         });
         if (steps.length >= limitWriteOrder) break;
       }
@@ -3654,14 +3711,16 @@ export class LocalBackend {
         for (const symbol of queryHeadSymbols) {
           const filePath = normalizePath(symbol?.filePath);
           if (!filePath) continue;
+          const symbolStartLine = toOptionalLineNumber(symbol?.startLine);
+          const symbolEndLine = toOptionalLineNumber(symbol?.endLine);
           steps.push({
             uid: String(symbol?.uid || symbol?.id || `file:${filePath}`),
             name: String(symbol?.name || path.basename(filePath)),
             kind: String(symbol?.kind || symbol?.type || 'CodeElement'),
             filePath,
             role: 'fallback-symbol',
-            ...(Number.isFinite(Number(symbol?.startLine)) ? { startLine: Number(symbol.startLine) } : {}),
-            ...(Number.isFinite(Number(symbol?.endLine)) ? { endLine: Number(symbol.endLine) } : {}),
+            ...(symbolStartLine !== undefined ? { startLine: symbolStartLine } : {}),
+            ...(symbolEndLine !== undefined ? { endLine: symbolEndLine } : {}),
           });
           if (steps.length >= limitWriteOrder) break;
         }
@@ -3844,11 +3903,13 @@ export class LocalBackend {
     const usedFallbackTarget = !implementPlan?.target;
 
     const gapSignals = implementPlan?.gap_signals || {};
+    const gapHigh = toFiniteNumber(gapSignals?.high, 0);
+    const gapDeterministic = toFiniteNumber(gapSignals?.deterministic, 0);
     const hypotheses: string[] = [];
-    if (Number(gapSignals?.high || 0) > 0) {
+    if (gapHigh > 0) {
       hypotheses.push('Top target slice has high-severity gaps; patch required slots before broad refactors.');
     }
-    if (Number(gapSignals?.deterministic || 0) > 0) {
+    if (gapDeterministic > 0) {
       hypotheses.push('Deterministic gap signals indicate concrete missing closure links in the target slice.');
     }
     if (!implementPlan?.closure_template) {
@@ -4012,7 +4073,12 @@ export class LocalBackend {
     const symptomText = String(params.symptom || '').trim();
     const failingTests = this.toStringArray(params.failing_tests);
     const errorStrings = this.toStringArray(params.error_strings);
-    const scope = params.scope || 'unstaged';
+    const scopeRaw = String(params.scope || 'unstaged').trim();
+    const scope = scopeRaw.toLowerCase() as 'unstaged' | 'staged' | 'all' | 'compare';
+    const allowedScopes = new Set(['unstaged', 'staged', 'all', 'compare']);
+    if (!allowedScopes.has(scope)) {
+      return { error: `scope must be one of unstaged|staged|all|compare (received "${scopeRaw}")` };
+    }
     const baseRef = String(params.base_ref || '').trim();
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
 
@@ -4146,14 +4212,16 @@ export class LocalBackend {
     const normalizeSymbol = (item: any) => {
       const uid = String(item?.uid || item?.id || '').trim();
       const filePath = String(item?.filePath || '').trim();
+      const startLine = toOptionalLineNumber(item?.startLine);
+      const endLine = toOptionalLineNumber(item?.endLine);
       if (!uid && !filePath) return null;
       return {
         uid: uid || null,
         name: String(item?.name || '').trim() || '',
         kind: String(item?.kind || item?.type || '').trim() || '',
         filePath,
-        ...(Number.isFinite(Number(item?.startLine)) ? { startLine: Number(item.startLine) } : {}),
-        ...(Number.isFinite(Number(item?.endLine)) ? { endLine: Number(item.endLine) } : {}),
+        ...(startLine !== undefined ? { startLine } : {}),
+        ...(endLine !== undefined ? { endLine } : {}),
       };
     };
 
@@ -4215,8 +4283,8 @@ export class LocalBackend {
       nextActions = Array.isArray(im?.next_actions) ? im.next_actions : [];
 
       const gapSignals = im?.gap_signals || {};
-      const high = Number(gapSignals?.high || 0);
-      const deterministic = Number(gapSignals?.deterministic || 0);
+      const high = toFiniteNumber(gapSignals?.high, 0);
+      const deterministic = toFiniteNumber(gapSignals?.deterministic, 0);
       const score = (high * 2) + deterministic;
       risk = {
         level: score >= 4 ? 'high' : score >= 2 ? 'medium' : 'low',
@@ -4263,7 +4331,7 @@ export class LocalBackend {
       ];
       nextActions = Array.isArray(debug?.next_actions) ? debug.next_actions : [];
 
-      const candidateScore = Number(candidates[0]?.score || 0);
+      const candidateScore = toFiniteNumber(candidates[0]?.score, 0);
       risk = {
         level: candidateScore >= 8 ? 'high' : candidateScore >= 4 ? 'medium' : 'low',
         score: candidateScore,
@@ -4350,11 +4418,15 @@ export class LocalBackend {
     limit_checks?: number;
     __skip_precedents?: boolean;
   }): Promise<any> {
-    const limitFiles = Math.max(1, Math.min(50, params.limit_files ?? 10));
-    const limitChecks = Math.max(1, Math.min(20, params.limit_checks ?? 10));
+    const limitFiles = clampInteger(params.limit_files, 10, 1, 50);
+    const limitChecks = clampInteger(params.limit_checks, 10, 1, 20);
     const skipPrecedents = params.__skip_precedents === true;
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
     const isInScope = (filePath: string): boolean => filePathTouchesPrefixes(filePath, pathPrefixes);
+    const toPrimaryLabel = (value: any): string => {
+      if (Array.isArray(value)) return String(value[0] || '').trim();
+      return String(value || '').trim();
+    };
 
     const result = await this.query(repo, {
       query: params.query,
@@ -4396,11 +4468,11 @@ export class LocalBackend {
 
     for (const sym of symbols) {
       const stepIndexRaw = sym?.step_index;
-      const stepIndex = typeof stepIndexRaw === 'number' ? stepIndexRaw : parseInt(stepIndexRaw, 10);
+      const stepIndex = toOptionalNonNegativeInteger(stepIndexRaw) ?? Number.POSITIVE_INFINITY;
       const stepWeight = Number.isFinite(stepIndex) && stepIndex >= 0 ? (1 / (1 + stepIndex)) : 0.1;
 
       const hitRankRaw = sym?.hit_rank;
-      const hitRank = typeof hitRankRaw === 'number' ? hitRankRaw : parseInt(hitRankRaw, 10);
+      const hitRank = toFiniteNumber(hitRankRaw, Number.POSITIVE_INFINITY);
       const hitWeight = Number.isFinite(hitRank) && hitRank > 0 ? (1 / hitRank) : 0;
 
       addAnchor(sym, 1.0 + stepWeight + (hitWeight * 2));
@@ -4496,7 +4568,7 @@ export class LocalBackend {
       const loaded = {
         id: r.id || r[0],
         name: r.name || r[1],
-        type: r.type || r[2],
+        type: toPrimaryLabel(r.type || r[2]),
         filePath: r.filePath || r[3],
         startLine: r.startLine ?? r[4],
         endLine: r.endLine ?? r[5],
@@ -4577,10 +4649,16 @@ export class LocalBackend {
       };
 
       const candidates: PermissionCandidate[] = [];
+      const seenCandidates = new Set<string>();
       for (const row of authRows) {
         const uid = row.uid || row[0];
         if (!uid || typeof uid !== 'string') continue;
-        const type = row.type || row[2] || '';
+        const type = toPrimaryLabel(row.type || row[2] || '');
+        const edgeReason = String(row.reason || row[4] || '');
+        const edgeConfidence = normalizeConfidence(row.confidence ?? row[5], 1.0);
+        const candidateKey = `${uid}|${type}|${edgeReason}`;
+        if (seenCandidates.has(candidateKey)) continue;
+        seenCandidates.add(candidateKey);
         if (uid.startsWith('CodeElement:permission:')) {
           candidates.push({
             kind: 'permission_slug',
@@ -4589,8 +4667,8 @@ export class LocalBackend {
             type: 'CodeElement',
             filePath: row.filePath || row[3] || '',
             edge: {
-              reason: row.reason || row[4] || '',
-              confidence: Number(row.confidence ?? row[5] ?? 1.0),
+              reason: edgeReason,
+              confidence: edgeConfidence,
             },
           });
           continue;
@@ -4603,8 +4681,8 @@ export class LocalBackend {
             type,
             filePath: row.filePath || row[3] || '',
             edge: {
-              reason: row.reason || row[4] || '',
-              confidence: Number(row.confidence ?? row[5] ?? 1.0),
+              reason: edgeReason,
+              confidence: edgeConfidence,
             },
           });
           continue;
@@ -4618,8 +4696,8 @@ export class LocalBackend {
             type,
             filePath: row.filePath || row[3] || '',
             edge: {
-              reason: row.reason || row[4] || '',
-              confidence: Number(row.confidence ?? row[5] ?? 1.0),
+              reason: edgeReason,
+              confidence: edgeConfidence,
             },
           });
         }
@@ -4629,26 +4707,36 @@ export class LocalBackend {
       const seen = new Set<string>();
       const roleRowsBySlugUid = new Map<string, any[]>();
       const slugRowsByConstUid = new Map<string, any[]>();
+      const cypherStringList = (values: string[]): string => {
+        if (values.length === 0) return '[]';
+        return `[${values.map(value => `'${String(value || '').replace(/'/g, "''")}'`).join(', ')}]`;
+      };
 
       const expandSlugToGrant = async (
         slugUid: string,
-        evidence: { controller_edge: { reason: string; confidence: number }; via_policy?: any; }
+        evidence: { controller_edge: { reason: string; confidence: number }; via_policy?: any; },
+        fallback?: { name?: string; filePath?: string },
       ): Promise<void> => {
         const slugEsc = slugUid.replace(/'/g, "''");
-        let slugRows: any[] = [];
-        try {
-          slugRows = await executeQuery(repo.id, `
-            MATCH (s:CodeElement {id: '${slugEsc}'})
-            RETURN s.id AS uid, s.name AS name, s.filePath AS filePath
-            LIMIT 1
-          `);
-        } catch {
-          return;
-        }
+        let slug = String(fallback?.name || '').trim();
+        let slugFilePath = String(fallback?.filePath || '').trim();
+        if (!slug) {
+          let slugRows: any[] = [];
+          try {
+            slugRows = await executeQuery(repo.id, `
+              MATCH (s:CodeElement {id: '${slugEsc}'})
+              RETURN s.id AS uid, s.name AS name, s.filePath AS filePath
+              LIMIT 1
+            `);
+          } catch {
+            return;
+          }
 
-        const slugRow = slugRows[0] || null;
-        const slug = String(slugRow?.name || '').trim();
-        if (!slug) return;
+          const slugRow = slugRows[0] || null;
+          slug = String(slugRow?.name || '').trim();
+          slugFilePath = String(slugRow?.filePath || '').trim();
+          if (!slug) return;
+        }
 
         const key = `${slugUid}:${slug}`;
         if (seen.has(key)) return;
@@ -4658,7 +4746,7 @@ export class LocalBackend {
           id: slugUid,
           name: slug,
           type: 'CodeElement',
-          filePath: slugRow?.filePath || '',
+          filePath: slugFilePath,
         });
 
         let roleRows = roleRowsBySlugUid.get(slugUid);
@@ -4679,15 +4767,18 @@ export class LocalBackend {
         }
 
         const roles: any[] = [];
+        const roleSeen = new Set<string>();
         for (const roleRow of roleRows) {
           const roleUid = roleRow.uid || roleRow[0];
           if (!roleUid || typeof roleUid !== 'string') continue;
+          if (roleSeen.has(roleUid)) continue;
+          roleSeen.add(roleUid);
           roles.push({
             uid: roleUid,
             name: roleRow.name || roleRow[1] || '',
             filePath: roleRow.filePath || roleRow[2] || '',
             reason: roleRow.reason || roleRow[3] || '',
-            confidence: Number(roleRow.confidence ?? roleRow[4] ?? 1.0),
+            confidence: normalizeConfidence(roleRow.confidence ?? roleRow[4], 1.0),
           });
         }
 
@@ -4699,7 +4790,7 @@ export class LocalBackend {
           } : {
             uid: slugUid,
             slug,
-            filePath: slugRow?.filePath || '',
+            filePath: slugFilePath,
           },
           roles,
           evidence,
@@ -4747,7 +4838,7 @@ export class LocalBackend {
 
           const slugEdge = {
             reason: String(slugRow.reason || slugRow[3] || ''),
-            confidence: Number(slugRow.confidence ?? slugRow[4] ?? 1.0),
+            confidence: normalizeConfidence(slugRow.confidence ?? slugRow[4], 1.0),
           };
 
           let roleRows = roleRowsBySlugUid.get(slugUid);
@@ -4769,15 +4860,18 @@ export class LocalBackend {
           }
 
           const roles: any[] = [];
+          const roleSeen = new Set<string>();
           for (const roleRow of roleRows) {
             const roleUid = roleRow.uid || roleRow[0];
             if (!roleUid || typeof roleUid !== 'string') continue;
+            if (roleSeen.has(roleUid)) continue;
+            roleSeen.add(roleUid);
             roles.push({
               uid: roleUid,
               name: roleRow.name || roleRow[1] || '',
               filePath: roleRow.filePath || roleRow[2] || '',
               reason: roleRow.reason || roleRow[3] || '',
-              confidence: Number(roleRow.confidence ?? roleRow[4] ?? 1.0),
+              confidence: normalizeConfidence(roleRow.confidence ?? roleRow[4], 1.0),
             });
           }
 
@@ -4800,9 +4894,46 @@ export class LocalBackend {
         }
       };
 
+      const constRowsByPolicyUid = new Map<string, any[]>();
+      const policyCandidates = candidates.filter(candidate => candidate.kind === 'policy_method');
+      if (policyCandidates.length > 0) {
+        try {
+          const policyIds = Array.from(new Set(policyCandidates.map(candidate => String(candidate.uid || '').trim()).filter(Boolean)));
+          const policyRows = await executeQuery(repo.id, `
+            MATCH (p)-[r:CodeRelation {type: 'CALLS'}]->(c:Const)
+            WHERE p.id IN ${cypherStringList(policyIds)}
+              AND r.confidence >= 0.9
+              AND r.reason STARTS WITH 'php-match-return:'
+            RETURN p.id AS policyUid, c.id AS uid, c.name AS name, c.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+            ORDER BY r.confidence DESC
+            LIMIT ${Math.max(80, Math.min(4000, policyIds.length * 20))}
+          `);
+          for (const row of policyRows) {
+            const policyUid = String(row.policyUid || row[0] || '').trim();
+            if (!policyUid) continue;
+            const list = constRowsByPolicyUid.get(policyUid) || [];
+            list.push({
+              uid: row.uid || row[1],
+              name: row.name || row[2],
+              filePath: row.filePath || row[3],
+              reason: row.reason || row[4],
+              confidence: normalizeConfidence(row.confidence ?? row[5], 1.0),
+            });
+            constRowsByPolicyUid.set(policyUid, list);
+          }
+        } catch {
+          // best-effort policy expansion
+        }
+      }
+
       for (const candidate of candidates) {
         if (candidate.kind === 'permission_slug') {
-          await expandSlugToGrant(candidate.uid, { controller_edge: candidate.edge });
+          await expandSlugToGrant(candidate.uid, {
+            controller_edge: candidate.edge,
+          }, {
+            name: candidate.name,
+            filePath: candidate.filePath,
+          });
           continue;
         }
 
@@ -4812,26 +4943,14 @@ export class LocalBackend {
         }
 
         // Policy method: attempt to derive permission enum cases deterministically via match-return edges.
-        const policyEsc = candidate.uid.replace(/'/g, "''");
-        let constRows: any[] = [];
-        try {
-          constRows = await executeQuery(repo.id, `
-            MATCH (p {id: '${policyEsc}'})-[r:CodeRelation {type: 'CALLS'}]->(c:Const)
-            WHERE r.confidence >= 0.9 AND r.reason STARTS WITH 'php-match-return:'
-            RETURN c.id AS uid, c.name AS name, c.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
-            ORDER BY r.confidence DESC
-            LIMIT 10
-          `);
-        } catch {
-          continue;
-        }
+        const constRows = constRowsByPolicyUid.get(candidate.uid) || [];
 
         for (const row of constRows) {
           const constUid = row.uid || row[0];
           if (!constUid || typeof constUid !== 'string') continue;
           const matchEdge = {
             reason: String(row.reason || row[3] || ''),
-            confidence: Number(row.confidence ?? row[4] ?? 1.0),
+            confidence: normalizeConfidence(row.confidence ?? row[4], 1.0),
           };
           await expandConstToGrant(constUid, {
             controller_edge: candidate.edge,
@@ -4908,7 +5027,7 @@ export class LocalBackend {
           if (rows.length > 0) {
             resolved = {
               reason: rows[0].reason || rows[0][0] || '',
-              confidence: Number(rows[0].confidence ?? rows[0][1] ?? 1.0),
+              confidence: normalizeConfidence(rows[0].confidence ?? rows[0][1], 1.0),
             };
           }
         } catch { /* ignore */ }
@@ -4949,7 +5068,20 @@ export class LocalBackend {
       });
     };
 
-    const hopWork: Promise<void>[] = [];
+    const hopWork: Array<() => Promise<void>> = [];
+
+    const preloadControllerGrants = async (controllerIds: string[]): Promise<void> => {
+      const uniqueControllerIds = Array.from(new Set(
+        controllerIds
+          .map(uid => String(uid || '').trim())
+          .filter(Boolean),
+      ));
+      if (uniqueControllerIds.length === 0) return;
+      await Promise.all(uniqueControllerIds.map(async (controllerUid) => {
+        if (controllerGrantCache.has(controllerUid)) return;
+        controllerGrantCache.set(controllerUid, await buildPermissionGrantsForController(controllerUid));
+      }));
+    };
 
     const buildFromController = async (controllerUid: string): Promise<void> => {
       const escaped = controllerUid.replace(/'/g, "''");
@@ -4978,7 +5110,7 @@ export class LocalBackend {
         const uiUid = row.uiUid || row[0];
         const endpointUid = row.endpointUid || row[1];
         const reason = row.reason || row[2];
-        const confidence = Number(row.confidence ?? row[3] ?? 1.0);
+        const confidence = normalizeConfidence(row.confidence ?? row[3], 1.0);
         if (!uiUid || typeof uiUid !== 'string') continue;
         if (!endpointUid || typeof endpointUid !== 'string') continue;
         if (!reason || typeof reason !== 'string') continue;
@@ -5017,7 +5149,7 @@ export class LocalBackend {
         const uiUid = row.uiUid || row[0];
         const controllerUid = row.controllerUid || row[1];
         const reason = row.reason || row[2];
-        const confidence = Number(row.confidence ?? row[3] ?? 1.0);
+        const confidence = normalizeConfidence(row.confidence ?? row[3], 1.0);
         if (!uiUid || typeof uiUid !== 'string') continue;
         if (!controllerUid || typeof controllerUid !== 'string') continue;
         if (!reason || typeof reason !== 'string') continue;
@@ -5056,7 +5188,7 @@ export class LocalBackend {
         const endpointUid = row.endpointUid || row[0];
         const controllerUid = row.controllerUid || row[1];
         const reason = row.reason || row[2];
-        const confidence = Number(row.confidence ?? row[3] ?? 1.0);
+        const confidence = normalizeConfidence(row.confidence ?? row[3], 1.0);
         if (!endpointUid || typeof endpointUid !== 'string') continue;
         if (!controllerUid || typeof controllerUid !== 'string') continue;
         if (!reason || typeof reason !== 'string') continue;
@@ -5071,26 +5203,27 @@ export class LocalBackend {
     };
 
     if (controllerCandidates.length > 0) {
+      await preloadControllerGrants(controllerCandidates);
       for (const controllerUid of controllerCandidates) {
         if (hops.length >= hopLimit) break;
-        hopWork.push(buildFromController(controllerUid));
+        hopWork.push(() => buildFromController(controllerUid));
       }
     } else if (endpointCandidates.length > 0) {
       for (const endpointUid of endpointCandidates) {
         if (hops.length >= hopLimit) break;
-        hopWork.push(buildFromEndpoint(endpointUid));
+        hopWork.push(() => buildFromEndpoint(endpointUid));
       }
     } else {
       for (const uiUid of uiCandidates) {
         if (hops.length >= hopLimit) break;
-        hopWork.push(buildFromUi(uiUid));
+        hopWork.push(() => buildFromUi(uiUid));
       }
     }
 
     try {
       for (const work of hopWork) {
         if (hops.length >= hopLimit) break;
-        await work;
+        await work();
       }
     } catch { /* ignore */ }
 
@@ -5152,7 +5285,7 @@ export class LocalBackend {
             mutations: Array.isArray(c?.mutations) ? c.mutations.slice(0, 5) : [],
             operations: Array.isArray(c?.operations) ? c.operations.slice(0, 8) : [],
             missing_queries: Array.isArray(c?.missing_queries) ? c.missing_queries.slice(0, 8) : [],
-            confidence: c?.confidence ?? 0.35,
+            confidence: normalizeConfidence(c?.confidence, 0.35),
           }))
           .slice(0, 10);
 
@@ -5244,8 +5377,8 @@ export class LocalBackend {
       if (!filePath) return;
       if (!isInScope(filePath)) return;
 
-      const nextScore = Number(score);
-      if (!Number.isFinite(nextScore) || nextScore <= 0) return;
+      const nextScore = toFiniteNumber(score, 0);
+      if (nextScore <= 0) return;
 
       let entry = companionSignals.get(filePath);
       if (!entry) {
@@ -5258,7 +5391,11 @@ export class LocalBackend {
     };
 
     for (const file of files.slice(0, 10)) {
-      addCompanionSignal(String(file?.filePath || ''), Number(file?.score || 0) + 0.1, 'ranked-file');
+      addCompanionSignal(
+        String(file?.filePath || ''),
+        toFiniteNumber(file?.score, 0) + 0.1,
+        'ranked-file',
+      );
       companionSources.seed_files += 1;
     }
 
@@ -5301,8 +5438,8 @@ export class LocalBackend {
           const kind = Array.isArray(kindValue) ? String(kindValue[0] || '').trim() : String(kindValue || '').trim();
           const filePath = normalizeRepoRelativePath(String(row.filePath ?? row[3] ?? ''));
           const role = parseSliceRole(String(row.roleReason ?? row[6] ?? '').trim());
-          const startLine = Number(row.startLine ?? row[4]);
-          const endLine = Number(row.endLine ?? row[5]);
+          const startLine = toOptionalLineNumber(row.startLine ?? row[4]);
+          const endLine = toOptionalLineNumber(row.endLine ?? row[5]);
 
           if (!uid || !filePath) continue;
           if (!isInScope(filePath)) continue;
@@ -5320,8 +5457,8 @@ export class LocalBackend {
               filePath,
               role,
               role_priority: roleWritePriority(role),
-              ...(Number.isFinite(startLine) ? { startLine } : {}),
-              ...(Number.isFinite(endLine) ? { endLine } : {}),
+              ...(startLine !== undefined ? { startLine } : {}),
+              ...(endLine !== undefined ? { endLine } : {}),
             });
           }
 
@@ -5354,7 +5491,7 @@ export class LocalBackend {
 
           for (const row of cochangeRows) {
             const filePath = String(row.filePath ?? row[0] ?? '').trim();
-            const confidence = Number(row.confidence ?? row[1] ?? 0) || 0;
+            const confidence = toFiniteNumber(row.confidence ?? row[1], 0);
             if (!filePath) continue;
             if (fileList.includes(filePath)) continue;
             addCompanionSignal(filePath, Math.max(0.05, confidence), 'cochange-neighbor');
@@ -5382,7 +5519,7 @@ export class LocalBackend {
           for (const row of shapeRows) {
             const filePath = String(row.filePath ?? row[0] ?? '').trim();
             const relType = String(row.relType ?? row[1] ?? '').trim();
-            const count = Number(row.count ?? row[2] ?? 0) || 0;
+            const count = toFiniteNumber(row.count ?? row[2], 0);
             if (!filePath || !relType || count <= 0) continue;
             addCompanionSignal(filePath, Math.min(3, 0.3 + (count * 0.2)), `shape-link:${relType.toLowerCase()}`);
             companionSources.shape_edges += count;
@@ -5450,8 +5587,8 @@ export class LocalBackend {
                 ? best.roleCoverage
                   .map((item: any) => ({
                     role: String(item?.role || '').trim(),
-                    coverage: Number(item?.coverage || 0) || 0,
-                    count: Number(item?.count || 0) || 0,
+                    coverage: toFiniteNumber(item?.coverage, 0),
+                    count: toFiniteNumber(item?.count, 0),
                   }))
                   .filter((item: any) => item.role)
                 : [];
@@ -5463,8 +5600,8 @@ export class LocalBackend {
                 required_slots: requiredSlots,
                 optional_slots: Array.isArray(best.optionalSlots) ? best.optionalSlots.map((item: any) => String(item || '').trim()).filter(Boolean) : [],
                 role_expectations: roleExpectations,
-                avg_closure_score: Number(best.avgClosureScore || 0) || 0,
-                slice_count: Number(best.sliceCount || 0) || 0,
+                avg_closure_score: toFiniteNumber(best.avgClosureScore, 0),
+                slice_count: toFiniteNumber(best.sliceCount, 0),
                 exemplar_slice_ids: Array.isArray(best.exemplarSliceIds) ? best.exemplarSliceIds.map((item: any) => String(item || '').trim()).filter(Boolean) : [],
               };
             }
@@ -5481,7 +5618,7 @@ export class LocalBackend {
       .slice(0, Math.min(limitFiles + 5, 15))
       .map(entry => ({
         filePath: entry.filePath,
-        score: Number(entry.score.toFixed(3)),
+        score: round3(entry.score),
         reasons: Array.from(entry.reasons).slice(0, 6),
         anchors: entry.anchors.slice(0, 4),
       }));
@@ -5489,8 +5626,8 @@ export class LocalBackend {
     const orderedWriteSteps = writeOrder
       .sort((left, right) => {
         if (left.role_priority !== right.role_priority) return left.role_priority - right.role_priority;
-        const leftStart = Number(left.startLine ?? Number.MAX_SAFE_INTEGER);
-        const rightStart = Number(right.startLine ?? Number.MAX_SAFE_INTEGER);
+        const leftStart = toFiniteNumber(left.startLine, Number.MAX_SAFE_INTEGER);
+        const rightStart = toFiniteNumber(right.startLine, Number.MAX_SAFE_INTEGER);
         if (leftStart !== rightStart) return leftStart - rightStart;
         if (left.filePath !== right.filePath) return String(left.filePath).localeCompare(String(right.filePath));
         return String(left.uid).localeCompare(String(right.uid));
@@ -5575,7 +5712,10 @@ export class LocalBackend {
   private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
       const escapedQuery = query.replace(/'/g, "''");
+      const safeLimit = clampInteger(limit, 50, 1, 500);
       const scoreMap = new Map<string, { score: number; bm25Score: number; data: any }>();
+      const isSingleToken = !/\s/.test(query);
+      const looksLikeIdentifier = isSingleToken && /^[A-Za-z_][$A-Za-z0-9_:/.-]*$/.test(query.trim());
       const tables: Array<{ table: string; index: string }> = [
         { table: 'Method', index: 'method_fts' },
         { table: 'Function', index: 'function_fts' },
@@ -5584,22 +5724,26 @@ export class LocalBackend {
         { table: 'CodeElement', index: 'codeelement_fts' },
         { table: 'Const', index: 'const_fts' },
         { table: 'File', index: 'file_fts' },
-      ];
+      ].filter(item => !(looksLikeIdentifier && item.table === 'File'));
 
-      for (const { table, index } of tables) {
-        let rows: any[] = [];
-        try {
-          rows = await executeQuery(repo.id, `
-            CALL QUERY_FTS_INDEX('${table}', '${index}', '${escapedQuery}', conjunctive := false)
-            RETURN node, score
-            ORDER BY score DESC
-            LIMIT ${limit}
-          `);
-        } catch {
-          // Index may not exist (older DB) — treat as empty.
-          continue;
-        }
+      const tableRows = await Promise.all(
+        tables.map(async ({ table, index }) => {
+          try {
+            const rows = await executeQuery(repo.id, `
+              CALL QUERY_FTS_INDEX('${table}', '${index}', '${escapedQuery}', conjunctive := false)
+              RETURN node, score
+              ORDER BY score DESC
+              LIMIT ${safeLimit}
+            `);
+            return { table, rows };
+          } catch {
+            // Index may not exist (older DB) — treat as empty.
+            return { table, rows: [] as any[] };
+          }
+        }),
+      );
 
+      for (const { table, rows } of tableRows) {
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
           const node = row.node || row[0] || {};
@@ -5608,7 +5752,7 @@ export class LocalBackend {
 
           const rrfScore = 1 / (60 + i + 1); // rank starts at 1
           const bm25ScoreRaw = row.score ?? row[1] ?? 0;
-          const bm25Score = typeof bm25ScoreRaw === 'number' ? bm25ScoreRaw : parseFloat(bm25ScoreRaw) || 0;
+          const bm25Score = toFiniteNumber(bm25ScoreRaw, 0);
 
           const existing = scoreMap.get(nodeId);
           if (existing) {
@@ -5623,8 +5767,8 @@ export class LocalBackend {
                 name: node.name || '',
                 type: table,
                 filePath: node.filePath || '',
-                startLine: typeof node.startLine === 'number' ? node.startLine : undefined,
-                endLine: typeof node.endLine === 'number' ? node.endLine : undefined,
+                startLine: toOptionalLineNumber(node.startLine),
+                endLine: toOptionalLineNumber(node.endLine),
               }
             });
           }
@@ -5633,7 +5777,7 @@ export class LocalBackend {
 
       return Array.from(scoreMap.values())
         .sort((a, b) => b.score - a.score)
-        .slice(0, limit)
+        .slice(0, safeLimit)
         .map(item => ({ ...item.data, bm25Score: item.bm25Score }));
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
@@ -5646,13 +5790,14 @@ export class LocalBackend {
    */
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
+      const safeLimit = clampInteger(limit, 50, 1, 500);
       const queryVec = await embedQuery(query);
       const dims = getEmbeddingDims();
       const queryVecStr = `[${queryVec.join(',')}]`;
       
       const vectorQuery = `
         CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 
-          CAST(${queryVecStr} AS FLOAT[${dims}]), ${limit})
+          CAST(${queryVecStr} AS FLOAT[${dims}]), ${safeLimit})
         YIELD node AS emb, distance
         WITH emb, distance
         WHERE distance < 0.6
@@ -5671,7 +5816,7 @@ export class LocalBackend {
         const nodeId = typeof nodeIdRaw === 'string' ? nodeIdRaw : String(nodeIdRaw || '');
         if (!nodeId) continue;
         const distanceRaw = embRow.distance ?? embRow[1];
-        const distance = typeof distanceRaw === 'number' ? distanceRaw : parseFloat(distanceRaw) || 0;
+        const distance = toFiniteNumber(distanceRaw, 0);
 
         const labelEndIdx = nodeId.indexOf(':');
         const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
@@ -5736,7 +5881,7 @@ export class LocalBackend {
         seen.add(candidate.nodeId);
       }
 
-      return results;
+      return results.slice(0, safeLimit);
     } catch (err: any) {
       console.error('GitNexus: Semantic search unavailable -', err.message);
       return [];
@@ -5775,7 +5920,7 @@ export class LocalBackend {
     const card = await extractUiContractCard(relativePath, content);
 
     const includeEndpoints = params.include_endpoints !== false;
-    const minHttpConfidence = params.min_http_confidence ?? 0.9;
+    const minHttpConfidence = normalizeConfidence(params.min_http_confidence, 0.9);
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
 
     let endpoints: any[] = [];
@@ -5783,7 +5928,7 @@ export class LocalBackend {
       await this.ensureInitialized(repo.id);
 
       const fileEsc = relativePath.replace(/'/g, "''");
-      const conf = Math.max(0, Math.min(1, minHttpConfidence));
+      const conf = minHttpConfidence;
 
       const directRows = await executeQuery(repo.id, `
         MATCH (f:File {filePath: '${fileEsc}'})-[d:CodeRelation {type: 'DEFINES'}]->(src)
@@ -5838,18 +5983,21 @@ export class LocalBackend {
       const seen = new Set<string>();
       endpoints = rows
         .map((row: any) => ({
-          http: { reason: row.reason ?? row[8] ?? '', confidence: row.confidence ?? row[9] ?? 1.0 },
+          http: {
+            reason: row.reason ?? row[8] ?? '',
+            confidence: normalizeConfidence(row.confidence ?? row[9], 1.0),
+          },
           surface: {
             uid: row.surfaceId ?? row[0] ?? '',
             name: row.surfaceName ?? row[1] ?? '',
             filePath: row.surfaceFilePath ?? row[2] ?? '',
-            startLine: row.surfaceStartLine ?? row[3] ?? undefined,
+            startLine: toOptionalLineNumber(row.surfaceStartLine ?? row[3]),
           },
           http_caller: {
             uid: row.httpCallerId ?? row[4] ?? '',
             name: row.httpCallerName ?? row[5] ?? '',
             filePath: row.httpCallerFilePath ?? row[6] ?? '',
-            startLine: row.httpCallerStartLine ?? row[7] ?? undefined,
+            startLine: toOptionalLineNumber(row.httpCallerStartLine ?? row[7]),
           },
           controller: {
             uid: row.controllerId ?? row[10] ?? '',
@@ -5859,7 +6007,7 @@ export class LocalBackend {
               return cls && base ? `${cls}::${base}` : base;
             })(),
             filePath: row.controllerFilePath ?? row[12] ?? '',
-            startLine: row.controllerStartLine ?? row[13] ?? undefined,
+            startLine: toOptionalLineNumber(row.controllerStartLine ?? row[13]),
             type: 'Method',
           },
         }))
@@ -6032,18 +6180,23 @@ export class LocalBackend {
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
-    const scope = params.scope || 'unstaged';
+    const scopeRaw = String(params.scope || 'unstaged').trim();
+    const scope = scopeRaw.toLowerCase() as 'unstaged' | 'staged' | 'all' | 'compare';
+    const allowedScopes = new Set(['unstaged', 'staged', 'all', 'compare']);
+    if (!allowedScopes.has(scope)) {
+      return { error: `scope must be one of unstaged|staged|all|compare (received "${scopeRaw}")` };
+    }
     const baseRef = String(params.base_ref || '').trim();
-    const limitSymbols = Math.max(1, Math.min(500, params.limit_symbols ?? 60));
-    const limitCallers = Math.max(1, Math.min(50, params.limit_callers ?? 10));
-    const limitTests = Math.max(1, Math.min(50, params.limit_tests ?? 10));
-    const minConfidence = Math.max(0, Math.min(1, params.min_confidence ?? 0.9));
+    const limitSymbols = clampInteger(params.limit_symbols, 60, 1, 500);
+    const limitCallers = clampInteger(params.limit_callers, 10, 1, 50);
+    const limitTests = clampInteger(params.limit_tests, 10, 1, 50);
+    const minConfidence = Math.max(0, Math.min(1, toFiniteNumber(params.min_confidence, 0.9)));
     const includeUiContracts = params.include_ui_contracts !== false;
-    const maxUiContractFiles = Math.max(0, Math.min(20, params.max_ui_contract_files ?? 5));
+    const maxUiContractFiles = clampInteger(params.max_ui_contract_files, 5, 0, 20);
     const includeEvidenceSpans = params.include_evidence_spans !== false;
-    const limitEvidence = Math.max(1, Math.min(200, params.limit_evidence ?? 40));
+    const limitEvidence = clampInteger(params.limit_evidence, 40, 1, 200);
     const includeSliceStencil = params.include_slice_stencil !== false;
-    const limitSliceStencil = Math.max(1, Math.min(25, params.limit_slice_stencil ?? 8));
+    const limitSliceStencil = clampInteger(params.limit_slice_stencil, 8, 1, 25);
     const indexStatus = await this.getIndexStatus(repo);
     const runtimeObservationPaths = parseStringList(process.env.GITNEXUS_RUNTIME_OBSERVATIONS_FILE || '');
     const runtimeSnapshot = await loadRuntimeObservationSnapshot(repo.storagePath, {
@@ -6057,6 +6210,10 @@ export class LocalBackend {
         .replace(/\\/g, '/')
         .replace(/^\.\/+/, '')
         .replace(/^\/+/, '');
+    };
+    const toPrimaryLabel = (value: any): string => {
+      if (Array.isArray(value)) return String(value[0] || '').trim();
+      return String(value || '').trim();
     };
 
     const normalizePrefix = (value: string): string => {
@@ -6285,26 +6442,38 @@ export class LocalBackend {
       };
       const authFamily = (Array.isArray(input.semantic_diffs?.families) ? input.semantic_diffs.families : [])
         .find((family: any) => String(family?.family || '') === 'auth');
-      const missingRequiredSlotSlices = Number(input.slice_stencil?.summary?.missing_required_slot_slices || 0);
-      const missingRoleSlices = Number(input.slice_stencil?.summary?.missing_role_slices || 0);
+      const missingRequiredSlotSlices = toFiniteNumber(input.slice_stencil?.summary?.missing_required_slot_slices, 0);
+      const missingRoleSlices = toFiniteNumber(input.slice_stencil?.summary?.missing_role_slices, 0);
+      const changedFiles = toFiniteNumber(input.changed_files, 0);
+      const untrackedFiles = toFiniteNumber(input.untracked_files, 0);
+      const changedSymbols = toFiniteNumber(input.changed_symbols, 0);
+      const suggestedTests = toFiniteNumber(input.suggested_tests, 0);
+      const uiContracts = toFiniteNumber(input.ui_contracts, 0);
+      const routeFiles = toFiniteNumber(input.route_files, 0);
+      const authzControllers = toFiniteNumber(input.authz_controllers, 0);
+      const runtimeHotspots = toFiniteNumber(input.runtime_hotspots, 0);
+      const semanticTotal = toFiniteNumber(semanticGap.total, 0);
+      const semanticHigh = toFiniteNumber(semanticGap.high, 0);
+      const semanticDeterministic = toFiniteNumber(semanticGap.deterministic, 0);
+      const authEdgeCount = toFiniteNumber(authFamily?.edge_count, 0);
 
       let riskScore = 0;
-      riskScore += Math.min(4, Math.ceil(Number(input.changed_symbols || 0) / 8));
-      riskScore += Math.min(6, (Number(semanticGap.high || 0) * 2) + Number(semanticGap.deterministic || 0));
+      riskScore += Math.min(4, Math.ceil(changedSymbols / 8));
+      riskScore += Math.min(6, (semanticHigh * 2) + semanticDeterministic);
       riskScore += Math.min(4, (missingRequiredSlotSlices * 2) + missingRoleSlices);
-      if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) riskScore += 2;
-      if (Number(input.suggested_tests || 0) === 0 && Number(input.changed_symbols || 0) > 0) riskScore += 1;
-      if (Number(input.untracked_files || 0) > 0) riskScore += Math.min(2, Number(input.untracked_files || 0));
-      if (Number(input.runtime_hotspots || 0) > 0) riskScore += Math.min(3, Math.ceil(Number(input.runtime_hotspots || 0) / 2));
+      if (authEdgeCount > 0 && authzControllers === 0) riskScore += 2;
+      if (suggestedTests === 0 && changedSymbols > 0) riskScore += 1;
+      if (untrackedFiles > 0) riskScore += Math.min(2, untrackedFiles);
+      if (runtimeHotspots > 0) riskScore += Math.min(3, Math.ceil(runtimeHotspots / 2));
 
       const risk_level = riskScore >= 10 ? 'high' : riskScore >= 5 ? 'medium' : 'low';
 
       const top_findings: string[] = [];
-      if (Number(semanticGap.high || 0) > 0) {
-        top_findings.push(`High-severity gap signals detected (${Number(semanticGap.high || 0)}).`);
+      if (semanticHigh > 0) {
+        top_findings.push(`High-severity gap signals detected (${semanticHigh}).`);
       }
-      if (Number(semanticGap.deterministic || 0) > 0) {
-        top_findings.push(`Deterministic missing links detected (${Number(semanticGap.deterministic || 0)}).`);
+      if (semanticDeterministic > 0) {
+        top_findings.push(`Deterministic missing links detected (${semanticDeterministic}).`);
       }
       if (missingRequiredSlotSlices > 0) {
         top_findings.push(`Slices missing required closure slots (${missingRequiredSlotSlices}).`);
@@ -6312,44 +6481,44 @@ export class LocalBackend {
       if (missingRoleSlices > 0) {
         top_findings.push(`Slices missing expected role coverage (${missingRoleSlices}).`);
       }
-      if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) {
+      if (authEdgeCount > 0 && authzControllers === 0) {
         top_findings.push('Auth-related relation deltas detected without controller auth closure checks.');
       }
-      if (Number(input.route_files || 0) > 0) {
-        top_findings.push(`Route files changed (${Number(input.route_files || 0)}); validate controller wiring targets.`);
+      if (routeFiles > 0) {
+        top_findings.push(`Route files changed (${routeFiles}); validate controller wiring targets.`);
       }
-      if (Number(input.untracked_files || 0) > 0) {
-        top_findings.push(`Untracked files present (${Number(input.untracked_files || 0)}); symbol coverage may be partial until re-index.`);
+      if (untrackedFiles > 0) {
+        top_findings.push(`Untracked files present (${untrackedFiles}); symbol coverage may be partial until re-index.`);
       }
-      if (Number(input.ui_contracts || 0) > 0) {
-        top_findings.push(`UI contract diffs available (${Number(input.ui_contracts || 0)}).`);
+      if (uiContracts > 0) {
+        top_findings.push(`UI contract diffs available (${uiContracts}).`);
       }
-      if (Number(input.runtime_hotspots || 0) > 0) {
-        top_findings.push(`Runtime hotspots overlap changed surfaces (${Number(input.runtime_hotspots || 0)}).`);
+      if (runtimeHotspots > 0) {
+        top_findings.push(`Runtime hotspots overlap changed surfaces (${runtimeHotspots}).`);
       }
-      if (top_findings.length === 0 && Number(input.changed_files || 0) === 0) {
+      if (top_findings.length === 0 && changedFiles === 0) {
         top_findings.push('No changed files detected for the selected review scope.');
       }
 
       const hypotheses: string[] = [];
-      if (Number(semanticGap.high || 0) > 0 || Number(semanticGap.deterministic || 0) > 0) {
+      if (semanticHigh > 0 || semanticDeterministic > 0) {
         hypotheses.push('Primary risk is incomplete closure on changed feature slices.');
       }
-      if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) {
+      if (authEdgeCount > 0 && authzControllers === 0) {
         hypotheses.push('Auth drift may exist between permission signals and runtime controller checks.');
       }
-      if (Number(input.suggested_tests || 0) === 0 && Number(input.changed_symbols || 0) > 0) {
+      if (suggestedTests === 0 && changedSymbols > 0) {
         hypotheses.push('Changed symbols may lack direct test callers in current graph coverage.');
       }
-      if (Number(input.untracked_files || 0) > 0) {
+      if (untrackedFiles > 0) {
         hypotheses.push('Untracked files may hide additional risk until they are indexed.');
       }
-      if (Number(input.runtime_hotspots || 0) > 0) {
+      if (runtimeHotspots > 0) {
         hypotheses.push('Runtime latency/lock signals align with changed surfaces and should be validated first.');
       } else if (input.runtime_source === 'none') {
         hypotheses.push('No runtime observation snapshot found; runtime risk assessment is static-only.');
       }
-      if (hypotheses.length === 0 && Number(input.changed_files || 0) > 0) {
+      if (hypotheses.length === 0 && changedFiles > 0) {
         hypotheses.push('Primary risk appears to be localized to changed files with bounded blast radius.');
       }
 
@@ -6357,22 +6526,22 @@ export class LocalBackend {
         'Open top changed symbols with context() to confirm ownership and dependencies.',
         'Run impact() on the highest-risk changed symbol to validate direct dependents.',
       ];
-      if (Number(semanticGap.total || 0) > 0 || missingRequiredSlotSlices > 0 || missingRoleSlices > 0) {
+      if (semanticTotal > 0 || missingRequiredSlotSlices > 0 || missingRoleSlices > 0) {
         next_actions.push('Review slice_stencil and semantic gap signals before applying follow-up edits.');
       }
-      if (Number(input.route_files || 0) > 0) {
+      if (routeFiles > 0) {
         next_actions.push('Verify route_targets controller mappings for each changed route file.');
       }
-      if (Number(input.ui_contracts || 0) > 0) {
+      if (uiContracts > 0) {
         next_actions.push('Inspect ui_contract diffs to verify mutation side-effects and cache triggers.');
       }
-      if (Number(input.suggested_tests || 0) > 0) {
+      if (suggestedTests > 0) {
         next_actions.push('Run suggested tests first, then expand coverage only if failures indicate wider drift.');
       }
-      if (Number(input.untracked_files || 0) > 0) {
+      if (untrackedFiles > 0) {
         next_actions.push('Review untracked files explicitly and refresh index before finalizing high-risk decisions.');
       }
-      if (Number(input.runtime_hotspots || 0) > 0) {
+      if (runtimeHotspots > 0) {
         next_actions.push('Validate runtime hotspot entries before broad refactors to confirm symptom-fit ordering.');
       }
 
@@ -6381,14 +6550,14 @@ export class LocalBackend {
           level: risk_level,
           score: riskScore,
           signals: {
-            changed_files: Number(input.changed_files || 0),
-            untracked_files: Number(input.untracked_files || 0),
-            changed_symbols: Number(input.changed_symbols || 0),
-            semantic_gap_total: Number(semanticGap.total || 0),
-            semantic_gap_high: Number(semanticGap.high || 0),
+            changed_files: changedFiles,
+            untracked_files: untrackedFiles,
+            changed_symbols: changedSymbols,
+            semantic_gap_total: semanticTotal,
+            semantic_gap_high: semanticHigh,
             missing_required_slot_slices: missingRequiredSlotSlices,
             missing_role_slices: missingRoleSlices,
-            runtime_hotspots: Number(input.runtime_hotspots || 0),
+            runtime_hotspots: runtimeHotspots,
           },
         },
         top_findings: top_findings.slice(0, 8),
@@ -6434,6 +6603,7 @@ export class LocalBackend {
     };
 
     const listUntrackedFiles = (): string[] => {
+      if (scope === 'staged' || scope === 'compare') return [];
       try {
         const output = execFileSync('git', ['status', '--porcelain'], {
           cwd: repo.repoPath,
@@ -6457,6 +6627,8 @@ export class LocalBackend {
       changedFileCount: number;
       untrackedFileCount: number;
       changedSymbolCount: number;
+      changedSymbolTotal?: number;
+      changedSymbolCap?: number;
       suggestedTestCount: number;
       symbolizedFileCount?: number;
       runtimeHotspotCount?: number;
@@ -6464,12 +6636,14 @@ export class LocalBackend {
       runtimeGeneratedAt?: string;
       runtimeSourceFiles?: string[];
     }) => {
-      const symbolizedFileCount = Number(input.symbolizedFileCount ?? 0);
-      const runtimeHotspotCount = Number(input.runtimeHotspotCount ?? 0);
+      const changedSymbolTotal = toFiniteNumber(input.changedSymbolTotal ?? input.changedSymbolCount, input.changedSymbolCount);
+      const changedSymbolCap = toFiniteNumber(input.changedSymbolCap ?? input.changedSymbolCount, input.changedSymbolCount);
+      const symbolizedFileCount = toFiniteNumber(input.symbolizedFileCount, 0);
+      const runtimeHotspotCount = toFiniteNumber(input.runtimeHotspotCount, 0);
       const runtimeSource = String(input.runtimeSource || 'none');
       const runtimeSourceFiles = Array.isArray(input.runtimeSourceFiles) ? input.runtimeSourceFiles : [];
       const symbolCoverageRatio = input.changedFileCount > 0
-        ? Number((symbolizedFileCount / input.changedFileCount).toFixed(3))
+        ? toFiniteNumber((symbolizedFileCount / input.changedFileCount).toFixed(3), 0)
         : 1;
       const warnings: string[] = [];
       if (indexStatus.isStale) {
@@ -6483,6 +6657,9 @@ export class LocalBackend {
       }
       if (input.changedSymbolCount > 0 && input.suggestedTestCount === 0) {
         warnings.push('No suggested tests were inferred for changed symbols; manual test selection required.');
+      }
+      if (changedSymbolTotal > changedSymbolCap) {
+        warnings.push(`Changed symbols truncated for analysis (${changedSymbolCap}/${changedSymbolTotal}); widen limit_symbols for full coverage.`);
       }
       if (runtimeHotspotCount > 0) {
         warnings.push(`Runtime snapshot reports ${runtimeHotspotCount} hotspot(s) tied to changed surfaces.`);
@@ -6503,6 +6680,8 @@ export class LocalBackend {
           changed_files: input.changedFileCount,
           untracked_files: input.untrackedFileCount,
           changed_symbols: input.changedSymbolCount,
+          changed_symbol_total: changedSymbolTotal,
+          changed_symbol_cap: changedSymbolCap,
           symbolized_files: symbolizedFileCount,
           symbol_coverage_ratio: symbolCoverageRatio,
           suggested_tests: input.suggestedTestCount,
@@ -6594,6 +6773,8 @@ export class LocalBackend {
           changedFileCount: 0,
           untrackedFileCount: 0,
           changedSymbolCount: 0,
+          changedSymbolTotal: 0,
+          changedSymbolCap: 0,
           suggestedTestCount: 0,
           symbolizedFileCount: 0,
           runtimeHotspotCount: 0,
@@ -6667,7 +6848,7 @@ export class LocalBackend {
           const bPath = m[2];
           const isAdded = aPath === '/dev/null';
           const isDeleted = bPath === '/dev/null';
-          const filePath = isDeleted ? aPath : bPath;
+          const filePath = isAdded ? bPath : (isDeleted ? aPath : bPath);
 
           let status: DiffFile['status'] = 'Modified';
           if (isAdded) status = 'Added';
@@ -6706,6 +6887,36 @@ export class LocalBackend {
           current.filePath = normalizePath(renameTo[1] || current.filePath);
           continue;
         }
+        const copyFrom = /^copy from (.+)$/.exec(line);
+        if (copyFrom) {
+          current.status = 'Copied';
+          current.fromPath = normalizePath(copyFrom[1] || '');
+          continue;
+        }
+        const copyTo = /^copy to (.+)$/.exec(line);
+        if (copyTo) {
+          current.status = 'Copied';
+          current.filePath = normalizePath(copyTo[1] || current.filePath);
+          continue;
+        }
+
+        const oldFileLine = /^---\s+(.+)$/.exec(line);
+        if (oldFileLine) {
+          const oldPath = String(oldFileLine[1] || '').trim();
+          if (oldPath === '/dev/null') current.status = 'Added';
+          else if (oldPath.startsWith('a/')) current.fromPath = normalizePath(oldPath.slice(2));
+          continue;
+        }
+        const newFileLine = /^\+\+\+\s+(.+)$/.exec(line);
+        if (newFileLine) {
+          const newPath = String(newFileLine[1] || '').trim();
+          if (newPath === '/dev/null') {
+            current.status = 'Deleted';
+          } else if (newPath.startsWith('b/')) {
+            current.filePath = normalizePath(newPath.slice(2));
+          }
+          continue;
+        }
 
         if (line.startsWith('Binary files ')) {
           current.binary = true;
@@ -6714,10 +6925,10 @@ export class LocalBackend {
 
         const h = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/.exec(line);
         if (h) {
-          const oldStart = parseInt(h[1], 10);
-          const oldLines = h[2] ? parseInt(h[2], 10) : 1;
-          const newStart = parseInt(h[3], 10);
-          const newLines = h[4] ? parseInt(h[4], 10) : 1;
+          const oldStart = toFiniteNumber(h[1], 1);
+          const oldLines = h[2] ? toFiniteNumber(h[2], 1) : 1;
+          const newStart = toFiniteNumber(h[3], 1);
+          const newLines = h[4] ? toFiniteNumber(h[4], 1) : 1;
           current.hunks.push({
             old_start: Number.isFinite(oldStart) ? oldStart : 0,
             old_lines: Number.isFinite(oldLines) ? oldLines : 0,
@@ -6814,7 +7025,7 @@ export class LocalBackend {
         result.set(filePath, {
           uid,
           name: String(row.name || row[1] || filePath),
-          kind: row.type || row[2] || 'File',
+          kind: toPrimaryLabel(row.type || row[2] || 'File') || 'File',
           filePath,
         });
       }
@@ -6826,8 +7037,10 @@ export class LocalBackend {
       return hunks
         .filter(h => Number.isFinite(h?.new_start) && Number.isFinite(h?.new_lines))
         .map(h => {
-          const start = Math.max(0, h.new_start - 1);
-          const count = Math.max(1, h.new_lines);
+          const start = Math.max(1, toFiniteNumber(h.new_start, 1));
+          // Deletion hunks report new_lines=0; use one-line anchor for overlap checks.
+          const rawCount = toFiniteNumber(h.new_lines, 0);
+          const count = rawCount > 0 ? rawCount : 1;
           return { start, end: start + count - 1 };
         });
     };
@@ -6874,11 +7087,11 @@ export class LocalBackend {
       const rangeWindows = rangedFiles
         .map(spec => {
           const starts = spec.ranges
-            .map(range => Number(range?.start))
-            .filter(value => Number.isFinite(value));
+            .map(range => toOptionalNonNegativeInteger(range?.start))
+            .filter((value): value is number => value !== undefined);
           const ends = spec.ranges
-            .map(range => Number(range?.end))
-            .filter(value => Number.isFinite(value));
+            .map(range => toOptionalNonNegativeInteger(range?.end))
+            .filter((value): value is number => value !== undefined);
           if (starts.length === 0 || ends.length === 0) return null;
           return {
             filePath: spec.filePath,
@@ -6944,10 +7157,10 @@ export class LocalBackend {
         for (const row of fileRows) {
           const uid = String(row.id || row[0] || '').trim();
           if (!uid) continue;
-          const startLine = Number(row.startLine ?? row[4]);
-          const endLine = Number(row.endLine ?? row[5]);
+          const startLine = toOptionalNonNegativeInteger(row.startLine ?? row[4]);
+          const endLine = toOptionalNonNegativeInteger(row.endLine ?? row[5]);
           const overlaps = spec.ranges.some(range => {
-            if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) return true;
+            if (startLine === undefined || endLine === undefined) return false;
             return startLine <= range.end && endLine >= range.start;
           });
           if (!overlaps) continue;
@@ -6955,18 +7168,31 @@ export class LocalBackend {
           addChangedSymbol({
             uid,
             name: row.name || row[1] || '',
-            kind: row.type || row[2] || '',
+            kind: toPrimaryLabel(row.type || row[2] || ''),
             filePath: row.filePath || row[3] || spec.filePath,
-            startLine: Number.isFinite(startLine) ? startLine : undefined,
-            endLine: Number.isFinite(endLine) ? endLine : undefined,
+            startLine,
+            endLine,
             evidence: { hunks: spec.hunks },
           });
         }
       }
     }
 
-    const changedSymbols = Array.from(changedSymbolsById.values())
-      .slice(0, limitSymbols);
+    const allChangedSymbols = Array.from(changedSymbolsById.values())
+      .sort((left, right) => {
+        const leftPath = normalizePath(String(left?.filePath || ''));
+        const rightPath = normalizePath(String(right?.filePath || ''));
+        if (leftPath !== rightPath) return leftPath.localeCompare(rightPath);
+        const leftStart = toFiniteNumber(left?.startLine, Number.POSITIVE_INFINITY);
+        const rightStart = toFiniteNumber(right?.startLine, Number.POSITIVE_INFINITY);
+        if (leftStart !== rightStart) return leftStart - rightStart;
+        return String(left?.uid || '').localeCompare(String(right?.uid || ''));
+      });
+    const changedSymbolCountTotal = allChangedSymbols.length;
+    const analysisSymbolCap = Math.max(200, Math.min(5000, limitSymbols * 20));
+    const analysisSymbols = allChangedSymbols.slice(0, analysisSymbolCap);
+    const changedSymbols = analysisSymbols.slice(0, limitSymbols);
+    const changedSymbolsTruncated = changedSymbolCountTotal > analysisSymbols.length;
 
     const callerFetchLimit = Math.min(200, Math.max(limitCallers, limitTests) * 6);
     const escapeCypherValue = (value: string): string => String(value || '').replace(/'/g, "''");
@@ -6975,13 +7201,13 @@ export class LocalBackend {
       return `[${values.map(value => `'${escapeCypherValue(value)}'`).join(', ')}]`;
     };
     const changedSymbolIds = Array.from(new Set(
-      changedSymbols
+      analysisSymbols
         .map(sym => String(sym?.uid || '').trim())
         .filter(Boolean)
     ));
     const changedSymbolIdSet = new Set(changedSymbolIds);
     const changedFilePathSet = new Set<string>();
-    for (const sym of changedSymbols) {
+    for (const sym of analysisSymbols) {
       const fp = normalizePath(String(sym?.filePath || ''));
       if (fp) changedFilePathSet.add(fp);
     }
@@ -7012,14 +7238,16 @@ export class LocalBackend {
       for (const row of rows) {
         const targetId = String(row.targetId || row[columnOffset + 0] || '').trim();
         if (!targetId) continue;
+        const filePath = normalizePath(String(row.filePath || row[columnOffset + 4] || ''));
+        if (!filePath) continue;
         const entry = {
           uid: row.uid || row[columnOffset + 1],
           name: row.name || row[columnOffset + 2],
-          kind: row.kind || row[columnOffset + 3],
-          filePath: row.filePath || row[columnOffset + 4],
+          kind: toPrimaryLabel(row.kind || row[columnOffset + 3]),
+          filePath,
           startLine: row.startLine ?? row[columnOffset + 5],
           edge: {
-            confidence: Number(row.confidence ?? row[columnOffset + 6] ?? 1.0),
+            confidence: normalizeConfidence(row.confidence ?? row[columnOffset + 6], 1.0),
             reason: String(row.reason ?? row[columnOffset + 7] ?? ''),
           },
         };
@@ -7085,8 +7313,8 @@ export class LocalBackend {
       }
     }
 
-    const symbols: any[] = [];
-    for (const sym of changedSymbols) {
+    const symbolReviews: any[] = [];
+    for (const sym of analysisSymbols) {
       const targetId = String(sym?.uid || '').trim();
       let callersRaw: any[] = callersByTargetId.get(targetId) || [];
 
@@ -7097,8 +7325,8 @@ export class LocalBackend {
         const key = uid || filePath;
         if (!key) continue;
         const prev = dedupedByCaller.get(key);
-        const nextConfidence = Number(caller?.edge?.confidence ?? 0);
-        const prevConfidence = Number(prev?.edge?.confidence ?? -1);
+        const nextConfidence = toFiniteNumber(caller?.edge?.confidence, 0);
+        const prevConfidence = toFiniteNumber(prev?.edge?.confidence, -1);
         if (prev && prevConfidence >= nextConfidence) continue;
         dedupedByCaller.set(key, {
           ...caller,
@@ -7108,7 +7336,7 @@ export class LocalBackend {
       callersRaw = Array.from(dedupedByCaller.values());
 
       callersRaw.sort((left, right) => {
-        const c = Number(right?.edge?.confidence ?? 0) - Number(left?.edge?.confidence ?? 0);
+        const c = toFiniteNumber(right?.edge?.confidence, 0) - toFiniteNumber(left?.edge?.confidence, 0);
         if (c !== 0) return c;
         return String(left?.filePath || '').localeCompare(String(right?.filePath || ''));
       });
@@ -7125,17 +7353,18 @@ export class LocalBackend {
       for (const t of testCallers) {
         const fp = String(t?.filePath || '').trim();
         if (!fp) continue;
-        const confidence = Number(t?.edge?.confidence ?? 1.0);
+        const confidence = normalizeConfidence(t?.edge?.confidence, 1.0);
         const reason = sym?.name ? `${sym.name} direct caller` : 'direct caller of changed symbol';
         addSuggestedTest(fp, 3 + Math.max(0, confidence), reason);
       }
 
-      symbols.push({
+      symbolReviews.push({
         symbol: sym,
         callers: callers.slice(0, limitCallers),
         test_callers: testCallers,
       });
     }
+    const symbols: any[] = symbolReviews.slice(0, limitSymbols);
 
     // Fallback tier 1: include lower-confidence test callers if no direct high-confidence hits were found.
     if (suggestedTestsAgg.size === 0 && changedSymbolIds.length > 0) {
@@ -7154,7 +7383,7 @@ export class LocalBackend {
           if (pathPrefixes.length > 0 && !isInScope(callerFilePath)) continue;
           if (!isTestFilePath(callerFilePath)) continue;
           const targetName = String(row.targetName || row[1] || '').trim();
-          const confidence = Number(row.confidence ?? row[2] ?? 0);
+          const confidence = normalizeConfidence(row.confidence ?? row[2], 0);
           const reason = targetName
             ? `${targetName} low-confidence caller (confidence ${confidence.toFixed(2)})`
             : `low-confidence caller (confidence ${confidence.toFixed(2)})`;
@@ -7182,7 +7411,7 @@ export class LocalBackend {
           if (pathPrefixes.length > 0 && !isInScope(callerFilePath)) continue;
           if (!isTestFilePath(callerFilePath)) continue;
           const targetFilePath = normalizePath(String(row.targetFilePath || row[1] || ''));
-          const confidence = Number(row.confidence ?? row[2] ?? 0);
+          const confidence = normalizeConfidence(row.confidence ?? row[2], 0);
           const reason = targetFilePath
             ? `imports changed file ${targetFilePath}`
             : 'imports changed file';
@@ -7198,7 +7427,7 @@ export class LocalBackend {
       const stopTokens = new Set([
         'apps', 'app', 'src', 'lib', 'utils', 'shared', 'common', 'components',
         'services', 'service', 'controllers', 'controller', 'index', 'test', 'tests',
-        'spec', 'feature', 'unit', 'backend', 'dashboard',
+        'spec', 'feature', 'unit', 'backend', 'dashboard', 'gitnexus', 'local',
       ]);
       const tokenize = (value: string): string[] => {
         return String(value || '')
@@ -7214,21 +7443,25 @@ export class LocalBackend {
         const base = path.basename(fp, path.extname(fp));
         for (const token of tokenize(base)) changedTokens.add(token);
       }
-      for (const sym of changedSymbols) {
+      for (const sym of analysisSymbols) {
         for (const token of tokenize(String(sym?.name || ''))) changedTokens.add(token);
       }
 
       if (changedTokens.size > 0) {
         try {
-          const output = execFileSync('git', ['ls-files'], {
-            cwd: repo.repoPath,
-            encoding: 'utf-8',
-            maxBuffer: 1024 * 1024 * 10,
-          });
-          const candidates = String(output || '')
-            .trim()
-            .split('\n')
-            .map(line => normalizePath(line))
+          const fileRows = await executeQuery(repo.id, `
+            MATCH (f:File)
+            WHERE (
+              lower(f.filePath) CONTAINS '/test/'
+              OR lower(f.filePath) CONTAINS '/tests/'
+              OR lower(f.filePath) CONTAINS '.test.'
+              OR lower(f.filePath) CONTAINS '.spec.'
+            )
+            RETURN f.filePath AS filePath
+            LIMIT 20000
+          `);
+          const candidates = fileRows
+            .map((row: any) => normalizePath(String(row.filePath ?? row[0] ?? '')))
             .filter(Boolean)
             .filter(filePath => isTestFilePath(filePath))
             .filter(filePath => pathPrefixes.length === 0 || isInScope(filePath));
@@ -7313,7 +7546,7 @@ export class LocalBackend {
       .slice(0, limitTests)
       .map(([filePath, meta]) => ({
         filePath,
-        score: Number(meta.score.toFixed(3)),
+        score: round3(meta.score),
         reasons: meta.reasons,
         ...buildSuggestedTestCommand(filePath),
       }));
@@ -7421,6 +7654,7 @@ export class LocalBackend {
             shared_closed_slots: string[];
             shared_roles: string[];
           }>;
+          memberSeen: Set<string>;
         }>();
 
         for (const row of sliceRows) {
@@ -7436,7 +7670,7 @@ export class LocalBackend {
               sliceType: String(row.sliceType ?? row[3] ?? '').trim(),
               anchorId: String(row.anchorId ?? row[4] ?? '').trim(),
               anchorName: String(row.anchorName ?? row[5] ?? '').trim(),
-              closureScore: Number(row.closureScore ?? row[6] ?? 0) || 0,
+              closureScore: toFiniteNumber(row.closureScore ?? row[6], 0),
               closureSlots: Array.isArray(row.closureSlots) ? row.closureSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
               closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
               roles: new Set<string>(),
@@ -7457,6 +7691,7 @@ export class LocalBackend {
                 closure_score_delta: 0,
               },
               siblingPrecedents: [],
+              memberSeen: new Set<string>(),
             };
             changedSliceMap.set(sliceId, entry);
           }
@@ -7465,17 +7700,21 @@ export class LocalBackend {
           if (role) entry.roles.add(role);
           const memberId = String(row.memberId ?? row[9] ?? '').trim();
           if (!memberId) continue;
-          const startLine = Number(row.memberStartLine ?? row[13]);
-          const endLine = Number(row.memberEndLine ?? row[14]);
+          const startLine = toOptionalLineNumber(row.memberStartLine ?? row[13]);
+          const endLine = toOptionalLineNumber(row.memberEndLine ?? row[14]);
+          const memberFilePath = String(row.memberFilePath ?? row[12] ?? '').trim();
+          const memberKey = `${memberId}|${role}|${memberFilePath}`;
+          if (entry.memberSeen.has(memberKey)) continue;
+          entry.memberSeen.add(memberKey);
 
           entry.changedMembers.push({
             uid: memberId,
             name: String(row.memberName ?? row[10] ?? '').trim(),
             kind: toPrimaryLabel(row.memberKind ?? row[11]),
-            filePath: String(row.memberFilePath ?? row[12] ?? '').trim(),
+            filePath: memberFilePath,
             role,
-            ...(Number.isFinite(startLine) ? { startLine } : {}),
-            ...(Number.isFinite(endLine) ? { endLine } : {}),
+            ...(startLine !== undefined ? { startLine } : {}),
+            ...(endLine !== undefined ? { endLine } : {}),
           });
         }
 
@@ -7489,29 +7728,31 @@ export class LocalBackend {
             MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
             WHERE s.id IN ${changedSliceIdsCypher}
               AND r.reason STARTS WITH 'feature-slice:'
-            RETURN s.id AS sliceId, n.id AS memberId, r.reason AS memberRoleReason
+            RETURN s.id AS sliceId,
+                   COUNT(DISTINCT n.id) AS memberCount,
+                   collect(DISTINCT r.reason) AS memberRoleReasons
             LIMIT 5000
           `);
 
-          const memberIdSets = new Map<string, Set<string>>();
+          const memberCountBySlice = new Map<string, number>();
           for (const row of sliceRoleRows) {
             const sliceId = String(row.sliceId ?? row[0] ?? '').trim();
             if (!sliceId) continue;
-            const memberId = String(row.memberId ?? row[1] ?? '').trim();
-            const role = parseSliceRole(String(row.memberRoleReason ?? row[2] ?? '').trim());
             const entry = changedSliceMap.get(sliceId);
             if (!entry) continue;
-            if (role) entry.roles.add(role);
-            if (!memberId) continue;
-            const memberSet = memberIdSets.get(sliceId) || new Set<string>();
-            memberSet.add(memberId);
-            memberIdSets.set(sliceId, memberSet);
+            const memberCount = toFiniteNumber(row.memberCount ?? row[1], 0);
+            if (memberCount > 0) memberCountBySlice.set(sliceId, memberCount);
+            const reasons = Array.isArray(row.memberRoleReasons) ? row.memberRoleReasons : [];
+            for (const reason of reasons) {
+              const role = parseSliceRole(String(reason || '').trim());
+              if (role) entry.roles.add(role);
+            }
           }
 
           const gapRows = await executeQuery(repo.id, `
             MATCH (g:Gap)-[:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
             WHERE s.id IN ${changedSliceIdsCypher}
-            RETURN s.id AS sliceId, g.absenceTier AS absenceTier, g.severity AS severity
+            RETURN DISTINCT s.id AS sliceId, g.absenceTier AS absenceTier, g.severity AS severity
             LIMIT 2000
           `);
 
@@ -7562,7 +7803,7 @@ export class LocalBackend {
 
               const requiredScore = requiredSlots.length > 0 ? (requiredHits / requiredSlots.length) : 1;
               const roleScore = templateRoles.length > 0 ? (roleHits / templateRoles.length) : 1;
-              const score = (requiredScore * 0.7) + (roleScore * 0.3) + ((Number(template.sliceCount || 0) || 0) * 0.0001);
+              const score = (requiredScore * 0.7) + (roleScore * 0.3) + (toFiniteNumber(template.sliceCount, 0) * 0.0001);
               if (score > bestScore) {
                 bestScore = score;
                 bestTemplate = template;
@@ -7581,8 +7822,8 @@ export class LocalBackend {
               ? bestTemplate.roleCoverage
                 .map((item: any) => ({
                   role: String(item?.role || '').trim(),
-                  coverage: Number(item?.coverage || 0) || 0,
-                  count: Number(item?.count || 0) || 0,
+                  coverage: toFiniteNumber(item?.coverage, 0),
+                  count: toFiniteNumber(item?.count, 0),
                 }))
                 .filter((item: any) => item.role)
               : [];
@@ -7600,15 +7841,15 @@ export class LocalBackend {
               required_slots: requiredSlots,
               optional_slots: optionalSlots,
               role_expectations: roleExpectations,
-              avg_closure_score: Number(bestTemplate.avgClosureScore || 0) || 0,
-              slice_count: Number(bestTemplate.sliceCount || 0) || 0,
+              avg_closure_score: toFiniteNumber(bestTemplate.avgClosureScore, 0),
+              slice_count: toFiniteNumber(bestTemplate.sliceCount, 0),
               exemplar_slice_ids: exemplarSliceIds,
             };
 
             entry.stencilDelta = {
               missing_required_slots: requiredSlots.filter(slot => !closedSlotSet.has(slot)),
               missing_roles: expectedRoles.filter(role => !roleSet.has(role)),
-              closure_score_delta: Number(((Number(bestTemplate.avgClosureScore || 0) || 0) - entry.closureScore).toFixed(3)),
+              closure_score_delta: round3(toFiniteNumber(bestTemplate.avgClosureScore, 0) - entry.closureScore),
             };
 
             for (const siblingId of exemplarSliceIds) {
@@ -7634,8 +7875,16 @@ export class LocalBackend {
             const siblingRows = await executeQuery(repo.id, `
               MATCH (s:FeatureSlice)
               WHERE s.id IN ${siblingIdsCypher}
-              RETURN s.id AS id, s.label AS label, s.heuristicLabel AS heuristicLabel, s.anchorName AS anchorName, s.closureScore AS closureScore, s.closedSlots AS closedSlots
-              LIMIT 1000
+              OPTIONAL MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s)
+              WHERE r.reason STARTS WITH 'feature-slice:'
+              RETURN s.id AS id,
+                     s.label AS label,
+                     s.heuristicLabel AS heuristicLabel,
+                     s.anchorName AS anchorName,
+                     s.closureScore AS closureScore,
+                     s.closedSlots AS closedSlots,
+                     collect(DISTINCT r.reason) AS memberRoleReasons
+              LIMIT 2000
             `);
 
             for (const row of siblingRows) {
@@ -7646,26 +7895,18 @@ export class LocalBackend {
                 label: String(row.label ?? row[1] ?? '').trim(),
                 heuristicLabel: String(row.heuristicLabel ?? row[2] ?? '').trim(),
                 anchorName: String(row.anchorName ?? row[3] ?? '').trim(),
-                closureScore: Number(row.closureScore ?? row[4] ?? 0) || 0,
+                closureScore: toFiniteNumber(row.closureScore ?? row[4], 0),
                 closedSlots: Array.isArray(row.closedSlots) ? row.closedSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
                 roles: new Set<string>(),
               });
-            }
-
-            const siblingRoleRows = await executeQuery(repo.id, `
-              MATCH (n)-[r:CodeRelation {type: 'MEMBER_OF'}]->(s:FeatureSlice)
-              WHERE s.id IN ${siblingIdsCypher}
-                AND r.reason STARTS WITH 'feature-slice:'
-              RETURN s.id AS sliceId, r.reason AS memberRoleReason
-              LIMIT 4000
-            `);
-
-            for (const row of siblingRoleRows) {
-              const siblingId = String(row.sliceId ?? row[0] ?? '').trim();
-              const role = parseSliceRole(String(row.memberRoleReason ?? row[1] ?? '').trim());
+              const reasons = Array.isArray(row.memberRoleReasons) ? row.memberRoleReasons : [];
               const sibling = siblingDetailsById.get(siblingId);
-              if (!sibling || !role) continue;
-              sibling.roles.add(role);
+              if (sibling) {
+                for (const reason of reasons) {
+                  const role = parseSliceRole(String(reason || '').trim());
+                  if (role) sibling.roles.add(role);
+                }
+              }
             }
           }
 
@@ -7699,7 +7940,7 @@ export class LocalBackend {
                   id: sibling.id,
                   label: sibling.label || sibling.heuristicLabel || sibling.id,
                   anchor_name: sibling.anchorName,
-                  closure_score: Number(sibling.closureScore.toFixed(3)),
+                  closure_score: round3(sibling.closureScore),
                   shared_closed_slots: sharedClosedSlots.slice(0, 8),
                   shared_roles: sharedRoles.slice(0, 8),
                   __rank: sharedClosedSlots.length + sharedRoles.length + sibling.closureScore,
@@ -7719,11 +7960,11 @@ export class LocalBackend {
                 sliceType: entry.sliceType,
                 anchorId: entry.anchorId,
                 anchorName: entry.anchorName,
-                closureScore: Number(entry.closureScore.toFixed(3)),
+                closureScore: round3(entry.closureScore),
                 closureSlots: entry.closureSlots,
                 closedSlots: entry.closedSlots,
                 roles: Array.from(entry.roles).sort(),
-                changed_member_count: (memberIdSets.get(entry.id)?.size || entry.changedMembers.length),
+                changed_member_count: (memberCountBySlice.get(entry.id) || entry.changedMembers.length),
               },
               changed_members: entry.changedMembers.slice(0, 12),
               template: entry.template,
@@ -7879,7 +8120,7 @@ export class LocalBackend {
         const targetName = String(raw.targetName ?? raw[5] ?? '').trim();
         const sourceFilePath = String(raw.sourceFilePath ?? raw[3] ?? '').trim();
         const targetFilePath = String(raw.targetFilePath ?? raw[7] ?? '').trim();
-        const confidence = Number(raw.confidence ?? raw[10] ?? 1);
+        const confidence = normalizeConfidence(raw.confidence ?? raw[10], 1);
         const edgeId = String(raw.edgeId ?? raw[11] ?? '').trim();
 
         const family = classifySemanticFamily({
@@ -8058,8 +8299,8 @@ export class LocalBackend {
                 name: String(sym?.name || ''),
                 kind: String(sym?.kind || ''),
                 filePath: String(sym?.filePath || ''),
-                ...(Number.isFinite(sym?.startLine) ? { startLine: Number(sym.startLine) } : {}),
-                ...(Number.isFinite(sym?.endLine) ? { endLine: Number(sym.endLine) } : {}),
+                ...(toOptionalLineNumber(sym?.startLine) !== undefined ? { startLine: toOptionalLineNumber(sym?.startLine) } : {}),
+                ...(toOptionalLineNumber(sym?.endLine) !== undefined ? { endLine: toOptionalLineNumber(sym?.endLine) } : {}),
               },
               primary_span: evidence.primarySpan || null,
               witness_spans: Array.isArray(evidence.witnessSpans) ? evidence.witnessSpans : [],
@@ -8095,7 +8336,7 @@ export class LocalBackend {
               id: edgeId,
               type: String(ref.edge?.type || ''),
               reason: String(ref.edge?.reason || ''),
-              confidence: Number(ref.edge?.confidence ?? 1) || 1,
+              confidence: normalizeConfidence(ref.edge?.confidence, 1),
               witness_path_ids: Array.isArray(ref.edge?.witnessPathIds) ? ref.edge.witnessPathIds : [],
             },
             witness_spans: Array.isArray(evidence.witnessSpans) ? evidence.witnessSpans : [],
@@ -8216,23 +8457,34 @@ export class LocalBackend {
 
       for (const routeFilePath of routeFiles) {
         const rows = rowsByRouteFile.get(routeFilePath) || [];
-        const targets = rows.map((row: any) => ({
-          controller: {
-            uid: row.uid || row[1],
-            name: (() => {
-              const base = row.name || row[2] || '';
-              const cls = row.className || row[5] || '';
-              return cls && base ? `${cls}::${base}` : base;
-            })(),
-            filePath: row.filePath || row[3] || '',
-            startLine: row.startLine ?? row[4] ?? undefined,
-            kind: 'Method',
-          },
-          edge: {
-            confidence: Number(row.confidence ?? row[6] ?? 1.0),
-            reason: String(row.reason ?? row[7] ?? ''),
-          },
-        })).filter((target: any) => target?.controller?.uid && target?.edge?.reason);
+        const targetByKey = new Map<string, any>();
+        for (const row of rows) {
+          const uid = String(row.uid || row[1] || '').trim();
+          const reason = String(row.reason ?? row[7] ?? '').trim();
+          if (!uid || !reason) continue;
+          const key = `${uid}|${reason}`;
+          const currentConfidence = normalizeConfidence(row.confidence ?? row[6], 1.0);
+          const existing = targetByKey.get(key);
+          if (existing && toFiniteNumber(existing?.edge?.confidence, 0) >= currentConfidence) continue;
+          targetByKey.set(key, {
+            controller: {
+              uid,
+              name: (() => {
+                const base = row.name || row[2] || '';
+                const cls = row.className || row[5] || '';
+                return cls && base ? `${cls}::${base}` : base;
+              })(),
+              filePath: row.filePath || row[3] || '',
+              startLine: row.startLine ?? row[4] ?? undefined,
+              kind: 'Method',
+            },
+            edge: {
+              confidence: currentConfidence,
+              reason,
+            },
+          });
+        }
+        const targets = Array.from(targetByKey.values());
 
         route_targets.push({
           route_file: routeFilePath,
@@ -8253,6 +8505,12 @@ export class LocalBackend {
         }
       }
       raw = raw.split('?')[0].split('#')[0];
+      try {
+        raw = decodeURIComponent(raw);
+      } catch {
+        // keep original
+      }
+      raw = raw.replace(/\/{2,}/g, '/');
       if (!raw.startsWith('/')) raw = `/${raw}`;
       return raw.replace(/\/+$/, '') || '/';
     };
@@ -8260,11 +8518,49 @@ export class LocalBackend {
     const routePatternToRegex = (pattern: string): RegExp | null => {
       const normalized = normalizeObservedRoute(pattern);
       if (!normalized) return null;
-      const escaped = normalized
-        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        .replace(/\\\*/g, '[^/]+');
+
+      if (normalized === '/') return /^\/$/;
+
+      const escapeRegex = (value: string): string => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const segments = normalized.replace(/^\/+/, '').split('/').filter(Boolean);
+      let patternSrc = '^';
+      for (const segment of segments) {
+        if (segment === '*') {
+          patternSrc += '/[^/]+';
+          continue;
+        }
+
+        const placeholderMatch = segment.match(/^\{(.+)\}$/);
+        if (!placeholderMatch) {
+          patternSrc += `/${escapeRegex(segment)}`;
+          continue;
+        }
+
+        let inner = String(placeholderMatch[1] || '').trim();
+        let optional = false;
+        let wildcard = false;
+        if (inner.endsWith('?')) {
+          optional = true;
+          inner = inner.slice(0, -1);
+        }
+        if (inner.endsWith('*')) {
+          wildcard = true;
+          inner = inner.slice(0, -1);
+        }
+
+        const colonIdx = inner.indexOf(':');
+        const constraint = colonIdx >= 0 ? inner.slice(colonIdx + 1).trim() : '';
+        let partPattern = '[^/]+';
+        if (wildcard) partPattern = '.+';
+        else if (constraint) partPattern = constraint;
+
+        if (optional) patternSrc += `(?:/${partPattern})?`;
+        else patternSrc += `/${partPattern}`;
+      }
+      patternSrc += '/?$';
+
       try {
-        return new RegExp(`^${escaped}$`);
+        return new RegExp(patternSrc);
       } catch {
         return null;
       }
@@ -8279,6 +8575,7 @@ export class LocalBackend {
       confidence: number;
       reason: string;
     }> = [];
+    const routePatternSeen = new Set<string>();
     for (const routeEntry of route_targets) {
       const routeFilePath = String(routeEntry?.route_file || '').trim();
       for (const target of Array.isArray(routeEntry?.targets) ? routeEntry.targets : []) {
@@ -8286,16 +8583,20 @@ export class LocalBackend {
         const match = reason.match(/^laravel-route:([a-z]+):(.+)$/i);
         if (!match) continue;
         const method = String(match[1] || '').trim().toUpperCase();
-        const pattern = String(match[2] || '').trim();
-        const matcher = routePatternToRegex(pattern);
-        if (!method || !pattern || !matcher) continue;
+        const normalizedPattern = normalizeObservedRoute(String(match[2] || '').trim());
+        const matcher = routePatternToRegex(normalizedPattern);
+        const controllerUid = String(target?.controller?.uid || '').trim();
+        if (!method || !normalizedPattern || !matcher) continue;
+        const dedupeKey = `${method}|${normalizedPattern}|${routeFilePath}|${controllerUid}`;
+        if (routePatternSeen.has(dedupeKey)) continue;
+        routePatternSeen.add(dedupeKey);
         routePatterns.push({
           method,
-          pattern,
+          pattern: normalizedPattern,
           matcher,
           route_file: routeFilePath,
           controller: target?.controller || null,
-          confidence: Number(target?.edge?.confidence ?? 0.9),
+          confidence: normalizeConfidence(target?.edge?.confidence, 0.9),
           reason,
         });
       }
@@ -8314,9 +8615,13 @@ export class LocalBackend {
       const cacheKey = `${normalizedMethod || '*'}|${normalizedRoute}`;
       const cached = routeMatchCache.get(cacheKey);
       if (cached) return cached;
-      const candidates = normalizedMethod
-        ? (routePatternsByMethod.get(normalizedMethod) || [])
-        : routePatterns;
+      const candidates = (() => {
+        if (!normalizedMethod) return routePatterns;
+        const byMethod = routePatternsByMethod.get(normalizedMethod) || [];
+        if (normalizedMethod !== 'HEAD') return byMethod;
+        const getRoutes = routePatternsByMethod.get('GET') || [];
+        return [...byMethod, ...getRoutes];
+      })();
       const matches = candidates
         .filter(routePattern => routePattern.matcher.test(normalizedRoute))
         .map(routePattern => ({
@@ -8326,8 +8631,15 @@ export class LocalBackend {
           controller: routePattern.controller,
           reason: routePattern.reason,
         }));
-      routeMatchCache.set(cacheKey, matches);
-      return matches;
+      const deduped = Array.from(new Map(
+        matches.map(item => {
+          const controllerUid = String(item?.controller?.uid || '').trim();
+          const key = `${String(item?.pattern || '')}|${String(item?.route_file || '')}|${controllerUid}`;
+          return [key, item];
+        }),
+      ).values());
+      routeMatchCache.set(cacheKey, deduped);
+      return deduped;
     };
 
     const runtimeSource = (
@@ -8344,16 +8656,59 @@ export class LocalBackend {
     );
 
     const runtime_hotspots: any[] = [];
+    const normalizeHotspotSqlSignature = (sql: string): string => {
+      return String(sql || '')
+        .toLowerCase()
+        .replace(/'[^']*'/g, '?')
+        .replace(/"[^"]*"/g, '?')
+        .replace(/\b\d+\b/g, '?')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 240);
+    };
+    const runtimeHotspotByKey = new Map<string, any>();
+    const runtimeHotspotKey = (entry: any): string => {
+      const kind = String(entry?.kind || '').trim();
+      if (kind === 'request_span') {
+        const span = entry?.evidence?.span || {};
+        return `${kind}|${String(span.method || '').toUpperCase()}|${normalizeObservedRoute(String(span.route || ''))}`;
+      }
+      if (kind === 'db_query') {
+        const query = entry?.evidence?.query || {};
+        const route = normalizeObservedRoute(String(query.route || ''));
+        const sql = normalizeHotspotSqlSignature(String(query.sql || ''));
+        return `${kind}|${route}|${sql}`;
+      }
+      return `${kind}|${String(entry?.summary || '')}`;
+    };
     const addRuntimeHotspot = (entry: any) => {
       if (!entry || !entry.summary) return;
-      runtime_hotspots.push(entry);
+      const key = runtimeHotspotKey(entry);
+      const existing = runtimeHotspotByKey.get(key);
+      const nextScore = toFiniteNumber(entry?.score, 0);
+      const existingScore = toFiniteNumber(existing?.score, 0);
+      if (!existing) {
+        runtimeHotspotByKey.set(key, entry);
+        return;
+      }
+
+      const mergedReasons = Array.from(new Set([
+        ...(Array.isArray(existing?.reasons) ? existing.reasons : []),
+        ...(Array.isArray(entry?.reasons) ? entry.reasons : []),
+      ])).slice(0, 8);
+      const winner = existingScore >= nextScore ? existing : entry;
+      runtimeHotspotByKey.set(key, {
+        ...winner,
+        reasons: mergedReasons,
+        score: Math.max(existingScore, nextScore),
+      });
     };
 
     for (const span of runtimeSnapshot.request_spans.slice(0, 200)) {
       const method = String(span.method || '').trim().toUpperCase() || 'GET';
       const observedRoute = normalizeObservedRoute(String(span.route || ''));
       if (!observedRoute) continue;
-      const reasons: string[] = [];
+      const reasons = new Set<string>();
       const matchedRoutes = findMatchedRoutes(method, observedRoute);
       const fileHints = Array.isArray(span.file_path_hints)
         ? span.file_path_hints.map(item => normalizePath(item)).filter(Boolean)
@@ -8361,16 +8716,16 @@ export class LocalBackend {
 
       for (const fileHint of fileHints) {
         if (!isInScope(fileHint)) continue;
-        if (runtimeChangedFilePathSet.has(fileHint)) reasons.push(`file-hint:${fileHint}`);
+        if (runtimeChangedFilePathSet.has(fileHint)) reasons.add(`file-hint:${fileHint}`);
       }
 
       for (const matchedRoute of matchedRoutes) {
-        reasons.push(`route-match:${matchedRoute.pattern}`);
+        reasons.add(`route-match:${matchedRoute.pattern}`);
       }
 
-      if (reasons.length === 0) continue;
-      const durationMs = Number(span.duration_ms || 0);
-      const payloadBytes = Number(span.payload_bytes || 0);
+      if (reasons.size === 0) continue;
+      const durationMs = toFiniteNumber(span.duration_ms, 0);
+      const payloadBytes = toFiniteNumber(span.payload_bytes, 0);
       const severity = durationMs >= 1000 || payloadBytes >= 500_000 ? 'high' : durationMs >= 400 ? 'medium' : 'low';
       const score = Number((
         (durationMs / 300)
@@ -8383,8 +8738,8 @@ export class LocalBackend {
         severity,
         score,
         summary: `${method} ${observedRoute} observed ${durationMs}ms`,
-        reasons: Array.from(new Set(reasons)).slice(0, 8),
-        confidence: Number(Math.min(0.95, 0.65 + (matchedRoutes.length > 0 ? 0.2 : 0.05)).toFixed(3)),
+        reasons: Array.from(reasons).sort().slice(0, 8),
+        confidence: round3(normalizeConfidence(Math.min(0.95, 0.65 + (matchedRoutes.length > 0 ? 0.2 : 0.05)), 0.7)),
         evidence: {
           span,
           matched_routes: matchedRoutes,
@@ -8393,35 +8748,35 @@ export class LocalBackend {
     }
 
     for (const query of runtimeSnapshot.db_queries.slice(0, 300)) {
-      const durationMs = Number(query.duration_ms || 0);
-      const lockWaitMs = Number(query.lock_wait_ms || 0);
+      const durationMs = toFiniteNumber(query.duration_ms, 0);
+      const lockWaitMs = toFiniteNumber(query.lock_wait_ms, 0);
       const sql = String(query.sql || '').trim();
       const route = normalizeObservedRoute(String(query.route || ''));
       const queryMethod = String((query as any).method || '').trim().toUpperCase();
-      const reasons: string[] = [];
+      const reasons = new Set<string>();
       const matchedRoutes = route ? findMatchedRoutes(queryMethod, route) : [];
       const fileHints = Array.isArray(query.file_path_hints)
         ? query.file_path_hints.map(item => normalizePath(item)).filter(Boolean)
         : [];
       for (const fileHint of fileHints) {
         if (!isInScope(fileHint)) continue;
-        if (runtimeChangedFilePathSet.has(fileHint)) reasons.push(`file-hint:${fileHint}`);
+        if (runtimeChangedFilePathSet.has(fileHint)) reasons.add(`file-hint:${fileHint}`);
       }
       for (const matchedRoute of matchedRoutes) {
-        reasons.push(`route-match:${matchedRoute.pattern}`);
+        reasons.add(`route-match:${matchedRoute.pattern}`);
       }
-      if (reasons.length === 0) continue;
+      if (reasons.size === 0) continue;
       if (durationMs < 80 && lockWaitMs < 25) continue;
 
       const severity = lockWaitMs >= 100 || durationMs >= 600 ? 'high' : durationMs >= 200 ? 'medium' : 'low';
-      const score = Number(((durationMs / 250) + (lockWaitMs / 120)).toFixed(3));
+      const score = round3((durationMs / 250) + (lockWaitMs / 120));
       addRuntimeHotspot({
         kind: 'db_query',
         severity,
         score,
         summary: `DB query observed ${durationMs}ms${lockWaitMs > 0 ? ` (${lockWaitMs}ms lock wait)` : ''}`,
-        reasons: Array.from(new Set(reasons)).slice(0, 8),
-        confidence: Number(Math.min(0.93, 0.6 + (lockWaitMs >= 50 ? 0.15 : 0.05) + (sql ? 0.05 : 0)).toFixed(3)),
+        reasons: Array.from(reasons).sort().slice(0, 8),
+        confidence: round3(normalizeConfidence(Math.min(0.93, 0.6 + (lockWaitMs >= 50 ? 0.15 : 0.05) + (sql ? 0.05 : 0)), 0.65)),
         evidence: {
           query,
           matched_routes: matchedRoutes,
@@ -8429,12 +8784,15 @@ export class LocalBackend {
       });
     }
 
+    runtime_hotspots.push(...runtimeHotspotByKey.values());
     runtime_hotspots.sort((left, right) => {
       const severityRank = (value: string): number => (value === 'high' ? 3 : value === 'medium' ? 2 : 1);
       const leftRank = severityRank(String(left?.severity || 'low'));
       const rightRank = severityRank(String(right?.severity || 'low'));
       if (rightRank !== leftRank) return rightRank - leftRank;
-      if (Number(right?.score || 0) !== Number(left?.score || 0)) return Number(right?.score || 0) - Number(left?.score || 0);
+      const rightScore = toFiniteNumber(right?.score, 0);
+      const leftScore = toFiniteNumber(left?.score, 0);
+      if (rightScore !== leftScore) return rightScore - leftScore;
       return String(left?.summary || '').localeCompare(String(right?.summary || ''));
     });
 
@@ -8451,14 +8809,14 @@ export class LocalBackend {
       if (!filePath || !isInScope(filePath)) return;
       const kind = String(candidate?.kind || 'Method').trim() || 'Method';
       const name = String(candidate?.name || '').trim();
-      const startLine = Number(candidate?.startLine);
+      const startLine = toOptionalLineNumber(candidate?.startLine);
       const incoming: any = {
         uid,
         name,
         filePath,
         kind,
       };
-      if (Number.isFinite(startLine)) incoming.startLine = startLine;
+      if (startLine !== undefined) incoming.startLine = startLine;
       const existing = controllerById.get(uid);
       if (!existing) {
         controllerById.set(uid, incoming);
@@ -8473,9 +8831,11 @@ export class LocalBackend {
       } else {
         merged.name = existing.name;
       }
-      if (Number.isFinite(existing.startLine)) {
+      const existingStartLine = toOptionalLineNumber(existing.startLine);
+      const incomingStartLine = toOptionalLineNumber(incoming.startLine);
+      if (existingStartLine !== undefined) {
         merged.startLine = existing.startLine;
-      } else if (!Number.isFinite(incoming.startLine)) {
+      } else if (incomingStartLine === undefined) {
         delete merged.startLine;
       }
       controllerById.set(uid, merged);
@@ -8501,14 +8861,14 @@ export class LocalBackend {
     for (const routePattern of routePatterns) {
       const controllerUid = String(routePattern?.controller?.uid || '').trim();
       const method = String(routePattern?.method || '').trim().toLowerCase();
-      const pattern = String(routePattern?.pattern || '').trim();
-      if (!controllerUid || !method || !pattern) continue;
-      const endpointName = `endpoint:${method}:${pattern}`;
+      const normalizedPattern = normalizeObservedRoute(String(routePattern?.pattern || '').trim());
+      if (!controllerUid || !method || !normalizedPattern) continue;
+      const endpointName = `endpoint:${method}:${normalizedPattern}`;
       const names = endpointNamesByControllerId.get(controllerUid) || new Set<string>();
       names.add(endpointName);
       endpointNamesByControllerId.set(controllerUid, names);
       const patternSet = endpointRoutePatternsByName.get(endpointName) || new Set<string>();
-      patternSet.add(pattern);
+      patternSet.add(normalizedPattern);
       endpointRoutePatternsByName.set(endpointName, patternSet);
     }
     const endpointControllersByName = new Map<string, Set<string>>();
@@ -8575,14 +8935,34 @@ export class LocalBackend {
             },
             edge: {
               reason: row.authReason || row[5] || '',
-              confidence: Number(row.authConfidence ?? row[6] ?? 1.0),
+              confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
             },
           };
           controllerChecks.set(checkKey, check);
           checksByController.set(controllerId, controllerChecks);
         }
+        const directPermissionSlug = targetUid.startsWith('CodeElement:permission:')
+          ? String(row.targetName || row[2] || '').trim()
+          : '';
+        if (directPermissionSlug) {
+          const slugKey = `${checkKey}|direct|${directPermissionSlug}`;
+          const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
+          if (!seen.has(slugKey)) {
+            seen.add(slugKey);
+            seenSlugsByCheck.set(controllerId, seen);
+            if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
+            check.permission_slugs.push({
+              name: directPermissionSlug,
+              filePath: String(row.targetFilePath || row[4] || '').trim(),
+              edge: {
+                reason: authReason,
+                confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
+              },
+            });
+          }
+        }
         const slugName = String(row.slugName || row[8] || '').trim();
-        if (!slugName || targetKind !== 'Const') continue;
+        if (!slugName || (targetKind !== 'Const' && !targetUid.startsWith('Const:'))) continue;
         const slugId = String(row.slugId || row[7] || '').trim();
         const slugReason = String(row.slugReason || row[10] || '').trim();
         const slugFilePath = String(row.slugFilePath || row[9] || '').trim();
@@ -8597,7 +8977,7 @@ export class LocalBackend {
           filePath: slugFilePath,
           edge: {
             reason: slugReason,
-            confidence: Number(row.slugConfidence ?? row[11] ?? 1.0),
+            confidence: normalizeConfidence(row.slugConfidence ?? row[11], 1.0),
           },
         });
       }
@@ -8636,9 +9016,9 @@ export class LocalBackend {
           if (!targetUid) continue;
           const controllerIds = endpointControllersByName.get(endpointName) || new Set<string>();
           if (controllerIds.size === 0) continue;
-          const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
-          const authReason = String(row.authReason || row[5] || '').trim();
-          const routePatternsForEndpoint = Array.from(endpointRoutePatternsByName.get(endpointName) || new Set<string>());
+            const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
+            const authReason = String(row.authReason || row[5] || '').trim();
+            const routePatternsForEndpoint = Array.from(endpointRoutePatternsByName.get(endpointName) || new Set<string>());
 
           for (const controllerId of controllerIds) {
             const checkKey = `endpoint:${endpointName}|${targetUid}|${authReason}`;
@@ -8659,15 +9039,35 @@ export class LocalBackend {
                 },
                 edge: {
                   reason: row.authReason || row[5] || '',
-                  confidence: Number(row.authConfidence ?? row[6] ?? 1.0),
+                  confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
                 },
               };
               controllerChecks.set(checkKey, check);
               checksByController.set(controllerId, controllerChecks);
             }
+            const directPermissionSlug = targetUid.startsWith('CodeElement:permission:')
+              ? String(row.targetName || row[2] || '').trim()
+              : '';
+            if (directPermissionSlug) {
+              const slugKey = `${checkKey}|direct|${directPermissionSlug}`;
+              const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
+              if (!seen.has(slugKey)) {
+                seen.add(slugKey);
+                seenSlugsByCheck.set(controllerId, seen);
+                if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
+                check.permission_slugs.push({
+                  name: directPermissionSlug,
+                  filePath: String(row.targetFilePath || row[4] || '').trim(),
+                  edge: {
+                    reason: authReason,
+                    confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
+                  },
+                });
+              }
+            }
 
             const slugName = String(row.slugName || row[8] || '').trim();
-            if (!slugName || targetKind !== 'Const') continue;
+            if (!slugName || (targetKind !== 'Const' && !targetUid.startsWith('Const:'))) continue;
             const slugId = String(row.slugId || row[7] || '').trim();
             const slugReason = String(row.slugReason || row[10] || '').trim();
             const slugFilePath = String(row.slugFilePath || row[9] || '').trim();
@@ -8682,7 +9082,7 @@ export class LocalBackend {
               filePath: slugFilePath,
               edge: {
                 reason: slugReason,
-                confidence: Number(row.slugConfidence ?? row[11] ?? 1.0),
+                confidence: normalizeConfidence(row.slugConfidence ?? row[11], 1.0),
               },
             });
           }
@@ -8724,7 +9124,7 @@ export class LocalBackend {
       dedupe.add(key);
       findings.push({
         ...finding,
-        confidence: Number(Math.max(0, Math.min(1, Number(finding.confidence || 0))).toFixed(3)),
+        confidence: round3(normalizeConfidence(finding.confidence, 0)),
       });
     };
 
@@ -8764,7 +9164,7 @@ export class LocalBackend {
         severity: hotspot.severity === 'high' ? 'high' : hotspot.severity === 'medium' ? 'medium' : 'low',
         summary: `Runtime hotspot overlaps review diff: ${String(hotspot.summary || '').trim()}.`,
         reason: Array.isArray(hotspot.reasons) ? hotspot.reasons.slice(0, 2).join('; ') : 'runtime-observation-hotspot',
-        confidence: Number(hotspot.confidence ?? 0.75),
+        confidence: normalizeConfidence(hotspot.confidence, 0.75),
         evidence: {
           filePath: normalizePath(evidenceFilePath),
           symbol: matchedRoute?.controller
@@ -8772,9 +9172,7 @@ export class LocalBackend {
               uid: String(matchedRoute.controller.uid || '').trim() || undefined,
               name: String(matchedRoute.controller.name || '').trim() || undefined,
               kind: String(matchedRoute.controller.kind || '').trim() || undefined,
-              startLine: Number.isFinite(Number(matchedRoute.controller.startLine))
-                ? Number(matchedRoute.controller.startLine)
-                : undefined,
+              startLine: toOptionalLineNumber(matchedRoute.controller.startLine),
             }
             : undefined,
         },
@@ -8793,8 +9191,8 @@ export class LocalBackend {
       if (!filePath) continue;
 
       if (missingRequiredSlots.length > 0) {
-        const deterministic = Number(sliceEntry?.gap_signals?.deterministic || 0) > 0;
-        const pattern = Number(sliceEntry?.gap_signals?.pattern || 0) > 0;
+        const deterministic = toFiniteNumber(sliceEntry?.gap_signals?.deterministic, 0) > 0;
+        const pattern = toFiniteNumber(sliceEntry?.gap_signals?.pattern, 0) > 0;
         addReviewFinding(reviewFindings, {
           code: 'slice-missing-required-slots',
           severity: deterministic ? 'high' : 'medium',
@@ -8812,7 +9210,7 @@ export class LocalBackend {
                 uid: String(changedMember.uid || '').trim() || undefined,
                 name: String(changedMember.name || '').trim() || undefined,
                 kind: String(changedMember.kind || '').trim() || undefined,
-                startLine: Number.isFinite(Number(changedMember.startLine)) ? Number(changedMember.startLine) : undefined,
+                startLine: toOptionalLineNumber(changedMember.startLine),
               }
               : undefined,
           },
@@ -8833,7 +9231,7 @@ export class LocalBackend {
                 uid: String(changedMember.uid || '').trim() || undefined,
                 name: String(changedMember.name || '').trim() || undefined,
                 kind: String(changedMember.kind || '').trim() || undefined,
-                startLine: Number.isFinite(Number(changedMember.startLine)) ? Number(changedMember.startLine) : undefined,
+                startLine: toOptionalLineNumber(changedMember.startLine),
               }
               : undefined,
           },
@@ -8862,14 +9260,14 @@ export class LocalBackend {
         severity: 'low',
         summary: `Route change maps to ${String(firstTarget?.controller?.name || '<unknown>')}.`,
         reason: String(firstTarget?.edge?.reason || 'laravel-route-edge'),
-        confidence: Number(firstTarget?.edge?.confidence ?? 0.9),
+        confidence: normalizeConfidence(firstTarget?.edge?.confidence, 0.9),
         evidence: {
           filePath: routeFile,
           symbol: {
             uid: String(firstTarget?.controller?.uid || '').trim() || undefined,
             name: String(firstTarget?.controller?.name || '').trim() || undefined,
             kind: String(firstTarget?.controller?.kind || '').trim() || undefined,
-            startLine: Number.isFinite(Number(firstTarget?.controller?.startLine)) ? Number(firstTarget.controller.startLine) : undefined,
+            startLine: toOptionalLineNumber(firstTarget?.controller?.startLine),
           },
         },
       }, findingDedupe);
@@ -8877,7 +9275,7 @@ export class LocalBackend {
 
     const authFamily = (Array.isArray(semantic_diffs?.families) ? semantic_diffs.families : [])
       .find((family: any) => String(family?.family || '') === 'auth');
-    if (Number(authFamily?.edge_count || 0) > 0 && authz.length === 0) {
+    if (toFiniteNumber(authFamily?.edge_count, 0) > 0 && authz.length === 0) {
       const sampleEdge = Array.isArray(authFamily?.sample_edges) ? authFamily.sample_edges[0] : null;
       const sourceFilePath = String(sampleEdge?.source?.filePath || '').trim();
       addReviewFinding(reviewFindings, {
@@ -8885,7 +9283,7 @@ export class LocalBackend {
         severity: 'high',
         summary: 'Auth-related edge deltas detected without controller auth closure checks.',
         reason: String(sampleEdge?.edge?.reason || 'auth-family-delta-without-authz'),
-        confidence: Number(sampleEdge?.edge?.confidence ?? 0.85),
+        confidence: normalizeConfidence(sampleEdge?.edge?.confidence, 0.85),
         evidence: {
           filePath: sourceFilePath || changedFileObjs[0]?.filePath || '',
           symbol: sampleEdge?.source
@@ -8902,7 +9300,7 @@ export class LocalBackend {
     const review_kernel: any = buildReviewKernel({
       changed_files: changedFileObjs.length,
       untracked_files: untrackedFiles.length,
-      changed_symbols: changedSymbols.length,
+      changed_symbols: changedSymbolCountTotal,
       suggested_tests: suggested_tests.length,
       ui_contracts: ui_contracts.length,
       route_files: route_targets.length,
@@ -8936,7 +9334,7 @@ export class LocalBackend {
     };
 
     const symbolizedFileSet = new Set(
-      changedSymbols
+      analysisSymbols
         .map(symbol => normalizePath(String(symbol?.filePath || '')))
         .filter(Boolean),
     );
@@ -8949,7 +9347,9 @@ export class LocalBackend {
     const coverage_banner = buildCoverageBanner({
       changedFileCount: changedFileObjs.length,
       untrackedFileCount: untrackedFiles.length,
-      changedSymbolCount: changedSymbols.length,
+      changedSymbolCount: analysisSymbols.length,
+      changedSymbolTotal: changedSymbolCountTotal,
+      changedSymbolCap: analysisSymbolCap,
       suggestedTestCount: suggested_tests.length,
       symbolizedFileCount,
       runtimeHotspotCount: runtime_hotspots.length,
@@ -8967,7 +9367,7 @@ export class LocalBackend {
       summary: {
         changed_files: changedFileObjs.length,
         untracked_files: untrackedFiles.length,
-        changed_symbols: changedSymbols.length,
+        changed_symbols: changedSymbolCountTotal,
         suggested_tests: suggested_tests.length,
         suggested_test_commands: test_commands.length,
         ui_contracts: ui_contracts.length,
@@ -9011,6 +9411,9 @@ export class LocalBackend {
         },
         knobs: {
           limit_symbols: limitSymbols,
+          analysis_symbol_cap: analysisSymbolCap,
+          changed_symbol_total: changedSymbolCountTotal,
+          changed_symbols_truncated: changedSymbolsTruncated,
           limit_callers: limitCallers,
           limit_tests: limitTests,
           min_confidence: minConfidence,
@@ -9045,8 +9448,8 @@ export class LocalBackend {
     const failingTests = this.toStringArray(params.failing_tests);
     const errorStrings = this.toStringArray(params.error_strings);
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
-    const limitCandidates = Math.max(1, Math.min(30, params.limit_candidates ?? 8));
-    const limitHops = Math.max(1, Math.min(20, params.limit_hops ?? 6));
+    const limitCandidates = clampInteger(params.limit_candidates, 8, 1, 30);
+    const limitHops = clampInteger(params.limit_hops, 6, 1, 20);
     const includePrecedents = params.include_precedents !== false;
 
     const normalizeNumber = (
@@ -9070,6 +9473,26 @@ export class LocalBackend {
         .trim();
       return normalized.slice(0, 240);
     };
+    const normalizeObservedRoute = (value: string): string => {
+      let raw = String(value || '').trim();
+      if (!raw) return '';
+      if (/^https?:\/\//i.test(raw)) {
+        try {
+          raw = new URL(raw).pathname || raw;
+        } catch {
+          // keep original
+        }
+      }
+      raw = raw.split('?')[0].split('#')[0];
+      try {
+        raw = decodeURIComponent(raw);
+      } catch {
+        // keep original
+      }
+      raw = raw.replace(/\/{2,}/g, '/');
+      if (!raw.startsWith('/')) raw = `/${raw}`;
+      return raw.replace(/\/+$/, '') || '/';
+    };
 
     const normalizeRuntimeObservations = (value: unknown): {
       request_spans: Array<{
@@ -9082,6 +9505,8 @@ export class LocalBackend {
       }>;
       db_queries: Array<{
         sql?: string;
+        route?: string;
+        method?: string;
         duration_ms: number;
         rows_examined?: number;
         lock_wait_ms?: number;
@@ -9115,11 +9540,18 @@ export class LocalBackend {
       const request_spans = requestSpansRaw
         .map((item: any) => ({
           method: String(item?.method || '').trim().toUpperCase() || undefined,
-          route: String(item?.route || item?.path || '').trim() || undefined,
+          route: (() => {
+            const normalized = normalizeObservedRoute(String(item?.route || item?.path || '').trim());
+            return normalized || undefined;
+          })(),
           duration_ms: normalizeNumber(item?.duration_ms ?? item?.durationMs, 0, 0, 60_000),
-          status: Number.isFinite(Number(item?.status)) ? Number(item.status) : undefined,
-          payload_bytes: Number.isFinite(Number(item?.payload_bytes ?? item?.payloadBytes))
-            ? Number(item?.payload_bytes ?? item?.payloadBytes)
+          status: (() => {
+            const status = toOptionalNonNegativeInteger(item?.status);
+            if (status === undefined) return undefined;
+            return status >= 100 && status <= 599 ? status : undefined;
+          })(),
+          payload_bytes: toOptionalFiniteNumber(item?.payload_bytes ?? item?.payloadBytes) !== undefined
+            ? normalizeNumber(item?.payload_bytes ?? item?.payloadBytes, 0, 0, 20_000_000)
             : undefined,
           trace_id: String(item?.trace_id || item?.traceId || '').trim() || undefined,
         }))
@@ -9129,14 +9561,21 @@ export class LocalBackend {
       const db_queries = dbQueriesRaw
         .map((item: any) => ({
           sql: String(item?.sql || item?.query || '').trim() || undefined,
+          route: (() => {
+            const normalized = normalizeObservedRoute(String(item?.route || item?.path || '').trim());
+            return normalized || undefined;
+          })(),
+          method: String(item?.method || '').trim().toUpperCase() || undefined,
           duration_ms: normalizeNumber(item?.duration_ms ?? item?.durationMs, 0, 0, 60_000),
-          rows_examined: Number.isFinite(Number(item?.rows_examined ?? item?.rowsExamined))
-            ? Number(item?.rows_examined ?? item?.rowsExamined)
+          rows_examined: toOptionalFiniteNumber(item?.rows_examined ?? item?.rowsExamined) !== undefined
+            ? normalizeNumber(item?.rows_examined ?? item?.rowsExamined, 0, 0, 1_000_000_000)
             : undefined,
-          lock_wait_ms: Number.isFinite(Number(item?.lock_wait_ms ?? item?.lockWaitMs))
-            ? Number(item?.lock_wait_ms ?? item?.lockWaitMs)
+          lock_wait_ms: toOptionalFiniteNumber(item?.lock_wait_ms ?? item?.lockWaitMs) !== undefined
+            ? normalizeNumber(item?.lock_wait_ms ?? item?.lockWaitMs, 0, 0, 60_000)
             : undefined,
-          count: Number.isFinite(Number(item?.count)) ? Number(item.count) : undefined,
+          count: toOptionalFiniteNumber(item?.count) !== undefined
+            ? normalizeNumber(item?.count, 1, 0, 1_000_000)
+            : undefined,
           explain_plan: String(item?.explain_plan || item?.explainPlan || '').trim() || undefined,
         }))
         .filter((item: any) => item.duration_ms > 0 || (item.sql && item.sql.length > 0))
@@ -9148,12 +9587,15 @@ export class LocalBackend {
             ? item.keys.map((entry: any) => String(entry || '').trim()).filter(Boolean).slice(0, 20)
             : [];
           return {
-            path: String(item?.path || item?.route || '').trim() || undefined,
-            item_count: Number.isFinite(Number(item?.item_count ?? item?.itemCount))
-              ? Number(item?.item_count ?? item?.itemCount)
+            path: (() => {
+              const normalized = normalizeObservedRoute(String(item?.path || item?.route || '').trim());
+              return normalized || undefined;
+            })(),
+            item_count: toOptionalFiniteNumber(item?.item_count ?? item?.itemCount) !== undefined
+              ? normalizeNumber(item?.item_count ?? item?.itemCount, 0, 0, 5_000_000)
               : undefined,
-            bytes: Number.isFinite(Number(item?.bytes ?? item?.payload_bytes ?? item?.payloadBytes))
-              ? Number(item?.bytes ?? item?.payload_bytes ?? item?.payloadBytes)
+            bytes: toOptionalFiniteNumber(item?.bytes ?? item?.payload_bytes ?? item?.payloadBytes) !== undefined
+              ? normalizeNumber(item?.bytes ?? item?.payload_bytes ?? item?.payloadBytes, 0, 0, 20_000_000)
               : undefined,
             keys,
           };
@@ -9172,30 +9614,61 @@ export class LocalBackend {
       primary: ReturnType<typeof normalizeRuntimeObservations>,
       secondary: ReturnType<typeof normalizeRuntimeObservations>,
     ): ReturnType<typeof normalizeRuntimeObservations> => {
-      const requestSeen = new Set<string>();
-      const dbSeen = new Set<string>();
-      const payloadSeen = new Set<string>();
-      const request_spans: ReturnType<typeof normalizeRuntimeObservations>['request_spans'] = [];
-      const db_queries: ReturnType<typeof normalizeRuntimeObservations>['db_queries'] = [];
-      const payload_shapes: ReturnType<typeof normalizeRuntimeObservations>['payload_shapes'] = [];
+      const requestByKey = new Map<string, any>();
+      const dbByKey = new Map<string, any>();
+      const payloadByKey = new Map<string, any>();
 
       const addRequestSpan = (item: any) => {
-        const key = `${item?.method || ''}|${item?.route || ''}|${item?.duration_ms || 0}|${item?.status || ''}`;
-        if (requestSeen.has(key)) return;
-        requestSeen.add(key);
-        request_spans.push(item);
+        const key = `${item?.method || ''}|${item?.route || ''}|${item?.status || ''}`;
+        const existing = requestByKey.get(key);
+        if (!existing) {
+          requestByKey.set(key, item);
+          return;
+        }
+        requestByKey.set(key, {
+          ...existing,
+          duration_ms: Math.max(toFiniteNumber(existing.duration_ms, 0), toFiniteNumber(item.duration_ms, 0)),
+          payload_bytes: Math.max(toFiniteNumber(existing.payload_bytes, 0), toFiniteNumber(item.payload_bytes, 0)),
+          trace_id: existing.trace_id || item.trace_id,
+        });
       };
       const addDbQuery = (item: any) => {
-        const key = `${item?.sql || ''}|${item?.duration_ms || 0}|${item?.lock_wait_ms || ''}|${item?.rows_examined || ''}`;
-        if (dbSeen.has(key)) return;
-        dbSeen.add(key);
-        db_queries.push(item);
+        const signature = normalizeSqlSignature(String(item?.sql || ''));
+        const key = `${signature}|${String(item?.route || '')}`;
+        const existing = dbByKey.get(key);
+        if (!existing) {
+          dbByKey.set(key, {
+            ...item,
+            count: Math.max(1, toFiniteNumber(item?.count, 1)),
+          });
+          return;
+        }
+        dbByKey.set(key, {
+          ...existing,
+          duration_ms: Math.max(toFiniteNumber(existing.duration_ms, 0), toFiniteNumber(item.duration_ms, 0)),
+          lock_wait_ms: Math.max(toFiniteNumber(existing.lock_wait_ms, 0), toFiniteNumber(item.lock_wait_ms, 0)),
+          rows_examined: Math.max(toFiniteNumber(existing.rows_examined, 0), toFiniteNumber(item.rows_examined, 0)),
+          count: toFiniteNumber(existing.count, 1) + Math.max(1, toFiniteNumber(item.count, 1)),
+          explain_plan: existing.explain_plan || item.explain_plan,
+        });
       };
       const addPayloadShape = (item: any) => {
-        const key = `${item?.path || ''}|${item?.item_count || ''}|${item?.bytes || ''}|${Array.isArray(item?.keys) ? item.keys.join(',') : ''}`;
-        if (payloadSeen.has(key)) return;
-        payloadSeen.add(key);
-        payload_shapes.push(item);
+        const key = String(item?.path || '').trim();
+        if (!key) return;
+        const existing = payloadByKey.get(key);
+        if (!existing) {
+          payloadByKey.set(key, item);
+          return;
+        }
+        payloadByKey.set(key, {
+          ...existing,
+          item_count: Math.max(toFiniteNumber(existing.item_count, 0), toFiniteNumber(item.item_count, 0)),
+          bytes: Math.max(toFiniteNumber(existing.bytes, 0), toFiniteNumber(item.bytes, 0)),
+          keys: Array.from(new Set([
+            ...(Array.isArray(existing.keys) ? existing.keys : []),
+            ...(Array.isArray(item.keys) ? item.keys : []),
+          ])).slice(0, 20),
+        });
       };
 
       for (const item of primary.request_spans) addRequestSpan(item);
@@ -9205,6 +9678,9 @@ export class LocalBackend {
       for (const item of primary.payload_shapes) addPayloadShape(item);
       for (const item of secondary.payload_shapes) addPayloadShape(item);
 
+      const request_spans = Array.from(requestByKey.values());
+      const db_queries = Array.from(dbByKey.values());
+      const payload_shapes = Array.from(payloadByKey.values());
       return {
         request_spans: request_spans.slice(0, 500),
         db_queries: db_queries.slice(0, 1000),
@@ -9265,7 +9741,7 @@ export class LocalBackend {
 
       const primary = scored[0];
       if (primary) {
-        const confidence = Number(Math.min(0.98, 0.45 + (primary.matched.length * 0.09)).toFixed(3));
+        const confidence = round3(normalizeConfidence(Math.min(0.98, 0.45 + (primary.matched.length * 0.09)), 0.45));
         return {
           family: primary.family,
           normalized,
@@ -9298,6 +9774,7 @@ export class LocalBackend {
       include_evidence_spans: true,
       limit_evidence: 20,
     });
+    if (queryResult?.error) return queryResult;
 
     const actionPlanResult = await this.actionPlan(repo, {
       query: seedQuery,
@@ -9308,6 +9785,7 @@ export class LocalBackend {
       limit_checks: 10,
       __skip_precedents: true,
     });
+    if (actionPlanResult?.error) return actionPlanResult;
 
     const targetSlice = Array.isArray(queryResult?.slice_cards) ? queryResult.slice_cards[0] : null;
     let precedentPack: any = null;
@@ -9332,7 +9810,7 @@ export class LocalBackend {
         seedQuery,
         ...topSymbols.map((item: any) => String(item?.name || '').trim()).filter(Boolean),
       ].join(' ').trim();
-      const fallbackAnchorUid = String(topSymbols[0]?.id || '').trim();
+      const fallbackAnchorUid = String(topSymbols[0]?.id || topSymbols[0]?.uid || '').trim();
       if (fallbackQuery) {
         try {
           const fallbackPack = await this.precedents(repo, {
@@ -9492,8 +9970,8 @@ export class LocalBackend {
         }
       }
 
-      const httpConfidence = Number(hop?.http?.confidence ?? 1) || 1;
-      const wiringConfidence = Number(hop?.endpoint_wiring?.confidence ?? 1) || 1;
+      const httpConfidence = toFiniteNumber(hop?.http?.confidence, 1);
+      const wiringConfidence = toFiniteNumber(hop?.endpoint_wiring?.confidence, 1);
       if (httpConfidence < 0.9 || wiringConfidence < 0.9) {
         findings.push('low-confidence-http-wiring');
         score += 1;
@@ -9517,7 +9995,7 @@ export class LocalBackend {
         kind: 'http_loop',
         score: finalScore,
         symptom_fit: symptomFit,
-        confidence: Number(Math.max(0, Math.min(1, (httpConfidence + wiringConfidence) / 2)).toFixed(3)),
+        confidence: round3(normalizeConfidence((httpConfidence + wiringConfidence) / 2, 0.5)),
         confidence_reason: 'Derived from averaged HTTP call edge + endpoint/controller wiring confidence.',
         symptom_fit_reasons: symptomFitReasons,
         summary: `${String(hop?.http?.reason || 'http-loop')} -> ${String(hop?.controller?.name || 'unknown-controller')}`,
@@ -9562,7 +10040,7 @@ export class LocalBackend {
 
     if (targetSlice?.gap_signals) {
       const gapSignals = targetSlice.gap_signals;
-      const severeGapCount = Number(gapSignals?.high || 0) + Number(gapSignals?.deterministic || 0);
+      const severeGapCount = toFiniteNumber(gapSignals?.high, 0) + toFiniteNumber(gapSignals?.deterministic, 0);
       if (severeGapCount > 0) {
         const symptomFit = symptomSignal.family === 'shape' ? 2 : 0;
         const findings = ['slice-closure-gaps'];
@@ -9588,7 +10066,7 @@ export class LocalBackend {
     for (const query of runtimeObservations.db_queries) {
       const signature = normalizeSqlSignature(String(query.sql || ''));
       if (!signature) continue;
-      dbSignatureCounts.set(signature, (dbSignatureCounts.get(signature) || 0) + Math.max(1, Number(query.count || 1)));
+      dbSignatureCounts.set(signature, (dbSignatureCounts.get(signature) || 0) + Math.max(1, toFiniteNumber(query.count, 1)));
     }
 
     const payloadShapeByPath = new Map<string, any>();
@@ -9606,7 +10084,7 @@ export class LocalBackend {
       const payloadShape = routeKey ? payloadShapeByPath.get(routeKey) : null;
 
       if (durationMs >= 350) findings.push('slow-request-path');
-      if (payloadBytes >= 250_000 || Number(payloadShape?.item_count || 0) >= 100) findings.push('large-payload-shape');
+      if (payloadBytes >= 250_000 || toFiniteNumber(payloadShape?.item_count, 0) >= 100) findings.push('large-payload-shape');
       if (findings.length === 0) continue;
 
       let symptomFit = 0;
@@ -9621,7 +10099,7 @@ export class LocalBackend {
       }
 
       const baseScore = 2 + Math.min(6, durationMs / 250) + (payloadBytes > 0 ? Math.min(2, payloadBytes / 500_000) : 0);
-      const confidence = Number(Math.min(0.92, 0.58 + (routeKey ? 0.12 : 0) + (durationMs >= 500 ? 0.1 : 0)).toFixed(3));
+      const confidence = round3(normalizeConfidence(Math.min(0.92, 0.58 + (routeKey ? 0.12 : 0) + (durationMs >= 500 ? 0.1 : 0)), 0.58));
       candidateLoops.push({
         kind: 'runtime_loop',
         score: baseScore + symptomFit,
@@ -9644,6 +10122,7 @@ export class LocalBackend {
       const durationMs = normalizeNumber(dbQuery.duration_ms, 0, 0, 60_000);
       const lockWaitMs = normalizeNumber(dbQuery.lock_wait_ms, 0, 0, 60_000);
       const rowsExamined = normalizeNumber(dbQuery.rows_examined, 0, 0, 1_000_000_000);
+      const routeKey = normalizeObservedRoute(String((dbQuery as any).route || ''));
       const signature = normalizeSqlSignature(String(dbQuery.sql || ''));
       const repeatedCount = signature ? (dbSignatureCounts.get(signature) || 0) : 0;
       const explainPlan = String(dbQuery.explain_plan || '');
@@ -9664,13 +10143,17 @@ export class LocalBackend {
         symptomFit += 1;
         symptomFitReasons.push('event-lock-contention');
       }
+      if (symptomSignal.family === 'routing' && routeKey) {
+        symptomFit += 1;
+        symptomFitReasons.push('routing-db-route-signal');
+      }
 
       const baseScore = 2
         + Math.min(5, durationMs / 200)
         + Math.min(3, lockWaitMs / 150)
         + (repeatedCount >= 4 ? Math.min(2, repeatedCount / 5) : 0)
         + (rowsExamined > 0 ? Math.min(2, rowsExamined / 50_000) : 0);
-      const confidence = Number(Math.min(0.94, 0.55 + (durationMs >= 200 ? 0.1 : 0) + (lockWaitMs >= 75 ? 0.12 : 0) + (signature ? 0.07 : 0)).toFixed(3));
+      const confidence = round3(normalizeConfidence(Math.min(0.94, 0.55 + (durationMs >= 200 ? 0.1 : 0) + (lockWaitMs >= 75 ? 0.12 : 0) + (signature ? 0.07 : 0)), 0.55));
       candidateLoops.push({
         kind: 'runtime_loop',
         score: baseScore + symptomFit,
@@ -9678,7 +10161,7 @@ export class LocalBackend {
         confidence,
         confidence_reason: 'Derived from observed query duration/lock-wait metrics and repeated SQL signature frequency.',
         symptom_fit_reasons: symptomFitReasons,
-        summary: `DB path observed ${durationMs}ms${lockWaitMs > 0 ? ` with ${lockWaitMs}ms lock wait` : ''}`,
+        summary: `${routeKey || 'DB path'} observed ${durationMs}ms${lockWaitMs > 0 ? ` with ${lockWaitMs}ms lock wait` : ''}`,
         findings,
         fix_recipes: buildFixRecipes(findings),
         evidence: {
@@ -9719,14 +10202,22 @@ export class LocalBackend {
     const writeInLoopRegex = /->(?:save|update|delete)\s*\(|::(?:create|update|delete|upsert|insert)\s*\(|\bDB::insert\s*\(/;
     const noOpWriteRegex = /->(?:save|update)\s*\(\s*(?:\[\s*\])?\s*\)/;
 
-    for (const filePath of Array.from(scanFileSet).slice(0, 10)) {
-      const fullPath = path.join(repo.repoPath, filePath);
-      let content = '';
-      try {
-        content = await fs.readFile(fullPath, 'utf-8');
-      } catch {
-        continue;
-      }
+    const scanTargets = Array.from(scanFileSet).slice(0, 10);
+    const scanContents = await Promise.all(
+      scanTargets.map(async (filePath) => {
+        const fullPath = path.join(repo.repoPath, filePath);
+        try {
+          const content = await fs.readFile(fullPath, 'utf-8');
+          return { filePath, content };
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    for (const scannedFile of scanContents) {
+      if (!scannedFile) continue;
+      const { filePath, content } = scannedFile;
 
       const lines = content.split('\n');
       let loopCount = 0;
@@ -9737,7 +10228,13 @@ export class LocalBackend {
       let noOpWriteCount = 0;
       let loopWindow = 0;
       for (const line of lines) {
-        const isLoopLine = loopLineRegex.test(line);
+        const codeLine = String(line || '').replace(/\/\/.*$/g, '').trim();
+        if (!codeLine) {
+          if (loopWindow > 0) loopWindow -= 1;
+          continue;
+        }
+
+        const isLoopLine = loopLineRegex.test(codeLine);
         if (isLoopLine) {
           loopCount += 1;
           if (loopWindow > 0) nestedLoopCount += 1;
@@ -9747,10 +10244,10 @@ export class LocalBackend {
         }
 
         if (loopWindow <= 0) continue;
-        if (linearLookupRegex.test(line)) linearLookups += 1;
-        if (queryInLoopRegex.test(line)) queryInLoopCount += 1;
-        if (writeInLoopRegex.test(line)) writeInLoopCount += 1;
-        if (noOpWriteRegex.test(line)) noOpWriteCount += 1;
+        if (linearLookupRegex.test(codeLine)) linearLookups += 1;
+        if (queryInLoopRegex.test(codeLine)) queryInLoopCount += 1;
+        if (writeInLoopRegex.test(codeLine)) writeInLoopCount += 1;
+        if (noOpWriteRegex.test(codeLine)) noOpWriteCount += 1;
       }
 
       const costScore = (loopCount * 0.25)
@@ -9764,7 +10261,7 @@ export class LocalBackend {
 
       scannedPerfFiles.push({
         filePath,
-        score: Number(costScore.toFixed(3)),
+        score: round3(costScore),
         metrics: {
           loop_count: loopCount,
           nested_loop_count: nestedLoopCount,
@@ -9789,13 +10286,13 @@ export class LocalBackend {
         symptomFit += 3;
         symptomFitReasons.push('performance-static-hotpath');
       }
-      const confidence = Number(Math.min(
+      const confidence = Number(normalizeConfidence(Math.min(
         0.9,
         0.42
         + Math.min(0.3, perf.score / 10)
         + (perf.metrics.query_calls_in_loop > 0 ? 0.08 : 0)
         + (perf.metrics.nested_loop_count > 0 ? 0.06 : 0),
-      ).toFixed(3));
+      ), 0.42).toFixed(3));
       candidateLoops.push({
         kind: 'perf_loop',
         score: perf.score + symptomFit,
@@ -9813,13 +10310,16 @@ export class LocalBackend {
       });
     }
 
-    const rankedCandidates = candidateLoops
+    const rankedCandidates = Array.from(new Map(
+      candidateLoops
       .sort((left, right) => {
         if (right.score !== left.score) return right.score - left.score;
         if (right.symptom_fit !== left.symptom_fit) return right.symptom_fit - left.symptom_fit;
         if (right.confidence !== left.confidence) return right.confidence - left.confidence;
         return left.summary.localeCompare(right.summary);
       })
+      .map(candidate => [`${String(candidate.kind || '')}|${String(candidate.summary || '')}`, candidate]),
+    ).values())
       .slice(0, limitCandidates);
 
     const siblingDiff = (() => {
@@ -9948,10 +10448,10 @@ export class LocalBackend {
       return total / values.length;
     };
     const routeOwnershipConfidence = hops.length > 0
-      ? average(hops.map((hop: any) => Number(hop?.http?.confidence ?? 0.7)))
+      ? average(hops.map((hop: any) => normalizeConfidence(hop?.http?.confidence, 0.7)))
       : 0.35;
     const rootCauseConfidence = rankedCandidates.length > 0
-      ? average(rankedCandidates.slice(0, 3).map(candidate => Number(candidate.confidence || 0)))
+      ? average(rankedCandidates.slice(0, 3).map(candidate => normalizeConfidence(candidate.confidence, 0)))
       : 0.3;
     const recipeCoverage = rankedCandidates.length > 0
       ? average(rankedCandidates.slice(0, 5).map(candidate => candidate.fix_recipes.length > 0 ? 1 : 0))
@@ -9962,21 +10462,21 @@ export class LocalBackend {
       claims: [
         {
           claim: 'route_ownership',
-          confidence: Number(routeOwnershipConfidence.toFixed(3)),
+          confidence: round3(normalizeConfidence(routeOwnershipConfidence, 0.35)),
           reason: hops.length > 0
             ? 'Based on HTTP + endpoint/controller edge confidence from top hops.'
             : 'No top hops available for ownership confidence.',
         },
         {
           claim: 'root_cause_localization',
-          confidence: Number(rootCauseConfidence.toFixed(3)),
+          confidence: round3(normalizeConfidence(rootCauseConfidence, 0.3)),
           reason: rankedCandidates.length > 0
             ? 'Based on weighted symptom fit and candidate evidence confidence.'
             : 'No ranked candidates available for localization confidence.',
         },
         {
           claim: 'fix_recommendation',
-          confidence: Number(fixRecommendationConfidence.toFixed(3)),
+          confidence: round3(normalizeConfidence(fixRecommendationConfidence, 0.35)),
           reason: hasRuntimeObservations
             ? 'Based on candidate fix recipe coverage plus runtime evidence availability.'
             : 'Based on static evidence only; runtime observations were not provided.',
@@ -10093,9 +10593,9 @@ export class LocalBackend {
     const groups = new Map<string, { ids: string[]; totalSymbols: number; weightedCohesion: number; largest: any }>();
 
     for (const c of clusters) {
-      const label = c.heuristicLabel || c.label || 'Unknown';
-      const symbols = c.symbolCount || 0;
-      const cohesion = c.cohesion || 0;
+      const label = String(c.heuristicLabel ?? c.label ?? 'Unknown').trim() || 'Unknown';
+      const symbols = toFiniteNumber(c.symbolCount, 0);
+      const cohesion = toFiniteNumber(c.cohesion, 0);
       const existing = groups.get(label);
 
       if (!existing) {
@@ -10126,7 +10626,7 @@ export class LocalBackend {
   private async overview(repo: RepoHandle, params: { showClusters?: boolean; showProcesses?: boolean; limit?: number }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
-    const limit = params.limit || 20;
+    const limit = clampInteger(params.limit, 20, 1, 200);
     const result: any = {
       repo: repo.name,
       repoPath: repo.repoPath,
@@ -10167,11 +10667,11 @@ export class LocalBackend {
           LIMIT ${limit}
         `);
         result.processes = processes.map((p: any) => ({
-          id: p.id || p[0],
-          label: p.label || p[1],
-          heuristicLabel: p.heuristicLabel || p[2],
-          processType: p.processType || p[3],
-          stepCount: p.stepCount || p[4],
+          id: String(p.id ?? p[0] ?? '').trim(),
+          label: String(p.label ?? p[1] ?? '').trim(),
+          heuristicLabel: String(p.heuristicLabel ?? p[2] ?? '').trim(),
+          processType: String(p.processType ?? p[3] ?? '').trim(),
+          stepCount: toNonNegativeInteger(p.stepCount ?? p[4], 0),
         }));
       } catch {
         result.processes = [];
@@ -10241,11 +10741,11 @@ export class LocalBackend {
         status: 'ambiguous',
         message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
         candidates: symbols.map((s: any) => ({
-          uid: s.id || s[0],
-          name: s.name || s[1],
-          kind: s.type || s[2],
-          filePath: s.filePath || s[3],
-          line: s.startLine || s[4],
+          uid: String(s.id ?? s[0] ?? '').trim(),
+          name: String(s.name ?? s[1] ?? '').trim(),
+          kind: primaryNodeLabel(s.type ?? s[2]),
+          filePath: String(s.filePath ?? s[3] ?? '').trim(),
+          line: toOptionalLineNumber(s.startLine ?? s[4]),
         })),
       };
     }
@@ -10290,16 +10790,14 @@ export class LocalBackend {
       const cats: Record<string, any[]> = {};
       for (const row of rows) {
         const relType = (row.relType || row[0] || '').toLowerCase();
-        const confidenceRaw = row.confidence ?? row[5];
-        const confidenceCandidate = confidenceRaw !== undefined && confidenceRaw !== null ? Number(confidenceRaw) : NaN;
-        const confidence = Number.isFinite(confidenceCandidate) ? confidenceCandidate : 1.0;
+        const confidence = normalizeConfidence(row.confidence ?? row[5], 1.0);
         const reasonRaw = row.reason ?? row[6];
         const reason = typeof reasonRaw === 'string' ? reasonRaw : reasonRaw !== undefined && reasonRaw !== null ? String(reasonRaw) : '';
         const entry = {
-          uid: row.uid || row[1],
-          name: row.name || row[2],
-          filePath: row.filePath || row[3],
-          kind: row.kind || row[4],
+          uid: String(row.uid ?? row[1] ?? '').trim(),
+          name: String(row.name ?? row[2] ?? '').trim(),
+          filePath: String(row.filePath ?? row[3] ?? '').trim(),
+          kind: primaryNodeLabel(row.kind ?? row[4]),
           confidence,
           reason,
         };
@@ -10312,21 +10810,21 @@ export class LocalBackend {
     return {
       status: 'found',
       symbol: {
-        uid: sym.id || sym[0],
-        name: sym.name || sym[1],
-        kind: sym.type || sym[2],
-        filePath: sym.filePath || sym[3],
-        startLine: sym.startLine || sym[4],
-        endLine: sym.endLine || sym[5],
-        ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
+        uid: String(sym.id ?? sym[0] ?? '').trim(),
+        name: String(sym.name ?? sym[1] ?? '').trim(),
+        kind: primaryNodeLabel(sym.type ?? sym[2]),
+        filePath: String(sym.filePath ?? sym[3] ?? '').trim(),
+        startLine: toOptionalLineNumber(sym.startLine ?? sym[4]),
+        endLine: toOptionalLineNumber(sym.endLine ?? sym[5]),
+        ...(include_content && (sym.content ?? sym[6]) ? { content: sym.content ?? sym[6] } : {}),
       },
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
       processes: processRows.map((r: any) => ({
-        id: r.pid || r[0],
-        name: r.label || r[1],
-        step_index: r.step || r[2],
-        step_count: r.stepCount || r[3],
+        id: String(r.pid ?? r[0] ?? '').trim(),
+        name: String(r.label ?? r[1] ?? '').trim(),
+        step_index: toNonNegativeInteger(r.step ?? r[2], 0),
+        step_count: toNonNegativeInteger(r.stepCount ?? r[3], 0),
       })),
     };
   }
@@ -10382,7 +10880,9 @@ export class LocalBackend {
           subCommunities: rawClusters.length,
         },
         members: members.map((m: any) => ({
-          name: m.name || m[0], type: m.type || m[1], filePath: m.filePath || m[2],
+          name: String(m.name ?? m[0] ?? '').trim(),
+          type: primaryNodeLabel(m.type ?? m[1]),
+          filePath: String(m.filePath ?? m[2] ?? '').trim(),
         })),
       };
     }
@@ -10398,19 +10898,26 @@ export class LocalBackend {
       
       const proc = processes[0];
       const procId = proc.id || proc[0];
+      const escapedProcId = String(procId || '').replace(/'/g, "''");
       const steps = await executeQuery(repo.id, `
-        MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: '${procId}'})
+        MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: '${escapedProcId}'})
         RETURN n.name AS name, labels(n) AS type, n.filePath AS filePath, r.step AS step
         ORDER BY r.step
       `);
       
       return {
         process: {
-          id: procId, label: proc.label || proc[1], heuristicLabel: proc.heuristicLabel || proc[2],
-          processType: proc.processType || proc[3], stepCount: proc.stepCount || proc[4],
+          id: String(procId ?? '').trim(),
+          label: String(proc.label ?? proc[1] ?? '').trim(),
+          heuristicLabel: String(proc.heuristicLabel ?? proc[2] ?? '').trim(),
+          processType: String(proc.processType ?? proc[3] ?? '').trim(),
+          stepCount: toNonNegativeInteger(proc.stepCount ?? proc[4], 0),
         },
         steps: steps.map((s: any) => ({
-          step: s.step || s[3], name: s.name || s[0], type: s.type || s[1], filePath: s.filePath || s[2],
+          step: toNonNegativeInteger(s.step ?? s[3], 0),
+          name: String(s.name ?? s[0] ?? '').trim(),
+          type: primaryNodeLabel(s.type ?? s[1]),
+          filePath: String(s.filePath ?? s[2] ?? '').trim(),
         })),
       };
     }
@@ -10428,7 +10935,12 @@ export class LocalBackend {
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
-    const scope = params.scope || 'unstaged';
+    const scopeRaw = String(params.scope || 'unstaged').trim();
+    const scope = scopeRaw.toLowerCase();
+    const allowedScopes = new Set(['unstaged', 'staged', 'all', 'compare']);
+    if (!allowedScopes.has(scope)) {
+      return { error: `scope must be one of unstaged|staged|all|compare (received "${scopeRaw}")` };
+    }
     const baseRef = String(params.base_ref || '').trim();
     const { execFileSync } = await import('child_process');
 
@@ -10538,7 +11050,7 @@ export class LocalBackend {
         changedSymbolsById.set(id, {
           id,
           name: String(row.name || row[1] || '').trim(),
-          type: row.type || row[2] || '',
+          type: primaryNodeLabel(row.type ?? row[2]),
           filePath,
           change_type: changedFileStatus.get(filePath) || 'Modified',
         });
@@ -10577,14 +11089,14 @@ export class LocalBackend {
               id: pid,
               name: String(row.label || row[3] || '').trim(),
               process_type: String(row.processType || row[4] || '').trim(),
-              step_count: Number(row.stepCount ?? row[5] ?? 0) || 0,
+              step_count: toNonNegativeInteger(row.stepCount ?? row[5], 0),
               changed_steps: [],
             });
           }
 
           affectedProcesses.get(pid)!.changed_steps.push({
             symbol: String(row.symbolName || row[1] || '').trim(),
-            step: Number(row.step ?? row[6] ?? 0) || 0,
+            step: toNonNegativeInteger(row.step ?? row[6], 0),
           });
         }
       } catch {
@@ -10656,6 +11168,10 @@ export class LocalBackend {
     if (oldName === new_name) {
       return { error: 'New name is the same as the current name.' };
     }
+
+    const oldNamePattern = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const makeWordRegex = (global = false): RegExp =>
+      new RegExp(`\\b${oldNamePattern}\\b`, global ? 'g' : '');
     
     // Step 2: Collect edits from graph (high confidence)
     const changes = new Map<string, { file_path: string; edits: any[] }>();
@@ -10674,7 +11190,7 @@ export class LocalBackend {
         const lines = content.split('\n');
         const lineIdx = sym.startLine - 1;
         if (lineIdx >= 0 && lineIdx < lines.length && lines[lineIdx].includes(oldName)) {
-          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(oldName, new_name).trim(), 'graph');
+          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(makeWordRegex(true), new_name).trim(), 'graph');
         }
       } catch { /* skip */ }
     }
@@ -10696,7 +11212,7 @@ export class LocalBackend {
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].includes(oldName)) {
-            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), new_name).trim(), 'graph');
+            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(makeWordRegex(true), new_name).trim(), 'graph');
             graphEdits++;
             break; // one edit per file from graph refs
           }
@@ -10710,9 +11226,15 @@ export class LocalBackend {
     
     // Simple text search across the repo for the old name (in files not already covered by graph)
     try {
-      const { execSync } = await import('child_process');
-      const rgCmd = `rg -l --type-add "code:*.{ts,tsx,js,jsx,py,go,rs,java}" -t code "\\b${oldName}\\b" .`;
-      const output = execSync(rgCmd, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 5000 });
+      const { spawnSync } = await import('child_process');
+      const rgResult = spawnSync(
+        'rg',
+        ['-l', '--type-add', 'code:*.{ts,tsx,js,jsx,py,go,rs,java}', '-t', 'code', `\\b${oldNamePattern}\\b`, '.'],
+        { cwd: repo.repoPath, encoding: 'utf-8', timeout: 5000 }
+      );
+      if (rgResult.error) throw rgResult.error;
+      if (rgResult.status !== 0 && rgResult.status !== 1) throw new Error(String(rgResult.stderr || 'rg failed'));
+      const output = String(rgResult.stdout || '');
       const files = output.trim().split('\n').filter(f => f.length > 0);
       
       for (const file of files) {
@@ -10722,12 +11244,11 @@ export class LocalBackend {
         try {
           const content = await fs.readFile(path.join(repo.repoPath, normalizedFile), 'utf-8');
           const lines = content.split('\n');
-          const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+          const searchRegex = makeWordRegex(false);
           for (let i = 0; i < lines.length; i++) {
-            if (regex.test(lines[i])) {
-              addEdit(normalizedFile, i + 1, lines[i].trim(), lines[i].replace(regex, new_name).trim(), 'text_search');
+            if (searchRegex.test(lines[i])) {
+              addEdit(normalizedFile, i + 1, lines[i].trim(), lines[i].replace(makeWordRegex(true), new_name).trim(), 'text_search');
               astSearchEdits++;
-              regex.lastIndex = 0; // reset regex
             }
           }
         } catch { /* skip */ }
@@ -10744,7 +11265,7 @@ export class LocalBackend {
         try {
           const fullPath = path.join(repo.repoPath, change.file_path);
           let content = await fs.readFile(fullPath, 'utf-8');
-          const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+          const regex = makeWordRegex(true);
           content = content.replace(regex, new_name);
           await fs.writeFile(fullPath, content, 'utf-8');
         } catch { /* skip failed files */ }
@@ -10778,12 +11299,18 @@ export class LocalBackend {
     await this.ensureInitialized(repo.id);
     
     const { direction } = params;
-    const maxDepth = params.maxDepth || 3;
-    const relationTypes = params.relationTypes && params.relationTypes.length > 0
+    const maxDepth = clampInteger(params.maxDepth, 3, 1, 6);
+    const allowedRelationTypes = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']);
+    const relationTypes = Array.isArray(params.relationTypes) && params.relationTypes.length > 0
       ? params.relationTypes
+        .map(value => String(value || '').trim().toUpperCase())
+        .filter(value => allowedRelationTypes.has(value))
       : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
     const includeTests = params.includeTests ?? false;
-    const minConfidence = params.minConfidence ?? 0;
+    const minConfidence = Math.max(0, Math.min(1, toFiniteNumber(params.minConfidence, 0)));
+    if (relationTypes.length === 0) {
+      return { error: 'relationTypes must include one or more of: CALLS, IMPORTS, EXTENDS, IMPLEMENTS.' };
+    }
     
     const relTypeFilter = relationTypes.map(t => `'${t}'`).join(', ');
     const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
@@ -10832,10 +11359,10 @@ export class LocalBackend {
         status: 'ambiguous',
         message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
         candidates: symbols.map((s: any) => ({
-          uid: s.id || s[0],
-          name: s.name || s[1],
-          kind: s.type || s[2],
-          filePath: s.filePath || s[3],
+          uid: String(s.id ?? s[0] ?? '').trim(),
+          name: String(s.name ?? s[1] ?? '').trim(),
+          kind: primaryNodeLabel(s.type ?? s[2]),
+          filePath: String(s.filePath ?? s[3] ?? '').trim(),
         })),
       };
     }
@@ -10871,12 +11398,12 @@ export class LocalBackend {
             impacted.push({
               depth,
               id: relId,
-              name: rel.name || rel[2],
-              type: rel.type || rel[3],
+              name: String(rel.name ?? rel[2] ?? '').trim(),
+              type: primaryNodeLabel(rel.type ?? rel[3]),
               filePath,
-              relationType: rel.relType || rel[5],
-              confidence: rel.confidence || rel[6] || 1.0,
-              reason: rel.reason || rel[7] || '',
+              relationType: String(rel.relType ?? rel[5] ?? '').trim(),
+              confidence: toFiniteNumber(rel.confidence ?? rel[6], 1.0),
+              reason: String(rel.reason ?? rel[7] ?? ''),
             });
           }
         }
@@ -10893,10 +11420,10 @@ export class LocalBackend {
     
     return {
       target: {
-        id: symId,
-        name: sym.name || sym[1],
-        type: sym.type || sym[2],
-        filePath: sym.filePath || sym[3],
+        id: String(symId || '').trim(),
+        name: String(sym.name ?? sym[1] ?? '').trim(),
+        type: primaryNodeLabel(sym.type ?? sym[2]),
+        filePath: String(sym.filePath ?? sym[3] ?? '').trim(),
       },
       direction,
       impactedCount: impacted.length,
@@ -10909,7 +11436,7 @@ export class LocalBackend {
     include_events?: boolean;
   }): Promise<any> {
     const repo = this.resolveRepo(repoName);
-    const limit = Number.isFinite(Number(options?.limit)) ? Number(options?.limit) : 10;
+    const limit = clampInteger(options?.limit, 10, 1, 200);
     const includeEvents = options?.include_events !== false;
     const state = await loadEpisodeGraphState(repo.storagePath);
     return {
@@ -10928,9 +11455,10 @@ export class LocalBackend {
   async queryClusters(repoName?: string, limit = 100): Promise<{ clusters: any[] }> {
     const repo = this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
+    const safeLimit = clampInteger(limit, 100, 1, 500);
 
     try {
-      const rawLimit = Math.max(limit * 5, 200);
+      const rawLimit = Math.max(safeLimit * 5, 200);
       const clusters = await executeQuery(repo.id, `
         MATCH (c:Community)
         RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -10944,7 +11472,7 @@ export class LocalBackend {
         cohesion: c.cohesion || c[3],
         symbolCount: c.symbolCount || c[4],
       }));
-      return { clusters: this.aggregateClusters(rawClusters).slice(0, limit) };
+      return { clusters: this.aggregateClusters(rawClusters).slice(0, safeLimit) };
     } catch {
       return { clusters: [] };
     }
@@ -10957,21 +11485,22 @@ export class LocalBackend {
   async queryProcesses(repoName?: string, limit = 50): Promise<{ processes: any[] }> {
     const repo = this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
+    const safeLimit = clampInteger(limit, 50, 1, 500);
 
     try {
       const processes = await executeQuery(repo.id, `
         MATCH (p:Process)
         RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
         ORDER BY p.stepCount DESC
-        LIMIT ${limit}
+        LIMIT ${safeLimit}
       `);
       return {
         processes: processes.map((p: any) => ({
-          id: p.id || p[0],
-          label: p.label || p[1],
-          heuristicLabel: p.heuristicLabel || p[2],
-          processType: p.processType || p[3],
-          stepCount: p.stepCount || p[4],
+          id: String(p.id ?? p[0] ?? '').trim(),
+          label: String(p.label ?? p[1] ?? '').trim(),
+          heuristicLabel: String(p.heuristicLabel ?? p[2] ?? '').trim(),
+          processType: String(p.processType ?? p[3] ?? '').trim(),
+          stepCount: toNonNegativeInteger(p.stepCount ?? p[4], 0),
         })),
       };
     } catch {
@@ -10992,9 +11521,9 @@ export class LocalBackend {
     const repo = this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
 
-    const limit = options?.limit ?? 25;
-    const examplesPerSignature = options?.examplesPerSignature ?? 3;
-    const minHttpConfidence = options?.minHttpConfidence ?? 0.9;
+    const limit = clampInteger(options?.limit, 25, 1, 100);
+    const examplesPerSignature = clampInteger(options?.examplesPerSignature, 3, 1, 10);
+    const minHttpConfidence = Math.max(0, Math.min(1, toFiniteNumber(options?.minHttpConfidence, 0.9)));
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (options as any)?.path_prefixes);
 
     const stepRows = await executeQuery(repo.id, `
@@ -11019,21 +11548,21 @@ export class LocalBackend {
       if (!proc) {
         proc = {
           id: processId,
-          label: row.label || row[1] || processId,
-          heuristicLabel: row.heuristicLabel || row[2] || row.label || row[1] || processId,
-          processType: row.processType || row[3] || '',
-          stepCount: row.stepCount || row[4] || 0,
+          label: String(row.label ?? row[1] ?? processId).trim(),
+          heuristicLabel: String(row.heuristicLabel ?? row[2] ?? row.label ?? row[1] ?? processId).trim(),
+          processType: String(row.processType ?? row[3] ?? '').trim(),
+          stepCount: toNonNegativeInteger(row.stepCount ?? row[4], 0),
           steps: [],
         };
         processesById.set(processId, proc);
       }
 
       proc.steps.push({
-        step: row.step || row[9] || 0,
-        nodeId: row.nodeId || row[5],
-        name: row.name || row[6] || '',
-        filePath: row.filePath || row[7] || '',
-        type: row.type || row[8] || '',
+        step: toNonNegativeInteger(row.step ?? row[9], 0),
+        nodeId: String(row.nodeId ?? row[5] ?? '').trim(),
+        name: String(row.name ?? row[6] ?? '').trim(),
+        filePath: String(row.filePath ?? row[7] ?? '').trim(),
+        type: primaryNodeLabel(row.type ?? row[8]),
       });
     }
 
@@ -11053,10 +11582,10 @@ export class LocalBackend {
     `);
 
     const httpEdges: HttpEdgeInfo[] = httpRows.map((r: any) => ({
-      sourceId: r.sourceId || r[0],
-      targetId: r.targetId || r[1],
-      reason: r.reason || r[2],
-      confidence: r.confidence || r[3] || 1.0,
+      sourceId: String(r.sourceId ?? r[0] ?? '').trim(),
+      targetId: String(r.targetId ?? r[1] ?? '').trim(),
+      reason: String(r.reason ?? r[2] ?? '').trim(),
+      confidence: toFiniteNumber(r.confidence ?? r[3], 1.0),
     }));
 
     const report = buildArchetypeReport(scopedProcesses, httpEdges, {
@@ -11114,7 +11643,9 @@ export class LocalBackend {
         subCommunities: rawClusters.length,
       },
       members: members.map((m: any) => ({
-        name: m.name || m[0], type: m.type || m[1], filePath: m.filePath || m[2],
+        name: String(m.name ?? m[0] ?? '').trim(),
+        type: primaryNodeLabel(m.type ?? m[1]),
+        filePath: String(m.filePath ?? m[2] ?? '').trim(),
       })),
     };
   }
@@ -11138,19 +11669,26 @@ export class LocalBackend {
 
     const proc = processes[0];
     const procId = proc.id || proc[0];
+    const escapedProcId = String(procId || '').replace(/'/g, "''");
     const steps = await executeQuery(repo.id, `
-      MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: '${procId}'})
+      MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: '${escapedProcId}'})
       RETURN n.name AS name, labels(n) AS type, n.filePath AS filePath, r.step AS step
       ORDER BY r.step
     `);
 
     return {
       process: {
-        id: procId, label: proc.label || proc[1], heuristicLabel: proc.heuristicLabel || proc[2],
-        processType: proc.processType || proc[3], stepCount: proc.stepCount || proc[4],
+        id: String(procId || '').trim(),
+        label: String(proc.label ?? proc[1] ?? '').trim(),
+        heuristicLabel: String(proc.heuristicLabel ?? proc[2] ?? '').trim(),
+        processType: String(proc.processType ?? proc[3] ?? '').trim(),
+        stepCount: toNonNegativeInteger(proc.stepCount ?? proc[4], 0),
       },
       steps: steps.map((s: any) => ({
-        step: s.step || s[3], name: s.name || s[0], type: s.type || s[1], filePath: s.filePath || s[2],
+        step: toNonNegativeInteger(s.step ?? s[3], 0),
+        name: String(s.name ?? s[0] ?? '').trim(),
+        type: primaryNodeLabel(s.type ?? s[1]),
+        filePath: String(s.filePath ?? s[2] ?? '').trim(),
       })),
     };
   }

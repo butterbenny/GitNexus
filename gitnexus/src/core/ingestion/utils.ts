@@ -85,6 +85,25 @@ export const getParseableContent = (filePath: string, content: string): string =
     : content;
 };
 
+const MIN_TREE_SITTER_BUFFER_SIZE = 1024 * 256; // 256 KB
+
+const getAdaptiveTreeSitterBufferSize = (content: string): number => {
+  const byteLength = Buffer.byteLength(content, 'utf8');
+  let bufferSize = MIN_TREE_SITTER_BUFFER_SIZE;
+  while (bufferSize <= byteLength) {
+    bufferSize *= 2;
+  }
+  return bufferSize;
+};
+
+export const parseWithAdaptiveBuffer = (
+  parser: { parse: (input: string, oldTree?: unknown, options?: { bufferSize?: number }) => unknown },
+  content: string,
+): unknown => {
+  const bufferSize = getAdaptiveTreeSitterBufferSize(content);
+  return parser.parse(content, undefined, { bufferSize });
+};
+
 /**
  * Map file extension to SupportedLanguage enum
  */

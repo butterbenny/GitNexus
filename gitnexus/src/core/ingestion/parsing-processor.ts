@@ -5,7 +5,7 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, getParseableContent, yieldToEventLoop } from './utils.js';
+import { getLanguageFromFilename, getParseableContent, parseWithAdaptiveBuffer, yieldToEventLoop } from './utils.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedPhpAssignment, ExtractedPhpTraitUse } from './workers/parse-worker.js';
@@ -275,7 +275,7 @@ const processParsingSequential = async (
     let tree;
     try {
       const content = getParseableContent(file.path, file.content);
-      tree = parser.parse(content, undefined, { bufferSize: 1024 * 256 });
+      tree = parseWithAdaptiveBuffer(parser, content);
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
       continue;
