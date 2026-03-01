@@ -499,6 +499,7 @@ Builds on detect_changes-style diffing, then surfaces:
 - upstream callers + suggested tests (confidence-first)
 - contract signals (UI contract diffs, Laravel route targets, controller auth checks)
 - semantic relation-family deltas (auth/shape/cache/test/event/template) + slice-linked gap signals
+- runtime hotspot overlays from runtime-observations snapshots (when available)
 - proof pack evidence spans for changed symbols and sampled semantic edges
 - slice stencil deltas (changed slices, closure-template fit, missing slots/roles, sibling precedents)
 - review kernel summary (risk level, top findings, hypotheses, and next actions)
@@ -535,9 +536,10 @@ AFTER THIS: Use context()/impact() on the highest-risk changed symbols or route/
     description: `Symptom-first debug planner: localize likely broken loops using graph anchors, slice closure signals, and sibling precedent diffs.
 
 Builds on query/action_plan/precedents to surface:
-- symptom classification (auth/cache/shape/routing/event)
+- symptom classification (auth/cache/shape/routing/event/performance)
 - anchored loop candidates (HTTP chain, cache coverage, slice closure gaps)
 - ranked findings with confidence/symptom fit
+- runtime-informed candidates (request latency, DB lock waits, payload cardinality)
 - sibling slice diff (when available) and concrete next actions
 
 WHEN TO USE: “Why is this failing?” investigations (stale UI, 403, null/field mismatch, routing misses, queue/event drift).
@@ -555,6 +557,10 @@ AFTER THIS: Open top candidate anchors with context()/impact(), patch, then run 
           type: 'array',
           description: 'Optional list of repo-relative (or absolute) path prefixes to scope debug analysis.',
           items: { type: 'string' },
+        },
+        runtime_observations: {
+          type: 'object',
+          description: 'Optional runtime evidence bundle (request spans, DB query timings/lock waits, payload shape snapshots) used to boost root-cause ranking. If omitted, debug_mode auto-loads .gitnexus/runtime-observations*.{json,ndjson} when available.',
         },
         limit_candidates: { type: 'number', description: 'Max ranked broken-loop candidates to return (default: 8).', default: 8 },
         limit_hops: { type: 'number', description: 'Max anchored HTTP hops to include (default: 6).', default: 6 },

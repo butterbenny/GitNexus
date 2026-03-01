@@ -57,6 +57,7 @@ test('Eval server formatter: kernel heads produce readable summaries', () => {
   const reviewText = formatToolResult('review_mode', {
     scope: 'unstaged',
     summary: { changed_files: 2, changed_symbols: 3 },
+    runtime_hotspots: [{ summary: 'POST /api/foo observed 980ms' }],
     review_kernel: {
       risk: { level: 'medium', score: 4 },
       top_findings: ['Cache invalidation gap detected.'],
@@ -65,19 +66,26 @@ test('Eval server formatter: kernel heads produce readable summaries', () => {
     suggested_tests: [{ name: 'NotificationControllerTest::test_forbidden' }],
   });
   assert.match(reviewText, /Review kernel/);
+  assert.match(reviewText, /Runtime hotspots:/);
   assert.match(reviewText, /Top findings:/);
 
   const debugText = formatToolResult('debug_mode', {
     query: 'fetchAccountNotifications',
     debug: {
       classification: { family: 'auth', confidence: 0.9 },
-      candidates: [{ kind: 'permission_chain', score: 9, summary: 'Missing role grant closure' }],
+      runtime_observations: { request_spans: [{ duration_ms: 500 }], db_queries: [{ duration_ms: 120 }] },
+      coverage: { warnings: ['No precedents resolved for this query.'] },
+      confidence_breakdown: { claims: [{ claim: 'route_ownership', confidence: 0.95 }] },
+      candidates: [{ kind: 'permission_chain', score: 9, confidence: 0.91, summary: 'Missing role grant closure' }],
       hypotheses: ['Permission slug resolves, but no role grants exist.'],
       next_actions: ['Open candidate evidence spans with context().'],
     },
   });
   assert.match(debugText, /Debug kernel for:/);
   assert.match(debugText, /Top broken loops:/);
+  assert.match(debugText, /Runtime evidence:/);
+  assert.match(debugText, /Confidence breakdown:/);
+  assert.match(debugText, /Coverage warnings:/);
 });
 
 test('Eval server tool registry: stays in parity with MCP tools and validates names', () => {

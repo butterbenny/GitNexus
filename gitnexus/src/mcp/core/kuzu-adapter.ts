@@ -13,8 +13,11 @@
  * from the same Database is the officially supported concurrency pattern.
  */
 
+import { existsSync } from 'fs';
 import fs from 'fs/promises';
+import path from 'path';
 import kuzu from 'kuzu';
+import { getRefreshLockPath, isRefreshLockActive, waitForRefreshLockRelease } from '../../storage/refresh-lock.js';
 
 /** Per-repo pool: one Database, many Connections */
 interface PoolEntry {
@@ -35,6 +38,7 @@ const pool = new Map<string, PoolEntry>();
 const MAX_POOL_SIZE = 5;
 /** Idle timeout before closing a repo's connections */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const MAINTENANCE_INTERVAL_MS = 2_000;
 /** Max connections per repo (caps concurrent queries per repo) */
 const MAX_CONNS_PER_REPO = 8;
 /** Connections created eagerly on init */
@@ -50,11 +54,17 @@ function ensureIdleTimer(): void {
   idleTimer = setInterval(() => {
     const now = Date.now();
     for (const [repoId, entry] of pool) {
+      const repoPath = getRepoPathFromDbPath(entry.dbPath);
+      const refreshLockPath = getRefreshLockPath(repoPath);
+      if (existsSync(refreshLockPath) && entry.checkedOut === 0 && entry.waiters.length === 0) {
+        closeOne(repoId);
+        continue;
+      }
       if (now - entry.lastUsed > IDLE_TIMEOUT_MS) {
         closeOne(repoId);
       }
     }
-  }, 60_000);
+  }, MAINTENANCE_INTERVAL_MS);
   if (idleTimer && typeof idleTimer === 'object' && 'unref' in idleTimer) {
     (idleTimer as NodeJS.Timeout).unref();
   }
@@ -108,6 +118,37 @@ function createConnection(db: kuzu.Database): kuzu.Connection {
 
 const LOCK_RETRY_ATTEMPTS = 3;
 const LOCK_RETRY_DELAY_MS = 2000;
+const REFRESH_LOCK_TIMEOUT_MS = Math.max(1_000, Number(process.env.GITNEXUS_REFRESH_LOCK_TIMEOUT_MS ?? 180_000));
+const REFRESH_LOCK_POLL_MS = Math.max(100, Number(process.env.GITNEXUS_REFRESH_LOCK_POLL_MS ?? 1_000));
+const QUERY_LOCK_RETRY_ATTEMPTS = 2;
+
+const getRepoPathFromDbPath = (dbPath: string): string => {
+  return path.dirname(path.dirname(path.resolve(dbPath)));
+};
+
+const isLockErrorMessage = (message: string): boolean => {
+  const text = String(message || '').toLowerCase();
+  return text.includes('could not set lock')
+    || text.includes('database is locked')
+    || text.includes('io exception')
+    || text.includes(' lock ');
+};
+
+const waitForActiveRefreshIfNeeded = async (repoId: string, dbPath: string): Promise<void> => {
+  const repoPath = getRepoPathFromDbPath(dbPath);
+  const active = await isRefreshLockActive(repoPath);
+  if (!active) return;
+
+  const entry = pool.get(repoId);
+  if (entry && entry.checkedOut === 0 && entry.waiters.length === 0) {
+    closeOne(repoId);
+  }
+
+  await waitForRefreshLockRelease(repoPath, {
+    timeoutMs: REFRESH_LOCK_TIMEOUT_MS,
+    pollMs: REFRESH_LOCK_POLL_MS,
+  });
+};
 
 const closeQueryResults = async (queryResult: any): Promise<void> => {
   if (!queryResult) return;
@@ -136,6 +177,8 @@ export const initKuzu = async (repoId: string, dbPath: string): Promise<void> =>
   } catch {
     throw new Error(`KuzuDB not found at ${dbPath}. Run: gitnexus analyze`);
   }
+
+  await waitForActiveRefreshIfNeeded(repoId, dbPath);
 
   evictLRU();
 
@@ -167,10 +210,10 @@ export const initKuzu = async (repoId: string, dbPath: string): Promise<void> =>
     } catch (err: any) {
       process.stdout.write = origWrite;
       lastError = err instanceof Error ? err : new Error(String(err));
-      const isLockError = lastError.message.includes('Could not set lock')
-        || lastError.message.includes('lock');
+      const isLockError = isLockErrorMessage(lastError.message);
       if (!isLockError || attempt === LOCK_RETRY_ATTEMPTS) break;
       await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_DELAY_MS * attempt));
+      await waitForActiveRefreshIfNeeded(repoId, dbPath);
     }
   }
 
@@ -227,27 +270,50 @@ function checkin(entry: PoolEntry, conn: kuzu.Connection): void {
  * Automatically checks out a connection, runs the query, and returns it.
  */
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
-  const entry = pool.get(repoId);
+  let entry = pool.get(repoId);
   if (!entry) {
     throw new Error(`KuzuDB not initialized for repo "${repoId}". Call initKuzu first.`);
   }
+  const dbPath = entry.dbPath;
 
-  entry.lastUsed = Date.now();
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= QUERY_LOCK_RETRY_ATTEMPTS; attempt++) {
+    await waitForActiveRefreshIfNeeded(repoId, dbPath);
 
-  const conn = await checkout(entry);
-  try {
-    const queryResult = await conn.query(cypher);
-    const results = Array.isArray(queryResult) ? queryResult : [queryResult];
-    try {
-      const result = results[0];
-      const rows = await result.getAll();
-      return rows;
-    } finally {
-      await closeQueryResults(results);
+    if (!pool.has(repoId)) {
+      await initKuzu(repoId, dbPath);
     }
-  } finally {
-    checkin(entry, conn);
+    entry = pool.get(repoId);
+    if (!entry) {
+      throw new Error(`KuzuDB not initialized for repo "${repoId}". Call initKuzu first.`);
+    }
+
+    entry.lastUsed = Date.now();
+
+    const conn = await checkout(entry);
+    try {
+      const queryResult = await conn.query(cypher);
+      const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+      try {
+        const result = results[0];
+        const rows = await result.getAll();
+        return rows;
+      } finally {
+        await closeQueryResults(results);
+      }
+    } catch (err: any) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const isLockError = isLockErrorMessage(lastError.message);
+      if (!isLockError || attempt === QUERY_LOCK_RETRY_ATTEMPTS) {
+        throw lastError;
+      }
+      await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_DELAY_MS * attempt));
+    } finally {
+      checkin(entry, conn);
+    }
   }
+
+  throw lastError || new Error(`Kuzu query failed for repo "${repoId}"`);
 };
 
 /**

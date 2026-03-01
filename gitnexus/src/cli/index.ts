@@ -10,6 +10,7 @@ import { setupCommand } from './setup.js';
 import { augmentCommand } from './augment.js';
 import { wikiCommand } from './wiki.js';
 import { archetypesCommand } from './archetypes.js';
+import { runtimeIngestCommand } from './runtime-ingest.js';
 import {
   queryCommand,
   queryModeCommand,
@@ -53,6 +54,48 @@ program
   .option('--write-context', 'Write GitNexus context into AGENTS.md/CLAUDE.md (and install .claude skills)')
   .option('--update-gitignore', 'Add .gitnexus to the repo .gitignore')
   .action(analyzeCommand);
+
+program
+  .command('runtime-ingest [input]')
+  .description('Ingest runtime trace evidence into .gitnexus/runtime-observations.json')
+  .option('--repo <path>', 'Target repo path (defaults to current directory)')
+  .option(
+    '--input <path>',
+    'Additional runtime payload file (json/ndjson, repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option('--output <path>', 'Output snapshot file path (default: <repo>/.gitnexus/runtime-observations.json)')
+  .option('--replace', 'Replace existing snapshot instead of merge')
+  .option('--print', 'Print normalized snapshot payload after write')
+  .option(
+    '--request-span <json>',
+    'Inline request span JSON object (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option(
+    '--db-query <json>',
+    'Inline DB query JSON object (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .option(
+    '--payload-shape <json>',
+    'Inline payload shape JSON object (repeatable)',
+    (value, previous: string[]) => (Array.isArray(previous) ? [...previous, value] : [value]),
+    []
+  )
+  .action((inputPath, options) => runtimeIngestCommand(inputPath, {
+    repo: options.repo,
+    input: options.input,
+    output: options.output,
+    replace: options.replace,
+    print: options.print,
+    requestSpan: options.requestSpan,
+    dbQuery: options.dbQuery,
+    payloadShape: options.payloadShape,
+  }));
 
 program
   .command('serve')

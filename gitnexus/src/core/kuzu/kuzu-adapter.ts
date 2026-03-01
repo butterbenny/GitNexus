@@ -10,9 +10,22 @@ import {
   NodeTableName,
 } from './schema.js';
 import { generateAllCSVs } from './csv-generator.js';
+import { acquireRefreshLock } from '../../storage/refresh-lock.js';
+import type { RefreshLockLease } from '../../storage/refresh-lock.js';
 
 let db: kuzu.Database | null = null;
 let conn: kuzu.Connection | null = null;
+let refreshLockLease: RefreshLockLease | null = null;
+
+const REFRESH_LOCK_TIMEOUT_MS = Math.max(1_000, Number(process.env.GITNEXUS_REFRESH_LOCK_TIMEOUT_MS ?? 180_000));
+const REFRESH_LOCK_POLL_MS = Math.max(100, Number(process.env.GITNEXUS_REFRESH_LOCK_POLL_MS ?? 1_000));
+const isLockErrorMessage = (message: string): boolean => {
+  const text = String(message || '').toLowerCase();
+  return text.includes('could not set lock')
+    || text.includes('database is locked')
+    || text.includes('io exception')
+    || text.includes(' lock ');
+};
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
@@ -41,6 +54,12 @@ const queryAllRows = async (targetConn: kuzu.Connection, cypher: string): Promis
 export const initKuzu = async (dbPath: string) => {
   if (conn) return { db, conn };
 
+  const repoPath = path.dirname(path.dirname(path.resolve(dbPath)));
+  refreshLockLease = await acquireRefreshLock(repoPath, {
+    timeoutMs: REFRESH_LOCK_TIMEOUT_MS,
+    pollMs: REFRESH_LOCK_POLL_MS,
+  });
+
   // kuzu v0.11 stores the database as a single file (not a directory).
   // If the path already exists, it must be a valid kuzu database file.
   // Remove stale empty directories or files from older versions.
@@ -65,23 +84,43 @@ export const initKuzu = async (dbPath: string) => {
   const parentDir = path.dirname(dbPath);
   await fs.mkdir(parentDir, { recursive: true });
 
-  db = new kuzu.Database(dbPath);
-  conn = new kuzu.Connection(db);
+  try {
+    db = new kuzu.Database(dbPath);
+    conn = new kuzu.Connection(db);
 
-  for (const schemaQuery of SCHEMA_QUERIES) {
-    try {
-      const queryResult = await conn.query(schemaQuery);
-      await closeQueryResults(queryResult);
-    } catch (err) {
-      // Only ignore "already exists" errors - log everything else
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('already exists')) {
-        console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+    let lockWarningLogged = false;
+    for (const schemaQuery of SCHEMA_QUERIES) {
+      try {
+        const queryResult = await conn.query(schemaQuery);
+        await closeQueryResults(queryResult);
+      } catch (err) {
+        // Only ignore "already exists" errors - log everything else
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('already exists')) {
+          if (isLockErrorMessage(msg)) {
+            if (!lockWarningLogged) {
+              console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+              lockWarningLogged = true;
+            }
+            break;
+          }
+          console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+        }
       }
     }
-  }
 
-  return { db, conn };
+    return { db, conn };
+  } catch (err) {
+    try { await conn?.close(); } catch {}
+    try { await db?.close(); } catch {}
+    conn = null;
+    db = null;
+    if (refreshLockLease) {
+      try { await refreshLockLease.release(); } catch {}
+      refreshLockLease = null;
+    }
+    throw err;
+  }
 };
 
 export type KuzuProgressCallback = (message: string) => void;
@@ -594,6 +633,12 @@ export const closeKuzu = async (): Promise<void> => {
       await db.close();
     } catch {}
     db = null;
+  }
+  if (refreshLockLease) {
+    try {
+      await refreshLockLease.release();
+    } catch {}
+    refreshLockLease = null;
   }
 };
 

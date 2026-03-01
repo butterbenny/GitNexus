@@ -44,6 +44,7 @@ import {
   loadClosureTemplateSnapshot,
   summarizeClosureTemplateSnapshot,
 } from '../../core/ingestion/closure-template-store.js';
+import { loadRuntimeObservationSnapshot } from '../../core/ingestion/runtime-observation-store.js';
 import { parseWitnessPathIds } from '../../core/graph/edge-metadata.js';
 import { GITNEXUS_TOOLS } from '../tools.js';
 // AI context generation is CLI-only (gitnexus analyze)
@@ -3383,11 +3384,20 @@ export class LocalBackend {
       }
     }
 
+    const indexStatus = await this.getIndexStatus(repo);
+
+    const normalizePath = (value: unknown): string => normalizeRepoRelativePath(String(value || ''));
+    const pathLayer = (filePath: string): string => deriveLayerTag(normalizePath(filePath));
+    const safeNumber = (value: unknown): number => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    };
+
     const implementPlan = actionPlanResult?.implement_plan || {};
-    const companionFiles = Array.isArray(implementPlan?.companion_set?.files)
+    const rawCompanionFiles = Array.isArray(implementPlan?.companion_set?.files)
       ? implementPlan.companion_set.files.slice(0, limitFiles)
       : [];
-    const writePlan = Array.isArray(implementPlan?.write_order)
+    const rawWritePlan = Array.isArray(implementPlan?.write_order)
       ? implementPlan.write_order.slice(0, limitWriteOrder)
       : [];
 
@@ -3400,7 +3410,7 @@ export class LocalBackend {
     const precedents = (precedentsFromPlan.length > 0 ? precedentsFromPlan : precedentsFromQuery)
       .slice(0, limitPrecedents);
 
-    const checks = Array.isArray(actionPlanResult?.checks)
+    const rawChecks = Array.isArray(actionPlanResult?.checks)
       ? actionPlanResult.checks.slice(0, limitChecks)
       : [];
     const hops = Array.isArray(actionPlanResult?.hops)
@@ -3409,6 +3419,265 @@ export class LocalBackend {
     const cacheEffects = Array.isArray(actionPlanResult?.cache_effects)
       ? actionPlanResult.cache_effects.slice(0, 4)
       : [];
+
+    const queryHeadSymbols = Array.isArray(queryModeResult?.query_mode?.symbols)
+      ? queryModeResult.query_mode.symbols.slice(0, 16)
+      : [];
+    const queryHeadProcesses = Array.isArray(queryModeResult?.query_mode?.processes)
+      ? queryModeResult.query_mode.processes.slice(0, 4)
+      : [];
+    const actionHintFiles = Array.isArray(actionPlanResult?.files)
+      ? actionPlanResult.files.slice(0, limitFiles)
+      : [];
+
+    const fallbackCompanionFiles: any[] = [];
+    const fallbackCompanionSeen = new Set<string>();
+    for (const item of actionHintFiles) {
+      const filePath = normalizePath(item?.filePath);
+      if (!filePath || fallbackCompanionSeen.has(filePath)) continue;
+      fallbackCompanionSeen.add(filePath);
+      fallbackCompanionFiles.push({
+        filePath,
+        score: safeNumber(item?.score || 0.2),
+        reasons: Array.isArray(item?.reasons) ? item.reasons.slice(0, 4) : ['fallback:action_plan.files'],
+        anchors: Array.isArray(item?.anchors) ? item.anchors.slice(0, 4) : [],
+      });
+      if (fallbackCompanionFiles.length >= limitFiles) break;
+    }
+    if (fallbackCompanionFiles.length === 0) {
+      for (const symbol of queryHeadSymbols) {
+        const filePath = normalizePath(symbol?.filePath);
+        if (!filePath || fallbackCompanionSeen.has(filePath)) continue;
+        fallbackCompanionSeen.add(filePath);
+        fallbackCompanionFiles.push({
+          filePath,
+          score: 0.15,
+          reasons: ['fallback:query_head.symbols'],
+          anchors: [{
+            id: symbol?.uid || symbol?.id,
+            name: symbol?.name || '',
+            type: symbol?.kind || symbol?.type || '',
+            startLine: symbol?.startLine,
+            endLine: symbol?.endLine,
+          }],
+        });
+        if (fallbackCompanionFiles.length >= limitFiles) break;
+      }
+    }
+    const usedFallbackCompanion = rawCompanionFiles.length === 0 && fallbackCompanionFiles.length > 0;
+    let companionFiles = (rawCompanionFiles.length > 0 ? rawCompanionFiles : fallbackCompanionFiles)
+      .slice(0, limitFiles);
+
+    const buildFallbackWritePlan = (): any[] => {
+      const steps: any[] = [];
+      for (const file of companionFiles) {
+        const filePath = normalizePath(file?.filePath);
+        if (!filePath) continue;
+        const anchor = Array.isArray(file?.anchors) && file.anchors.length > 0 ? file.anchors[0] : null;
+        steps.push({
+          uid: String(anchor?.id || `file:${filePath}`),
+          name: String(anchor?.name || path.basename(filePath)),
+          kind: String(anchor?.type || 'File'),
+          filePath,
+          role: 'fallback-anchor',
+          ...(Number.isFinite(Number(anchor?.startLine)) ? { startLine: Number(anchor.startLine) } : {}),
+          ...(Number.isFinite(Number(anchor?.endLine)) ? { endLine: Number(anchor.endLine) } : {}),
+        });
+        if (steps.length >= limitWriteOrder) break;
+      }
+
+      if (steps.length === 0) {
+        for (const symbol of queryHeadSymbols) {
+          const filePath = normalizePath(symbol?.filePath);
+          if (!filePath) continue;
+          steps.push({
+            uid: String(symbol?.uid || symbol?.id || `file:${filePath}`),
+            name: String(symbol?.name || path.basename(filePath)),
+            kind: String(symbol?.kind || symbol?.type || 'CodeElement'),
+            filePath,
+            role: 'fallback-symbol',
+            ...(Number.isFinite(Number(symbol?.startLine)) ? { startLine: Number(symbol.startLine) } : {}),
+            ...(Number.isFinite(Number(symbol?.endLine)) ? { endLine: Number(symbol.endLine) } : {}),
+          });
+          if (steps.length >= limitWriteOrder) break;
+        }
+      }
+
+      return steps;
+    };
+
+    const fallbackWritePlan = buildFallbackWritePlan();
+    const usedFallbackWritePlan = rawWritePlan.length === 0 && fallbackWritePlan.length > 0;
+    const writePlanBase = (rawWritePlan.length > 0 ? rawWritePlan : fallbackWritePlan)
+      .slice(0, limitWriteOrder);
+
+    const collectPrecedentCandidates = (items: any[]): Array<{
+      signature: string;
+      source: 'anchor' | 'example';
+      filePath: string;
+      symbolName: string;
+      symbolKind: string;
+      layer: string;
+    }> => {
+      const out: Array<{
+        signature: string;
+        source: 'anchor' | 'example';
+        filePath: string;
+        symbolName: string;
+        symbolKind: string;
+        layer: string;
+      }> = [];
+      const pushNode = (node: any, signature: string, source: 'anchor' | 'example') => {
+        if (!node || typeof node !== 'object') return;
+        const filePath = normalizePath(node?.filePath);
+        if (!filePath) return;
+        out.push({
+          signature,
+          source,
+          filePath,
+          symbolName: String(node?.name || '').trim(),
+          symbolKind: String(node?.kind || node?.type || '').trim(),
+          layer: pathLayer(filePath),
+        });
+      };
+      for (const precedent of items) {
+        const signature = String(precedent?.signature || precedent?.kind || '').trim() || 'precedent';
+        const anchor = precedent?.anchor;
+        if (anchor && typeof anchor === 'object') {
+          pushNode(anchor, signature, 'anchor');
+          pushNode(anchor?.ui, signature, 'anchor');
+          pushNode(anchor?.endpoint, signature, 'anchor');
+          pushNode(anchor?.controller, signature, 'anchor');
+        }
+        const examples = Array.isArray(precedent?.examples) ? precedent.examples : [];
+        for (const example of examples) {
+          pushNode(example, signature, 'example');
+          pushNode(example?.ui, signature, 'example');
+          pushNode(example?.endpoint, signature, 'example');
+          pushNode(example?.controller, signature, 'example');
+        }
+      }
+      return out;
+    };
+
+    const precedentCandidates = collectPrecedentCandidates(precedents);
+    const rankPrecedentMatches = (filePath: string): Array<{
+      signature: string;
+      source: 'anchor' | 'example';
+      filePath: string;
+      symbol_name: string;
+      symbol_kind: string;
+      score: number;
+      reason: string;
+    }> => {
+      const normalized = normalizePath(filePath);
+      if (!normalized) return [];
+      const layer = pathLayer(normalized);
+      const ext = path.extname(normalized).toLowerCase();
+      const scored = precedentCandidates.map(candidate => {
+        let score = 0;
+        const reasons: string[] = [];
+        if (candidate.filePath === normalized) {
+          score += 4;
+          reasons.push('exact-file');
+        }
+        if (candidate.layer === layer && layer) {
+          score += 2;
+          reasons.push(`layer:${layer}`);
+        }
+        if (path.extname(candidate.filePath).toLowerCase() === ext && ext) {
+          score += 1;
+          reasons.push(`ext:${ext}`);
+        }
+        return {
+          signature: candidate.signature,
+          source: candidate.source,
+          filePath: candidate.filePath,
+          symbol_name: candidate.symbolName,
+          symbol_kind: candidate.symbolKind,
+          score,
+          reason: reasons.join(' + ') || 'generic-precedent',
+        };
+      });
+
+      return scored
+        .filter(item => item.score > 0)
+        .sort((left, right) => {
+          if (right.score !== left.score) return right.score - left.score;
+          return left.filePath.localeCompare(right.filePath);
+        })
+        .slice(0, 3);
+    };
+
+    let writePlan = writePlanBase.map(step => {
+      const filePath = normalizePath(step?.filePath);
+      const matches = rankPrecedentMatches(filePath);
+      return {
+        ...step,
+        filePath,
+        precedent_mapping: {
+          matched: matches.length > 0,
+          candidates: matches,
+        },
+      };
+    });
+
+    let companionFilesWithPrecedents = companionFiles.map(file => {
+      const filePath = normalizePath(file?.filePath);
+      const matches = rankPrecedentMatches(filePath);
+      return {
+        ...file,
+        filePath,
+        precedent_mapping: {
+          matched: matches.length > 0,
+          candidates: matches,
+        },
+      };
+    });
+
+    if (companionFilesWithPrecedents.length === 0) {
+      const placeholderPath = String(pathPrefixes[0] || '.').trim() || '.';
+      companionFilesWithPrecedents = [{
+        filePath: placeholderPath,
+        score: 0,
+        reasons: ['fallback:placeholder'],
+        anchors: [],
+        precedent_mapping: {
+          matched: false,
+          candidates: [],
+        },
+      }];
+    }
+
+    if (writePlan.length === 0) {
+      const placeholderFilePath = String(companionFilesWithPrecedents[0]?.filePath || pathPrefixes[0] || '.').trim() || '.';
+      writePlan = [{
+        uid: `fallback:${placeholderFilePath}`,
+        name: path.basename(placeholderFilePath) || placeholderFilePath,
+        kind: 'File',
+        filePath: placeholderFilePath,
+        role: 'fallback-placeholder',
+        precedent_mapping: {
+          matched: false,
+          candidates: [],
+        },
+      }];
+    }
+
+    const fallbackChecks = [
+      'Run review_mode(scope=unstaged) and verify changed_files reflects intended edits.',
+      'Verify route/auth/cache contracts for touched surfaces using context() and action_plan().',
+      'Execute at least one focused test per touched backend/frontend contract boundary.',
+    ].slice(0, limitChecks);
+    const usedFallbackChecks = rawChecks.length === 0;
+    const checks = (rawChecks.length > 0 ? rawChecks : fallbackChecks).slice(0, limitChecks);
+
+    const implementTarget = implementPlan?.target || {
+      query_intent: queryText,
+      archetype: String(queryHeadProcesses?.[0]?.summary || queryHeadProcesses?.[0]?.process_type || '').trim() || null,
+      slice: null,
+    };
+    const usedFallbackTarget = !implementPlan?.target;
 
     const gapSignals = implementPlan?.gap_signals || {};
     const hypotheses: string[] = [];
@@ -3421,8 +3690,11 @@ export class LocalBackend {
     if (!implementPlan?.closure_template) {
       hypotheses.push('No closure template match found; verify anatomy against sibling precedents before adding new structure.');
     }
-    if (companionFiles.length === 0) {
+    if (companionFilesWithPrecedents.length === 0) {
       hypotheses.push('Companion set is sparse; expand anchor query or path scope to avoid under-editing dependent surfaces.');
+    }
+    if (usedFallbackWritePlan || usedFallbackChecks || usedFallbackCompanion || usedFallbackTarget) {
+      hypotheses.push('Plan used fallback synthesis for one or more required fields; confirm anchors manually before editing.');
     }
 
     const postEditReviewBase = implementPlan?.post_edit_review || {
@@ -3434,7 +3706,69 @@ export class LocalBackend {
         include_evidence_spans: true,
       },
     };
-    const postEditReview = includeReviewContract ? postEditReviewBase : null;
+    const postEditReview = includeReviewContract
+      ? {
+          ...postEditReviewBase,
+          verification_contract: {
+            mode: 'diff-aware',
+            pass_gates: [
+              { id: 'changed-files-detected', path: 'summary.changed_files', condition: '> 0' },
+              { id: 'suggested-tests-available', path: 'summary.suggested_tests', condition: '>= 1' },
+              { id: 'risk-not-high', path: 'review_kernel.risk.level', condition: '!= high' },
+            ],
+            fail_gates: [
+              { id: 'stale-index', path: 'coverage_banner.freshness.is_stale', condition: '=== true' },
+            ],
+          },
+        }
+      : null;
+
+    const qualityReasons: string[] = [];
+    if (usedFallbackTarget) qualityReasons.push('target synthesized from query context');
+    if (usedFallbackCompanion) qualityReasons.push('companion_files synthesized from action hints');
+    if (usedFallbackWritePlan) qualityReasons.push('write_plan synthesized from available anchors');
+    if (usedFallbackChecks) qualityReasons.push('verification checklist synthesized');
+    if (precedents.length === 0) qualityReasons.push('precedent set is empty');
+
+    const qualityScore = Math.max(0, Math.min(100,
+      40
+      + (companionFilesWithPrecedents.length > 0 ? 20 : 0)
+      + (writePlan.length > 0 ? 20 : 0)
+      + (checks.length > 0 ? 10 : 0)
+      + (precedents.length > 0 ? 10 : 0)
+      - (qualityReasons.length * 8),
+    ));
+    const qualityLevel = qualityScore >= 85 ? 'high' : qualityScore >= 65 ? 'medium' : 'low';
+    const degraded = qualityReasons.length > 0;
+
+    const coverageWarnings: string[] = [];
+    if (indexStatus.isStale) {
+      coverageWarnings.push('Index is stale versus HEAD; implement suggestions may miss recent edits.');
+    }
+    if (degraded) {
+      coverageWarnings.push('Implement plan used synthesized fallback fields; verify write anchors before editing.');
+    }
+    if (precedents.length === 0) {
+      coverageWarnings.push('No precedents were resolved for this query; anatomy checks are weaker.');
+    }
+    const coverage_banner = {
+      freshness: {
+        is_stale: indexStatus.isStale,
+        indexed_at: indexStatus.indexedAt,
+        indexed_commit: indexStatus.indexedCommit || null,
+        head_commit: indexStatus.headCommit || null,
+        refresh_command: indexStatus.refreshCommandSandbox,
+        refresh_command_force: indexStatus.refreshCommandSandboxForce,
+      },
+      coverage: {
+        companion_files: companionFilesWithPrecedents.length,
+        write_plan_steps: writePlan.length,
+        checks: checks.length,
+        precedents: precedents.length,
+        fallback_fields: qualityReasons.length,
+      },
+      warnings: coverageWarnings,
+    };
 
     const nextActions = [
       'Open the first write-plan anchor with context() and confirm callers before editing.',
@@ -3450,26 +3784,34 @@ export class LocalBackend {
       repo: repo.name,
       query: queryText,
       implement_mode: {
-        target: implementPlan?.target || null,
+        target: implementTarget,
         closure_template: implementPlan?.closure_template || null,
-        companion_files: companionFiles,
+        companion_files: companionFilesWithPrecedents,
         write_plan: writePlan,
         precedents,
         action_hints: {
-          files: Array.isArray(actionPlanResult?.files) ? actionPlanResult.files.slice(0, limitFiles) : [],
+          files: actionHintFiles,
           checks,
           hops,
           cache_effects: cacheEffects,
         },
+        verification_checklist: checks,
         query_head: includeQueryHead
           ? {
               query_plan: queryModeResult?.query_mode?.query_plan || null,
               slices: Array.isArray(queryModeResult?.query_mode?.slices) ? queryModeResult.query_mode.slices.slice(0, 2) : [],
-              processes: Array.isArray(queryModeResult?.query_mode?.processes) ? queryModeResult.query_mode.processes.slice(0, 4) : [],
-              symbols: Array.isArray(queryModeResult?.query_mode?.symbols) ? queryModeResult.query_mode.symbols.slice(0, 16) : [],
+              processes: queryHeadProcesses,
+              symbols: queryHeadSymbols,
             }
           : null,
         gap_signals: gapSignals,
+        quality: {
+          level: qualityLevel,
+          score: qualityScore,
+          degraded,
+          reasons: qualityReasons,
+        },
+        coverage_banner,
         hypotheses: Array.from(new Set(hypotheses)).slice(0, 6),
         next_actions: nextActions,
         post_edit_review: postEditReview,
@@ -5503,6 +5845,12 @@ export class LocalBackend {
     const limitEvidence = Math.max(1, Math.min(200, params.limit_evidence ?? 40));
     const includeSliceStencil = params.include_slice_stencil !== false;
     const limitSliceStencil = Math.max(1, Math.min(25, params.limit_slice_stencil ?? 8));
+    const indexStatus = await this.getIndexStatus(repo);
+    const runtimeObservationPaths = parseStringList(process.env.GITNEXUS_RUNTIME_OBSERVATIONS_FILE || '');
+    const runtimeSnapshot = await loadRuntimeObservationSnapshot(repo.storagePath, {
+      repoPath: repo.repoPath,
+      extraPaths: runtimeObservationPaths,
+    });
 
     const normalizePath = (value: string): string => {
       return String(value || '')
@@ -5547,12 +5895,29 @@ export class LocalBackend {
     type DiffHunk = { old_start: number; old_lines: number; new_start: number; new_lines: number };
     type DiffFile = {
       filePath: string;
-      status: 'Modified' | 'Added' | 'Deleted' | 'Renamed' | 'Copied';
+      status: 'Modified' | 'Added' | 'Deleted' | 'Renamed' | 'Copied' | 'Untracked';
       fromPath?: string;
       hunks: DiffHunk[];
       binary?: boolean;
     };
     type SemanticFamily = 'auth' | 'shape' | 'cache' | 'test' | 'event' | 'template';
+    type ReviewFindingSeverity = 'low' | 'medium' | 'high';
+    type ReviewFinding = {
+      code: string;
+      severity: ReviewFindingSeverity;
+      summary: string;
+      reason: string;
+      confidence: number;
+      evidence: {
+        filePath: string;
+        symbol?: {
+          uid?: string;
+          name?: string;
+          kind?: string;
+          startLine?: number;
+        };
+      };
+    };
 
     const { execFileSync } = await import('child_process');
 
@@ -5697,11 +6062,14 @@ export class LocalBackend {
 
     const buildReviewKernel = (input: {
       changed_files: number;
+      untracked_files: number;
       changed_symbols: number;
       suggested_tests: number;
       ui_contracts: number;
       route_files: number;
       authz_controllers: number;
+      runtime_hotspots: number;
+      runtime_source: string;
       semantic_diffs: ReturnType<typeof buildEmptySemanticDiffs>;
       slice_stencil: ReturnType<typeof buildEmptySliceStencil>;
       scope: string;
@@ -5727,6 +6095,8 @@ export class LocalBackend {
       riskScore += Math.min(4, (missingRequiredSlotSlices * 2) + missingRoleSlices);
       if (Number(authFamily?.edge_count || 0) > 0 && Number(input.authz_controllers || 0) === 0) riskScore += 2;
       if (Number(input.suggested_tests || 0) === 0 && Number(input.changed_symbols || 0) > 0) riskScore += 1;
+      if (Number(input.untracked_files || 0) > 0) riskScore += Math.min(2, Number(input.untracked_files || 0));
+      if (Number(input.runtime_hotspots || 0) > 0) riskScore += Math.min(3, Math.ceil(Number(input.runtime_hotspots || 0) / 2));
 
       const risk_level = riskScore >= 10 ? 'high' : riskScore >= 5 ? 'medium' : 'low';
 
@@ -5749,8 +6119,14 @@ export class LocalBackend {
       if (Number(input.route_files || 0) > 0) {
         top_findings.push(`Route files changed (${Number(input.route_files || 0)}); validate controller wiring targets.`);
       }
+      if (Number(input.untracked_files || 0) > 0) {
+        top_findings.push(`Untracked files present (${Number(input.untracked_files || 0)}); symbol coverage may be partial until re-index.`);
+      }
       if (Number(input.ui_contracts || 0) > 0) {
         top_findings.push(`UI contract diffs available (${Number(input.ui_contracts || 0)}).`);
+      }
+      if (Number(input.runtime_hotspots || 0) > 0) {
+        top_findings.push(`Runtime hotspots overlap changed surfaces (${Number(input.runtime_hotspots || 0)}).`);
       }
       if (top_findings.length === 0 && Number(input.changed_files || 0) === 0) {
         top_findings.push('No changed files detected for the selected review scope.');
@@ -5765,6 +6141,14 @@ export class LocalBackend {
       }
       if (Number(input.suggested_tests || 0) === 0 && Number(input.changed_symbols || 0) > 0) {
         hypotheses.push('Changed symbols may lack direct test callers in current graph coverage.');
+      }
+      if (Number(input.untracked_files || 0) > 0) {
+        hypotheses.push('Untracked files may hide additional risk until they are indexed.');
+      }
+      if (Number(input.runtime_hotspots || 0) > 0) {
+        hypotheses.push('Runtime latency/lock signals align with changed surfaces and should be validated first.');
+      } else if (input.runtime_source === 'none') {
+        hypotheses.push('No runtime observation snapshot found; runtime risk assessment is static-only.');
       }
       if (hypotheses.length === 0 && Number(input.changed_files || 0) > 0) {
         hypotheses.push('Primary risk appears to be localized to changed files with bounded blast radius.');
@@ -5786,6 +6170,12 @@ export class LocalBackend {
       if (Number(input.suggested_tests || 0) > 0) {
         next_actions.push('Run suggested tests first, then expand coverage only if failures indicate wider drift.');
       }
+      if (Number(input.untracked_files || 0) > 0) {
+        next_actions.push('Review untracked files explicitly and refresh index before finalizing high-risk decisions.');
+      }
+      if (Number(input.runtime_hotspots || 0) > 0) {
+        next_actions.push('Validate runtime hotspot entries before broad refactors to confirm symptom-fit ordering.');
+      }
 
       return {
         risk: {
@@ -5793,11 +6183,13 @@ export class LocalBackend {
           score: riskScore,
           signals: {
             changed_files: Number(input.changed_files || 0),
+            untracked_files: Number(input.untracked_files || 0),
             changed_symbols: Number(input.changed_symbols || 0),
             semantic_gap_total: Number(semanticGap.total || 0),
             semantic_gap_high: Number(semanticGap.high || 0),
             missing_required_slot_slices: missingRequiredSlotSlices,
             missing_role_slices: missingRoleSlices,
+            runtime_hotspots: Number(input.runtime_hotspots || 0),
           },
         },
         top_findings: top_findings.slice(0, 8),
@@ -5842,6 +6234,88 @@ export class LocalBackend {
       return args;
     };
 
+    const listUntrackedFiles = (): string[] => {
+      try {
+        const output = execFileSync('git', ['status', '--porcelain'], {
+          cwd: repo.repoPath,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024 * 5,
+        });
+        return String(output || '')
+          .split('\n')
+          .map(line => line.trimEnd())
+          .filter(Boolean)
+          .filter(line => line.startsWith('?? '))
+          .map(line => normalizePath(line.slice(3)))
+          .filter(Boolean)
+          .filter(filePath => isInScope(filePath));
+      } catch {
+        return [];
+      }
+    };
+
+    const buildCoverageBanner = (input: {
+      changedFileCount: number;
+      untrackedFileCount: number;
+      changedSymbolCount: number;
+      suggestedTestCount: number;
+      symbolizedFileCount?: number;
+      runtimeHotspotCount?: number;
+      runtimeSource?: string;
+      runtimeGeneratedAt?: string;
+      runtimeSourceFiles?: string[];
+    }) => {
+      const symbolizedFileCount = Number(input.symbolizedFileCount ?? 0);
+      const runtimeHotspotCount = Number(input.runtimeHotspotCount ?? 0);
+      const runtimeSource = String(input.runtimeSource || 'none');
+      const runtimeSourceFiles = Array.isArray(input.runtimeSourceFiles) ? input.runtimeSourceFiles : [];
+      const symbolCoverageRatio = input.changedFileCount > 0
+        ? Number((symbolizedFileCount / input.changedFileCount).toFixed(3))
+        : 1;
+      const warnings: string[] = [];
+      if (indexStatus.isStale) {
+        warnings.push('Index is stale versus HEAD; refresh before trusting full blast-radius decisions.');
+      }
+      if (input.untrackedFileCount > 0) {
+        warnings.push(`Detected ${input.untrackedFileCount} untracked file(s); index-backed symbol coverage may be incomplete.`);
+      }
+      if (input.changedFileCount > 0 && symbolCoverageRatio < 0.5) {
+        warnings.push('Less than half of changed files mapped to symbols; review changed_files directly.');
+      }
+      if (input.changedSymbolCount > 0 && input.suggestedTestCount === 0) {
+        warnings.push('No suggested tests were inferred for changed symbols; manual test selection required.');
+      }
+      if (runtimeHotspotCount > 0) {
+        warnings.push(`Runtime snapshot reports ${runtimeHotspotCount} hotspot(s) tied to changed surfaces.`);
+      } else if (runtimeSource === 'none') {
+        warnings.push('No runtime observation snapshot found; runtime risk checks are static-only.');
+      }
+
+      return {
+        freshness: {
+          is_stale: indexStatus.isStale,
+          indexed_at: indexStatus.indexedAt,
+          indexed_commit: indexStatus.indexedCommit || null,
+          head_commit: indexStatus.headCommit || null,
+          refresh_command: indexStatus.refreshCommandSandbox,
+          refresh_command_force: indexStatus.refreshCommandSandboxForce,
+        },
+        coverage: {
+          changed_files: input.changedFileCount,
+          untracked_files: input.untrackedFileCount,
+          changed_symbols: input.changedSymbolCount,
+          symbolized_files: symbolizedFileCount,
+          symbol_coverage_ratio: symbolCoverageRatio,
+          suggested_tests: input.suggestedTestCount,
+          runtime_hotspots: runtimeHotspotCount,
+          runtime_source: runtimeSource,
+          runtime_generated_at: String(input.runtimeGeneratedAt || ''),
+          runtime_source_files: runtimeSourceFiles,
+        },
+        warnings,
+      };
+    };
+
     let changedFilesRaw: string[] = [];
     let effectiveScope: 'unstaged' | 'staged' | 'all' | 'compare' = scope;
     let diffSource = 'requested';
@@ -5868,9 +6342,11 @@ export class LocalBackend {
       }
     }
 
-    const changedFiles = changedFilesRaw
+    const trackedChangedFiles = changedFilesRaw
       .map(f => normalizePath(f))
       .filter(f => isInScope(f));
+    const untrackedFiles = listUntrackedFiles();
+    const changedFiles = Array.from(new Set([...trackedChangedFiles, ...untrackedFiles]));
 
     if (changedFiles.length === 0) {
       const semantic_diffs = buildEmptySemanticDiffs();
@@ -5878,11 +6354,18 @@ export class LocalBackend {
       const slice_stencil = buildEmptySliceStencil();
       const review_kernel = buildReviewKernel({
         changed_files: 0,
+        untracked_files: 0,
         changed_symbols: 0,
         suggested_tests: 0,
         ui_contracts: 0,
         route_files: 0,
         authz_controllers: 0,
+        runtime_hotspots: 0,
+        runtime_source: (
+          runtimeSnapshot.request_spans.length > 0
+          || runtimeSnapshot.db_queries.length > 0
+          || runtimeSnapshot.payload_shapes.length > 0
+        ) ? 'snapshot' : 'none',
         semantic_diffs,
         slice_stencil,
         scope: effectiveScope,
@@ -5896,22 +6379,43 @@ export class LocalBackend {
         path_prefixes: pathPrefixes,
         summary: {
           changed_files: 0,
+          untracked_files: 0,
           changed_symbols: 0,
           suggested_tests: 0,
+          suggested_test_commands: 0,
           semantic_families: semantic_diffs.summary.family_count,
           semantic_gap_signals: semantic_diffs.summary.gap_signals,
           proof_symbols: proof_pack.summary.symbol_spans,
           proof_edges: proof_pack.summary.edge_spans,
           stencil_slices: slice_stencil.summary.changed_slices,
           stencil_templates: slice_stencil.summary.with_templates,
+          runtime_hotspots: 0,
         },
+        coverage_banner: buildCoverageBanner({
+          changedFileCount: 0,
+          untrackedFileCount: 0,
+          changedSymbolCount: 0,
+          suggestedTestCount: 0,
+          symbolizedFileCount: 0,
+          runtimeHotspotCount: 0,
+          runtimeSource: (
+            runtimeSnapshot.request_spans.length > 0
+            || runtimeSnapshot.db_queries.length > 0
+            || runtimeSnapshot.payload_shapes.length > 0
+          ) ? 'snapshot' : 'none',
+          runtimeGeneratedAt: runtimeSnapshot.generatedAt || '',
+          runtimeSourceFiles: runtimeSnapshot.source_files,
+        }),
+        untracked_files: [],
         changed_files: [],
         changed_symbols: [],
         symbols: [],
         suggested_tests: [],
+        test_commands: [],
         ui_contracts: [],
         route_targets: [],
         authz: [],
+        runtime_hotspots: [],
         semantic_diffs,
         proof_pack,
         slice_stencil,
@@ -6031,10 +6535,33 @@ export class LocalBackend {
 
     const diffFiles = parsePatch(patch);
 
-    // Fallback: if patch parsing failed (e.g., empty patch), still return name-only list.
-    const changedFileObjs: DiffFile[] = diffFiles.length > 0
+    // Fallback: if patch parsing failed (e.g., empty patch), still return tracked name-only list.
+    const changedFileMap = new Map<string, DiffFile>();
+    const baseChangedFileObjs: DiffFile[] = diffFiles.length > 0
       ? diffFiles
-      : changedFiles.map(filePath => ({ filePath, status: 'Modified', hunks: [] }));
+      : trackedChangedFiles.map(filePath => ({ filePath, status: 'Modified', hunks: [] }));
+
+    for (const file of baseChangedFileObjs) {
+      const normalizedPath = normalizePath(file.filePath);
+      if (!normalizedPath || !isInScope(normalizedPath)) continue;
+      changedFileMap.set(normalizedPath, {
+        ...file,
+        filePath: normalizedPath,
+      });
+    }
+
+    for (const filePath of untrackedFiles) {
+      const normalizedPath = normalizePath(filePath);
+      if (!normalizedPath || !isInScope(normalizedPath)) continue;
+      const existing = changedFileMap.get(normalizedPath);
+      changedFileMap.set(normalizedPath, {
+        ...(existing || { filePath: normalizedPath, hunks: [] }),
+        filePath: normalizedPath,
+        status: 'Untracked',
+      });
+    }
+
+    const changedFileObjs: DiffFile[] = Array.from(changedFileMap.values());
 
     type ChangedSymbol = {
       uid: string;
@@ -6062,26 +6589,56 @@ export class LocalBackend {
       changedSymbolsById.set(sym.uid, sym);
     };
 
-    const loadFileNode = async (filePath: string): Promise<ChangedSymbol | null> => {
-      const escaped = filePath.replace(/'/g, "''");
+    const batchLoadFileNodes = async (filePaths: string[]): Promise<Map<string, ChangedSymbol>> => {
+      const result = new Map<string, ChangedSymbol>();
+      const normalized = Array.from(new Set(filePaths.map(filePath => normalizePath(filePath)).filter(Boolean)));
+      if (normalized.length === 0) return result;
+
+      const filesCypher = `[${normalized.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+      let rows: any[] = [];
       try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (f:File {filePath: '${escaped}'})
+        rows = await executeQuery(repo.id, `
+          MATCH (f:File)
+          WHERE f.filePath IN ${filesCypher}
           RETURN f.id AS id, f.name AS name, labels(f) AS type, f.filePath AS filePath
-          LIMIT 1
+          LIMIT ${Math.max(200, Math.min(10000, normalized.length * 10))}
         `);
-        if (rows.length === 0) return null;
-        const r = rows[0];
-        return {
-          uid: r.id || r[0],
-          name: r.name || r[1] || filePath,
-          kind: r.type || r[2] || 'File',
-          filePath: r.filePath || r[3] || filePath,
-        };
       } catch {
-        return null;
+        rows = [];
       }
+
+      for (const row of rows) {
+        const filePath = normalizePath(String(row.filePath || row[3] || ''));
+        const uid = String(row.id || row[0] || '').trim();
+        if (!filePath || !uid) continue;
+        if (result.has(filePath)) continue;
+        result.set(filePath, {
+          uid,
+          name: String(row.name || row[1] || filePath),
+          kind: row.type || row[2] || 'File',
+          filePath,
+        });
+      }
+
+      return result;
     };
+
+    const toRanges = (hunks: DiffHunk[]): Array<{ start: number; end: number }> => {
+      return hunks
+        .filter(h => Number.isFinite(h?.new_start) && Number.isFinite(h?.new_lines))
+        .map(h => {
+          const start = Math.max(0, h.new_start - 1);
+          const count = Math.max(1, h.new_lines);
+          return { start, end: start + count - 1 };
+        });
+    };
+
+    const fileNodeCandidates: string[] = [];
+    const rangedFiles: Array<{
+      filePath: string;
+      hunks: DiffHunk[];
+      ranges: Array<{ start: number; end: number }>;
+    }> = [];
 
     for (const file of changedFileObjs) {
       const filePath = normalizePath(file.filePath);
@@ -6091,61 +6648,75 @@ export class LocalBackend {
 
       const hunks = Array.isArray(file.hunks) ? file.hunks : [];
       if (hunks.length === 0) {
-        if (file.binary) {
-          const fileNode = await loadFileNode(filePath);
-          if (fileNode) addChangedSymbol(fileNode);
+        if (file.binary || file.status === 'Untracked' || file.status === 'Added') {
+          fileNodeCandidates.push(filePath);
         }
         continue;
       }
 
-      const ranges = hunks
-        .filter(h => Number.isFinite(h?.new_start) && Number.isFinite(h?.new_lines))
-        .map(h => {
-          // Git diff hunk line numbers are 1-based; graph node startLine/endLine are 0-based rows.
-          const start = Math.max(0, h.new_start - 1);
-          const count = Math.max(1, h.new_lines);
-          return { start, end: start + count - 1 };
-        });
+      const ranges = toRanges(hunks);
       if (ranges.length === 0) continue;
+      rangedFiles.push({ filePath, hunks, ranges });
+    }
 
-      const minStart = Math.min(...ranges.map(r => r.start));
-      const maxEnd = Math.max(...ranges.map(r => r.end));
+    if (fileNodeCandidates.length > 0) {
+      const fileNodes = await batchLoadFileNodes(fileNodeCandidates);
+      for (const filePath of fileNodeCandidates) {
+        const fileNode = fileNodes.get(normalizePath(filePath));
+        if (fileNode) addChangedSymbol(fileNode);
+      }
+    }
 
-      const escaped = filePath.replace(/'/g, "''");
-      let rows: any[] = [];
+    if (rangedFiles.length > 0) {
+      const rangedFilePaths = Array.from(new Set(rangedFiles.map(item => item.filePath)));
+      const rangedFilesCypher = `[${rangedFilePaths.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+
+      let symbolRows: any[] = [];
       try {
-        rows = await executeQuery(repo.id, `
+        symbolRows = await executeQuery(repo.id, `
           MATCH (n)
-          WHERE n.filePath = '${escaped}'
-            AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
-            AND n.startLine <= ${maxEnd} AND n.endLine >= ${minStart}
+          WHERE n.filePath IN ${rangedFilesCypher}
+            AND n.startLine IS NOT NULL
+            AND n.endLine IS NOT NULL
           RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
-          LIMIT 200
+          LIMIT ${Math.max(500, Math.min(100000, rangedFilePaths.length * 600))}
         `);
       } catch {
-        rows = [];
+        symbolRows = [];
       }
 
-      for (const row of rows) {
-        const uid = row.id || row[0];
-        if (!uid || typeof uid !== 'string') continue;
-        const startLine = Number(row.startLine ?? row[4]);
-        const endLine = Number(row.endLine ?? row[5]);
-        const overlaps = ranges.some(r => {
-          if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) return true;
-          return startLine <= r.end && endLine >= r.start;
-        });
-        if (!overlaps) continue;
+      const rowsByFile = new Map<string, any[]>();
+      for (const row of symbolRows) {
+        const filePath = normalizePath(String(row.filePath || row[3] || ''));
+        if (!filePath) continue;
+        const list = rowsByFile.get(filePath) || [];
+        list.push(row);
+        rowsByFile.set(filePath, list);
+      }
 
-        addChangedSymbol({
-          uid,
-          name: row.name || row[1] || '',
-          kind: row.type || row[2] || '',
-          filePath: row.filePath || row[3] || filePath,
-          startLine: Number.isFinite(startLine) ? startLine : undefined,
-          endLine: Number.isFinite(endLine) ? endLine : undefined,
-          evidence: { hunks },
-        });
+      for (const spec of rangedFiles) {
+        const fileRows = rowsByFile.get(spec.filePath) || [];
+        for (const row of fileRows) {
+          const uid = String(row.id || row[0] || '').trim();
+          if (!uid) continue;
+          const startLine = Number(row.startLine ?? row[4]);
+          const endLine = Number(row.endLine ?? row[5]);
+          const overlaps = spec.ranges.some(range => {
+            if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) return true;
+            return startLine <= range.end && endLine >= range.start;
+          });
+          if (!overlaps) continue;
+
+          addChangedSymbol({
+            uid,
+            name: row.name || row[1] || '',
+            kind: row.type || row[2] || '',
+            filePath: row.filePath || row[3] || spec.filePath,
+            startLine: Number.isFinite(startLine) ? startLine : undefined,
+            endLine: Number.isFinite(endLine) ? endLine : undefined,
+            evidence: { hunks: spec.hunks },
+          });
+        }
       }
     }
 
@@ -6186,38 +6757,95 @@ export class LocalBackend {
       suggestedTestsAgg.set(fp, { score: current.score + safeScore, reasons });
     };
 
+    const callersByTargetId = new Map<string, any[]>();
+    if (changedSymbolIds.length > 0) {
+      try {
+        const changedSymbolIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        const callerRows = await executeQuery(repo.id, `
+          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t)
+          WHERE t.id IN ${changedSymbolIdsCypher}
+            AND r.confidence >= ${minConfidence}
+          RETURN
+            t.id AS targetId,
+            caller.id AS uid,
+            caller.name AS name,
+            labels(caller) AS kind,
+            caller.filePath AS filePath,
+            caller.startLine AS startLine,
+            r.confidence AS confidence,
+            r.reason AS reason
+          ORDER BY r.confidence DESC
+          LIMIT ${Math.max(200, Math.min(10000, callerFetchLimit * Math.max(1, changedSymbolIds.length)))}
+        `);
+
+        for (const row of callerRows) {
+          const targetId = String(row.targetId || row[0] || '').trim();
+          if (!targetId) continue;
+          const entry = {
+            uid: row.uid || row[1],
+            name: row.name || row[2],
+            kind: row.kind || row[3],
+            filePath: row.filePath || row[4],
+            startLine: row.startLine ?? row[5],
+            edge: {
+              confidence: Number(row.confidence ?? row[6] ?? 1.0),
+              reason: String(row.reason ?? row[7] ?? ''),
+            },
+          };
+          const list = callersByTargetId.get(targetId) || [];
+          list.push(entry);
+          callersByTargetId.set(targetId, list);
+        }
+      } catch {
+        // fallback to per-symbol query below when batch retrieval fails
+      }
+    }
+
     const symbols: any[] = [];
     for (const sym of changedSymbols) {
-      const escaped = String(sym.uid || '').replace(/'/g, "''");
-      let rows: any[] = [];
-      try {
-        rows = await executeQuery(repo.id, `
-          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t {id: '${escaped}'})
-          WHERE r.confidence >= ${minConfidence}
-          RETURN caller.id AS uid, caller.name AS name, labels(caller) AS kind, caller.filePath AS filePath, caller.startLine AS startLine,
-                 r.confidence AS confidence, r.reason AS reason
-          ORDER BY r.confidence DESC
-          LIMIT ${callerFetchLimit}
-        `);
-      } catch {
-        rows = [];
+      const targetId = String(sym?.uid || '').trim();
+      let callersRaw: any[] = callersByTargetId.get(targetId) || [];
+
+      // Fallback: keep prior per-symbol behavior if batch retrieval is unavailable.
+      if (callersRaw.length === 0 && targetId) {
+        const escaped = targetId.replace(/'/g, "''");
+        let rows: any[] = [];
+        try {
+          rows = await executeQuery(repo.id, `
+            MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(t {id: '${escaped}'})
+            WHERE r.confidence >= ${minConfidence}
+            RETURN caller.id AS uid, caller.name AS name, labels(caller) AS kind, caller.filePath AS filePath, caller.startLine AS startLine,
+                   r.confidence AS confidence, r.reason AS reason
+            ORDER BY r.confidence DESC
+            LIMIT ${callerFetchLimit}
+          `);
+        } catch {
+          rows = [];
+        }
+
+        callersRaw = rows.map((row: any) => ({
+          uid: row.uid || row[0],
+          name: row.name || row[1],
+          kind: row.kind || row[2],
+          filePath: row.filePath || row[3],
+          startLine: row.startLine ?? row[4],
+          edge: {
+            confidence: Number(row.confidence ?? row[5] ?? 1.0),
+            reason: String(row.reason ?? row[6] ?? ''),
+          },
+        }));
       }
 
-      const callersRaw = rows.map((row: any) => ({
-        uid: row.uid || row[0],
-        name: row.name || row[1],
-        kind: row.kind || row[2],
-        filePath: row.filePath || row[3],
-        startLine: row.startLine ?? row[4],
-        edge: {
-          confidence: Number(row.confidence ?? row[5] ?? 1.0),
-          reason: String(row.reason ?? row[6] ?? ''),
-        },
-      }));
+      callersRaw.sort((left, right) => {
+        const c = Number(right?.edge?.confidence ?? 0) - Number(left?.edge?.confidence ?? 0);
+        if (c !== 0) return c;
+        return String(left?.filePath || '').localeCompare(String(right?.filePath || ''));
+      });
 
-      const callers = pathPrefixes.length > 0
+      const callers = (pathPrefixes.length > 0
         ? callersRaw.filter((c: any) => isInScope(String(c?.filePath || '')))
-        : callersRaw;
+        : callersRaw)
+        .slice(0, callerFetchLimit);
 
       const testCallers = callers
         .filter((c: any) => isTestFilePath(String(c?.filePath || '')))
@@ -6357,6 +6985,58 @@ export class LocalBackend {
       }
     }
 
+    const shellQuote = (value: string): string => {
+      const raw = String(value || '');
+      return `'${raw.replace(/'/g, `'\\''`)}'`;
+    };
+
+    const buildSuggestedTestCommand = (filePath: string): {
+      runner: string;
+      cwd: string;
+      command: string;
+    } => {
+      const fp = normalizePath(filePath);
+      if (fp.startsWith('apps/backend/')) {
+        const rel = normalizePath(path.relative('apps/backend', fp));
+        return {
+          runner: 'phpunit',
+          cwd: 'apps/backend',
+          command: `./vendor/bin/phpunit ${shellQuote(rel || fp)}`,
+        };
+      }
+
+      if (fp.startsWith('apps/dashboard/')) {
+        const rel = normalizePath(path.relative('apps/dashboard', fp));
+        return {
+          runner: 'pnpm-test',
+          cwd: 'apps/dashboard',
+          command: `pnpm test -- ${shellQuote(rel || fp)}`,
+        };
+      }
+
+      if (fp.toLowerCase().endsWith('.php')) {
+        return {
+          runner: 'phpunit',
+          cwd: '.',
+          command: `./vendor/bin/phpunit ${shellQuote(fp)}`,
+        };
+      }
+
+      if (/\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(fp)) {
+        return {
+          runner: 'node-test',
+          cwd: '.',
+          command: `node --test ${shellQuote(fp)}`,
+        };
+      }
+
+      return {
+        runner: 'generic-test',
+        cwd: '.',
+        command: `node --test ${shellQuote(fp)}`,
+      };
+    };
+
     const suggested_tests = Array.from(suggestedTestsAgg.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, limitTests)
@@ -6364,7 +7044,16 @@ export class LocalBackend {
         filePath,
         score: Number(meta.score.toFixed(3)),
         reasons: meta.reasons,
+        ...buildSuggestedTestCommand(filePath),
       }));
+
+    const test_commands = Array.from(new Map(
+      suggested_tests.map(test => {
+        const cwd = String(test?.cwd || '.').trim() || '.';
+        const command = String(test?.command || '').trim();
+        return [`${cwd}::${command}`, { cwd, command }];
+      }),
+    ).values());
 
     const slice_stencil = buildEmptySliceStencil();
     if (includeSliceStencil && changedSymbolIds.length > 0) {
@@ -7177,146 +7866,620 @@ export class LocalBackend {
 
     const ROUTE_FILE_PATH_RE = /(^|\/)routes\/[^/]+\.php$/i;
     const route_targets: any[] = [];
-    for (const file of changedFileObjs) {
-      const filePath = normalizePath(file.filePath);
-      if (!filePath) continue;
-      if (!isInScope(filePath)) continue;
-      if (file.status === 'Deleted') continue;
-      if (!ROUTE_FILE_PATH_RE.test(filePath)) continue;
+    const routeFiles = changedFileObjs
+      .map(file => normalizePath(file.filePath))
+      .filter(filePath => !!filePath)
+      .filter(filePath => isInScope(filePath))
+      .filter((filePath, index, arr) => arr.indexOf(filePath) === index)
+      .filter(filePath => !changedFileObjs.find(file => normalizePath(file.filePath) === filePath && file.status === 'Deleted'))
+      .filter(filePath => ROUTE_FILE_PATH_RE.test(filePath));
 
-      const escaped = filePath.replace(/'/g, "''");
-      let rows: any[] = [];
+    if (routeFiles.length > 0) {
+      const routeFilesCypher = `[${routeFiles.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+      let routeRows: any[] = [];
       try {
-        rows = await executeQuery(repo.id, `
-          MATCH (f:File {filePath: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
-          WHERE r.reason STARTS WITH 'laravel-route' AND r.confidence >= ${minConfidence}
+        routeRows = await executeQuery(repo.id, `
+          MATCH (f:File)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
+          WHERE f.filePath IN ${routeFilesCypher}
+            AND r.reason STARTS WITH 'laravel-route'
+            AND r.confidence >= ${minConfidence}
           OPTIONAL MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
-          RETURN m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
+          RETURN f.filePath AS routeFilePath,
+                 m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
                  c.name AS className,
                  r.confidence AS confidence, r.reason AS reason
-          ORDER BY r.confidence DESC
-          LIMIT 100
+          ORDER BY f.filePath ASC, r.confidence DESC
+          LIMIT ${Math.max(100, Math.min(10000, routeFiles.length * 120))}
         `);
       } catch {
-        rows = [];
+        routeRows = [];
       }
 
-      const targets = rows.map((row: any) => ({
-        controller: {
-          uid: row.uid || row[0],
-          name: (() => {
-            const base = row.name || row[1] || '';
-            const cls = row.className || row[4] || '';
-            return cls && base ? `${cls}::${base}` : base;
-          })(),
-          filePath: row.filePath || row[2] || '',
-          startLine: row.startLine ?? row[3] ?? undefined,
-          kind: 'Method',
-        },
-        edge: {
-          confidence: Number(row.confidence ?? row[5] ?? 1.0),
-          reason: String(row.reason ?? row[6] ?? ''),
-        },
-      })).filter((t: any) => t?.controller?.uid && t?.edge?.reason);
+      const rowsByRouteFile = new Map<string, any[]>();
+      for (const row of routeRows) {
+        const routeFilePath = normalizePath(String(row.routeFilePath || row[0] || ''));
+        if (!routeFilePath) continue;
+        const list = rowsByRouteFile.get(routeFilePath) || [];
+        list.push(row);
+        rowsByRouteFile.set(routeFilePath, list);
+      }
 
-      route_targets.push({
-        route_file: filePath,
-        targets,
+      for (const routeFilePath of routeFiles) {
+        const rows = rowsByRouteFile.get(routeFilePath) || [];
+        const targets = rows.map((row: any) => ({
+          controller: {
+            uid: row.uid || row[1],
+            name: (() => {
+              const base = row.name || row[2] || '';
+              const cls = row.className || row[5] || '';
+              return cls && base ? `${cls}::${base}` : base;
+            })(),
+            filePath: row.filePath || row[3] || '',
+            startLine: row.startLine ?? row[4] ?? undefined,
+            kind: 'Method',
+          },
+          edge: {
+            confidence: Number(row.confidence ?? row[6] ?? 1.0),
+            reason: String(row.reason ?? row[7] ?? ''),
+          },
+        })).filter((target: any) => target?.controller?.uid && target?.edge?.reason);
+
+        route_targets.push({
+          route_file: routeFilePath,
+          targets,
+        });
+      }
+    }
+
+    const normalizeObservedRoute = (value: string): string => {
+      let raw = String(value || '').trim();
+      if (!raw) return '';
+      if (/^https?:\/\//i.test(raw)) {
+        try {
+          const parsed = new URL(raw);
+          raw = parsed.pathname || raw;
+        } catch {
+          // keep original
+        }
+      }
+      raw = raw.split('?')[0].split('#')[0];
+      if (!raw.startsWith('/')) raw = `/${raw}`;
+      return raw.replace(/\/+$/, '') || '/';
+    };
+
+    const routePatternToRegex = (pattern: string): RegExp | null => {
+      const normalized = normalizeObservedRoute(pattern);
+      if (!normalized) return null;
+      const escaped = normalized
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        .replace(/\\\*/g, '[^/]+');
+      try {
+        return new RegExp(`^${escaped}$`);
+      } catch {
+        return null;
+      }
+    };
+
+    const routePatterns: Array<{
+      method: string;
+      pattern: string;
+      matcher: RegExp;
+      route_file: string;
+      controller: any;
+      confidence: number;
+      reason: string;
+    }> = [];
+    for (const routeEntry of route_targets) {
+      const routeFilePath = String(routeEntry?.route_file || '').trim();
+      for (const target of Array.isArray(routeEntry?.targets) ? routeEntry.targets : []) {
+        const reason = String(target?.edge?.reason || '').trim();
+        const match = reason.match(/^laravel-route:([a-z]+):(.+)$/i);
+        if (!match) continue;
+        const method = String(match[1] || '').trim().toUpperCase();
+        const pattern = String(match[2] || '').trim();
+        const matcher = routePatternToRegex(pattern);
+        if (!method || !pattern || !matcher) continue;
+        routePatterns.push({
+          method,
+          pattern,
+          matcher,
+          route_file: routeFilePath,
+          controller: target?.controller || null,
+          confidence: Number(target?.edge?.confidence ?? 0.9),
+          reason,
+        });
+      }
+    }
+
+    const runtimeSource = (
+      runtimeSnapshot.request_spans.length > 0
+      || runtimeSnapshot.db_queries.length > 0
+      || runtimeSnapshot.payload_shapes.length > 0
+    ) ? 'snapshot' : 'none';
+
+    const runtimeChangedFilePathSet = new Set(
+      [
+        ...changedFileObjs.map(item => normalizePath(item.filePath)),
+        ...untrackedFiles.map(item => normalizePath(item)),
+      ].filter(Boolean),
+    );
+
+    const runtime_hotspots: any[] = [];
+    const addRuntimeHotspot = (entry: any) => {
+      if (!entry || !entry.summary) return;
+      runtime_hotspots.push(entry);
+    };
+
+    for (const span of runtimeSnapshot.request_spans.slice(0, 200)) {
+      const method = String(span.method || '').trim().toUpperCase() || 'GET';
+      const observedRoute = normalizeObservedRoute(String(span.route || ''));
+      if (!observedRoute) continue;
+      const reasons: string[] = [];
+      const matchedRoutes: any[] = [];
+      const fileHints = Array.isArray(span.file_path_hints)
+        ? span.file_path_hints.map(item => normalizePath(item)).filter(Boolean)
+        : [];
+
+      for (const fileHint of fileHints) {
+        if (!isInScope(fileHint)) continue;
+        if (runtimeChangedFilePathSet.has(fileHint)) reasons.push(`file-hint:${fileHint}`);
+      }
+
+      for (const routePattern of routePatterns) {
+        if (routePattern.method !== method) continue;
+        if (!routePattern.matcher.test(observedRoute)) continue;
+        reasons.push(`route-match:${routePattern.pattern}`);
+        matchedRoutes.push({
+          route_file: routePattern.route_file,
+          pattern: routePattern.pattern,
+          confidence: routePattern.confidence,
+          controller: routePattern.controller,
+          reason: routePattern.reason,
+        });
+      }
+
+      if (reasons.length === 0) continue;
+      const durationMs = Number(span.duration_ms || 0);
+      const payloadBytes = Number(span.payload_bytes || 0);
+      const severity = durationMs >= 1000 || payloadBytes >= 500_000 ? 'high' : durationMs >= 400 ? 'medium' : 'low';
+      const score = Number((
+        (durationMs / 300)
+        + (payloadBytes > 0 ? Math.min(2, payloadBytes / 400_000) : 0)
+        + (matchedRoutes.length > 0 ? 1 : 0)
+      ).toFixed(3));
+
+      addRuntimeHotspot({
+        kind: 'request_span',
+        severity,
+        score,
+        summary: `${method} ${observedRoute} observed ${durationMs}ms`,
+        reasons: Array.from(new Set(reasons)).slice(0, 8),
+        confidence: Number(Math.min(0.95, 0.65 + (matchedRoutes.length > 0 ? 0.2 : 0.05)).toFixed(3)),
+        evidence: {
+          span,
+          matched_routes: matchedRoutes,
+        },
       });
     }
 
+    for (const query of runtimeSnapshot.db_queries.slice(0, 300)) {
+      const durationMs = Number(query.duration_ms || 0);
+      const lockWaitMs = Number(query.lock_wait_ms || 0);
+      const sql = String(query.sql || '').trim();
+      const route = normalizeObservedRoute(String(query.route || ''));
+      const reasons: string[] = [];
+      const fileHints = Array.isArray(query.file_path_hints)
+        ? query.file_path_hints.map(item => normalizePath(item)).filter(Boolean)
+        : [];
+      for (const fileHint of fileHints) {
+        if (!isInScope(fileHint)) continue;
+        if (runtimeChangedFilePathSet.has(fileHint)) reasons.push(`file-hint:${fileHint}`);
+      }
+      if (route) {
+        for (const routePattern of routePatterns) {
+          if (!routePattern.matcher.test(route)) continue;
+          reasons.push(`route-match:${routePattern.pattern}`);
+        }
+      }
+      if (reasons.length === 0) continue;
+      if (durationMs < 80 && lockWaitMs < 25) continue;
+
+      const severity = lockWaitMs >= 100 || durationMs >= 600 ? 'high' : durationMs >= 200 ? 'medium' : 'low';
+      const score = Number(((durationMs / 250) + (lockWaitMs / 120)).toFixed(3));
+      addRuntimeHotspot({
+        kind: 'db_query',
+        severity,
+        score,
+        summary: `DB query observed ${durationMs}ms${lockWaitMs > 0 ? ` (${lockWaitMs}ms lock wait)` : ''}`,
+        reasons: Array.from(new Set(reasons)).slice(0, 8),
+        confidence: Number(Math.min(0.93, 0.6 + (lockWaitMs >= 50 ? 0.15 : 0.05) + (sql ? 0.05 : 0)).toFixed(3)),
+        evidence: {
+          query,
+        },
+      });
+    }
+
+    runtime_hotspots.sort((left, right) => {
+      const severityRank = (value: string): number => (value === 'high' ? 3 : value === 'medium' ? 2 : 1);
+      const leftRank = severityRank(String(left?.severity || 'low'));
+      const rightRank = severityRank(String(right?.severity || 'low'));
+      if (rightRank !== leftRank) return rightRank - leftRank;
+      if (Number(right?.score || 0) !== Number(left?.score || 0)) return Number(right?.score || 0) - Number(left?.score || 0);
+      return String(left?.summary || '').localeCompare(String(right?.summary || ''));
+    });
+
     const authz: any[] = [];
-    for (const sym of changedSymbols) {
+    const controllerSymbols = changedSymbols.filter(sym => {
       const kind = String(sym?.kind || '');
       const filePath = String(sym?.filePath || '');
-      if (kind !== 'Method') continue;
-      if (!filePath.includes('/Http/Controllers/')) continue;
-      if (!filePath.toLowerCase().endsWith('.php')) continue;
+      return kind === 'Method'
+        && filePath.includes('/Http/Controllers/')
+        && filePath.toLowerCase().endsWith('.php');
+    });
 
-      const escaped = String(sym.uid || '').replace(/'/g, "''");
+    if (controllerSymbols.length > 0) {
+      const controllerById = new Map(
+        controllerSymbols
+          .map(sym => [String(sym?.uid || '').trim(), sym] as const)
+          .filter(([uid]) => !!uid),
+      );
+      const controllerIds = Array.from(controllerById.keys());
+      const controllerIdsCypher = `[${controllerIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+
       let authRows: any[] = [];
       try {
         authRows = await executeQuery(repo.id, `
-          MATCH (c {id: '${escaped}'})-[r:CodeRelation {type: 'CALLS'}]->(t)
-          WHERE r.confidence >= ${minConfidence}
+          MATCH (c)-[r:CodeRelation {type: 'CALLS'}]->(t)
+          WHERE c.id IN ${controllerIdsCypher}
+            AND r.confidence >= ${minConfidence}
             AND (
               r.reason STARTS WITH 'laravel-authorize:'
               OR r.reason STARTS WITH 'laravel-gate:'
               OR r.reason STARTS WITH 'laravel-can:'
             )
-          RETURN t.id AS uid, t.name AS name, labels(t) AS kind, t.filePath AS filePath,
+          RETURN c.id AS controllerId,
+                 t.id AS uid, t.name AS name, labels(t) AS kind, t.filePath AS filePath,
                  r.reason AS reason, r.confidence AS confidence
-          ORDER BY r.confidence DESC
-          LIMIT 25
+          ORDER BY c.id ASC, r.confidence DESC
+          LIMIT ${Math.max(200, Math.min(20000, controllerIds.length * 80))}
         `);
       } catch {
         authRows = [];
       }
 
-      const checks: any[] = [];
+      const authRowsByController = new Map<string, any[]>();
+      const constTargetIds = new Set<string>();
       for (const row of authRows) {
-        const targetUid = row.uid || row[0];
-        if (!targetUid || typeof targetUid !== 'string') continue;
-        const targetKind = row.kind || row[2] || '';
-        const check: any = {
-          target: {
-            uid: targetUid,
-            name: row.name || row[1] || '',
-            kind: targetKind,
-            filePath: row.filePath || row[3] || '',
-          },
-          edge: {
-            reason: row.reason || row[4] || '',
-            confidence: Number(row.confidence ?? row[5] ?? 1.0),
-          },
-        };
+        const controllerId = String(row.controllerId || row[0] || '').trim();
+        if (!controllerId) continue;
+        const list = authRowsByController.get(controllerId) || [];
+        list.push(row);
+        authRowsByController.set(controllerId, list);
 
-        // Expand enum const → permission slug when available
-        if (targetKind === 'Const') {
-          const constEscaped = targetUid.replace(/'/g, "''");
-          try {
-            const slugRows = await executeQuery(repo.id, `
-              MATCH (c {id: '${constEscaped}'})-[r:CodeRelation {type: 'CALLS'}]->(s:CodeElement)
-              WHERE r.reason STARTS WITH 'laravel-permission-slug:'
-              RETURN s.name AS name, s.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
-              ORDER BY r.confidence DESC
-              LIMIT 3
-            `);
-            if (slugRows.length > 0) {
-              check.permission_slugs = slugRows.map((sr: any) => ({
-                name: sr.name || sr[0] || '',
-                filePath: sr.filePath || sr[1] || '',
-                edge: {
-                  reason: sr.reason || sr[2] || '',
-                  confidence: Number(sr.confidence ?? sr[3] ?? 1.0),
-                },
-              })).filter((s: any) => s.name);
-            }
-          } catch { /* ignore */ }
-        }
-
-        checks.push(check);
+        const targetUid = String(row.uid || row[1] || '').trim();
+        const targetKind = row.kind || row[3] || '';
+        if (targetUid && targetKind === 'Const') constTargetIds.add(targetUid);
       }
 
-      if (checks.length === 0) continue;
-      authz.push({
-        controller: sym,
-        checks,
-      });
+      const permissionSlugsByConstId = new Map<string, any[]>();
+      if (constTargetIds.size > 0) {
+        const constIds = Array.from(constTargetIds);
+        const constIdsCypher = `[${constIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        let slugRows: any[] = [];
+        try {
+          slugRows = await executeQuery(repo.id, `
+            MATCH (c)-[r:CodeRelation {type: 'CALLS'}]->(s:CodeElement)
+            WHERE c.id IN ${constIdsCypher}
+              AND r.reason STARTS WITH 'laravel-permission-slug:'
+            RETURN c.id AS constId, s.name AS name, s.filePath AS filePath, r.reason AS reason, r.confidence AS confidence
+            ORDER BY c.id ASC, r.confidence DESC
+            LIMIT ${Math.max(100, Math.min(10000, constIds.length * 10))}
+          `);
+        } catch {
+          slugRows = [];
+        }
+
+        for (const row of slugRows) {
+          const constId = String(row.constId || row[0] || '').trim();
+          if (!constId) continue;
+          const list = permissionSlugsByConstId.get(constId) || [];
+          list.push({
+            name: row.name || row[1] || '',
+            filePath: row.filePath || row[2] || '',
+            edge: {
+              reason: row.reason || row[3] || '',
+              confidence: Number(row.confidence ?? row[4] ?? 1.0),
+            },
+          });
+          permissionSlugsByConstId.set(constId, list);
+        }
+      }
+
+      for (const [controllerId, controller] of controllerById.entries()) {
+        const rows = authRowsByController.get(controllerId) || [];
+        const checks = rows.map((row: any) => {
+          const targetUid = String(row.uid || row[1] || '').trim();
+          const targetKind = row.kind || row[3] || '';
+          const check: any = {
+            target: {
+              uid: targetUid,
+              name: row.name || row[2] || '',
+              kind: targetKind,
+              filePath: row.filePath || row[4] || '',
+            },
+            edge: {
+              reason: row.reason || row[5] || '',
+              confidence: Number(row.confidence ?? row[6] ?? 1.0),
+            },
+          };
+
+          if (targetUid && targetKind === 'Const') {
+            const permissionSlugs = permissionSlugsByConstId.get(targetUid) || [];
+            if (permissionSlugs.length > 0) {
+              check.permission_slugs = permissionSlugs
+                .filter((slug: any) => slug?.name)
+                .slice(0, 3);
+            }
+          }
+
+          return check;
+        }).filter((check: any) => check?.target?.uid);
+
+        if (checks.length === 0) continue;
+        authz.push({
+          controller,
+          checks,
+        });
+      }
     }
 
-    const review_kernel = buildReviewKernel({
+    const addReviewFinding = (
+      findings: ReviewFinding[],
+      finding: ReviewFinding,
+      dedupe: Set<string>,
+    ): void => {
+      const key = [
+        finding.code,
+        finding.evidence?.filePath || '',
+        finding.evidence?.symbol?.uid || '',
+      ].join('|');
+      if (dedupe.has(key)) return;
+      dedupe.add(key);
+      findings.push({
+        ...finding,
+        confidence: Number(Math.max(0, Math.min(1, Number(finding.confidence || 0))).toFixed(3)),
+      });
+    };
+
+    const reviewFindings: ReviewFinding[] = [];
+    const findingDedupe = new Set<string>();
+
+    for (const filePath of untrackedFiles) {
+      addReviewFinding(reviewFindings, {
+        code: 'untracked-file',
+        severity: 'medium',
+        summary: `Untracked file requires manual review: ${filePath}.`,
+        reason: 'untracked-file-not-indexed',
+        confidence: 0.99,
+        evidence: {
+          filePath,
+        },
+      }, findingDedupe);
+    }
+
+    for (const hotspot of runtime_hotspots.slice(0, 20)) {
+      const matchedRoute = Array.isArray(hotspot?.evidence?.matched_routes) ? hotspot.evidence.matched_routes[0] : null;
+      const fileHint = Array.isArray(hotspot?.evidence?.span?.file_path_hints)
+        ? hotspot.evidence.span.file_path_hints[0]
+        : Array.isArray(hotspot?.evidence?.query?.file_path_hints)
+          ? hotspot.evidence.query.file_path_hints[0]
+          : '';
+      const evidenceFilePath = String(
+        fileHint
+        || matchedRoute?.route_file
+        || changedFileObjs[0]?.filePath
+        || '',
+      ).trim();
+      if (!evidenceFilePath) continue;
+
+      addReviewFinding(reviewFindings, {
+        code: hotspot.kind === 'db_query' ? 'runtime-db-hotspot' : 'runtime-request-hotspot',
+        severity: hotspot.severity === 'high' ? 'high' : hotspot.severity === 'medium' ? 'medium' : 'low',
+        summary: `Runtime hotspot overlaps review diff: ${String(hotspot.summary || '').trim()}.`,
+        reason: Array.isArray(hotspot.reasons) ? hotspot.reasons.slice(0, 2).join('; ') : 'runtime-observation-hotspot',
+        confidence: Number(hotspot.confidence ?? 0.75),
+        evidence: {
+          filePath: normalizePath(evidenceFilePath),
+          symbol: matchedRoute?.controller
+            ? {
+              uid: String(matchedRoute.controller.uid || '').trim() || undefined,
+              name: String(matchedRoute.controller.name || '').trim() || undefined,
+              kind: String(matchedRoute.controller.kind || '').trim() || undefined,
+              startLine: Number.isFinite(Number(matchedRoute.controller.startLine))
+                ? Number(matchedRoute.controller.startLine)
+                : undefined,
+            }
+            : undefined,
+        },
+      }, findingDedupe);
+    }
+
+    for (const sliceEntry of Array.isArray(slice_stencil?.slices) ? slice_stencil.slices : []) {
+      const missingRequiredSlots = Array.isArray(sliceEntry?.stencil_delta?.missing_required_slots)
+        ? sliceEntry.stencil_delta.missing_required_slots
+        : [];
+      const missingRoles = Array.isArray(sliceEntry?.stencil_delta?.missing_roles)
+        ? sliceEntry.stencil_delta.missing_roles
+        : [];
+      const changedMember = Array.isArray(sliceEntry?.changed_members) ? sliceEntry.changed_members[0] : null;
+      const filePath = String(changedMember?.filePath || changedFileObjs[0]?.filePath || '').trim();
+      if (!filePath) continue;
+
+      if (missingRequiredSlots.length > 0) {
+        const deterministic = Number(sliceEntry?.gap_signals?.deterministic || 0) > 0;
+        const pattern = Number(sliceEntry?.gap_signals?.pattern || 0) > 0;
+        addReviewFinding(reviewFindings, {
+          code: 'slice-missing-required-slots',
+          severity: deterministic ? 'high' : 'medium',
+          summary: `Slice ${String(sliceEntry?.slice?.label || sliceEntry?.slice?.heuristicLabel || sliceEntry?.slice?.id || '').trim() || '<unknown>'} is missing required slots: ${missingRequiredSlots.join(', ')}.`,
+          reason: deterministic
+            ? 'slice-stencil:deterministic-missing-required-slots'
+            : pattern
+              ? 'slice-stencil:pattern-missing-required-slots'
+              : 'slice-stencil:heuristic-missing-required-slots',
+          confidence: deterministic ? 0.95 : pattern ? 0.9 : 0.8,
+          evidence: {
+            filePath,
+            symbol: changedMember
+              ? {
+                uid: String(changedMember.uid || '').trim() || undefined,
+                name: String(changedMember.name || '').trim() || undefined,
+                kind: String(changedMember.kind || '').trim() || undefined,
+                startLine: Number.isFinite(Number(changedMember.startLine)) ? Number(changedMember.startLine) : undefined,
+              }
+              : undefined,
+          },
+        }, findingDedupe);
+      }
+
+      if (missingRoles.length > 0) {
+        addReviewFinding(reviewFindings, {
+          code: 'slice-missing-roles',
+          severity: 'medium',
+          summary: `Slice ${String(sliceEntry?.slice?.label || sliceEntry?.slice?.heuristicLabel || sliceEntry?.slice?.id || '').trim() || '<unknown>'} is missing expected roles: ${missingRoles.join(', ')}.`,
+          reason: 'slice-stencil:missing-role-coverage',
+          confidence: 0.82,
+          evidence: {
+            filePath,
+            symbol: changedMember
+              ? {
+                uid: String(changedMember.uid || '').trim() || undefined,
+                name: String(changedMember.name || '').trim() || undefined,
+                kind: String(changedMember.kind || '').trim() || undefined,
+                startLine: Number.isFinite(Number(changedMember.startLine)) ? Number(changedMember.startLine) : undefined,
+              }
+              : undefined,
+          },
+        }, findingDedupe);
+      }
+    }
+
+    for (const route of route_targets) {
+      const routeFile = String(route?.route_file || '').trim();
+      if (!routeFile) continue;
+      const firstTarget = Array.isArray(route?.targets) ? route.targets[0] : null;
+      if (!firstTarget) {
+        addReviewFinding(reviewFindings, {
+          code: 'route-target-missing',
+          severity: 'high',
+          summary: `Route file changed without resolved controller target: ${routeFile}.`,
+          reason: 'route-file-without-controller-wiring',
+          confidence: 0.92,
+          evidence: { filePath: routeFile },
+        }, findingDedupe);
+        continue;
+      }
+
+      addReviewFinding(reviewFindings, {
+        code: 'route-target-changed',
+        severity: 'low',
+        summary: `Route change maps to ${String(firstTarget?.controller?.name || '<unknown>')}.`,
+        reason: String(firstTarget?.edge?.reason || 'laravel-route-edge'),
+        confidence: Number(firstTarget?.edge?.confidence ?? 0.9),
+        evidence: {
+          filePath: routeFile,
+          symbol: {
+            uid: String(firstTarget?.controller?.uid || '').trim() || undefined,
+            name: String(firstTarget?.controller?.name || '').trim() || undefined,
+            kind: String(firstTarget?.controller?.kind || '').trim() || undefined,
+            startLine: Number.isFinite(Number(firstTarget?.controller?.startLine)) ? Number(firstTarget.controller.startLine) : undefined,
+          },
+        },
+      }, findingDedupe);
+    }
+
+    const authFamily = (Array.isArray(semantic_diffs?.families) ? semantic_diffs.families : [])
+      .find((family: any) => String(family?.family || '') === 'auth');
+    if (Number(authFamily?.edge_count || 0) > 0 && authz.length === 0) {
+      const sampleEdge = Array.isArray(authFamily?.sample_edges) ? authFamily.sample_edges[0] : null;
+      const sourceFilePath = String(sampleEdge?.source?.filePath || '').trim();
+      addReviewFinding(reviewFindings, {
+        code: 'auth-delta-without-closure',
+        severity: 'high',
+        summary: 'Auth-related edge deltas detected without controller auth closure checks.',
+        reason: String(sampleEdge?.edge?.reason || 'auth-family-delta-without-authz'),
+        confidence: Number(sampleEdge?.edge?.confidence ?? 0.85),
+        evidence: {
+          filePath: sourceFilePath || changedFileObjs[0]?.filePath || '',
+          symbol: sampleEdge?.source
+            ? {
+              uid: String(sampleEdge.source.uid || '').trim() || undefined,
+              name: String(sampleEdge.source.name || '').trim() || undefined,
+              kind: String(sampleEdge.source.kind || '').trim() || undefined,
+            }
+            : undefined,
+        },
+      }, findingDedupe);
+    }
+
+    const review_kernel: any = buildReviewKernel({
       changed_files: changedFileObjs.length,
+      untracked_files: untrackedFiles.length,
       changed_symbols: changedSymbols.length,
       suggested_tests: suggested_tests.length,
       ui_contracts: ui_contracts.length,
       route_files: route_targets.length,
       authz_controllers: authz.length,
+      runtime_hotspots: runtime_hotspots.length,
+      runtime_source: runtimeSource,
       semantic_diffs,
       slice_stencil,
-        scope: effectiveScope,
-        path_prefixes: pathPrefixes,
-      });
+      scope: effectiveScope,
+      path_prefixes: pathPrefixes,
+    });
+
+    const severityRank: Record<ReviewFindingSeverity, number> = { high: 3, medium: 2, low: 1 };
+    reviewFindings.sort((left, right) => {
+      const leftRank = severityRank[left.severity] || 0;
+      const rightRank = severityRank[right.severity] || 0;
+      if (rightRank !== leftRank) return rightRank - leftRank;
+      if (right.confidence !== left.confidence) return right.confidence - left.confidence;
+      return left.summary.localeCompare(right.summary);
+    });
+
+    if (reviewFindings.length > 0) {
+      review_kernel.top_findings = Array.from(new Set(reviewFindings.map(finding => finding.summary))).slice(0, 8);
+    }
+    review_kernel.findings = reviewFindings.slice(0, 30);
+    review_kernel.findings_summary = {
+      total: reviewFindings.length,
+      high: reviewFindings.filter(finding => finding.severity === 'high').length,
+      medium: reviewFindings.filter(finding => finding.severity === 'medium').length,
+      low: reviewFindings.filter(finding => finding.severity === 'low').length,
+    };
+
+    const symbolizedFileSet = new Set(
+      changedSymbols
+        .map(symbol => normalizePath(String(symbol?.filePath || '')))
+        .filter(Boolean),
+    );
+    const symbolizedFileCount = changedFileObjs.reduce((count, file) => {
+      if (file.status === 'Deleted') return count;
+      const filePath = normalizePath(String(file?.filePath || ''));
+      if (!filePath) return count;
+      return symbolizedFileSet.has(filePath) ? count + 1 : count;
+    }, 0);
+    const coverage_banner = buildCoverageBanner({
+      changedFileCount: changedFileObjs.length,
+      untrackedFileCount: untrackedFiles.length,
+      changedSymbolCount: changedSymbols.length,
+      suggestedTestCount: suggested_tests.length,
+      symbolizedFileCount,
+      runtimeHotspotCount: runtime_hotspots.length,
+      runtimeSource,
+      runtimeGeneratedAt: runtimeSnapshot.generatedAt || '',
+      runtimeSourceFiles: runtimeSnapshot.source_files,
+    });
 
     return {
       status: 'ok',
@@ -7326,11 +8489,14 @@ export class LocalBackend {
       path_prefixes: pathPrefixes,
       summary: {
         changed_files: changedFileObjs.length,
+        untracked_files: untrackedFiles.length,
         changed_symbols: changedSymbols.length,
         suggested_tests: suggested_tests.length,
+        suggested_test_commands: test_commands.length,
         ui_contracts: ui_contracts.length,
         route_files: route_targets.length,
         authz_controllers: authz.length,
+        runtime_hotspots: runtime_hotspots.length,
         semantic_families: semantic_diffs.summary.family_count,
         semantic_gap_signals: semantic_diffs.summary.gap_signals,
         proof_symbols: proof_pack.summary.symbol_spans,
@@ -7338,6 +8504,8 @@ export class LocalBackend {
         stencil_slices: slice_stencil.summary.changed_slices,
         stencil_templates: slice_stencil.summary.with_templates,
       },
+      coverage_banner,
+      untracked_files: untrackedFiles,
       changed_files: changedFileObjs.map(f => ({
         filePath: normalizePath(f.filePath),
         status: f.status,
@@ -7348,9 +8516,11 @@ export class LocalBackend {
       changed_symbols: changedSymbols,
       symbols,
       suggested_tests,
+      test_commands,
       ui_contracts,
       route_targets,
       authz,
+      runtime_hotspots: runtime_hotspots.slice(0, 20),
       semantic_diffs,
       proof_pack,
       slice_stencil,
@@ -7373,6 +8543,8 @@ export class LocalBackend {
           limit_evidence: limitEvidence,
           include_slice_stencil: includeSliceStencil,
           limit_slice_stencil: limitSliceStencil,
+          runtime_source: runtimeSource,
+          runtime_source_files: runtimeSnapshot.source_files,
         },
       },
     };
@@ -7389,6 +8561,7 @@ export class LocalBackend {
     limit_candidates?: number;
     limit_hops?: number;
     include_precedents?: boolean;
+    runtime_observations?: unknown;
   }): Promise<any> {
     const queryText = String(params.query || '').trim();
     const symptomText = String(params.symptom || '').trim();
@@ -7399,33 +8572,233 @@ export class LocalBackend {
     const limitHops = Math.max(1, Math.min(20, params.limit_hops ?? 6));
     const includePrecedents = params.include_precedents !== false;
 
+    const normalizeNumber = (
+      value: unknown,
+      fallback = 0,
+      minValue = 0,
+      maxValue = Number.POSITIVE_INFINITY,
+    ): number => {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.max(minValue, Math.min(maxValue, parsed));
+    };
+
+    const normalizeSqlSignature = (sql: string): string => {
+      const normalized = String(sql || '')
+        .toLowerCase()
+        .replace(/'[^']*'/g, '?')
+        .replace(/"[^"]*"/g, '?')
+        .replace(/\b\d+\b/g, '?')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return normalized.slice(0, 240);
+    };
+
+    const normalizeRuntimeObservations = (value: unknown): {
+      request_spans: Array<{
+        method?: string;
+        route?: string;
+        duration_ms: number;
+        status?: number;
+        payload_bytes?: number;
+        trace_id?: string;
+      }>;
+      db_queries: Array<{
+        sql?: string;
+        duration_ms: number;
+        rows_examined?: number;
+        lock_wait_ms?: number;
+        count?: number;
+        explain_plan?: string;
+      }>;
+      payload_shapes: Array<{
+        path?: string;
+        item_count?: number;
+        bytes?: number;
+        keys?: string[];
+      }>;
+    } => {
+      const raw = (value && typeof value === 'object') ? (value as any) : {};
+      const requestSpansRaw = Array.isArray(raw.request_spans)
+        ? raw.request_spans
+        : Array.isArray(raw.requestSpans)
+          ? raw.requestSpans
+          : [];
+      const dbQueriesRaw = Array.isArray(raw.db_queries)
+        ? raw.db_queries
+        : Array.isArray(raw.dbQueries)
+          ? raw.dbQueries
+          : [];
+      const payloadShapesRaw = Array.isArray(raw.payload_shapes)
+        ? raw.payload_shapes
+        : Array.isArray(raw.payloadShapes)
+          ? raw.payloadShapes
+          : [];
+
+      const request_spans = requestSpansRaw
+        .map((item: any) => ({
+          method: String(item?.method || '').trim().toUpperCase() || undefined,
+          route: String(item?.route || item?.path || '').trim() || undefined,
+          duration_ms: normalizeNumber(item?.duration_ms ?? item?.durationMs, 0, 0, 60_000),
+          status: Number.isFinite(Number(item?.status)) ? Number(item.status) : undefined,
+          payload_bytes: Number.isFinite(Number(item?.payload_bytes ?? item?.payloadBytes))
+            ? Number(item?.payload_bytes ?? item?.payloadBytes)
+            : undefined,
+          trace_id: String(item?.trace_id || item?.traceId || '').trim() || undefined,
+        }))
+        .filter((item: any) => item.duration_ms > 0)
+        .slice(0, 200);
+
+      const db_queries = dbQueriesRaw
+        .map((item: any) => ({
+          sql: String(item?.sql || item?.query || '').trim() || undefined,
+          duration_ms: normalizeNumber(item?.duration_ms ?? item?.durationMs, 0, 0, 60_000),
+          rows_examined: Number.isFinite(Number(item?.rows_examined ?? item?.rowsExamined))
+            ? Number(item?.rows_examined ?? item?.rowsExamined)
+            : undefined,
+          lock_wait_ms: Number.isFinite(Number(item?.lock_wait_ms ?? item?.lockWaitMs))
+            ? Number(item?.lock_wait_ms ?? item?.lockWaitMs)
+            : undefined,
+          count: Number.isFinite(Number(item?.count)) ? Number(item.count) : undefined,
+          explain_plan: String(item?.explain_plan || item?.explainPlan || '').trim() || undefined,
+        }))
+        .filter((item: any) => item.duration_ms > 0 || (item.sql && item.sql.length > 0))
+        .slice(0, 500);
+
+      const payload_shapes = payloadShapesRaw
+        .map((item: any) => {
+          const keys = Array.isArray(item?.keys)
+            ? item.keys.map((entry: any) => String(entry || '').trim()).filter(Boolean).slice(0, 20)
+            : [];
+          return {
+            path: String(item?.path || item?.route || '').trim() || undefined,
+            item_count: Number.isFinite(Number(item?.item_count ?? item?.itemCount))
+              ? Number(item?.item_count ?? item?.itemCount)
+              : undefined,
+            bytes: Number.isFinite(Number(item?.bytes ?? item?.payload_bytes ?? item?.payloadBytes))
+              ? Number(item?.bytes ?? item?.payload_bytes ?? item?.payloadBytes)
+              : undefined,
+            keys,
+          };
+        })
+        .filter((item: any) => item.path || item.item_count || item.bytes)
+        .slice(0, 200);
+
+      return {
+        request_spans,
+        db_queries,
+        payload_shapes,
+      };
+    };
+
+    const mergeRuntimeObservations = (
+      primary: ReturnType<typeof normalizeRuntimeObservations>,
+      secondary: ReturnType<typeof normalizeRuntimeObservations>,
+    ): ReturnType<typeof normalizeRuntimeObservations> => {
+      const requestSeen = new Set<string>();
+      const dbSeen = new Set<string>();
+      const payloadSeen = new Set<string>();
+      const request_spans: ReturnType<typeof normalizeRuntimeObservations>['request_spans'] = [];
+      const db_queries: ReturnType<typeof normalizeRuntimeObservations>['db_queries'] = [];
+      const payload_shapes: ReturnType<typeof normalizeRuntimeObservations>['payload_shapes'] = [];
+
+      const addRequestSpan = (item: any) => {
+        const key = `${item?.method || ''}|${item?.route || ''}|${item?.duration_ms || 0}|${item?.status || ''}`;
+        if (requestSeen.has(key)) return;
+        requestSeen.add(key);
+        request_spans.push(item);
+      };
+      const addDbQuery = (item: any) => {
+        const key = `${item?.sql || ''}|${item?.duration_ms || 0}|${item?.lock_wait_ms || ''}|${item?.rows_examined || ''}`;
+        if (dbSeen.has(key)) return;
+        dbSeen.add(key);
+        db_queries.push(item);
+      };
+      const addPayloadShape = (item: any) => {
+        const key = `${item?.path || ''}|${item?.item_count || ''}|${item?.bytes || ''}|${Array.isArray(item?.keys) ? item.keys.join(',') : ''}`;
+        if (payloadSeen.has(key)) return;
+        payloadSeen.add(key);
+        payload_shapes.push(item);
+      };
+
+      for (const item of primary.request_spans) addRequestSpan(item);
+      for (const item of secondary.request_spans) addRequestSpan(item);
+      for (const item of primary.db_queries) addDbQuery(item);
+      for (const item of secondary.db_queries) addDbQuery(item);
+      for (const item of primary.payload_shapes) addPayloadShape(item);
+      for (const item of secondary.payload_shapes) addPayloadShape(item);
+
+      return {
+        request_spans: request_spans.slice(0, 500),
+        db_queries: db_queries.slice(0, 1000),
+        payload_shapes: payload_shapes.slice(0, 500),
+      };
+    };
+
+    const runtimeObservationPaths = parseStringList(process.env.GITNEXUS_RUNTIME_OBSERVATIONS_FILE || '');
+    const runtimeSnapshot = await loadRuntimeObservationSnapshot(repo.storagePath, {
+      repoPath: repo.repoPath,
+      extraPaths: runtimeObservationPaths,
+    });
+    const runtimeFromParams = normalizeRuntimeObservations((params as any).runtime_observations);
+    const runtimeFromSnapshot = normalizeRuntimeObservations(runtimeSnapshot);
+    const runtimeObservations = mergeRuntimeObservations(runtimeFromParams, runtimeFromSnapshot);
+    const hasRuntimeObservations = runtimeObservations.request_spans.length > 0
+      || runtimeObservations.db_queries.length > 0
+      || runtimeObservations.payload_shapes.length > 0;
+    const runtimeObservationSource = runtimeFromParams.request_spans.length > 0
+      || runtimeFromParams.db_queries.length > 0
+      || runtimeFromParams.payload_shapes.length > 0
+      ? (runtimeFromSnapshot.request_spans.length > 0 || runtimeFromSnapshot.db_queries.length > 0 || runtimeFromSnapshot.payload_shapes.length > 0
+        ? 'params+snapshot'
+        : 'params')
+      : (runtimeFromSnapshot.request_spans.length > 0 || runtimeFromSnapshot.db_queries.length > 0 || runtimeFromSnapshot.payload_shapes.length > 0
+        ? 'snapshot'
+        : 'none');
+
     const seedQuery = queryText || symptomText || failingTests[0] || errorStrings[0] || '';
     if (!seedQuery.trim()) {
       return { error: 'Provide at least one of query, symptom, failing_tests, or error_strings.' };
     }
 
     const classifySymptom = (value: string): {
-      family: 'auth' | 'cache' | 'shape' | 'routing' | 'event' | 'unknown';
+      family: 'auth' | 'cache' | 'shape' | 'routing' | 'event' | 'performance' | 'unknown';
       normalized: string;
       matched_tokens: string[];
+      confidence: number;
+      secondary_families: string[];
     } => {
       const normalized = String(value || '').trim().toLowerCase();
-      const tokenMap: Array<{ family: 'auth' | 'cache' | 'shape' | 'routing' | 'event'; tokens: string[] }> = [
+      const tokenMap: Array<{ family: 'auth' | 'cache' | 'shape' | 'routing' | 'event' | 'performance'; tokens: string[] }> = [
         { family: 'auth', tokens: ['403', 'forbidden', 'unauthorized', 'permission', 'authorize', 'auth', 'policy', 'can('] },
         { family: 'cache', tokens: ['stale', 'cache', 'invalidate', 'refetch', 'query key', 'setquerydata', 'missing update'] },
         { family: 'shape', tokens: ['field', 'payload', 'serialize', 'validation', 'null', 'undefined', 'wrong field'] },
         { family: 'routing', tokens: ['route', '404', 'endpoint', 'controller', 'path', 'url', 'method not allowed'] },
         { family: 'event', tokens: ['queue', 'event', 'listener', 'job', 'broadcast'] },
+        { family: 'performance', tokens: ['timeout', 'timed out', 'slow', 'latency', 'performance', 'n+1', 'lock wait', 'deadlock', 'rows examined', 'explain'] },
       ];
 
-      for (const entry of tokenMap) {
-        const matched = entry.tokens.filter(token => normalized.includes(token));
-        if (matched.length > 0) {
-          return { family: entry.family, normalized, matched_tokens: matched.slice(0, 8) };
-        }
+      const scored = tokenMap
+        .map(entry => ({
+          family: entry.family,
+          matched: entry.tokens.filter(token => normalized.includes(token)),
+        }))
+        .filter(entry => entry.matched.length > 0)
+        .sort((left, right) => right.matched.length - left.matched.length);
+
+      const primary = scored[0];
+      if (primary) {
+        const confidence = Number(Math.min(0.98, 0.45 + (primary.matched.length * 0.09)).toFixed(3));
+        return {
+          family: primary.family,
+          normalized,
+          matched_tokens: primary.matched.slice(0, 8),
+          confidence,
+          secondary_families: scored.slice(1, 4).map(entry => entry.family),
+        };
       }
 
-      return { family: 'unknown', normalized, matched_tokens: [] };
+      return { family: 'unknown', normalized, matched_tokens: [], confidence: 0.2, secondary_families: [] };
     };
 
     const symptomSignal = classifySymptom([
@@ -7475,13 +8848,142 @@ export class LocalBackend {
       }
     }
 
+    const hasPrecedentResults = () => Array.isArray(precedentPack?.precedents) && precedentPack.precedents.length > 0;
+    if (includePrecedents && !hasPrecedentResults()) {
+      const topSymbols = Array.isArray(queryResult?.process_symbols) ? queryResult.process_symbols.slice(0, 4) : [];
+      const fallbackQuery = [
+        seedQuery,
+        ...topSymbols.map((item: any) => String(item?.name || '').trim()).filter(Boolean),
+      ].join(' ').trim();
+      const fallbackAnchorUid = String(topSymbols[0]?.id || '').trim();
+      if (fallbackQuery) {
+        try {
+          const fallbackPack = await this.precedents(repo, {
+            query: fallbackQuery,
+            ...(fallbackAnchorUid ? { anchor_uid: fallbackAnchorUid } : {}),
+            limit: 2,
+            examples: 3,
+            path_prefixes: pathPrefixes,
+          });
+          if (Array.isArray(fallbackPack?.precedents) && fallbackPack.precedents.length > 0) {
+            precedentPack = fallbackPack;
+          }
+        } catch {
+          // best-effort fallback
+        }
+      }
+    }
+
+    const buildFixRecipes = (findings: string[]): Array<{ id: string; action: string; rationale: string }> => {
+      const catalog: Record<string, { id: string; action: string; rationale: string }> = {
+        'missing-endpoint-link': {
+          id: 'tighten-http-routing-signals',
+          action: 'Tighten HTTP path/method extraction so endpoint wiring resolves deterministically.',
+          rationale: 'Routing hops should use high-confidence endpoint links instead of fuzzy fallback edges.',
+        },
+        'missing-controller-link': {
+          id: 'wire-endpoint-controller-edge',
+          action: 'Ensure endpoint -> controller edges are emitted from route extraction.',
+          rationale: 'Missing handler links block one-hop cross-stack debug flows.',
+        },
+        'missing-permission-closure': {
+          id: 'add-auth-closure-edge',
+          action: 'Emit explicit permission slug edges for controller authorization calls.',
+          rationale: 'Auth symptoms require controller -> permission -> role closure in graph.',
+        },
+        'no-role-grants': {
+          id: 'parse-role-permission-grants',
+          action: 'Parse role grant sources and link roles directly to permission slugs.',
+          rationale: 'Without role grant edges, auth decisions remain partially manual.',
+        },
+        'missing-cache-coverage': {
+          id: 'expand-cache-contract',
+          action: 'Add invalidate/refetch/writeback coverage for queries affected by this mutation.',
+          rationale: 'Cache drift issues usually come from incomplete invalidation or writeback contracts.',
+        },
+        'slice-closure-gaps': {
+          id: 'mirror-sibling-closure',
+          action: 'Mirror required slice slots/roles from sibling precedents before editing logic.',
+          rationale: 'Closure gaps often indicate missing companion files or boundary logic.',
+        },
+        'low-confidence-http-wiring': {
+          id: 'raise-http-edge-confidence',
+          action: 'Prefer exact route/path matching and skip ambiguous edges.',
+          rationale: 'Debug recommendations degrade when cross-stack wiring confidence is low.',
+        },
+        'slow-request-path': {
+          id: 'trim-request-hot-path',
+          action: 'Reduce synchronous work on the request path and defer non-critical side effects.',
+          rationale: 'Request-level timeout symptoms are often dominated by serialized hot-path work.',
+        },
+        'large-payload-shape': {
+          id: 'bound-payload-cardinality',
+          action: 'Chunk or page large request arrays and avoid repeated full-array scans.',
+          rationale: 'Large payload cardinality amplifies O(n²) patterns and lock time windows.',
+        },
+        'slow-db-query': {
+          id: 'improve-query-selectivity',
+          action: 'Add/select better indexes and trim selected columns in slow query paths.',
+          rationale: 'High query duration indicates low selectivity or over-fetching.',
+        },
+        'possible-n-plus-one': {
+          id: 'collapse-looped-queries',
+          action: 'Replace per-item queries with eager loading, batched lookups, or keyed maps.',
+          rationale: 'Repeated query signatures under loops indicate likely N+1 behavior.',
+        },
+        'lock-contention': {
+          id: 'narrow-lock-scope',
+          action: 'Shorten transaction scope and acquire locks in a deterministic order.',
+          rationale: 'Long lock waits point to contention across competing write paths.',
+        },
+        'hot-path-cost': {
+          id: 'reduce-hot-path-complexity',
+          action: 'Pre-index inputs by key and avoid repeated linear lookups inside loops.',
+          rationale: 'High hot-path complexity drives timeout variance under larger payloads.',
+        },
+        'repeated-linear-lookups': {
+          id: 'replace-linear-lookups',
+          action: 'Build keyed maps once and use O(1) lookups in loops.',
+          rationale: 'Repeated .find()/findOrFail() scans inside loops scale poorly.',
+        },
+        'write-amplification': {
+          id: 'batch-write-path',
+          action: 'Skip unchanged rows and batch persistent writes where possible.',
+          rationale: 'Per-item save/update loops increase lock hold time and request latency.',
+        },
+        'no-op-write-churn': {
+          id: 'suppress-noop-writes',
+          action: 'Guard writes with diff checks so unchanged records are not persisted.',
+          rationale: 'No-op writes add DB and lock pressure without state changes.',
+        },
+        'db-plan-risk': {
+          id: 'review-explain-plan',
+          action: 'Capture EXPLAIN and remove plan operators that force scans/filesort/temporary tables.',
+          rationale: 'Plan regressions can dominate request latency even with small payloads.',
+        },
+      };
+
+      const recipes: Array<{ id: string; action: string; rationale: string }> = [];
+      const seen = new Set<string>();
+      for (const finding of findings) {
+        const item = catalog[finding];
+        if (!item || seen.has(item.id)) continue;
+        seen.add(item.id);
+        recipes.push(item);
+      }
+      return recipes;
+    };
+
     const candidateLoops: Array<{
-      kind: 'http_loop' | 'cache_loop' | 'slice_gap';
+      kind: 'http_loop' | 'cache_loop' | 'slice_gap' | 'runtime_loop' | 'perf_loop';
       score: number;
       symptom_fit: number;
       confidence: number;
+      confidence_reason: string;
+      symptom_fit_reasons: string[];
       summary: string;
       findings: string[];
+      fix_recipes: Array<{ id: string; action: string; rationale: string }>;
       evidence: any;
     }> = [];
 
@@ -7490,6 +8992,7 @@ export class LocalBackend {
       const findings: string[] = [];
       let score = 1;
       let symptomFit = 0;
+      const symptomFitReasons: string[] = [];
       const permissions = Array.isArray(hop?.permissions) ? hop.permissions : [];
 
       if (!hop?.endpoint?.uid) {
@@ -7521,9 +9024,15 @@ export class LocalBackend {
 
       if (symptomSignal.family === 'auth' && (findings.includes('missing-permission-closure') || findings.includes('no-role-grants'))) {
         symptomFit += 3;
+        symptomFitReasons.push('auth-permission-closure');
       }
       if (symptomSignal.family === 'routing' && (findings.includes('missing-endpoint-link') || findings.includes('missing-controller-link'))) {
         symptomFit += 3;
+        symptomFitReasons.push('routing-hop-gap');
+      }
+      if (symptomSignal.family === 'performance' && findings.includes('low-confidence-http-wiring')) {
+        symptomFit += 1;
+        symptomFitReasons.push('performance-ambiguous-routing');
       }
 
       const finalScore = score + symptomFit;
@@ -7532,8 +9041,11 @@ export class LocalBackend {
         score: finalScore,
         symptom_fit: symptomFit,
         confidence: Number(Math.max(0, Math.min(1, (httpConfidence + wiringConfidence) / 2)).toFixed(3)),
+        confidence_reason: 'Derived from averaged HTTP call edge + endpoint/controller wiring confidence.',
+        symptom_fit_reasons: symptomFitReasons,
         summary: `${String(hop?.http?.reason || 'http-loop')} -> ${String(hop?.controller?.name || 'unknown-controller')}`,
         findings,
+        fix_recipes: buildFixRecipes(findings),
         evidence: {
           hop: {
             http: hop?.http || null,
@@ -7552,13 +9064,17 @@ export class LocalBackend {
       if (gaps.length === 0) continue;
 
       const symptomFit = symptomSignal.family === 'cache' ? 3 : 0;
+      const findings = ['missing-cache-coverage'];
       candidateLoops.push({
         kind: 'cache_loop',
         score: 2 + (gaps.length * 0.5) + symptomFit,
         symptom_fit: symptomFit,
         confidence: 0.7,
+        confidence_reason: 'Cache coverage gaps are inferred from query/mutation contract extraction.',
+        symptom_fit_reasons: symptomFit > 0 ? ['cache-symptom-signal'] : [],
         summary: `${String(effect?.filePath || 'cache-surface')} has ${gaps.length} cache coverage gaps`,
-        findings: ['missing-cache-coverage'],
+        findings,
+        fix_recipes: buildFixRecipes(findings),
         evidence: {
           filePath: effect?.filePath || '',
           coverage_gaps: gaps.slice(0, 8),
@@ -7572,13 +9088,17 @@ export class LocalBackend {
       const severeGapCount = Number(gapSignals?.high || 0) + Number(gapSignals?.deterministic || 0);
       if (severeGapCount > 0) {
         const symptomFit = symptomSignal.family === 'shape' ? 2 : 0;
+        const findings = ['slice-closure-gaps'];
         candidateLoops.push({
           kind: 'slice_gap',
           score: 2 + severeGapCount + symptomFit,
           symptom_fit: symptomFit,
           confidence: 0.75,
+          confidence_reason: 'Feature-slice closure gaps are high-confidence structural signals from indexed slice slots/roles.',
+          symptom_fit_reasons: symptomFit > 0 ? ['shape-symptom-signal'] : [],
           summary: `Target slice ${String(targetSlice?.label || targetSlice?.uid || '')} has closure gap signals`,
-          findings: ['slice-closure-gaps'],
+          findings,
+          fix_recipes: buildFixRecipes(findings),
           evidence: {
             slice: targetSlice,
             gap_signals: gapSignals,
@@ -7587,10 +9107,240 @@ export class LocalBackend {
       }
     }
 
+    const dbSignatureCounts = new Map<string, number>();
+    for (const query of runtimeObservations.db_queries) {
+      const signature = normalizeSqlSignature(String(query.sql || ''));
+      if (!signature) continue;
+      dbSignatureCounts.set(signature, (dbSignatureCounts.get(signature) || 0) + Math.max(1, Number(query.count || 1)));
+    }
+
+    const payloadShapeByPath = new Map<string, any>();
+    for (const item of runtimeObservations.payload_shapes) {
+      const key = String(item.path || '').trim();
+      if (!key) continue;
+      payloadShapeByPath.set(key, item);
+    }
+
+    for (const requestSpan of runtimeObservations.request_spans.slice(0, Math.max(4, limitCandidates))) {
+      const findings: string[] = [];
+      const durationMs = normalizeNumber(requestSpan.duration_ms, 0, 0, 60_000);
+      const payloadBytes = normalizeNumber(requestSpan.payload_bytes, 0, 0, 20_000_000);
+      const routeKey = String(requestSpan.route || '').trim();
+      const payloadShape = routeKey ? payloadShapeByPath.get(routeKey) : null;
+
+      if (durationMs >= 350) findings.push('slow-request-path');
+      if (payloadBytes >= 250_000 || Number(payloadShape?.item_count || 0) >= 100) findings.push('large-payload-shape');
+      if (findings.length === 0) continue;
+
+      let symptomFit = 0;
+      const symptomFitReasons: string[] = [];
+      if (symptomSignal.family === 'performance') {
+        symptomFit += 4;
+        symptomFitReasons.push('performance-latency-signal');
+      }
+      if (symptomSignal.family === 'routing' && routeKey) {
+        symptomFit += 1;
+        symptomFitReasons.push('routing-route-signal');
+      }
+
+      const baseScore = 2 + Math.min(6, durationMs / 250) + (payloadBytes > 0 ? Math.min(2, payloadBytes / 500_000) : 0);
+      const confidence = Number(Math.min(0.92, 0.58 + (routeKey ? 0.12 : 0) + (durationMs >= 500 ? 0.1 : 0)).toFixed(3));
+      candidateLoops.push({
+        kind: 'runtime_loop',
+        score: baseScore + symptomFit,
+        symptom_fit: symptomFit,
+        confidence,
+        confidence_reason: 'Derived from observed request duration/payload metrics provided in runtime_observations.',
+        symptom_fit_reasons: symptomFitReasons,
+        summary: `${requestSpan.method || 'REQUEST'} ${routeKey || '(unknown-route)'} observed ${durationMs}ms`,
+        findings,
+        fix_recipes: buildFixRecipes(findings),
+        evidence: {
+          request_span: requestSpan,
+          payload_shape: payloadShape || null,
+        },
+      });
+    }
+
+    for (const dbQuery of runtimeObservations.db_queries.slice(0, Math.max(8, limitCandidates * 2))) {
+      const findings: string[] = [];
+      const durationMs = normalizeNumber(dbQuery.duration_ms, 0, 0, 60_000);
+      const lockWaitMs = normalizeNumber(dbQuery.lock_wait_ms, 0, 0, 60_000);
+      const rowsExamined = normalizeNumber(dbQuery.rows_examined, 0, 0, 1_000_000_000);
+      const signature = normalizeSqlSignature(String(dbQuery.sql || ''));
+      const repeatedCount = signature ? (dbSignatureCounts.get(signature) || 0) : 0;
+      const explainPlan = String(dbQuery.explain_plan || '');
+
+      if (durationMs >= 120) findings.push('slow-db-query');
+      if (lockWaitMs >= 40) findings.push('lock-contention');
+      if (repeatedCount >= 4) findings.push('possible-n-plus-one');
+      if (/\b(using temporary|filesort|seq scan|full scan|all)\b/i.test(explainPlan)) findings.push('db-plan-risk');
+      if (findings.length === 0) continue;
+
+      let symptomFit = 0;
+      const symptomFitReasons: string[] = [];
+      if (symptomSignal.family === 'performance') {
+        symptomFit += 4;
+        symptomFitReasons.push('performance-db-latency');
+      }
+      if (symptomSignal.family === 'event' && findings.includes('lock-contention')) {
+        symptomFit += 1;
+        symptomFitReasons.push('event-lock-contention');
+      }
+
+      const baseScore = 2
+        + Math.min(5, durationMs / 200)
+        + Math.min(3, lockWaitMs / 150)
+        + (repeatedCount >= 4 ? Math.min(2, repeatedCount / 5) : 0)
+        + (rowsExamined > 0 ? Math.min(2, rowsExamined / 50_000) : 0);
+      const confidence = Number(Math.min(0.94, 0.55 + (durationMs >= 200 ? 0.1 : 0) + (lockWaitMs >= 75 ? 0.12 : 0) + (signature ? 0.07 : 0)).toFixed(3));
+      candidateLoops.push({
+        kind: 'runtime_loop',
+        score: baseScore + symptomFit,
+        symptom_fit: symptomFit,
+        confidence,
+        confidence_reason: 'Derived from observed query duration/lock-wait metrics and repeated SQL signature frequency.',
+        symptom_fit_reasons: symptomFitReasons,
+        summary: `DB path observed ${durationMs}ms${lockWaitMs > 0 ? ` with ${lockWaitMs}ms lock wait` : ''}`,
+        findings,
+        fix_recipes: buildFixRecipes(findings),
+        evidence: {
+          db_query: dbQuery,
+          signature: signature || null,
+          repeated_signature_count: repeatedCount,
+          explain_plan: explainPlan || null,
+        },
+      });
+    }
+
+    const scanFileSet = new Set<string>();
+    const addScanFile = (filePathRaw: unknown) => {
+      const filePath = normalizeRepoRelativePath(String(filePathRaw || ''));
+      if (!filePath) return;
+      if (!filePathTouchesPrefixes(filePath, pathPrefixes)) return;
+      scanFileSet.add(filePath);
+    };
+    for (const symbol of Array.isArray(queryResult?.process_symbols) ? queryResult.process_symbols : []) {
+      addScanFile(symbol?.filePath);
+    }
+    for (const symbol of Array.isArray(queryResult?.definitions) ? queryResult.definitions : []) {
+      addScanFile(symbol?.filePath);
+    }
+    for (const file of Array.isArray(actionPlanResult?.files) ? actionPlanResult.files : []) {
+      addScanFile(file?.filePath);
+    }
+    for (const hop of hops) {
+      addScanFile(hop?.ui?.filePath);
+      addScanFile(hop?.endpoint?.filePath);
+      addScanFile(hop?.controller?.filePath);
+    }
+
+    const scannedPerfFiles: Array<{ filePath: string; metrics: any; score: number }> = [];
+    const loopLineRegex = /\b(?:for(?:each)?|while)\s*\(|\bforeach\s*\(/;
+    const linearLookupRegex = /\.(?:find|findIndex|some|filter)\s*\(|->(?:find|findOrFail|firstWhere)\s*\(|\barray_filter\s*\(/;
+    const queryInLoopRegex = /->where\s*\(|::where\s*\(|\bDB::(?:table|select|statement)\s*\(|->(?:load|loadMissing)\s*\(/;
+    const writeInLoopRegex = /->(?:save|update|delete)\s*\(|::(?:create|update|delete|upsert|insert)\s*\(|\bDB::insert\s*\(/;
+    const noOpWriteRegex = /->(?:save|update)\s*\(\s*(?:\[\s*\])?\s*\)/;
+
+    for (const filePath of Array.from(scanFileSet).slice(0, 10)) {
+      const fullPath = path.join(repo.repoPath, filePath);
+      let content = '';
+      try {
+        content = await fs.readFile(fullPath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const lines = content.split('\n');
+      let loopCount = 0;
+      let nestedLoopCount = 0;
+      let linearLookups = 0;
+      let queryInLoopCount = 0;
+      let writeInLoopCount = 0;
+      let noOpWriteCount = 0;
+      let loopWindow = 0;
+      for (const line of lines) {
+        const isLoopLine = loopLineRegex.test(line);
+        if (isLoopLine) {
+          loopCount += 1;
+          if (loopWindow > 0) nestedLoopCount += 1;
+          loopWindow = Math.max(loopWindow, 8);
+        } else if (loopWindow > 0) {
+          loopWindow -= 1;
+        }
+
+        if (loopWindow <= 0) continue;
+        if (linearLookupRegex.test(line)) linearLookups += 1;
+        if (queryInLoopRegex.test(line)) queryInLoopCount += 1;
+        if (writeInLoopRegex.test(line)) writeInLoopCount += 1;
+        if (noOpWriteRegex.test(line)) noOpWriteCount += 1;
+      }
+
+      const costScore = (loopCount * 0.25)
+        + (nestedLoopCount * 1.3)
+        + (linearLookups * 0.7)
+        + (queryInLoopCount * 1.5)
+        + (writeInLoopCount * 1.0)
+        + (noOpWriteCount * 0.9);
+
+      if (costScore < 2) continue;
+
+      scannedPerfFiles.push({
+        filePath,
+        score: Number(costScore.toFixed(3)),
+        metrics: {
+          loop_count: loopCount,
+          nested_loop_count: nestedLoopCount,
+          linear_lookups_in_loop: linearLookups,
+          query_calls_in_loop: queryInLoopCount,
+          write_calls_in_loop: writeInLoopCount,
+          noop_writes_in_loop: noOpWriteCount,
+        },
+      });
+    }
+
+    for (const perf of scannedPerfFiles.slice(0, Math.max(4, limitCandidates))) {
+      const findings = ['hot-path-cost'];
+      if (perf.metrics.linear_lookups_in_loop > 0) findings.push('repeated-linear-lookups');
+      if (perf.metrics.query_calls_in_loop > 0) findings.push('possible-n-plus-one');
+      if (perf.metrics.write_calls_in_loop > 0) findings.push('write-amplification');
+      if (perf.metrics.noop_writes_in_loop > 0) findings.push('no-op-write-churn');
+
+      let symptomFit = 0;
+      const symptomFitReasons: string[] = [];
+      if (symptomSignal.family === 'performance') {
+        symptomFit += 3;
+        symptomFitReasons.push('performance-static-hotpath');
+      }
+      const confidence = Number(Math.min(
+        0.9,
+        0.42
+        + Math.min(0.3, perf.score / 10)
+        + (perf.metrics.query_calls_in_loop > 0 ? 0.08 : 0)
+        + (perf.metrics.nested_loop_count > 0 ? 0.06 : 0),
+      ).toFixed(3));
+      candidateLoops.push({
+        kind: 'perf_loop',
+        score: perf.score + symptomFit,
+        symptom_fit: symptomFit,
+        confidence,
+        confidence_reason: 'Static hot-path heuristics over loop/query/write patterns in scoped files.',
+        symptom_fit_reasons: symptomFitReasons,
+        summary: `${perf.filePath} has hot-path complexity signals (score=${perf.score.toFixed(2)})`,
+        findings,
+        fix_recipes: buildFixRecipes(findings),
+        evidence: {
+          filePath: perf.filePath,
+          metrics: perf.metrics,
+        },
+      });
+    }
+
     const rankedCandidates = candidateLoops
       .sort((left, right) => {
         if (right.score !== left.score) return right.score - left.score;
         if (right.symptom_fit !== left.symptom_fit) return right.symptom_fit - left.symptom_fit;
+        if (right.confidence !== left.confidence) return right.confidence - left.confidence;
         return left.summary.localeCompare(right.summary);
       })
       .slice(0, limitCandidates);
@@ -7639,10 +9389,16 @@ export class LocalBackend {
         hypotheses.push('Feature slice closure is below sibling expectations; missing companions likely drive symptom.');
       } else if (candidate.findings.includes('missing-endpoint-link') || candidate.findings.includes('missing-controller-link')) {
         hypotheses.push('Routing chain has a missing/ambiguous hop between UI endpoint call and backend controller.');
+      } else if (candidate.findings.includes('lock-contention')) {
+        hypotheses.push('Observed lock waits suggest transaction/lock scope contention on the request path.');
+      } else if (candidate.findings.includes('possible-n-plus-one')) {
+        hypotheses.push('Repeated query signatures or query-inside-loop patterns indicate likely N+1 amplification.');
+      } else if (candidate.findings.includes('hot-path-cost')) {
+        hypotheses.push('Hot-path cost model flags repeated loop scans/writes as likely timeout contributors.');
       }
     }
 
-    const nextActions = [
+    const nextActions: string[] = [
       'Open candidate evidence spans with context() on top-ranked symbols.',
       'Run impact() on the first broken-loop symbol to map direct dependents.',
       'Compare target slice vs sibling precedent before editing shared utilities.',
@@ -7651,6 +9407,125 @@ export class LocalBackend {
     if (failingTests.length > 0) {
       nextActions.push('Re-run failing tests after applying the highest-confidence loop fix.');
     }
+    if (!hasRuntimeObservations) {
+      nextActions.push('Attach runtime_observations (request spans, DB timings, lock waits) for stronger root-cause ranking.');
+    }
+    if (!hasPrecedentResults() && includePrecedents) {
+      nextActions.push('Precedent retrieval returned empty; rely on action_plan hops + context() before editing.');
+    }
+
+    const timeline = hops.slice(0, limitHops).map((hop: any, index: number) => ({
+      step: index + 1,
+      ui: hop?.ui ? {
+        uid: hop.ui.uid,
+        name: hop.ui.name,
+        filePath: hop.ui.filePath,
+        startLine: hop.ui.startLine,
+      } : null,
+      http: hop?.http ? {
+        reason: hop.http.reason,
+        confidence: hop.http.confidence,
+      } : null,
+      endpoint: hop?.endpoint ? {
+        uid: hop.endpoint.uid,
+        name: hop.endpoint.name,
+        filePath: hop.endpoint.filePath,
+        startLine: hop.endpoint.startLine,
+      } : null,
+      controller: hop?.controller ? {
+        uid: hop.controller.uid,
+        name: hop.controller.name,
+        filePath: hop.controller.filePath,
+        startLine: hop.controller.startLine,
+      } : null,
+      permissions: Array.isArray(hop?.permissions) ? hop.permissions.map((grant: any) => ({
+        permission: grant?.permission || null,
+        role_count: Array.isArray(grant?.roles) ? grant.roles.length : 0,
+      })) : [],
+    }));
+
+    const indexStatus = await this.getIndexStatus(repo);
+    const precedentCount = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents.length : 0;
+    const coverageWarnings: string[] = [];
+    if (indexStatus.isStale) {
+      coverageWarnings.push('Index is stale versus HEAD; refresh before trusting complete root-cause ranking.');
+    }
+    if (!hasRuntimeObservations) {
+      coverageWarnings.push('No runtime observations provided; performance root-cause confidence is capped.');
+    } else if (runtimeObservationSource === 'snapshot' || runtimeObservationSource === 'params+snapshot') {
+      coverageWarnings.push('Runtime observations were auto-loaded from snapshot sidecar files.');
+    }
+    if (includePrecedents && precedentCount === 0) {
+      coverageWarnings.push('No precedents resolved; anatomy-fit findings rely on static signals only.');
+    }
+    if (hops.length === 0) {
+      coverageWarnings.push('No cross-stack HTTP hops found for this anchor query; routing evidence is limited.');
+    }
+    if (scannedPerfFiles.length === 0) {
+      coverageWarnings.push('Static hot-path scan found no strong loop/query/write signals in scanned files.');
+    }
+
+    const average = (values: number[]): number => {
+      if (values.length === 0) return 0;
+      const total = values.reduce((sum, value) => sum + value, 0);
+      return total / values.length;
+    };
+    const routeOwnershipConfidence = hops.length > 0
+      ? average(hops.map((hop: any) => Number(hop?.http?.confidence ?? 0.7)))
+      : 0.35;
+    const rootCauseConfidence = rankedCandidates.length > 0
+      ? average(rankedCandidates.slice(0, 3).map(candidate => Number(candidate.confidence || 0)))
+      : 0.3;
+    const recipeCoverage = rankedCandidates.length > 0
+      ? average(rankedCandidates.slice(0, 5).map(candidate => candidate.fix_recipes.length > 0 ? 1 : 0))
+      : 0;
+    const fixRecommendationConfidence = Math.min(0.92, 0.35 + (recipeCoverage * 0.45) + (hasRuntimeObservations ? 0.1 : 0));
+
+    const confidenceBreakdown = {
+      claims: [
+        {
+          claim: 'route_ownership',
+          confidence: Number(routeOwnershipConfidence.toFixed(3)),
+          reason: hops.length > 0
+            ? 'Based on HTTP + endpoint/controller edge confidence from top hops.'
+            : 'No top hops available for ownership confidence.',
+        },
+        {
+          claim: 'root_cause_localization',
+          confidence: Number(rootCauseConfidence.toFixed(3)),
+          reason: rankedCandidates.length > 0
+            ? 'Based on weighted symptom fit and candidate evidence confidence.'
+            : 'No ranked candidates available for localization confidence.',
+        },
+        {
+          claim: 'fix_recommendation',
+          confidence: Number(fixRecommendationConfidence.toFixed(3)),
+          reason: hasRuntimeObservations
+            ? 'Based on candidate fix recipe coverage plus runtime evidence availability.'
+            : 'Based on static evidence only; runtime observations were not provided.',
+        },
+      ],
+    };
+
+    const actionChecks = Array.isArray(actionPlanResult?.checks) ? actionPlanResult.checks : [];
+    const verificationChecks = Array.from(new Set([
+      ...failingTests.slice(0, 6).map(testName => `Re-run failing test: ${testName}`),
+      ...actionChecks.slice(0, 4),
+      'Run review_mode(scope=unstaged, include_slice_stencil=true, include_evidence_spans=true) after patch.',
+    ])).slice(0, 10);
+
+    const verificationContract = {
+      checks: verificationChecks,
+      post_edit_review: {
+        tool: 'review_mode',
+        params: {
+          scope: 'unstaged',
+          ...(pathPrefixes.length > 0 ? { path_prefixes: pathPrefixes } : {}),
+          include_slice_stencil: true,
+          include_evidence_spans: true,
+        },
+      },
+    };
 
     return {
       status: 'ok',
@@ -7670,10 +9545,38 @@ export class LocalBackend {
           hops: hops.slice(0, limitHops),
           cache_effects: cacheEffects.slice(0, 5),
         },
+        runtime_observations: {
+          request_spans: runtimeObservations.request_spans.slice(0, 20),
+          db_queries: runtimeObservations.db_queries.slice(0, 20),
+          payload_shapes: runtimeObservations.payload_shapes.slice(0, 20),
+          source: runtimeObservationSource,
+          snapshot_generated_at: runtimeSnapshot.generatedAt || '',
+          source_files: Array.isArray(runtimeSnapshot.source_files) ? runtimeSnapshot.source_files : [],
+        },
+        timeline,
         candidates: rankedCandidates,
         sibling_diff: siblingDiff,
         hypotheses: Array.from(new Set(hypotheses)).slice(0, 8),
         next_actions: nextActions.slice(0, 8),
+        confidence_breakdown: confidenceBreakdown,
+        coverage: {
+          freshness: {
+            is_stale: indexStatus.isStale,
+            indexed_at: indexStatus.indexedAt,
+            indexed_commit: indexStatus.indexedCommit || null,
+            head_commit: indexStatus.headCommit || null,
+          },
+          runtime_observations: hasRuntimeObservations,
+          runtime_source: runtimeObservationSource,
+          runtime_snapshot_generated_at: runtimeSnapshot.generatedAt || '',
+          runtime_source_files: Array.isArray(runtimeSnapshot.source_files) ? runtimeSnapshot.source_files : [],
+          precedents: precedentCount,
+          hops: hops.length,
+          cache_effects: cacheEffects.length,
+          static_perf_scan_files: scannedPerfFiles.length,
+          warnings: coverageWarnings,
+        },
+        verification_contract: verificationContract,
       },
       _debug_mode: {
         knobs: {
@@ -7681,6 +9584,9 @@ export class LocalBackend {
           limit_hops: limitHops,
           include_precedents: includePrecedents,
           path_prefixes: pathPrefixes,
+          runtime_observations: hasRuntimeObservations,
+          runtime_source: runtimeObservationSource,
+          scanned_perf_files: scannedPerfFiles.length,
         },
       },
     };
@@ -8046,103 +9952,187 @@ export class LocalBackend {
     await this.ensureInitialized(repo.id);
     
     const scope = params.scope || 'unstaged';
-    const { execSync } = await import('child_process');
-    
-    // Build git diff command based on scope
-    let diffCmd: string;
-    switch (scope) {
-      case 'staged':
-        diffCmd = 'git diff --staged --name-only';
-        break;
-      case 'all':
-        diffCmd = 'git diff HEAD --name-only';
-        break;
-      case 'compare':
-        if (!params.base_ref) return { error: 'base_ref is required for "compare" scope' };
-        diffCmd = `git diff ${params.base_ref} --name-only`;
-        break;
-      case 'unstaged':
-      default:
-        diffCmd = 'git diff --name-only';
-        break;
-    }
-    
-    let changedFiles: string[];
+    const baseRef = String(params.base_ref || '').trim();
+    const { execFileSync } = await import('child_process');
+
+    const normalizePath = (value: string): string => normalizeRepoRelativePath(value);
+    const parseLines = (output: string): string[] => (
+      String(output || '')
+        .split('\n')
+        .map(line => normalizePath(line))
+        .filter(Boolean)
+    );
+
+    const buildDiffArgs = (): string[] => {
+      const args = ['diff', '--name-only'];
+      switch (scope) {
+        case 'staged':
+          args.push('--staged');
+          break;
+        case 'all':
+          args.push('HEAD');
+          break;
+        case 'compare':
+          if (!baseRef) throw new Error('base_ref is required for "compare" scope');
+          args.push(`${baseRef}...HEAD`);
+          break;
+        case 'unstaged':
+        default:
+          break;
+      }
+      return args;
+    };
+
+    const changedFileStatus = new Map<string, 'Modified' | 'Untracked'>();
     try {
-      const output = execSync(diffCmd, { cwd: repo.repoPath, encoding: 'utf-8' });
-      changedFiles = output.trim().split('\n').filter(f => f.length > 0);
+      const output = execFileSync('git', buildDiffArgs(), {
+        cwd: repo.repoPath,
+        encoding: 'utf-8',
+      });
+      for (const filePath of parseLines(output)) {
+        changedFileStatus.set(filePath, 'Modified');
+      }
     } catch (err: any) {
-      return { error: `Git diff failed: ${err.message}` };
+      return { error: `Git diff failed: ${err?.message || 'unknown error'}` };
     }
-    
+
+    // Include untracked files for non-staged scopes so detect_changes matches review behavior.
+    if (scope !== 'staged') {
+      try {
+        const statusOutput = execFileSync('git', ['status', '--porcelain'], {
+          cwd: repo.repoPath,
+          encoding: 'utf-8',
+        });
+        for (const line of String(statusOutput || '').split('\n')) {
+          if (!line.startsWith('?? ')) continue;
+          const filePath = normalizePath(line.slice(3));
+          if (!filePath) continue;
+          if (!changedFileStatus.has(filePath)) changedFileStatus.set(filePath, 'Untracked');
+        }
+      } catch {
+        // best-effort only
+      }
+    }
+
+    const changedFiles = Array.from(changedFileStatus.entries()).map(([filePath, status]) => ({ filePath, status }));
+
     if (changedFiles.length === 0) {
       return {
-        summary: { changed_count: 0, affected_count: 0, risk_level: 'none', message: 'No changes detected.' },
+        summary: {
+          changed_count: 0,
+          affected_count: 0,
+          changed_files: 0,
+          untracked_files: 0,
+          risk_level: 'none',
+          message: 'No changes detected.',
+        },
+        changed_files: [],
         changed_symbols: [],
         affected_processes: [],
       };
     }
-    
-    // Map changed files to indexed symbols
-    const changedSymbols: any[] = [];
-    for (const file of changedFiles) {
-      const escaped = file.replace(/\\/g, '/').replace(/'/g, "''");
-      try {
-        const symbols = await executeQuery(repo.id, `
-          MATCH (n) WHERE n.filePath CONTAINS '${escaped}'
-          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath
-          LIMIT 20
-        `);
-        for (const sym of symbols) {
-          changedSymbols.push({
-            id: sym.id || sym[0],
-            name: sym.name || sym[1],
-            type: sym.type || sym[2],
-            filePath: sym.filePath || sym[3],
-            change_type: 'Modified',
-          });
-        }
-      } catch { /* skip */ }
+
+    const changedFilePaths = changedFiles.map(file => file.filePath);
+    const changedFilesCypher = `[${changedFilePaths.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+
+    // Map changed files to indexed symbols (exact path match for accuracy).
+    const changedSymbolsById = new Map<string, {
+      id: string;
+      name: string;
+      type: string;
+      filePath: string;
+      change_type: 'Modified' | 'Untracked';
+    }>();
+
+    try {
+      const symbolRows = await executeQuery(repo.id, `
+        MATCH (n)
+        WHERE n.filePath IN ${changedFilesCypher}
+        RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath
+        LIMIT ${Math.max(200, Math.min(5000, changedFilePaths.length * 50))}
+      `);
+
+      for (const row of symbolRows) {
+        const id = String(row.id || row[0] || '').trim();
+        const filePath = normalizePath(String(row.filePath || row[3] || ''));
+        if (!id || !filePath) continue;
+        if (changedSymbolsById.has(id)) continue;
+
+        changedSymbolsById.set(id, {
+          id,
+          name: String(row.name || row[1] || '').trim(),
+          type: row.type || row[2] || '',
+          filePath,
+          change_type: changedFileStatus.get(filePath) || 'Modified',
+        });
+      }
+    } catch {
+      // best-effort only
     }
-    
-    // Find affected processes
-    const affectedProcesses = new Map<string, any>();
-    for (const sym of changedSymbols) {
-      const escaped = (sym.id as string).replace(/'/g, "''");
+
+    const changedSymbols = Array.from(changedSymbolsById.values());
+    const changedSymbolIds = changedSymbols.map(symbol => symbol.id).filter(Boolean);
+
+    // Find affected processes in one batched query.
+    const affectedProcesses = new Map<string, {
+      id: string;
+      name: string;
+      process_type: string;
+      step_count: number;
+      changed_steps: Array<{ symbol: string; step: number }>;
+    }>();
+
+    if (changedSymbolIds.length > 0) {
       try {
-        const procs = await executeQuery(repo.id, `
-          MATCH (n {id: '${escaped}'})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          RETURN p.id AS pid, p.heuristicLabel AS label, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        const changedSymbolIdsCypher = `[${changedSymbolIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]`;
+        const processRows = await executeQuery(repo.id, `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE n.id IN ${changedSymbolIdsCypher}
+          RETURN n.id AS symbolId, n.name AS symbolName, p.id AS pid, p.heuristicLabel AS label, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+          LIMIT ${Math.max(500, Math.min(15000, changedSymbolIds.length * 80))}
         `);
-        for (const proc of procs) {
-          const pid = proc.pid || proc[0];
+
+        for (const row of processRows) {
+          const pid = String(row.pid || row[2] || '').trim();
+          if (!pid) continue;
           if (!affectedProcesses.has(pid)) {
             affectedProcesses.set(pid, {
               id: pid,
-              name: proc.label || proc[1],
-              process_type: proc.processType || proc[2],
-              step_count: proc.stepCount || proc[3],
+              name: String(row.label || row[3] || '').trim(),
+              process_type: String(row.processType || row[4] || '').trim(),
+              step_count: Number(row.stepCount ?? row[5] ?? 0) || 0,
               changed_steps: [],
             });
           }
+
           affectedProcesses.get(pid)!.changed_steps.push({
-            symbol: sym.name,
-            step: proc.step || proc[4],
+            symbol: String(row.symbolName || row[1] || '').trim(),
+            step: Number(row.step ?? row[6] ?? 0) || 0,
           });
         }
-      } catch { /* skip */ }
+      } catch {
+        // best-effort only
+      }
     }
-    
+
     const processCount = affectedProcesses.size;
-    const risk = processCount === 0 ? 'low' : processCount <= 5 ? 'medium' : processCount <= 15 ? 'high' : 'critical';
-    
+    const risk = processCount === 0
+      ? (changedSymbols.length === 0 ? 'low' : 'medium')
+      : processCount <= 5
+        ? 'medium'
+        : processCount <= 15
+          ? 'high'
+          : 'critical';
+
     return {
       summary: {
         changed_count: changedSymbols.length,
         affected_count: processCount,
         changed_files: changedFiles.length,
+        untracked_files: changedFiles.filter(file => file.status === 'Untracked').length,
         risk_level: risk,
       },
+      changed_files: changedFiles,
       changed_symbols: changedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
     };

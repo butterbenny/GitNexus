@@ -203,6 +203,23 @@ test('MCP debug_mode: ranks auth broken loop candidates using symptom + hop evid
     query: 'fetchAccountNotifications',
     symptom: '403 forbidden on notifications page',
     failing_tests: ['NotificationsApiTest::test_forbidden_without_permission'],
+    runtime_observations: {
+      request_spans: [
+        { method: 'GET', route: '/api/accounts/42/notifications', duration_ms: 920, payload_bytes: 402120, status: 403 },
+      ],
+      db_queries: [
+        {
+          sql: 'select * from notifications where account_id = 42',
+          duration_ms: 180,
+          lock_wait_ms: 65,
+          rows_examined: 12000,
+          explain_plan: 'Using temporary; Using filesort',
+        },
+      ],
+      payload_shapes: [
+        { path: '/api/accounts/42/notifications', item_count: 240, bytes: 402120, keys: ['accounts', 'notifications'] },
+      ],
+    },
   }, env);
 
   assert.equal(debug.status, 'ok');
@@ -220,5 +237,102 @@ test('MCP debug_mode: ranks auth broken loop candidates using symptom + hop evid
   );
   assert.ok(Array.isArray(debug.debug?.next_actions));
   assert.ok(debug.debug.next_actions.some(step => String(step).includes('review_mode')));
+  assert.ok(Array.isArray(debug.debug?.timeline), 'expected timeline output');
+  assert.ok(debug.debug.timeline.length > 0, 'expected timeline steps');
+  assert.ok(Array.isArray(debug.debug?.coverage?.warnings), 'expected coverage warnings');
+  assert.equal(debug.debug?.coverage?.runtime_observations, true, 'expected runtime observation coverage flag');
+  assert.ok(Array.isArray(debug.debug?.confidence_breakdown?.claims), 'expected confidence breakdown claims');
+  assert.ok(
+    debug.debug.candidates.every(c => Array.isArray(c?.fix_recipes)),
+    'expected candidate fix recipes to be emitted',
+  );
+  assert.ok(
+    debug.debug.candidates.some(c =>
+      Array.isArray(c?.findings)
+      && (
+        c.findings.includes('slow-request-path')
+        || c.findings.includes('slow-db-query')
+        || c.findings.includes('lock-contention')
+      )
+    ),
+    'expected runtime-derived findings in debug candidates',
+  );
+  assert.equal(debug.debug?.verification_contract?.post_edit_review?.tool, 'review_mode');
   assert.equal(debug._debug_mode?.knobs?.include_precedents, true);
+  assert.equal(debug._debug_mode?.knobs?.runtime_observations, true);
+});
+
+test('MCP debug_mode: auto-loads runtime observations from snapshot sidecar', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-debug-mode-runtime-snapshot-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.writeFile(
+    path.join(repoPath, 'src/slowPath.ts'),
+    [
+      'export const slowPath = (items: number[]): number => {',
+      '  let total = 0;',
+      '  for (const item of items) {',
+      '    total += items.find(v => v === item) ?? 0;',
+      '  }',
+      '  return total;',
+      '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output = runAnalyze(repoPath, env);
+  assert.match(output, /Repository indexed successfully/i);
+
+  await fs.mkdir(path.join(repoPath, '.gitnexus'), { recursive: true });
+  await fs.writeFile(
+    path.join(repoPath, '.gitnexus/runtime-observations.json'),
+    JSON.stringify({
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      request_spans: [
+        { method: 'POST', route: '/api/slow-path', duration_ms: 1450, payload_bytes: 620000, file_path_hints: ['src/slowPath.ts'] },
+      ],
+      db_queries: [
+        {
+          sql: 'select * from jobs where queue = ?',
+          duration_ms: 260,
+          lock_wait_ms: 90,
+          rows_examined: 34000,
+          file_path_hints: ['src/slowPath.ts'],
+          explain_plan: 'Using temporary',
+        },
+      ],
+      payload_shapes: [
+        { path: '/api/slow-path', item_count: 500, bytes: 620000, keys: ['items'] },
+      ],
+    }, null, 2),
+    'utf-8'
+  );
+
+  const debug = runTool('debug_mode', {
+    query: 'slowPath',
+    symptom: 'timeout while processing slow path',
+  }, env);
+
+  assert.equal(debug.status, 'ok');
+  assert.equal(debug.debug?.coverage?.runtime_observations, true);
+  assert.equal(debug.debug?.runtime_observations?.source, 'snapshot');
+  assert.equal(debug._debug_mode?.knobs?.runtime_source, 'snapshot');
+  assert.ok(
+    Array.isArray(debug.debug?.candidates)
+      && debug.debug.candidates.some(c => Array.isArray(c?.findings) && (
+        c.findings.includes('slow-request-path')
+        || c.findings.includes('slow-db-query')
+        || c.findings.includes('lock-contention')
+      )),
+    'expected runtime snapshot findings in candidates',
+  );
 });

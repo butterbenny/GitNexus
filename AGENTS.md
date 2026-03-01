@@ -16,9 +16,11 @@ For any task involving code understanding, debugging, impact analysis, or refact
 3. **Follow the skill's workflow and checklist**
 
 > If step 1 warns the index is stale, refresh via the local build (avoid `npx gitnexus@...` which won’t include this fork’s monorepo/PHP features):
-> - `node /Users/benny/code/GitNexus/gitnexus/dist/cli/index.js analyze /path/to/repo --skip-embeddings --no-registry --no-hooks`
+> - `CODEX_HOME="${CODEX_HOME:-$HOME/.codex}" "$CODEX_HOME/skills/nexus-maintenance/scripts/refresh_index.sh" /path/to/repo`
 
 ## Skills
+
+Core-only policy: use only the 4 kernel-head skills below. Legacy wrapper skills are deprecated.
 
 | Task | Read this skill file |
 |------|---------------------|
@@ -26,10 +28,6 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | Implement kernel head (`implement_mode`) | `.claude/skills/gitnexus/implement/SKILL.md` |
 | Review kernel head (`review_mode`) | `.claude/skills/gitnexus/review/SKILL.md` |
 | Debug kernel head (`debug_mode`) | `.claude/skills/gitnexus/debug/SKILL.md` |
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/refactoring/SKILL.md` |
 
 ## Tools Reference
 

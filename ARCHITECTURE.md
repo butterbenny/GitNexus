@@ -154,7 +154,7 @@ graph TB
     subgraph Hooks["IDE Integration"]
         claude_hook["Claude Code Hooks"]
         cursor_hook["Cursor Hooks"]
-        skills["Skills<br/>(exploring, debugging,<br/>impact, refactoring)"]
+        skills["Skills<br/>(query, implement,<br/>review, debug)"]
     end
 
     subgraph Web["Web Frontend"]

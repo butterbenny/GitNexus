@@ -353,10 +353,12 @@ function formatReviewModeResult(result: any): string {
   const findings = Array.isArray(kernel.top_findings) ? kernel.top_findings : [];
   const nextActions = Array.isArray(kernel.next_actions) ? kernel.next_actions : [];
   const suggestedTests = Array.isArray(result.suggested_tests) ? result.suggested_tests : [];
+  const runtimeHotspots = Array.isArray(result.runtime_hotspots) ? result.runtime_hotspots : [];
 
   const lines: string[] = [];
   lines.push(`Review kernel (${result.scope || 'unstaged'})`);
   lines.push(`Changed files: ${summary.changed_files || 0} | Changed symbols: ${summary.changed_symbols || 0}`);
+  if (runtimeHotspots.length > 0) lines.push(`Runtime hotspots: ${runtimeHotspots.length}`);
   lines.push(`Risk: ${kernel?.risk?.level || 'unknown'} (score=${Number(kernel?.risk?.score || 0).toFixed(2)})`);
   lines.push('');
 
@@ -388,18 +390,43 @@ function formatDebugModeResult(result: any): string {
   const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
   const hypotheses = Array.isArray(payload.hypotheses) ? payload.hypotheses : [];
   const nextActions = Array.isArray(payload.next_actions) ? payload.next_actions : [];
+  const coverage = payload.coverage || {};
+  const coverageWarnings = Array.isArray(coverage.warnings) ? coverage.warnings : [];
+  const confidenceClaims = Array.isArray(payload?.confidence_breakdown?.claims)
+    ? payload.confidence_breakdown.claims
+    : [];
+  const runtime = payload.runtime_observations || {};
+  const runtimeRequestSpans = Array.isArray(runtime.request_spans) ? runtime.request_spans.length : 0;
+  const runtimeDbQueries = Array.isArray(runtime.db_queries) ? runtime.db_queries.length : 0;
 
   const lines: string[] = [];
   lines.push(`Debug kernel for: ${result.query || '(no query)'}`);
   lines.push(`Symptom family: ${classification.family || 'unknown'} | confidence=${Number(classification.confidence || 0).toFixed(2)}`);
   lines.push(`Candidates: ${candidates.length}`);
+  if (runtimeRequestSpans > 0 || runtimeDbQueries > 0) {
+    lines.push(`Runtime evidence: request_spans=${runtimeRequestSpans} db_queries=${runtimeDbQueries}`);
+  }
   lines.push('');
 
   if (candidates.length > 0) {
     lines.push('Top broken loops:');
     for (const candidate of candidates.slice(0, 6)) {
-      lines.push(`  • [${candidate?.kind || 'candidate'}] score=${Number(candidate?.score || 0).toFixed(2)} — ${candidate?.summary || ''}`);
+      lines.push(`  • [${candidate?.kind || 'candidate'}] score=${Number(candidate?.score || 0).toFixed(2)} conf=${Number(candidate?.confidence || 0).toFixed(2)} — ${candidate?.summary || ''}`);
     }
+    lines.push('');
+  }
+
+  if (confidenceClaims.length > 0) {
+    lines.push('Confidence breakdown:');
+    for (const claim of confidenceClaims.slice(0, 4)) {
+      lines.push(`  • ${claim?.claim || 'claim'}=${Number(claim?.confidence || 0).toFixed(2)}`);
+    }
+    lines.push('');
+  }
+
+  if (coverageWarnings.length > 0) {
+    lines.push('Coverage warnings:');
+    for (const warning of coverageWarnings.slice(0, 4)) lines.push(`  • ${warning}`);
     lines.push('');
   }
 

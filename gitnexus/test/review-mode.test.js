@@ -154,6 +154,42 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   const output2 = runAnalyze(repoPath, env);
   assert.match(output2, /Repository (indexed successfully|updated incrementally)/i);
 
+  await fs.mkdir(path.join(repoPath, '.gitnexus'), { recursive: true });
+  await fs.writeFile(
+    path.join(repoPath, '.gitnexus/runtime-observations.json'),
+    JSON.stringify({
+      generatedAt: '2026-01-02T00:00:00.000Z',
+      request_spans: [
+        {
+          method: 'POST',
+          route: '/api/foo',
+          duration_ms: 980,
+          payload_bytes: 320000,
+          file_path_hints: ['apps/dashboard/src/pages/FooPage.tsx'],
+        },
+      ],
+      db_queries: [
+        {
+          sql: 'update foo set updated_at = now() where id = ?',
+          duration_ms: 210,
+          lock_wait_ms: 60,
+          rows_examined: 1200,
+          file_path_hints: ['src/doThing.ts'],
+        },
+      ],
+    }, null, 2),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/dashboard/src/pages/UntrackedPage.tsx'),
+    [
+      'export const UntrackedPage = () => <div>untracked</div>;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
   const result = runTool('review_mode', { repo: repoPath, scope: 'unstaged' }, env);
   assert.equal(result.status, 'ok');
   assert.ok(Array.isArray(result.changed_files) && result.changed_files.length >= 2);
@@ -166,6 +202,13 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
     result.changed_files.some(f => f.filePath === 'apps/dashboard/src/pages/FooPage.tsx'),
     'expected changed_files to include FooPage.tsx'
   );
+  assert.ok(
+    result.changed_files.some(f => f.filePath === 'apps/dashboard/src/pages/UntrackedPage.tsx' && f.status === 'Untracked'),
+    'expected changed_files to include untracked dashboard file'
+  );
+  assert.ok(Array.isArray(result.untracked_files), 'expected untracked_files list');
+  assert.ok(result.untracked_files.includes('apps/dashboard/src/pages/UntrackedPage.tsx'));
+  assert.ok(Number(result.summary?.untracked_files || 0) >= 1, 'expected summary.untracked_files >= 1');
 
   assert.ok(
     Array.isArray(result.changed_symbols) && result.changed_symbols.some(s => s.filePath === 'src/doThing.ts' && s.name === 'doThing'),
@@ -176,6 +219,11 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
     Array.isArray(result.suggested_tests) && result.suggested_tests.some(t => t.filePath === 'tests/doThing.test.ts'),
     'expected suggested_tests to include tests/doThing.test.ts'
   );
+  const suggestedDoThingTest = result.suggested_tests.find(t => t.filePath === 'tests/doThing.test.ts');
+  assert.ok(typeof suggestedDoThingTest?.command === 'string' && suggestedDoThingTest.command.length > 0);
+  assert.ok(typeof suggestedDoThingTest?.cwd === 'string' && suggestedDoThingTest.cwd.length > 0);
+  assert.ok(Array.isArray(result.test_commands), 'expected test_commands list');
+  assert.ok(result.test_commands.some(t => typeof t?.command === 'string' && t.command.length > 0));
 
   const doThingCard = (result.symbols || []).find(s => s?.symbol?.filePath === 'src/doThing.ts' && s?.symbol?.name === 'doThing');
   assert.ok(doThingCard, 'expected symbols[] to include doThing review card');
@@ -216,9 +264,26 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(result.review_kernel, 'expected review_kernel payload');
   assert.ok(result.review_kernel.risk, 'expected review_kernel risk section');
   assert.ok(Array.isArray(result.review_kernel.top_findings), 'expected review_kernel top_findings list');
+  assert.ok(Array.isArray(result.review_kernel.findings), 'expected review_kernel findings list');
+  assert.ok(
+    result.review_kernel.findings.every(f => typeof f.reason === 'string' && Number.isFinite(Number(f.confidence))),
+    'expected review findings to include reason + confidence'
+  );
+  assert.ok(Array.isArray(result.runtime_hotspots), 'expected runtime_hotspots payload');
+  assert.ok(result.runtime_hotspots.length > 0, 'expected runtime hotspot overlap for changed files');
+  assert.ok(Number(result.summary?.runtime_hotspots || 0) >= 1, 'expected summary.runtime_hotspots >= 1');
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '').startsWith('runtime-')),
+    'expected runtime hotspots to feed review findings',
+  );
   assert.ok(Array.isArray(result.review_kernel.hypotheses), 'expected review_kernel hypotheses list');
   assert.ok(Array.isArray(result.review_kernel.next_actions), 'expected review_kernel next_actions list');
   assert.ok(result.review_kernel.next_actions.some(step => String(step).includes('impact()')));
+  assert.ok(result.coverage_banner, 'expected coverage_banner payload');
+  assert.ok(result.coverage_banner.freshness, 'expected coverage_banner freshness section');
+  assert.ok(result.coverage_banner.coverage, 'expected coverage_banner coverage section');
+  assert.equal(result.coverage_banner.coverage.untracked_files, result.summary.untracked_files);
+  assert.equal(result.summary.suggested_test_commands, result.test_commands.length);
   assert.equal(result._review_mode?.knobs?.include_evidence_spans, true);
   assert.equal(result._review_mode?.knobs?.include_slice_stencil, true);
 
