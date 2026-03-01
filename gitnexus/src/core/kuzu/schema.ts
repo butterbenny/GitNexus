@@ -28,7 +28,7 @@ export const REL_TABLE_NAME = 'CodeRelation';
 
 // Increment when Kuzu schema changes (node/rel table definitions).
 // Used to force full re-index when upgrading existing indexes.
-export const KUZU_SCHEMA_VERSION = 10;
+export const KUZU_SCHEMA_VERSION = 11;
 
 // Valid relation types
 export const REL_TYPES = [
@@ -414,6 +414,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM CodeElement TO CodeElement,
   FROM CodeElement TO Function,
   FROM CodeElement TO Method,
+  FROM CodeElement TO ContractField,
   FROM CodeElement TO \`Const\`,
   FROM Interface TO Community,
   FROM Interface TO Function,
@@ -532,6 +533,8 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Template\` TO ValueNode,
   FROM \`Module\` TO ValueNode,
   FROM CacheKey TO ValueNode,
+  FROM DBTable TO ValueNode,
+  FROM DBColumn TO ValueNode,
   FROM TestCase TO ContractShape,
   type STRING,
   confidence DOUBLE,

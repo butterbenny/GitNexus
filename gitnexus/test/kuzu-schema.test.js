@@ -47,6 +47,7 @@ test('Kuzu schema: CodeRelation allows gap-to-slice links', () => {
 test('Kuzu schema: CodeRelation allows contract shape links', () => {
   assert.match(RELATION_SCHEMA, /FROM Class TO ContractShape/);
   assert.match(RELATION_SCHEMA, /FROM Class TO ContractField/);
+  assert.match(RELATION_SCHEMA, /FROM CodeElement TO ContractField/);
   assert.match(RELATION_SCHEMA, /FROM ContractField TO ContractShape/);
 });
 
@@ -60,6 +61,8 @@ test('Kuzu schema: CodeRelation allows value graph links', () => {
   assert.match(RELATION_SCHEMA, /FROM Function TO ValueNode/);
   assert.match(RELATION_SCHEMA, /FROM Method TO ValueNode/);
   assert.match(RELATION_SCHEMA, /FROM CacheKey TO ValueNode/);
+  assert.match(RELATION_SCHEMA, /FROM DBTable TO ValueNode/);
+  assert.match(RELATION_SCHEMA, /FROM DBColumn TO ValueNode/);
 });
 
 test('Kuzu schema: CodeRelation allows static test closure links', () => {
