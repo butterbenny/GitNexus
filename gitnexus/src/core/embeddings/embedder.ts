@@ -9,6 +9,9 @@
 
 import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/transformers';
 import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type ModelProgress } from './types.js';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 // Module-level state for singleton pattern
 let embedderInstance: FeatureExtractionPipeline | null = null;
@@ -56,13 +59,22 @@ export const initEmbedder = async (
   // On Windows, use DirectML for GPU acceleration (via DirectX12)
   // CUDA is only available on Linux x64 with onnxruntime-node
   const isWindows = process.platform === 'win32';
-  const gpuDevice = isWindows ? 'dml' : 'cuda';
+  const isLinux = process.platform === 'linux';
+  const gpuDevice = isWindows ? 'dml' : isLinux ? 'cuda' : 'cpu';
   let requestedDevice = forceDevice || (finalConfig.device === 'auto' ? gpuDevice : finalConfig.device);
 
   initPromise = (async () => {
     try {
       // Configure transformers.js environment
       env.allowLocalModels = false;
+      env.cacheDir = process.env.GITNEXUS_EMBEDDING_CACHE_DIR
+        || process.env.GITNEXUS_CACHE_DIR
+        || path.join(os.homedir(), '.cache', 'gitnexus');
+      try {
+        await fs.mkdir(env.cacheDir, { recursive: true });
+      } catch {
+        // Best effort: cache dir creation failure should not block embedding.
+      }
       
       const isDev = process.env.NODE_ENV === 'development';
       if (isDev) {
@@ -202,16 +214,31 @@ export const embedBatch = async (texts: string[]): Promise<Float32Array[]> => {
   
   // Result shape is [batch_size, dimensions]
   // Need to split into individual vectors
-  const data = result.data as ArrayLike<number>;
+  const data = result.data as any as ArrayLike<number>;
   const dimensions = DEFAULT_EMBEDDING_CONFIG.dimensions;
-  const embeddings: Float32Array[] = [];
-  
+  const embeddings: Float32Array[] = new Array(texts.length);
+
+  // Fast-path: typed arrays support subarray/slice without allocating a JS Array first.
+  if (ArrayBuffer.isView(data) && typeof (data as any).subarray === 'function') {
+    const typed = data as unknown as { subarray: (start: number, end: number) => ArrayLike<number> };
+    for (let i = 0; i < texts.length; i++) {
+      const start = i * dimensions;
+      const end = start + dimensions;
+      embeddings[i] = new Float32Array(typed.subarray(start, end) as any);
+    }
+    return embeddings;
+  }
+
+  // Fallback: generic array-like
   for (let i = 0; i < texts.length; i++) {
     const start = i * dimensions;
-    const end = start + dimensions;
-    embeddings.push(new Float32Array(Array.prototype.slice.call(data, start, end)));
+    const embedding = new Float32Array(dimensions);
+    for (let j = 0; j < dimensions; j++) {
+      embedding[j] = Number((data as any)[start + j]);
+    }
+    embeddings[i] = embedding;
   }
-  
+
   return embeddings;
 };
 
@@ -220,6 +247,38 @@ export const embedBatch = async (texts: string[]): Promise<Float32Array[]> => {
  */
 export const embeddingToArray = (embedding: Float32Array): number[] => {
   return Array.from(embedding);
+};
+
+/**
+ * Embed multiple texts and return JS number[] vectors directly.
+ * This avoids allocating intermediate Float32Arrays when the caller ultimately needs number[].
+ */
+export const embedBatchToArrays = async (texts: string[]): Promise<number[][]> => {
+  if (texts.length === 0) {
+    return [];
+  }
+
+  const embedder = getEmbedder();
+
+  const result = await embedder(texts, {
+    pooling: 'mean',
+    normalize: true,
+  });
+
+  const data = result.data as any as ArrayLike<number>;
+  const dimensions = DEFAULT_EMBEDDING_CONFIG.dimensions;
+  const embeddings: number[][] = new Array(texts.length);
+
+  for (let i = 0; i < texts.length; i++) {
+    const start = i * dimensions;
+    const embedding = new Array<number>(dimensions);
+    for (let j = 0; j < dimensions; j++) {
+      embedding[j] = Number((data as any)[start + j]);
+    }
+    embeddings[i] = embedding;
+  }
+
+  return embeddings;
 };
 
 /**
@@ -240,4 +299,3 @@ export const disposeEmbedder = async (): Promise<void> => {
     initPromise = null;
   }
 };
-

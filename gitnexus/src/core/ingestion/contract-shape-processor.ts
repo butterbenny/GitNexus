@@ -1,7 +1,7 @@
 import { generateId } from '../../lib/utils.js';
 import { GraphNode, KnowledgeGraph } from '../graph/types.js';
 
-type ShapeType = 'form_request' | 'resource';
+type ShapeType = 'form_request' | 'resource' | 'controller_validation';
 type CacheKeyType = 'query_key_factory' | 'literal';
 
 export interface ContractShapeNode {
@@ -299,6 +299,100 @@ const extractPhpArrayFieldKeys = (methodBody: string): string[] => {
   }
 
   return Array.from(found);
+};
+
+const extractPhpBracketArrayKeys = (expr: string): string[] => {
+  const text = String(expr || '').trim();
+  const openBracketIdx = text.indexOf('[');
+  if (openBracketIdx < 0) return [];
+  const closeBracketIdx = findBalancedEnd(text, openBracketIdx, '[', ']');
+  if (closeBracketIdx <= openBracketIdx) return [];
+
+  const arrayText = text.slice(openBracketIdx + 1, closeBracketIdx);
+  const found = new Set<string>();
+  const keyRe = /(['"])([A-Za-z0-9_.*\-\[\]]+)\1\s*=>/g;
+  let keyMatch: RegExpExecArray | null;
+  while ((keyMatch = keyRe.exec(arrayText)) !== null) {
+    const key = String(keyMatch[2] || '').trim();
+    if (!key) continue;
+    found.add(key);
+  }
+  return Array.from(found);
+};
+
+const extractLaravelInlineValidationKeysFromMethodBody = (methodBody: string): { keys: string[]; reason: string } => {
+  const keys = new Set<string>();
+  let reason = 'laravel-controller:validate';
+
+  const scanMethodCall = (needle: string, reasonHint: string): void => {
+    for (let idx = 0; idx < methodBody.length;) {
+      const at = methodBody.indexOf(needle, idx);
+      if (at < 0) break;
+      idx = at + needle.length;
+
+      const openParenIdx = methodBody.indexOf('(', idx);
+      if (openParenIdx < 0) continue;
+      const closeParenIdx = findBalancedEnd(methodBody, openParenIdx, '(', ')');
+      if (closeParenIdx <= openParenIdx) continue;
+
+      const argsText = methodBody.slice(openParenIdx + 1, closeParenIdx).trim();
+      if (!argsText) continue;
+
+      const segments = splitTopLevelSegments(argsText);
+      const arraySegment = segments.find(segment => segment.trim().startsWith('['));
+      if (!arraySegment) continue;
+
+      const extracted = extractPhpBracketArrayKeys(arraySegment);
+      if (extracted.length === 0) continue;
+      reason = reasonHint;
+      for (const key of extracted) keys.add(key);
+
+      idx = closeParenIdx + 1;
+    }
+  };
+
+  scanMethodCall('->validateWithBag', 'laravel-request:validate-with-bag');
+  scanMethodCall('->validate', 'laravel-request:validate');
+  scanMethodCall('$this->validate', 'laravel-controller:validate-helper');
+
+  // Common Laravel inline validation pattern:
+  //   Validator::make($data, [...])->validate();
+  for (let idx = 0; idx < methodBody.length;) {
+    const at = methodBody.indexOf('Validator::make', idx);
+    if (at < 0) break;
+    idx = at + 'Validator::make'.length;
+
+    const openParenIdx = methodBody.indexOf('(', idx);
+    if (openParenIdx < 0) continue;
+    const closeParenIdx = findBalancedEnd(methodBody, openParenIdx, '(', ')');
+    if (closeParenIdx <= openParenIdx) continue;
+
+    const tail = methodBody.slice(closeParenIdx, Math.min(methodBody.length, closeParenIdx + 160));
+    if (!tail.includes('->validate')) {
+      idx = closeParenIdx + 1;
+      continue;
+    }
+
+    const argsText = methodBody.slice(openParenIdx + 1, closeParenIdx).trim();
+    const segments = splitTopLevelSegments(argsText);
+    const rulesSegment = segments.length >= 2 ? segments[1] : '';
+    if (!String(rulesSegment || '').trim().startsWith('[')) {
+      idx = closeParenIdx + 1;
+      continue;
+    }
+
+    const extracted = extractPhpBracketArrayKeys(rulesSegment);
+    if (extracted.length === 0) {
+      idx = closeParenIdx + 1;
+      continue;
+    }
+
+    reason = 'laravel-validator:make-validate';
+    for (const key of extracted) keys.add(key);
+    idx = closeParenIdx + 1;
+  }
+
+  return { keys: Array.from(keys).sort(), reason };
 };
 
 const extractObjectPropertyExpression = (objectBody: string, propertyName: string): string | null => {
@@ -716,12 +810,22 @@ export const processContractShapes = async (
   const classByFile = new Map<string, GraphNode>();
   const classById = new Map<string, GraphNode>();
   const functionByName = new Map<string, GraphNode[]>();
+  const methodByFile = new Map<string, GraphNode[]>();
 
   for (const node of knowledgeGraph.nodes) {
     if (node.label === 'Class') {
       const filePath = normalizePath(node.properties.filePath || '');
       if (filePath && !classByFile.has(filePath)) classByFile.set(filePath, node);
       classById.set(node.id, node);
+      continue;
+    }
+
+    if (node.label === 'Method') {
+      const filePath = normalizePath(node.properties.filePath || '');
+      if (!filePath) continue;
+      const list = methodByFile.get(filePath) || [];
+      list.push(node);
+      methodByFile.set(filePath, list);
       continue;
     }
 
@@ -752,36 +856,44 @@ export const processContractShapes = async (
 
   const ensureShape = (
     shapeType: ShapeType,
-    sourceClassNode: GraphNode,
+    sourceNode: GraphNode,
   ): ContractShapeNode => {
-    const id = generateId('ContractShape', `${shapeType}:${sourceClassNode.id}`);
+    const id = generateId('ContractShape', `${shapeType}:${sourceNode.id}`);
     const existing = shapeNodeMap.get(id);
     if (existing) return existing;
 
-    const className = String(sourceClassNode.properties.name || '').trim();
+    const sourceName = String(sourceNode.properties.name || '').trim();
     const shapeLabel = shapeType === 'form_request'
-      ? buildLabel('FormRequest Shape', className || sourceClassNode.id)
-      : buildLabel('Resource Shape', className || sourceClassNode.id);
+      ? buildLabel('FormRequest Shape', sourceName || sourceNode.id)
+      : shapeType === 'resource'
+        ? buildLabel('Resource Shape', sourceName || sourceNode.id)
+        : buildLabel('Controller Validation Shape', sourceName || sourceNode.id);
 
     const node: ContractShapeNode = {
       id,
       label: shapeLabel,
       heuristicLabel: shapeLabel,
       shapeType,
-      sourceNodeId: sourceClassNode.id,
-      sourceFilePath: String(sourceClassNode.properties.filePath || ''),
+      sourceNodeId: sourceNode.id,
+      sourceFilePath: String(sourceNode.properties.filePath || ''),
     };
 
     shapeNodeMap.set(id, node);
 
-    addEdge({
-      id: generateId('DEFINES', `${sourceClassNode.id}->${id}`),
-      type: 'DEFINES',
-      sourceId: sourceClassNode.id,
-      targetId: id,
-      confidence: 1.0,
-      reason: shapeType === 'form_request' ? 'shape:form-request' : 'shape:resource',
-    });
+    if (sourceNode.label === 'Class') {
+      addEdge({
+        id: generateId('DEFINES', `${sourceNode.id}->${id}`),
+        type: 'DEFINES',
+        sourceId: sourceNode.id,
+        targetId: id,
+        confidence: 1.0,
+        reason: shapeType === 'form_request'
+          ? 'shape:form-request'
+          : shapeType === 'resource'
+            ? 'shape:resource'
+            : 'shape:controller-validation',
+      });
+    }
 
     return node;
   };
@@ -961,6 +1073,41 @@ export const processContractShapes = async (
         reason: 'laravel-form-request:rules',
       });
       validatedFieldEdges++;
+    }
+  }
+
+  const controllerCandidates = files.filter(file => {
+    const filePath = normalizePath(file.path);
+    return filePath.includes('/Http/Controllers/') && filePath.toLowerCase().endsWith('.php');
+  });
+  for (const file of controllerCandidates) {
+    const filePath = normalizePath(file.path);
+    const methodNodes = methodByFile.get(filePath) || [];
+    if (methodNodes.length === 0) continue;
+
+    for (const methodNode of methodNodes) {
+      const methodName = String(methodNode.properties.name || '').trim();
+      if (!methodName) continue;
+
+      const methodBody = extractPhpMethodBody(file.content, methodName);
+      if (!methodBody) continue;
+
+      const inlineValidation = extractLaravelInlineValidationKeysFromMethodBody(methodBody);
+      if (inlineValidation.keys.length === 0) continue;
+
+      const shape = ensureShape('controller_validation', methodNode);
+      for (const fieldName of inlineValidation.keys) {
+        const field = ensureField(fieldName, shape);
+        addEdge({
+          id: generateId('VALIDATES_FIELD', `${methodNode.id}:${field.id}`),
+          type: 'VALIDATES_FIELD',
+          sourceId: methodNode.id,
+          targetId: field.id,
+          confidence: 0.9,
+          reason: inlineValidation.reason,
+        });
+        validatedFieldEdges++;
+      }
     }
   }
 

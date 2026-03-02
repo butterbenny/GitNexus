@@ -7,7 +7,7 @@
 import path from 'path';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, loadCachedEmbeddings, deleteNodesForFile, deleteOutgoingRelationshipsForFile, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu, loadEmbeddingNodeIds } from '../core/kuzu/kuzu-adapter.js';
+import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, loadCachedEmbeddings, deleteNodesForFile, deleteOutgoingRelationshipsForFile, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
 import { runEmbeddingPipeline } from '../core/embeddings/embedding-pipeline.js';
 import { disposeEmbedder } from '../core/embeddings/embedder.js';
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
@@ -87,17 +87,15 @@ export interface AnalyzeOptions {
   incrementalDerivedMode?: string;
 }
 
-type IncrementalDerivedMode = 'full' | 'adaptive' | 'fast';
+type IncrementalDerivedMode = 'full' | 'adaptive';
 
-const normalizeIncrementalDerivedMode = (value?: string): IncrementalDerivedMode => {
+const normalizeIncrementalDerivedMode = (value?: string): { mode: IncrementalDerivedMode; usedFast: boolean } => {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'fast') return 'fast';
-  if (normalized === 'adaptive') return 'adaptive';
-  return 'full';
+  if (normalized === 'adaptive') return { mode: 'adaptive', usedFast: false };
+  if (normalized === 'fast') return { mode: 'full', usedFast: true };
+  return { mode: 'full', usedFast: false };
 };
 
-/** Threshold: auto-skip embeddings for repos with more nodes than this */
-const EMBEDDING_NODE_LIMIT = 50_000;
 const INCREMENTAL_MAX_CHANGES_DEFAULT = 500;
 const INCREMENTAL_MAX_CHANGES_CAP = 5_000;
 const INCREMENTAL_MAX_CHANGES_FRACTION_OF_FILES = 0.2;
@@ -171,9 +169,11 @@ export const analyzeCommand = async (
   const ftsSchemaVersion = Number(existingMeta?.ftsSchemaVersion || 0);
   const shouldEnsureFtsIndexes = !existingMeta || schemaMismatch || ftsSchemaVersion !== KUZU_SCHEMA_VERSION;
   const precisionOverlayMode = normalizePrecisionOverlayMode(options?.precisionOverlay);
-  const incrementalDerivedMode = normalizeIncrementalDerivedMode(
+  const incrementalDerivedNormalized = normalizeIncrementalDerivedMode(
     options?.incrementalDerivedMode ?? (options as any)?.incrementalDerived,
   );
+  const incrementalDerivedMode = incrementalDerivedNormalized.mode;
+  const incrementalDerivedFastDeprecated = incrementalDerivedNormalized.usedFast;
 
   const ensureFtsIndexes = async (): Promise<string> => {
     const t0Fts = Date.now();
@@ -751,10 +751,6 @@ export const analyzeCommand = async (
       await deleteOutgoingRelationshipsForFile(fp, EDGE_TYPES_TO_CLEAR);
     }
 
-    // Capture embedding skip set AFTER deletions (so removed embeddings aren't treated as cached)
-    debug('loadEmbeddingNodeIds');
-    const cachedEmbeddingNodeIds = await loadEmbeddingNodeIds();
-
     // Load full symbol table from the existing index (post-delete)
     bar.update(24, { phase: 'Incremental: loading symbol table...' });
     debug('loadSymbolDefinitionsFromKuzu');
@@ -1087,6 +1083,9 @@ export const analyzeCommand = async (
     const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
 
     const kuzuWarnings = [...kuzuResult.warnings];
+    if (incrementalDerivedFastDeprecated) {
+      kuzuWarnings.push('Incremental derived mode "fast" is deprecated; running as "full".');
+    }
 
     let precisionSummary: {
       mode: PrecisionOverlayMode;
@@ -1819,8 +1818,10 @@ export const analyzeCommand = async (
       }
     }
 
-    const shouldRecomputeSlicesAndGaps = incrementalDerivedMode !== 'fast'
-      && (shouldRunAdaptiveHeavyPasses || sourceSignalsTouched || shapeSignalsTouched || entrypointSignalsTouched);
+    const shouldRecomputeSlicesAndGaps = shouldRunAdaptiveHeavyPasses
+      || sourceSignalsTouched
+      || shapeSignalsTouched
+      || entrypointSignalsTouched;
     const featureSlicePassStartedAt = Date.now();
     if (!shouldRecomputeSlicesAndGaps) {
       skipDerivedPass('slices');
@@ -2554,7 +2555,7 @@ export const analyzeCommand = async (
       markPassTiming('cochange', cochangePassStartedAt);
     }
 
-    if (incrementalDerivedMode === 'fast' || !shouldRunAdaptiveHeavyPasses) {
+    if (!shouldRunAdaptiveHeavyPasses) {
       skipDerivedPass('evidence-spans');
       skipDerivedPass('structured-summaries');
       skipDerivedPass('closure-templates');
@@ -2835,26 +2836,29 @@ export const analyzeCommand = async (
     if (options?.skipEmbeddings) {
       embeddingSkipped = true;
       embeddingSkipReason = 'skipped (--skip-embeddings)';
-    } else if (stats.nodes > EMBEDDING_NODE_LIMIT) {
-      embeddingSkipped = true;
-      embeddingSkipReason = `skipped (${stats.nodes.toLocaleString()} nodes > ${EMBEDDING_NODE_LIMIT.toLocaleString()} limit)`;
     }
 
     if (!embeddingSkipped) {
       bar.update(90, { phase: 'Embedding new/changed nodes...' });
       const t0Emb = Date.now();
-      await runEmbeddingPipeline(
-        executeQuery,
-        executeWithReusedStatement,
-        (progress) => {
-          const scaled = 90 + Math.round((progress.percent / 100) * 8);
-          const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
-          bar.update(scaled, { phase: label });
-        },
-        {},
-        cachedEmbeddingNodeIds,
-      );
-      embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
+      try {
+        await runEmbeddingPipeline(
+          executeQuery,
+          executeWithReusedStatement,
+          (progress) => {
+            const scaled = 90 + Math.round((progress.percent / 100) * 8);
+            const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
+            bar.update(scaled, { phase: label });
+          },
+          {},
+        );
+        embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        embeddingSkipped = true;
+        embeddingSkipReason = `skipped (embedding pipeline error: ${msg.slice(0, 120)})`;
+        kuzuWarnings.push(`Embeddings skipped (${msg.slice(0, 120)})`);
+      }
     }
 
     const fileCount = await getCount('File');
@@ -3110,7 +3114,6 @@ export const analyzeCommand = async (
   }
 
   // ── Cache embeddings from existing index before rebuild ────────────
-  let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
 
   if (existingMeta && !options?.force) {
@@ -3118,7 +3121,6 @@ export const analyzeCommand = async (
       bar.update(0, { phase: 'Caching embeddings...' });
       await initKuzu(kuzuPath);
       const cached = await loadCachedEmbeddings();
-      cachedEmbeddingNodeIds = cached.embeddingNodeIds;
       cachedEmbeddings = cached.embeddings;
       await closeKuzu();
     } catch {
@@ -3180,6 +3182,9 @@ export const analyzeCommand = async (
   });
   const kuzuTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
   const kuzuWarnings = kuzuResult.warnings;
+  if (incrementalDerivedFastDeprecated) {
+    kuzuWarnings.push('Incremental derived mode "fast" is deprecated; running as "full".');
+  }
 
   try {
     bar.update(84, { phase: 'Materializing evidence spans...' });
@@ -3272,26 +3277,29 @@ export const analyzeCommand = async (
   if (options?.skipEmbeddings) {
     embeddingSkipped = true;
     embeddingSkipReason = 'skipped (--skip-embeddings)';
-  } else if (stats.nodes > EMBEDDING_NODE_LIMIT) {
-    embeddingSkipped = true;
-    embeddingSkipReason = `skipped (${stats.nodes.toLocaleString()} nodes > ${EMBEDDING_NODE_LIMIT.toLocaleString()} limit)`;
   }
 
   if (!embeddingSkipped) {
     bar.update(90, { phase: 'Loading embedding model...' });
     const t0Emb = Date.now();
-    await runEmbeddingPipeline(
-      executeQuery,
-      executeWithReusedStatement,
-      (progress) => {
-        const scaled = 90 + Math.round((progress.percent / 100) * 8);
-        const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
-        bar.update(scaled, { phase: label });
-      },
-      {},
-      cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
-    );
-    embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
+    try {
+      await runEmbeddingPipeline(
+        executeQuery,
+        executeWithReusedStatement,
+        (progress) => {
+          const scaled = 90 + Math.round((progress.percent / 100) * 8);
+          const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
+          bar.update(scaled, { phase: label });
+        },
+        {},
+      );
+      embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      embeddingSkipped = true;
+      embeddingSkipReason = `skipped (embedding pipeline error: ${msg.slice(0, 120)})`;
+      kuzuWarnings.push(`Embeddings skipped (${msg.slice(0, 120)})`);
+    }
   }
 
   // ── Phase 5: Finalize (98–100%) ───────────────────────────────────

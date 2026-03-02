@@ -266,6 +266,150 @@ function parseStringList(value: unknown): string[] {
   );
 }
 
+type PatternCatalogSection = {
+  category: string;
+  title: string;
+  templateFiles: string[];
+  alsoGoodFiles: string[];
+  otherFiles: string[];
+  tokenSet: Set<string>;
+};
+
+const patternCatalogCache = new Map<string, { mtimeMs: number; sections: PatternCatalogSection[] }>();
+
+function tokenizePatternCatalogText(value: string): string[] {
+  return String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .map(token => token.trim())
+    .filter(token => token.length >= 3);
+}
+
+function extractBacktickFilePaths(line: string): string[] {
+  const out: string[] = [];
+  const re = /`([^`]+)`/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(line)) !== null) {
+    const raw = String(match[1] || '').trim();
+    if (!raw) continue;
+    if (raw.includes(' ')) continue;
+    if (!raw.includes('/')) continue;
+    if (!/\.[a-z0-9]{1,8}$/i.test(raw)) continue;
+    out.push(normalizeRepoRelativePath(raw));
+  }
+  return out;
+}
+
+function parsePatternCatalogMarkdown(content: string): PatternCatalogSection[] {
+  const lines = String(content || '').split('\n');
+  const sections: PatternCatalogSection[] = [];
+
+  let category = '';
+  let mode: 'template' | 'also-good' | 'other' | null = null;
+  let current: PatternCatalogSection | null = null;
+
+  const finalizeCurrent = () => {
+    if (!current) return;
+    const dedupe = (items: string[]) => Array.from(new Set(items.map(item => normalizeRepoRelativePath(item)).filter(Boolean)));
+    current.templateFiles = dedupe(current.templateFiles);
+    current.alsoGoodFiles = dedupe(current.alsoGoodFiles);
+    current.otherFiles = dedupe(current.otherFiles);
+
+    const tokens = new Set<string>([
+      ...tokenizePatternCatalogText(current.category),
+      ...tokenizePatternCatalogText(current.title),
+      ...current.templateFiles.flatMap(tokenizePatternCatalogText),
+      ...current.alsoGoodFiles.flatMap(tokenizePatternCatalogText),
+    ]);
+    current.tokenSet = tokens;
+    sections.push(current);
+    current = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || '');
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('## ')) {
+      category = trimmed.slice(3).trim();
+      mode = null;
+      continue;
+    }
+
+    if (trimmed.startsWith('### ')) {
+      finalizeCurrent();
+      current = {
+        category,
+        title: trimmed.slice(4).trim(),
+        templateFiles: [],
+        alsoGoodFiles: [],
+        otherFiles: [],
+        tokenSet: new Set<string>(),
+      };
+      mode = null;
+      continue;
+    }
+
+    if (!current) continue;
+
+    if (trimmed.toLowerCase() === 'template:') {
+      mode = 'template';
+      continue;
+    }
+    if (trimmed.toLowerCase() === 'also good:') {
+      mode = 'also-good';
+      continue;
+    }
+    if (trimmed.toLowerCase() === 'notes:' || trimmed.toLowerCase() === 'note:') {
+      mode = 'other';
+      continue;
+    }
+
+    const filePaths = extractBacktickFilePaths(line);
+    if (filePaths.length === 0) continue;
+
+    const target = mode === 'template'
+      ? current.templateFiles
+      : mode === 'also-good'
+        ? current.alsoGoodFiles
+        : current.otherFiles;
+    target.push(...filePaths);
+  }
+
+  finalizeCurrent();
+  return sections;
+}
+
+async function loadPatternCatalogSections(repoPath: string): Promise<{ relativePath: string; sections: PatternCatalogSection[] } | null> {
+  const resolved = resolvePathInsideRepo(repoPath, '.agents/review/pattern-catalog.md');
+  if (!resolved) return null;
+
+  let stat: { mtimeMs: number } | null = null;
+  try {
+    stat = await fs.stat(resolved.absolutePath);
+  } catch {
+    stat = null;
+  }
+  if (!stat) return null;
+
+  const cached = patternCatalogCache.get(resolved.absolutePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs) {
+    return { relativePath: resolved.relativePath, sections: cached.sections };
+  }
+
+  let content = '';
+  try {
+    content = await fs.readFile(resolved.absolutePath, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const sections = parsePatternCatalogMarkdown(content);
+  patternCatalogCache.set(resolved.absolutePath, { mtimeMs: stat.mtimeMs, sections });
+  return { relativePath: resolved.relativePath, sections };
+}
+
 function normalizeSliceStencilToken(value: unknown): string {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -787,7 +931,7 @@ export class LocalBackend {
     const isStale = !!headCommit && !!indexedCommit && headCommit !== indexedCommit;
 
     const cliPath = this.getCliPath();
-    const refreshCommand = `node ${JSON.stringify(cliPath)} analyze ${JSON.stringify(repo.repoPath)} --skip-embeddings`;
+    const refreshCommand = `node ${JSON.stringify(cliPath)} analyze ${JSON.stringify(repo.repoPath)} --incremental-derived full`;
     const refreshCommandForce = `${refreshCommand} --force`;
     const refreshCommandSandbox = `${refreshCommand} --no-registry --no-hooks`;
     const refreshCommandSandboxForce = `${refreshCommandSandbox} --force`;
@@ -2525,6 +2669,83 @@ export class LocalBackend {
       }
     }
 
+    let patternCatalogPrecedents: any[] = [];
+    let patternCatalogDiagnostics: any | null = null;
+    if (queryTokens.length > 0) {
+      const queryTokenSet = new Set<string>(queryTokens);
+      const catalog = await loadPatternCatalogSections(repo.repoPath);
+      if (catalog && catalog.sections.length > 0) {
+        const maxPatterns = Math.min(3, Math.max(limit, 2));
+        const scored = catalog.sections
+          .map(section => {
+            let score = 0;
+            for (const token of queryTokenSet) {
+              if (section.tokenSet.has(token)) score += 1;
+            }
+            return { section, score };
+          })
+          .filter(item => item.score > 0)
+          .sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            if (left.section.category !== right.section.category) return left.section.category.localeCompare(right.section.category);
+            return left.section.title.localeCompare(right.section.title);
+          })
+          .slice(0, maxPatterns);
+
+        const resolveCatalogFile = (filePathRaw: string): string | null => {
+          const resolved = resolvePathInsideRepo(repo.repoPath, filePathRaw);
+          if (!resolved) return null;
+          const relative = normalizeRepoRelativePath(resolved.relativePath);
+          if (!relative) return null;
+          if (!filePathTouchesPrefixes(relative, pathPrefixes)) return null;
+          return relative;
+        };
+
+        for (const match of scored) {
+          const templateFiles = match.section.templateFiles.map(resolveCatalogFile).filter(Boolean) as string[];
+          const alsoGoodFiles = match.section.alsoGoodFiles.map(resolveCatalogFile).filter(Boolean) as string[];
+          const otherFiles = match.section.otherFiles.map(resolveCatalogFile).filter(Boolean) as string[];
+          const anchorFilePath = templateFiles[0] || alsoGoodFiles[0] || otherFiles[0];
+          if (!anchorFilePath) continue;
+
+          const exampleFiles = Array.from(
+            new Set<string>([
+              ...templateFiles.slice(1),
+              ...alsoGoodFiles,
+              ...otherFiles,
+            ]),
+          )
+            .filter(filePath => filePath !== anchorFilePath)
+            .slice(0, examplesPer);
+
+          patternCatalogPrecedents.push({
+            kind: 'pattern-catalog',
+            signature: `pattern-catalog:${match.section.title}`,
+            score: match.score,
+            anchor: {
+              name: match.section.title,
+              kind: 'File',
+              filePath: anchorFilePath,
+              category: match.section.category || undefined,
+              catalog_path: catalog.relativePath,
+              score: match.score,
+            },
+            examples: exampleFiles.map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+          });
+        }
+
+        patternCatalogDiagnostics = {
+          filePath: catalog.relativePath,
+          candidates: catalog.sections.length,
+          matched: patternCatalogPrecedents.length,
+        };
+      }
+    }
+
     const slicePrecedents = buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById, cochangeMap);
     const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
@@ -2532,8 +2753,8 @@ export class LocalBackend {
       addProcessPrecedent(pid);
     }
 
-    const precedents = [...slicePrecedents, ...hopPrecedents, ...processPrecedents]
-      .slice(0, Math.max(limit, slicePrecedents.length + hopPrecedents.length + processPrecedents.length));
+    const precedents = [...patternCatalogPrecedents, ...slicePrecedents, ...hopPrecedents, ...processPrecedents]
+      .slice(0, Math.max(limit, patternCatalogPrecedents.length + slicePrecedents.length + hopPrecedents.length + processPrecedents.length));
 
     const diagnostics: any = {
       anchor_uid: anchorUid || undefined,
@@ -2543,6 +2764,7 @@ export class LocalBackend {
       anchor_slices: anchorSliceScores.size,
       scoped_slices: inScopeSlices.length,
       slice_precedents: slicePrecedents.length,
+      ...(patternCatalogDiagnostics ? { pattern_catalog: patternCatalogDiagnostics } : {}),
       path_prefixes: pathPrefixes,
     };
     if (precedents.length === 0) {

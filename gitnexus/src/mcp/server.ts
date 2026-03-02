@@ -88,8 +88,8 @@ function getStalenessBanner(backend: LocalBackend, toolName: string, args: Recor
     if (!staleness.isStale) return '';
 
     const repoPath = repo.repoPath;
-    const refreshCmd = `gitnexus analyze "${repoPath}" --skip-embeddings`;
-    const forceCmd = `gitnexus analyze "${repoPath}" --force --skip-embeddings`;
+    const refreshCmd = `gitnexus analyze "${repoPath}" --incremental-derived full`;
+    const forceCmd = `gitnexus analyze "${repoPath}" --force`;
 
     const hint = staleness.hint
       ? staleness.hint

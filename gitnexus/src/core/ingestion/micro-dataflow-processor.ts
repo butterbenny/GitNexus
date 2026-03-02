@@ -161,7 +161,11 @@ export const processMicroDataflow = async (
   const methodFieldLinks = new Map<string, MethodFieldLink[]>();
 
   for (const relationship of knowledgeGraph.relationships) {
-    if (relationship.type !== 'READS_FIELD' && relationship.type !== 'WRITES_FIELD') continue;
+    if (
+      relationship.type !== 'READS_FIELD'
+      && relationship.type !== 'WRITES_FIELD'
+      && relationship.type !== 'VALIDATES_FIELD'
+    ) continue;
     const sourceNode = nodeById.get(relationship.sourceId);
     const targetNode = nodeById.get(relationship.targetId);
     if (!sourceNode || !targetNode) continue;
@@ -169,7 +173,7 @@ export const processMicroDataflow = async (
 
     addMethodFieldLink(methodFieldLinks, sourceNode.id, {
       fieldId: targetNode.id,
-      kind: relationship.type === 'READS_FIELD' ? 'request' : 'response',
+      kind: relationship.type === 'WRITES_FIELD' ? 'response' : 'request',
       confidence: relationship.confidence,
     });
   }

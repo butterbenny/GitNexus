@@ -9,7 +9,7 @@
  * 5. Create vector index for semantic search
  */
 
-import { initEmbedder, embedBatch, embedText, embeddingToArray, isEmbedderReady } from './embedder.js';
+import { initEmbedder, embedBatchToArrays, embedText, embeddingToArray, isEmbedderReady } from './embedder.js';
 import { generateBatchEmbeddingTexts } from './text-generator.js';
 import {
   type EmbeddingProgress,
@@ -46,6 +46,9 @@ const queryEmbeddableNodes = async (
         // File nodes don't have startLine/endLine
         query = `
           MATCH (n:File)
+          OPTIONAL MATCH (e:CodeEmbedding {nodeId: n.id})
+          WITH n, e
+          WHERE e IS NULL
           RETURN n.id AS id, n.name AS name, 'File' AS label, 
                  n.filePath AS filePath, n.content AS content
         `;
@@ -53,6 +56,9 @@ const queryEmbeddableNodes = async (
         // Code elements have startLine/endLine
         query = `
           MATCH (n:${label})
+          OPTIONAL MATCH (e:CodeEmbedding {nodeId: n.id})
+          WITH n, e
+          WHERE e IS NULL
           RETURN n.id AS id, n.name AS name, '${label}' AS label, 
                  n.filePath AS filePath, n.content AS content,
                  n.startLine AS startLine, n.endLine AS endLine
@@ -72,7 +78,42 @@ const queryEmbeddableNodes = async (
         });
       }
     } catch (error) {
-      // Table might not exist or be empty, continue
+      // Best-effort fallback: if the embedding table isn't available yet,
+      // embed everything rather than silently returning zero nodes.
+      try {
+        let fallbackQuery: string;
+
+        if (label === 'File') {
+          fallbackQuery = `
+            MATCH (n:File)
+            RETURN n.id AS id, n.name AS name, 'File' AS label, 
+                   n.filePath AS filePath, n.content AS content
+          `;
+        } else {
+          fallbackQuery = `
+            MATCH (n:${label})
+            RETURN n.id AS id, n.name AS name, '${label}' AS label, 
+                   n.filePath AS filePath, n.content AS content,
+                   n.startLine AS startLine, n.endLine AS endLine
+          `;
+        }
+
+        const rows = await executeQuery(fallbackQuery);
+        for (const row of rows) {
+          allNodes.push({
+            id: row.id ?? row[0],
+            name: row.name ?? row[1],
+            label: row.label ?? row[2],
+            filePath: row.filePath ?? row[3],
+            content: row.content ?? row[4] ?? '',
+            startLine: row.startLine ?? row[5],
+            endLine: row.endLine ?? row[6],
+          });
+        }
+      } catch {
+        // Table might not exist or be empty, continue
+      }
+
       if (isDev) {
         console.warn(`Query for ${label} nodes failed:`, error);
       }
@@ -128,19 +169,40 @@ const createVectorIndex = async (
  * @param executeWithReusedStatement - Function to execute with reused prepared statement
  * @param onProgress - Callback for progress updates
  * @param config - Optional configuration override
- * @param skipNodeIds - Optional set of node IDs that already have embeddings (incremental mode)
  */
 export const runEmbeddingPipeline = async (
   executeQuery: (cypher: string) => Promise<any[]>,
   executeWithReusedStatement: (cypher: string, paramsList: Array<Record<string, any>>) => Promise<void>,
   onProgress: EmbeddingProgressCallback,
   config: Partial<EmbeddingConfig> = {},
-  skipNodeIds?: Set<string>,
 ): Promise<void> => {
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
 
   try {
-    // Phase 1: Load embedding model
+    if (isDev) {
+      console.log('🔍 Querying embeddable nodes...');
+    }
+
+    // Phase 1: Query embeddable nodes (avoid loading model if there's nothing to embed)
+    let nodes = await queryEmbeddableNodes(executeQuery);
+
+    const totalNodes = nodes.length;
+
+    if (isDev) {
+      console.log(`📊 Found ${totalNodes} embeddable nodes`);
+    }
+
+    if (totalNodes === 0) {
+      onProgress({
+        phase: 'ready',
+        percent: 100,
+        nodesProcessed: 0,
+        totalNodes: 0,
+      });
+      return;
+    }
+
+    // Phase 2: Load embedding model
     onProgress({
       phase: 'loading-model',
       percent: 0,
@@ -161,38 +223,6 @@ export const runEmbeddingPipeline = async (
       percent: 20,
       modelDownloadPercent: 100,
     });
-
-    if (isDev) {
-      console.log('🔍 Querying embeddable nodes...');
-    }
-
-    // Phase 2: Query embeddable nodes
-    let nodes = await queryEmbeddableNodes(executeQuery);
-
-    // Incremental mode: filter out nodes that already have embeddings
-    if (skipNodeIds && skipNodeIds.size > 0) {
-      const beforeCount = nodes.length;
-      nodes = nodes.filter(n => !skipNodeIds.has(n.id));
-      if (isDev) {
-        console.log(`📦 Incremental embeddings: ${beforeCount} total, ${skipNodeIds.size} cached, ${nodes.length} to embed`);
-      }
-    }
-
-    const totalNodes = nodes.length;
-
-    if (isDev) {
-      console.log(`📊 Found ${totalNodes} embeddable nodes`);
-    }
-
-    if (totalNodes === 0) {
-      onProgress({
-        phase: 'ready',
-        percent: 100,
-        nodesProcessed: 0,
-        totalNodes: 0,
-      });
-      return;
-    }
 
     // Phase 3: Batch embed nodes
     const batchSize = finalConfig.batchSize;
@@ -217,12 +247,12 @@ export const runEmbeddingPipeline = async (
       const texts = generateBatchEmbeddingTexts(batch, finalConfig);
 
       // Embed the batch
-      const embeddings = await embedBatch(texts);
+      const embeddings = await embedBatchToArrays(texts);
 
       // Update KuzuDB with embeddings
       const updates = batch.map((node, i) => ({
         id: node.id,
-        embedding: embeddingToArray(embeddings[i]),
+        embedding: embeddings[i],
       }));
 
       await batchInsertEmbeddings(executeWithReusedStatement, updates);

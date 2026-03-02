@@ -334,7 +334,7 @@ test('Incremental indexing: metadata-only fast path when no indexable files chan
   assert.equal(meta.ftsSchemaVersion, meta.kuzuSchemaVersion);
 });
 
-test('Incremental indexing: fast derived mode is accepted and reported', async () => {
+test('Incremental indexing: fast derived mode is deprecated (treated as full)', async () => {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-inc-fast-derived-'));
   const repoPath = path.join(tmpRoot, 'repo');
   await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
@@ -375,9 +375,10 @@ test('Incremental indexing: fast derived mode is accepted and reported', async (
 
   const second = runAnalyzeWithArgs(repoPath, ['--incremental-derived', 'fast'], env);
   assert.match(second, /Repository updated incrementally/i);
-  assert.match(second, /Incremental derived mode: fast/i);
-  assert.match(second, /skipped .*slices/i);
-  assert.match(second, /skipped .*gaps/i);
+  assert.match(second, /Incremental derived mode \"fast\" is deprecated; running as \"full\"/i);
+  assert.ok(!/Incremental derived mode: fast/i.test(second));
+  assert.ok(!/skipped .*slices/i.test(second));
+  assert.ok(!/skipped .*gaps/i.test(second));
 });
 
 test('Incremental indexing: adaptive mode skips heavy passes on low-signal changes', async () => {

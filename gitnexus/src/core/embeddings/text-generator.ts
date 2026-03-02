@@ -54,10 +54,8 @@ const cleanContent = (content: string): string => {
     .replace(/\r\n/g, '\n')
     // Remove excessive blank lines (more than 2)
     .replace(/\n{3,}/g, '\n\n')
-    // Trim each line
-    .split('\n')
-    .map(line => line.trimEnd())
-    .join('\n')
+    // Trim trailing whitespace per line (avoid split/map/join)
+    .replace(/[^\S\n]+$/gm, '')
     .trim();
 };
 
@@ -232,4 +230,3 @@ export const generateBatchEmbeddingTexts = (
 ): string[] => {
   return nodes.map(node => generateEmbeddingText(node, config));
 };
-

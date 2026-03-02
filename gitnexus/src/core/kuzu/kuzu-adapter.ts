@@ -17,6 +17,7 @@ let db: kuzu.Database | null = null;
 let conn: kuzu.Connection | null = null;
 let refreshLockLease: RefreshLockLease | null = null;
 let ftsExtensionLoadAttempted = false;
+let preparedStatementCache: Map<string, any> = new Map();
 
 const REFRESH_LOCK_TIMEOUT_MS = Math.max(1_000, Number(process.env.GITNEXUS_REFRESH_LOCK_TIMEOUT_MS ?? 180_000));
 const REFRESH_LOCK_POLL_MS = Math.max(100, Number(process.env.GITNEXUS_REFRESH_LOCK_POLL_MS ?? 1_000));
@@ -88,6 +89,7 @@ export const initKuzu = async (dbPath: string) => {
   try {
     db = new kuzu.Database(dbPath);
     conn = new kuzu.Connection(db);
+    preparedStatementCache.clear();
 
     let lockWarningLogged = false;
     for (const schemaQuery of SCHEMA_QUERIES) {
@@ -117,6 +119,7 @@ export const initKuzu = async (dbPath: string) => {
     conn = null;
     db = null;
     ftsExtensionLoadAttempted = false;
+    preparedStatementCache.clear();
     if (refreshLockLease) {
       try { await refreshLockLease.release(); } catch {}
       refreshLockLease = null;
@@ -540,24 +543,30 @@ export const executeWithReusedStatement = async (
   }
   if (paramsList.length === 0) return;
 
-  const SUB_BATCH_SIZE = 4;
-  for (let i = 0; i < paramsList.length; i += SUB_BATCH_SIZE) {
-    const subBatch = paramsList.slice(i, i + SUB_BATCH_SIZE);
-    const stmt = await conn.prepare(cypher);
+  const SUB_BATCH_SIZE = 200;
+
+  let stmt = preparedStatementCache.get(cypher);
+  if (!stmt) {
+    stmt = await conn.prepare(cypher);
     if (!stmt.isSuccess()) {
       const errMsg = await stmt.getErrorMessage();
       throw new Error(`Prepare failed: ${errMsg}`);
     }
-    try {
-      for (const params of subBatch) {
+    preparedStatementCache.set(cypher, stmt);
+  }
+
+  for (let i = 0; i < paramsList.length; i += SUB_BATCH_SIZE) {
+    const subBatch = paramsList.slice(i, i + SUB_BATCH_SIZE);
+
+    for (const params of subBatch) {
+      try {
         const execResult = await conn.execute(stmt, params);
         await closeQueryResults(execResult);
+      } catch (e) {
+        // Best effort: keep going for the rest of the batch.
+        console.warn('Batch execution error:', e);
       }
-    } catch (e) {
-      // Log the error and continue with next batch
-      console.warn('Batch execution error:', e);
     }
-    // Note: kuzu 0.8.2 PreparedStatement doesn't require explicit close()
   }
 };
 
@@ -643,6 +652,7 @@ export const closeKuzu = async (): Promise<void> => {
     refreshLockLease = null;
   }
   ftsExtensionLoadAttempted = false;
+  preparedStatementCache.clear();
 };
 
 export const isKuzuReady = (): boolean => conn !== null && db !== null;

@@ -625,7 +625,9 @@ export async function runReviewMode(
       if (untrackedFiles > 0) riskScore += Math.min(2, untrackedFiles);
       if (runtimeHotspots > 0) riskScore += Math.min(3, Math.ceil(runtimeHotspots / 2));
       if (contractParityLow > 0) riskScore += Math.min(3, contractParityLow);
-      if (perfBackendFindings > 0) riskScore += Math.min(3, Math.ceil(perfBackendFindings / 2));
+      if (perfBackendFindings > 0 && input.runtime_source === 'snapshot') {
+        riskScore += Math.min(3, Math.ceil(perfBackendFindings / 2));
+      }
 
       const risk_level = riskScore >= 10 ? 'high' : riskScore >= 5 ? 'medium' : 'low';
 
@@ -669,7 +671,7 @@ export async function runReviewMode(
       if (contractParityLow > 0) {
         top_findings.push(`Endpoint contract parity gaps detected (${contractParityLow}).`);
       }
-      if (perfBackendFindings > 0) {
+      if (perfBackendFindings > 0 && input.runtime_source === 'snapshot') {
         top_findings.push(`Backend loop/perf risks detected with line-level evidence (${perfBackendFindings}).`);
       }
       if (top_findings.length === 0 && changedFiles === 0) {
@@ -692,8 +694,10 @@ export async function runReviewMode(
       if (contractParityLow > 0) {
         hypotheses.push('Endpoint request/response/status semantics likely drift from expected contracts.');
       }
-      if (perfBackendFindings > 0) {
+      if (perfBackendFindings > 0 && input.runtime_source === 'snapshot') {
         hypotheses.push('Loop-level scans/writes in backend paths may amplify latency or write contention.');
+      } else if (perfBackendFindings > 0 && input.runtime_source === 'none') {
+        hypotheses.push('Static perf heuristics were detected, but runtime evidence is required to prioritize and validate them.');
       }
       if (runtimeHotspots > 0) {
         hypotheses.push('Runtime latency/lock signals align with changed surfaces and should be validated first.');
@@ -732,8 +736,10 @@ export async function runReviewMode(
       if (contractParityRoutes > 0) {
         next_actions.push('Review contract_parity entries for touched routes and confirm status + shape semantics.');
       }
-      if (perfBackendFindings > 0) {
+      if (perfBackendFindings > 0 && input.runtime_source === 'snapshot') {
         next_actions.push('Address perf_backend_findings at cited lines and re-run focused regression tests.');
+      } else if (perfBackendFindings > 0 && input.runtime_source === 'none') {
+        next_actions.push('Ingest a runtime observation snapshot and re-run review_mode before acting on perf_backend_findings.');
       }
 
       return {
@@ -1882,7 +1888,7 @@ export async function runReviewMode(
             .slice(0, limitTests);
 
           for (const hit of ranked) {
-            addSuggestedTest(hit.filePath, hit.score, hit.reason);
+            addSuggestedTest(hit.filePath, hit.score, hit.reason, { allowOutOfScope: true });
           }
         } catch {
           // best-effort fallback
@@ -1890,40 +1896,8 @@ export async function runReviewMode(
       }
     }
 
-    // Fallback tier 5: deterministic scoped escape hatch when lexical overlap is absent.
-    if (suggestedTestsAgg.size === 0 && pathPrefixes.length > 0) {
-      try {
-        const fileRows = await executeQuery(repo.id, `
-          MATCH (f:File)
-          WHERE (
-            lower(f.filePath) CONTAINS '/test/'
-            OR lower(f.filePath) CONTAINS '/tests/'
-            OR lower(f.filePath) CONTAINS '.test.'
-            OR lower(f.filePath) CONTAINS '.spec.'
-          )
-          RETURN f.filePath AS filePath
-          ORDER BY f.filePath
-          LIMIT ${Math.max(limitTests * 20, 100)}
-        `);
-        const candidates = fileRows
-          .map((row: any) => normalizePath(String(row.filePath ?? row[0] ?? '')))
-          .filter(Boolean)
-          .filter(filePath => isTestFilePath(filePath))
-          .filter(filePath => isRunnableSuggestedTestFile(filePath))
-          .slice(0, limitTests);
-
-        for (const filePath of candidates) {
-          addSuggestedTest(
-            filePath,
-            0.05,
-            'scope fallback token proximity: broad fallback (no lexical overlap)',
-            { allowOutOfScope: true },
-          );
-        }
-      } catch {
-        // best-effort fallback
-      }
-    }
+    // NOTE: We intentionally do not emit a broad "no overlap" fallback list here.
+    // In real-world reviews this produced low-relevance suggestions; prefer returning 0 tests.
 
     const shellQuote = (value: string): string => {
       const raw = String(value || '');
@@ -2040,7 +2014,94 @@ export async function runReviewMode(
       .length;
     const suggestedTestsReordered = suggestedTestsBaseOrder.join('|') !== suggestedTestsRankedOrder.join('|');
 
-    const suggested_tests = suggestedTestsRanked
+    const SUGGESTED_TEST_MIN_RANK = 0.3;
+    const SUGGESTED_TEST_MIN_AFFINITY = 0.2;
+    const suggestedTestTargetPaths = Array.from(changedFilePathSet)
+      .filter(Boolean)
+      .slice(0, 160);
+    const getDomainRoot = (filePath: string): string => {
+      const fp = normalizePath(filePath);
+      if (!fp) return '';
+      const parts = fp.split('/').filter(Boolean);
+      if (parts.length === 0) return '';
+      if (parts[0] === 'apps' && parts.length >= 2) return `${parts[0]}/${parts[1]}`;
+      if (parts[0] === 'packages' && parts.length >= 2) return `${parts[0]}/${parts[1]}`;
+      return parts[0];
+    };
+    const changedDomainRoots = new Set<string>();
+    for (const fp of suggestedTestTargetPaths) {
+      const root = getDomainRoot(fp);
+      if (root) changedDomainRoots.add(root);
+    }
+    const isDomainAffined = (filePath: string): boolean => {
+      const root = getDomainRoot(filePath);
+      if (!root) return false;
+      if (changedDomainRoots.has(root)) return true;
+      if (root === 'tests' && changedDomainRoots.has('app')) return true;
+      if (root === 'app' && changedDomainRoots.has('tests')) return true;
+      if (
+        (root === 'tests' || root === 'test' || root === '__tests__')
+        && (changedDomainRoots.has('src') || changedDomainRoots.has('lib'))
+      ) return true;
+      if (
+        (root === 'src' || root === 'lib')
+        && (changedDomainRoots.has('tests') || changedDomainRoots.has('test') || changedDomainRoots.has('__tests__'))
+      ) return true;
+      return false;
+    };
+    const getSuggestedTestAffinity = (filePath: string): number => {
+      const fp = normalizePath(filePath);
+      if (!fp) return 0;
+      let best = 0;
+      for (const targetPath of suggestedTestTargetPaths) {
+        const affinity = pathAffinity(fp, targetPath);
+        if (affinity > best) best = affinity;
+      }
+      return round3(best);
+    };
+    const isHighSignalSuggestedTest = (entry: any): boolean => {
+      const filePath = normalizePath(String(entry?.filePath || ''));
+      if (!filePath) return false;
+      if (changedTestFileSet.has(filePath)) return true;
+      const metaScore = toFiniteNumber(entry?.meta?.score, 0);
+      if (metaScore >= 1.5) return true;
+      const reasons = Array.isArray(entry?.meta?.reasons) ? entry.meta.reasons : [];
+      return reasons.some((reason: string) => {
+        const text = String(reason || '').toLowerCase();
+        return text.includes('direct caller')
+          || text.includes('imports changed file')
+          || text.includes('low-confidence caller');
+      });
+    };
+
+    let suggestedTestsSuppressedLowRank = 0;
+    let suggestedTestsSuppressedLowAffinity = 0;
+    const suggestedTestsFiltered = suggestedTestsRanked.filter(entry => {
+      const filePath = normalizePath(String(entry?.filePath || ''));
+      if (!filePath) return false;
+      if (changedTestFileSet.has(filePath)) return true;
+
+      const rank = toFiniteNumber(entry?.rank, 0);
+      const highSignal = isHighSignalSuggestedTest(entry);
+
+      if (!highSignal && rank < SUGGESTED_TEST_MIN_RANK) {
+        suggestedTestsSuppressedLowRank += 1;
+        return false;
+      }
+
+      if (!highSignal) {
+        const domainMatch = isDomainAffined(filePath);
+        const affinity = domainMatch ? 1 : getSuggestedTestAffinity(filePath);
+        if (!domainMatch && affinity < SUGGESTED_TEST_MIN_AFFINITY) {
+          suggestedTestsSuppressedLowAffinity += 1;
+          return false;
+        }
+      }
+
+      return true;
+    });
+
+    const suggested_tests = suggestedTestsFiltered
       .slice(0, limitTests)
       .map(entry => {
         const filePath = entry.filePath;
@@ -4179,6 +4240,367 @@ export async function runReviewMode(
       }
     }
 
+    const frontendHygieneSignals: Array<{
+      code: 'prop-drilling-score' | 'nested-component-declaration' | 'signature-too-many-args' | 'inline-param-type-object';
+      filePath: string;
+      line: number;
+      summary: string;
+      reason: string;
+      confidence: number;
+      severity: ReviewFindingSeverity;
+    }> = [];
+
+    const frontendScanTargets = changedFileObjs
+      .map(item => normalizePath(String(item?.filePath || '')))
+      .filter(Boolean)
+      .filter(filePath => filePath.startsWith('apps/dashboard/'))
+      .filter(filePath => !filePath.endsWith('.md'))
+      .filter(filePath => !filePath.endsWith('.d.ts'))
+      .filter(filePath => (
+        filePath.endsWith('.ts')
+        || filePath.endsWith('.tsx')
+        || filePath.endsWith('.js')
+        || filePath.endsWith('.jsx')
+      ))
+      .filter((filePath, idx, arr) => arr.indexOf(filePath) === idx)
+      .slice(0, 60);
+
+    const countTopLevelParameters = (paramList: string): number => {
+      const raw = String(paramList || '').trim();
+      if (!raw) return 0;
+
+      let depthParen = 0;
+      let depthBrace = 0;
+      let depthBracket = 0;
+      let depthAngle = 0;
+      let inSingle = false;
+      let inDouble = false;
+      let inTemplate = false;
+      let escape = false;
+
+      let count = 1;
+      for (let idx = 0; idx < raw.length; idx += 1) {
+        const ch = raw[idx];
+        if (escape) {
+          escape = false;
+          continue;
+        }
+        if (inSingle) {
+          if (ch === '\\\\') escape = true;
+          else if (ch === '\'') inSingle = false;
+          continue;
+        }
+        if (inDouble) {
+          if (ch === '\\\\') escape = true;
+          else if (ch === '"') inDouble = false;
+          continue;
+        }
+        if (inTemplate) {
+          if (ch === '\\\\') escape = true;
+          else if (ch === '`') inTemplate = false;
+          continue;
+        }
+
+        if (ch === '\'') {
+          inSingle = true;
+          continue;
+        }
+        if (ch === '"') {
+          inDouble = true;
+          continue;
+        }
+        if (ch === '`') {
+          inTemplate = true;
+          continue;
+        }
+
+        if (ch === '(') depthParen += 1;
+        else if (ch === ')') depthParen = Math.max(0, depthParen - 1);
+        else if (ch === '{') depthBrace += 1;
+        else if (ch === '}') depthBrace = Math.max(0, depthBrace - 1);
+        else if (ch === '[') depthBracket += 1;
+        else if (ch === ']') depthBracket = Math.max(0, depthBracket - 1);
+        else if (ch === '<') depthAngle += 1;
+        else if (ch === '>') depthAngle = Math.max(0, depthAngle - 1);
+
+        if (ch === ',' && depthParen === 0 && depthBrace === 0 && depthBracket === 0 && depthAngle === 0) {
+          count += 1;
+        }
+      }
+
+      return count;
+    };
+
+    const extractParenGroup = (
+      lines: string[],
+      startLineIndex: number,
+      startCharIndex: number,
+      maxLines: number,
+    ): { text: string; endLineIndex: number; endCharIndex: number } | null => {
+      const start = Math.max(0, startLineIndex);
+      const end = Math.min(lines.length, start + Math.max(1, maxLines));
+      let depth = 0;
+      let text = '';
+
+      for (let lineIdx = start; lineIdx < end; lineIdx += 1) {
+        const line = String(lines[lineIdx] || '');
+        const startChar = lineIdx === start ? Math.max(0, startCharIndex) : 0;
+        for (let col = startChar; col < line.length; col += 1) {
+          const ch = line[col];
+          if (ch === '(') {
+            depth += 1;
+            if (depth === 1) continue;
+          } else if (ch === ')') {
+            depth -= 1;
+            if (depth === 0) {
+              return { text, endLineIndex: lineIdx, endCharIndex: col };
+            }
+          }
+          if (depth >= 1) text += ch;
+        }
+        if (depth >= 1) text += '\n';
+      }
+      return null;
+    };
+
+    const identityPropRegex = /([A-Za-z_$][\w$]*)\s*=\s*\{\s*\1\s*\}/g;
+    const spreadPropRegex = /\{\s*\.\.\.\s*[A-Za-z_$][\w$]*\s*\}/g;
+    const nestedComponentFnRegex = /\bfunction\s+([A-Z][A-Za-z0-9_]*)\s*\(/;
+    const nestedComponentConstRegex = /\bconst\s+([A-Z][A-Za-z0-9_]*)\b[^=]*=\s*\(/;
+    const inlineParamObjectRegex = /:\s*\{/;
+
+    for (const filePath of frontendScanTargets) {
+      const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
+      if (!resolved) continue;
+      let content = '';
+      try {
+        content = await fs.readFile(resolved.absolutePath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const ranges = changedRangeByFile.get(filePath) || [];
+      const lineNearChanged = (lineNo: number): boolean => {
+        if (ranges.length === 0) return true;
+        return ranges.some(range => lineNo >= (range.start - 10) && lineNo <= (range.end + 10));
+      };
+
+      const lines = content.split('\n');
+      const isJsxFile = filePath.endsWith('.tsx') || filePath.endsWith('.jsx');
+      const isTsFile = filePath.endsWith('.ts') || filePath.endsWith('.tsx');
+
+      // Prop drilling score (heuristic): identity props + spread props in a single JSX tag.
+      if (isJsxFile) {
+        const startTagRegex = /<([A-Z][A-Za-z0-9_]*)\b/;
+        let currentTag: { component: string; startLine: number; identity: number; spread: number; braceDepth: number; eligible: boolean } | null = null;
+        let best: { component: string; line: number; score: number; identity: number; spread: number } | null = null;
+
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const lineNo = idx + 1;
+          const rawLine = String(lines[idx] || '');
+          const codeLine = rawLine.replace(/\/\/.*$/g, '');
+          if (!currentTag) {
+            const match = startTagRegex.exec(codeLine);
+            if (!match) continue;
+            currentTag = {
+              component: match[1],
+              startLine: lineNo,
+              identity: 0,
+              spread: 0,
+              braceDepth: 0,
+              eligible: lineNearChanged(lineNo),
+            };
+          }
+
+          identityPropRegex.lastIndex = 0;
+          spreadPropRegex.lastIndex = 0;
+          while (identityPropRegex.exec(codeLine) !== null) currentTag.identity += 1;
+          while (spreadPropRegex.exec(codeLine) !== null) currentTag.spread += 1;
+
+          let closed = false;
+          for (let col = 0; col < codeLine.length; col += 1) {
+            const ch = codeLine[col];
+            if (ch === '{') currentTag.braceDepth += 1;
+            else if (ch === '}' && currentTag.braceDepth > 0) currentTag.braceDepth -= 1;
+            else if (ch === '>' && currentTag.braceDepth === 0) {
+              closed = true;
+              break;
+            }
+          }
+          if (!closed) continue;
+
+          const score = currentTag.identity + (currentTag.spread * 3);
+          if (currentTag.eligible && score >= 6 && (!best || score > best.score)) {
+            best = {
+              component: currentTag.component,
+              line: currentTag.startLine,
+              score,
+              identity: currentTag.identity,
+              spread: currentTag.spread,
+            };
+          }
+          currentTag = null;
+        }
+
+        if (best) {
+          frontendHygieneSignals.push({
+            code: 'prop-drilling-score',
+            filePath,
+            line: best.line,
+            severity: 'low',
+            confidence: 0.72,
+            reason: 'jsx-prop-drilling-heuristic',
+            summary: `Prop drilling score ${best.score} at line ${best.line} (<${best.component} …> passes ${best.identity} identity prop(s) and ${best.spread} spread prop(s)).`,
+          });
+        }
+      }
+
+      // Nested component declarations (heuristic): component defined at braceDepth > 0.
+      if (isJsxFile) {
+        let inBlockComment = false;
+        let braceDepth = 0;
+        let nestedCount = 0;
+        let firstNested: { name: string; line: number } | null = null;
+
+        const stripComments = (line: string): string => {
+          let out = String(line || '');
+
+          if (inBlockComment) {
+            const endIdx = out.indexOf('*/');
+            if (endIdx === -1) return '';
+            out = out.slice(endIdx + 2);
+            inBlockComment = false;
+          }
+
+          while (true) {
+            const blockIdx = out.indexOf('/*');
+            const lineIdx = out.indexOf('//');
+            if (blockIdx !== -1 && (lineIdx === -1 || blockIdx < lineIdx)) {
+              const endIdx = out.indexOf('*/', blockIdx + 2);
+              if (endIdx === -1) {
+                inBlockComment = true;
+                out = out.slice(0, blockIdx);
+                break;
+              }
+              out = out.slice(0, blockIdx) + out.slice(endIdx + 2);
+              continue;
+            }
+            if (lineIdx !== -1) out = out.slice(0, lineIdx);
+            break;
+          }
+
+          return out;
+        };
+
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const lineNo = idx + 1;
+          const codeLine = stripComments(lines[idx]).trim();
+          if (braceDepth > 0 && lineNearChanged(lineNo)) {
+            const fnMatch = nestedComponentFnRegex.exec(codeLine);
+            const constMatch = fnMatch ? null : nestedComponentConstRegex.exec(codeLine);
+            const nestedName = fnMatch?.[1] || constMatch?.[1] || '';
+            if (nestedName) {
+              nestedCount += 1;
+              if (!firstNested) firstNested = { name: nestedName, line: lineNo };
+            }
+          }
+
+          for (let col = 0; col < codeLine.length; col += 1) {
+            const ch = codeLine[col];
+            if (ch === '{') braceDepth += 1;
+            else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+          }
+        }
+
+        if (nestedCount > 0 && firstNested) {
+          frontendHygieneSignals.push({
+            code: 'nested-component-declaration',
+            filePath,
+            line: firstNested.line,
+            severity: 'low',
+            confidence: 0.78,
+            reason: 'nested-react-component-declaration',
+            summary: `Nested component declaration detected (${nestedCount}); first is ${firstNested.name} at line ${firstNested.line}.`,
+          });
+        }
+      }
+
+      // Function signatures: > 3 args, and inline param type objects.
+      if (isTsFile) {
+        let tooManyArgs: { name: string; line: number; count: number } | null = null;
+        let inlineParamType: { name: string; line: number } | null = null;
+
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const lineNo = idx + 1;
+          if (!lineNearChanged(lineNo)) continue;
+          const codeLine = String(lines[idx] || '').replace(/\/\/.*$/g, '');
+
+          const fnMatch = /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(/.exec(codeLine);
+          if (fnMatch) {
+            const startIdx = codeLine.indexOf('(', fnMatch.index);
+            const group = extractParenGroup(lines, idx, startIdx, 12);
+            if (group) {
+              const paramCount = countTopLevelParameters(group.text);
+              if (!tooManyArgs && paramCount >= 4) {
+                tooManyArgs = { name: fnMatch[1], line: lineNo, count: paramCount };
+              }
+              if (!inlineParamType && inlineParamObjectRegex.test(group.text)) {
+                inlineParamType = { name: fnMatch[1], line: lineNo };
+              }
+            }
+          }
+
+          const constMatch = /\b(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\b[^=]*=\s*\(/.exec(codeLine);
+          if (constMatch) {
+            const eqIdx = codeLine.indexOf('=');
+            const startIdx = eqIdx >= 0 ? codeLine.indexOf('(', eqIdx) : -1;
+            if (startIdx >= 0) {
+              const group = extractParenGroup(lines, idx, startIdx, 12);
+              if (group) {
+                const tail = String(lines[group.endLineIndex] || '').slice(group.endCharIndex + 1)
+                  + ' ' + String(lines[group.endLineIndex + 1] || '');
+                if (tail.includes('=>')) {
+                  const paramCount = countTopLevelParameters(group.text);
+                  if (!tooManyArgs && paramCount >= 4) {
+                    tooManyArgs = { name: constMatch[1], line: lineNo, count: paramCount };
+                  }
+                  if (!inlineParamType && inlineParamObjectRegex.test(group.text)) {
+                    inlineParamType = { name: constMatch[1], line: lineNo };
+                  }
+                }
+              }
+            }
+          }
+
+          if (tooManyArgs && inlineParamType) break;
+        }
+
+        if (tooManyArgs) {
+          frontendHygieneSignals.push({
+            code: 'signature-too-many-args',
+            filePath,
+            line: tooManyArgs.line,
+            severity: 'low',
+            confidence: 0.74,
+            reason: 'function-signature-arg-count',
+            summary: `Function signature has ${tooManyArgs.count} parameters at line ${tooManyArgs.line} (${tooManyArgs.name}). Prefer an options object or variants.`,
+          });
+        }
+
+        if (inlineParamType) {
+          frontendHygieneSignals.push({
+            code: 'inline-param-type-object',
+            filePath,
+            line: inlineParamType.line,
+            severity: 'low',
+            confidence: 0.84,
+            reason: 'typescript-inline-param-object-type',
+            summary: `Inline object type in parameter list at line ${inlineParamType.line} (${inlineParamType.name}). Prefer a named type/interface.`,
+          });
+        }
+      }
+    }
+
     const addReviewFinding = (
       findings: ReviewFinding[],
       finding: ReviewFinding,
@@ -4222,6 +4644,23 @@ export async function runReviewMode(
         confidence: 0.99,
         evidence: {
           filePath: normalizePath(artifactEntry.filePath),
+        },
+      }, findingDedupe);
+    }
+
+    for (const signal of frontendHygieneSignals.slice(0, 40)) {
+      addReviewFinding(reviewFindings, {
+        code: signal.code,
+        severity: signal.severity,
+        summary: signal.summary,
+        reason: signal.reason,
+        confidence: signal.confidence,
+        evidence: {
+          filePath: signal.filePath,
+          symbol: {
+            kind: 'Line',
+            startLine: signal.line,
+          },
         },
       }, findingDedupe);
     }
@@ -4327,22 +4766,24 @@ export async function runReviewMode(
       }, findingDedupe);
     }
 
-    for (const perfFinding of perf_backend_findings.slice(0, 30)) {
-      addReviewFinding(reviewFindings, {
-        code: String(perfFinding.code || 'perf-hot-path'),
-        severity: perfFinding.severity,
-        summary: `${perfFinding.summary} (${perfFinding.filePath}:${perfFinding.line})`,
-        reason: perfFinding.snippet || perfFinding.code,
-        confidence: perfFinding.confidence,
-        evidence: {
-          filePath: normalizePath(perfFinding.filePath),
-          symbol: {
-            name: perfFinding.code,
-            kind: 'File',
-            startLine: toOptionalLineNumber(perfFinding.line),
+    if (runtimeSource === 'snapshot') {
+      for (const perfFinding of perf_backend_findings.slice(0, 30)) {
+        addReviewFinding(reviewFindings, {
+          code: String(perfFinding.code || 'perf-hot-path'),
+          severity: perfFinding.severity,
+          summary: `${perfFinding.summary} (${perfFinding.filePath}:${perfFinding.line})`,
+          reason: perfFinding.snippet || perfFinding.code,
+          confidence: perfFinding.confidence,
+          evidence: {
+            filePath: normalizePath(perfFinding.filePath),
+            symbol: {
+              name: perfFinding.code,
+              kind: 'File',
+              startLine: toOptionalLineNumber(perfFinding.line),
+            },
           },
-        },
-      }, findingDedupe);
+        }, findingDedupe);
+      }
     }
 
     for (const sliceEntry of Array.isArray(slice_stencil?.slices) ? slice_stencil.slices : []) {
@@ -4659,6 +5100,25 @@ export async function runReviewMode(
       runtimeGeneratedAt: runtimeSnapshot.generatedAt || '',
       runtimeSourceFiles: runtimeSnapshot.source_files,
     });
+    if (
+      analysisSymbols.length > 0
+      && suggested_tests.length === 0
+      && (suggestedTestsSuppressedLowRank > 0 || suggestedTestsSuppressedLowAffinity > 0)
+      && Array.isArray((coverage_banner as any)?.warnings)
+    ) {
+      coverage_banner.warnings.push(
+        `Suggested tests suppressed due to low confidence/affinity (min_rank=${SUGGESTED_TEST_MIN_RANK}, min_affinity=${SUGGESTED_TEST_MIN_AFFINITY}); treat as "no confident suggested tests".`,
+      );
+    }
+    if (
+      runtimeSource === 'none'
+      && perf_backend_findings.length > 0
+      && Array.isArray((coverage_banner as any)?.warnings)
+    ) {
+      coverage_banner.warnings.push(
+        'perf_backend_findings detected but not promoted into review findings without a runtime snapshot; ingest runtime evidence and re-run review_mode for perf/merge-safety prioritization.',
+      );
+    }
     const convergenceMeta = {
       enabled: Boolean(convergenceMatrix),
       source_path: convergenceMatrix?.sourcePath || null,
@@ -4666,6 +5126,12 @@ export async function runReviewMode(
       suggested_tests_boosted: suggestedTestsBoosted,
       suggested_tests_reordered: suggestedTestsReordered,
       suggested_tests_scope_fallback: scopeFallbackSuggestedTests,
+      suggested_tests_candidates: suggestedTestsRanked.length,
+      suggested_tests_candidates_post_filter: suggestedTestsFiltered.length,
+      suggested_tests_suppressed_low_rank: suggestedTestsSuppressedLowRank,
+      suggested_tests_suppressed_low_affinity: suggestedTestsSuppressedLowAffinity,
+      suggested_tests_min_rank: SUGGESTED_TEST_MIN_RANK,
+      suggested_tests_min_affinity: SUGGESTED_TEST_MIN_AFFINITY,
       findings_boosted: findingsBoosted,
       findings_reordered: findingsReordered,
       low_signal_fallback_findings: lowSignalFallbackFindingCount,
