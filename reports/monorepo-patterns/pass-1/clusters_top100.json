@@ -1,0 +1,702 @@
+[
+  {
+    "cluster": "Services",
+    "symbols": 2412,
+    "frontend_total": "29",
+    "backend_total": "2383",
+    "cohesion": 0.8784451775072628
+  },
+  {
+    "cluster": "Api",
+    "symbols": 2107,
+    "frontend_total": "1936",
+    "backend_total": "118",
+    "cohesion": 0.8034483314153106
+  },
+  {
+    "cluster": "Engage",
+    "symbols": 1289,
+    "frontend_total": "55",
+    "backend_total": "1234",
+    "cohesion": 0.7793650867972445
+  },
+  {
+    "cluster": "Controllers",
+    "symbols": 720,
+    "frontend_total": "29",
+    "backend_total": "684",
+    "cohesion": 0.9152028917384558
+  },
+  {
+    "cluster": "Campaign",
+    "symbols": 701,
+    "frontend_total": "15",
+    "backend_total": "686",
+    "cohesion": 0.7239090560091302
+  },
+  {
+    "cluster": "Models",
+    "symbols": 693,
+    "frontend_total": "4",
+    "backend_total": "689",
+    "cohesion": 0.8256391597510161
+  },
+  {
+    "cluster": "Traits",
+    "symbols": 548,
+    "frontend_total": "4",
+    "backend_total": "544",
+    "cohesion": 0.6890131219674596
+  },
+  {
+    "cluster": "Actions",
+    "symbols": 535,
+    "frontend_total": "13",
+    "backend_total": "522",
+    "cohesion": 0.8083099650668639
+  },
+  {
+    "cluster": "Listeners",
+    "symbols": 496,
+    "frontend_total": "7",
+    "backend_total": "489",
+    "cohesion": 0.7784178561205398
+  },
+  {
+    "cluster": "Checkout",
+    "symbols": 493,
+    "frontend_total": "5",
+    "backend_total": "488",
+    "cohesion": 0.7985073593856221
+  },
+  {
+    "cluster": "Components",
+    "symbols": 458,
+    "frontend_total": "122",
+    "backend_total": "168",
+    "cohesion": 0.8338312368373777
+  },
+  {
+    "cluster": "Imports",
+    "symbols": 410,
+    "frontend_total": "47",
+    "backend_total": "363",
+    "cohesion": 0.8286011425811104
+  },
+  {
+    "cluster": "Dashboard",
+    "symbols": 407,
+    "frontend_total": "30",
+    "backend_total": "377",
+    "cohesion": 0.8679434397918505
+  },
+  {
+    "cluster": "Jobs",
+    "symbols": 393,
+    "frontend_total": "1",
+    "backend_total": "392",
+    "cohesion": 0.8969187928195603
+  },
+  {
+    "cluster": "Workflows",
+    "symbols": 383,
+    "frontend_total": "24",
+    "backend_total": "359",
+    "cohesion": 0.7932925576210319
+  },
+  {
+    "cluster": "Contacts",
+    "symbols": 383,
+    "frontend_total": "51",
+    "backend_total": "332",
+    "cohesion": 0.8044425368416187
+  },
+  {
+    "cluster": "Filters",
+    "symbols": 345,
+    "frontend_total": "254",
+    "backend_total": "91",
+    "cohesion": 0.8352628214511477
+  },
+  {
+    "cluster": "CustomHooks",
+    "symbols": 338,
+    "frontend_total": "325",
+    "backend_total": "7",
+    "cohesion": 0.6936031699301278
+  },
+  {
+    "cluster": "ModelFilters",
+    "symbols": 334,
+    "frontend_total": "2",
+    "backend_total": "332",
+    "cohesion": 0.6491621457232954
+  },
+  {
+    "cluster": "Transaction",
+    "symbols": 323,
+    "frontend_total": "3",
+    "backend_total": "320",
+    "cohesion": 0.7101239257044374
+  },
+  {
+    "cluster": "Auction",
+    "symbols": 322,
+    "frontend_total": "25",
+    "backend_total": "297",
+    "cohesion": 0.7498358309872943
+  },
+  {
+    "cluster": "Unit",
+    "symbols": 306,
+    "frontend_total": "1",
+    "backend_total": "305",
+    "cohesion": 0.7201521992100188
+  },
+  {
+    "cluster": "Auctions",
+    "symbols": 305,
+    "frontend_total": "14",
+    "backend_total": "291",
+    "cohesion": 0.7795914611649565
+  },
+  {
+    "cluster": "Hooks",
+    "symbols": 304,
+    "frontend_total": "222",
+    "backend_total": "29",
+    "cohesion": 0.7270356146634763
+  },
+  {
+    "cluster": "Support",
+    "symbols": 294,
+    "frontend_total": "0",
+    "backend_total": "294",
+    "cohesion": 0.8786427716261438
+  },
+  {
+    "cluster": "Contact",
+    "symbols": 289,
+    "frontend_total": "4",
+    "backend_total": "285",
+    "cohesion": 0.7497362989121598
+  },
+  {
+    "cluster": "Transactions",
+    "symbols": 266,
+    "frontend_total": "29",
+    "backend_total": "237",
+    "cohesion": 0.851276983871484
+  },
+  {
+    "cluster": "Auth",
+    "symbols": 243,
+    "frontend_total": "1",
+    "backend_total": "242",
+    "cohesion": 0.806424820057619
+  },
+  {
+    "cluster": "Account",
+    "symbols": 231,
+    "frontend_total": "20",
+    "backend_total": "211",
+    "cohesion": 0.6698978829650836
+  },
+  {
+    "cluster": "Providers",
+    "symbols": 223,
+    "frontend_total": "5",
+    "backend_total": "171",
+    "cohesion": 0.8825478392270931
+  },
+  {
+    "cluster": "Exports",
+    "symbols": 223,
+    "frontend_total": "0",
+    "backend_total": "217",
+    "cohesion": 0.8924869223365809
+  },
+  {
+    "cluster": "Rules",
+    "symbols": 222,
+    "frontend_total": "1",
+    "backend_total": "221",
+    "cohesion": 0.8223758512480318
+  },
+  {
+    "cluster": "API",
+    "symbols": 221,
+    "frontend_total": "20",
+    "backend_total": "201",
+    "cohesion": 0.9093703484094207
+  },
+  {
+    "cluster": "Finance",
+    "symbols": 204,
+    "frontend_total": "82",
+    "backend_total": "122",
+    "cohesion": 0.7993752425984171
+  },
+  {
+    "cluster": "DataTransferObjects",
+    "symbols": 204,
+    "frontend_total": "0",
+    "backend_total": "204",
+    "cohesion": 0.8219403821487009
+  },
+  {
+    "cluster": "Js",
+    "symbols": 198,
+    "frontend_total": "0",
+    "backend_total": "177",
+    "cohesion": 0.9051885227481377
+  },
+  {
+    "cluster": "Reporting",
+    "symbols": 198,
+    "frontend_total": "0",
+    "backend_total": "198",
+    "cohesion": 0.7036403153771631
+  },
+  {
+    "cluster": "Accounts",
+    "symbols": 195,
+    "frontend_total": "51",
+    "backend_total": "144",
+    "cohesion": 0.7882432504873096
+  },
+  {
+    "cluster": "Webhooks",
+    "symbols": 190,
+    "frontend_total": "7",
+    "backend_total": "174",
+    "cohesion": 0.9278489248367263
+  },
+  {
+    "cluster": "Campaigns",
+    "symbols": 189,
+    "frontend_total": "20",
+    "backend_total": "169",
+    "cohesion": 0.8350671527860734
+  },
+  {
+    "cluster": "Pledges",
+    "symbols": 185,
+    "frontend_total": "13",
+    "backend_total": "172",
+    "cohesion": 0.6529872928123028
+  },
+  {
+    "cluster": "Messages",
+    "symbols": 179,
+    "frontend_total": "0",
+    "backend_total": "179",
+    "cohesion": 0.862164448619101
+  },
+  {
+    "cluster": "Triggers",
+    "symbols": 166,
+    "frontend_total": "40",
+    "backend_total": "126",
+    "cohesion": 0.9322694285915591
+  },
+  {
+    "cluster": "Tools",
+    "symbols": 161,
+    "frontend_total": "0",
+    "backend_total": "161",
+    "cohesion": 0.9119905478660901
+  },
+  {
+    "cluster": "Factories",
+    "symbols": 151,
+    "frontend_total": "0",
+    "backend_total": "151",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Payments",
+    "symbols": 145,
+    "frontend_total": "0",
+    "backend_total": "145",
+    "cohesion": 0.7800662181209209
+  },
+  {
+    "cluster": "Aggregator",
+    "symbols": 139,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8148656722600521
+  },
+  {
+    "cluster": "Middleware",
+    "symbols": 136,
+    "frontend_total": "0",
+    "backend_total": "136",
+    "cohesion": 0.8823114925965703
+  },
+  {
+    "cluster": "V1",
+    "symbols": 131,
+    "frontend_total": "1",
+    "backend_total": "130",
+    "cohesion": 0.8927979858532828
+  },
+  {
+    "cluster": "Summary",
+    "symbols": 124,
+    "frontend_total": "0",
+    "backend_total": "124",
+    "cohesion": 0.9231987496649592
+  },
+  {
+    "cluster": "Opensearch",
+    "symbols": 123,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.7839071497608081
+  },
+  {
+    "cluster": "Filters-next",
+    "symbols": 118,
+    "frontend_total": "116",
+    "backend_total": "0",
+    "cohesion": 0.7790188724839578
+  },
+  {
+    "cluster": "Pipeline",
+    "symbols": 116,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.7631280210483798
+  },
+  {
+    "cluster": "Commands",
+    "symbols": 112,
+    "frontend_total": "1",
+    "backend_total": "111",
+    "cohesion": 0.7735257168062899
+  },
+  {
+    "cluster": "Generation",
+    "symbols": 110,
+    "frontend_total": "0",
+    "backend_total": "110",
+    "cohesion": 0.6193038550241159
+  },
+  {
+    "cluster": "Schema",
+    "symbols": 110,
+    "frontend_total": "0",
+    "backend_total": "37",
+    "cohesion": 0.7741428571428572
+  },
+  {
+    "cluster": "Payout",
+    "symbols": 107,
+    "frontend_total": "0",
+    "backend_total": "107",
+    "cohesion": 0.776968669959324
+  },
+  {
+    "cluster": "Orchestra",
+    "symbols": 106,
+    "frontend_total": "0",
+    "backend_total": "106",
+    "cohesion": 0.7048499124300741
+  },
+  {
+    "cluster": "Event",
+    "symbols": 104,
+    "frontend_total": "5",
+    "backend_total": "99",
+    "cohesion": 0.7038039082017994
+  },
+  {
+    "cluster": "Form",
+    "symbols": 102,
+    "frontend_total": "102",
+    "backend_total": "0",
+    "cohesion": 0.6453074282511734
+  },
+  {
+    "cluster": "Ledger",
+    "symbols": 98,
+    "frontend_total": "0",
+    "backend_total": "98",
+    "cohesion": 0.9039684563484162
+  },
+  {
+    "cluster": "Notifications",
+    "symbols": 92,
+    "frontend_total": "0",
+    "backend_total": "92",
+    "cohesion": 0.9246007793762605
+  },
+  {
+    "cluster": "Mobile",
+    "symbols": 90,
+    "frontend_total": "0",
+    "backend_total": "90",
+    "cohesion": 0.8039963382485596
+  },
+  {
+    "cluster": "Hydrator",
+    "symbols": 89,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8822574468472038
+  },
+  {
+    "cluster": "Contracts",
+    "symbols": 87,
+    "frontend_total": "0",
+    "backend_total": "87",
+    "cohesion": 0.9043549043549043
+  },
+  {
+    "cluster": "Task",
+    "symbols": 85,
+    "frontend_total": "6",
+    "backend_total": "79",
+    "cohesion": 0.8340885689412119
+  },
+  {
+    "cluster": "Backfill",
+    "symbols": 84,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.8373850482811246
+  },
+  {
+    "cluster": "Households",
+    "symbols": 82,
+    "frontend_total": "3",
+    "backend_total": "79",
+    "cohesion": 0.7377818686561224
+  },
+  {
+    "cluster": "Extensions",
+    "symbols": 82,
+    "frontend_total": "12",
+    "backend_total": "2",
+    "cohesion": 0.7703655680341477
+  },
+  {
+    "cluster": "Kafka",
+    "symbols": 82,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.6367184899919175
+  },
+  {
+    "cluster": "Collections",
+    "symbols": 81,
+    "frontend_total": "6",
+    "backend_total": "33",
+    "cohesion": 0.7098177694885512
+  },
+  {
+    "cluster": "Mail",
+    "symbols": 79,
+    "frontend_total": "0",
+    "backend_total": "79",
+    "cohesion": 0.8757265940810245
+  },
+  {
+    "cluster": "Requests",
+    "symbols": 79,
+    "frontend_total": "2",
+    "backend_total": "77",
+    "cohesion": 0.8010482681875085
+  },
+  {
+    "cluster": "Feature",
+    "symbols": 77,
+    "frontend_total": "0",
+    "backend_total": "77",
+    "cohesion": 0.8644357509903728
+  },
+  {
+    "cluster": "MailPiece",
+    "symbols": 75,
+    "frontend_total": "0",
+    "backend_total": "75",
+    "cohesion": 0.7078771816418875
+  },
+  {
+    "cluster": "DataSync",
+    "symbols": 75,
+    "frontend_total": "0",
+    "backend_total": "75",
+    "cohesion": 0.7635714285714286
+  },
+  {
+    "cluster": "Translate",
+    "symbols": 74,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9460317460317461
+  },
+  {
+    "cluster": "Scheduling",
+    "symbols": 73,
+    "frontend_total": "6",
+    "backend_total": "67",
+    "cohesion": 0.8378562576196064
+  },
+  {
+    "cluster": "Repairs",
+    "symbols": 72,
+    "frontend_total": "0",
+    "backend_total": "72",
+    "cohesion": 0.878766349844781
+  },
+  {
+    "cluster": "Blueprint",
+    "symbols": 71,
+    "frontend_total": "3",
+    "backend_total": "68",
+    "cohesion": 0.7757066462948817
+  },
+  {
+    "cluster": "Stripe",
+    "symbols": 70,
+    "frontend_total": "1",
+    "backend_total": "69",
+    "cohesion": 0.9024646781789638
+  },
+  {
+    "cluster": "Http",
+    "symbols": 68,
+    "frontend_total": "9",
+    "backend_total": "59",
+    "cohesion": 0.8141734082910553
+  },
+  {
+    "cluster": "Methods",
+    "symbols": 67,
+    "frontend_total": "0",
+    "backend_total": "67",
+    "cohesion": 0.7983905353308338
+  },
+  {
+    "cluster": "ContactActivity",
+    "symbols": 66,
+    "frontend_total": "0",
+    "backend_total": "66",
+    "cohesion": 0.8708580691339312
+  },
+  {
+    "cluster": "Termui",
+    "symbols": 66,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.7835238472493374
+  },
+  {
+    "cluster": "Line",
+    "symbols": 65,
+    "frontend_total": "0",
+    "backend_total": "65",
+    "cohesion": 0.7145151501642373
+  },
+  {
+    "cluster": "Mediators",
+    "symbols": 65,
+    "frontend_total": "0",
+    "backend_total": "65",
+    "cohesion": 0.8686495726495728
+  },
+  {
+    "cluster": "Sanitizer",
+    "symbols": 64,
+    "frontend_total": "0",
+    "backend_total": "64",
+    "cohesion": 0.903293656947891
+  },
+  {
+    "cluster": "BranchConditions",
+    "symbols": 61,
+    "frontend_total": "0",
+    "backend_total": "61",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Policies",
+    "symbols": 60,
+    "frontend_total": "2",
+    "backend_total": "58",
+    "cohesion": 0.8105291005291005
+  },
+  {
+    "cluster": "Service",
+    "symbols": 59,
+    "frontend_total": "0",
+    "backend_total": "59",
+    "cohesion": 0.7653880848297598
+  },
+  {
+    "cluster": "Integrations",
+    "symbols": 59,
+    "frontend_total": "29",
+    "backend_total": "30",
+    "cohesion": 0.7888220030242239
+  },
+  {
+    "cluster": "Dev",
+    "symbols": 58,
+    "frontend_total": "0",
+    "backend_total": "58",
+    "cohesion": 0.7929052429052429
+  },
+  {
+    "cluster": "Seeders",
+    "symbols": 57,
+    "frontend_total": "0",
+    "backend_total": "57",
+    "cohesion": 0.9769980506822616
+  },
+  {
+    "cluster": "Whisk-eval",
+    "symbols": 57,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8535039521881627
+  },
+  {
+    "cluster": "Intl-tel-input",
+    "symbols": 55,
+    "frontend_total": "0",
+    "backend_total": "54",
+    "cohesion": 0.88673578522318
+  },
+  {
+    "cluster": "Testing",
+    "symbols": 55,
+    "frontend_total": "0",
+    "backend_total": "55",
+    "cohesion": 0.9650349650349649
+  },
+  {
+    "cluster": "Concerns",
+    "symbols": 55,
+    "frontend_total": "0",
+    "backend_total": "55",
+    "cohesion": 0.9930735930735931
+  },
+  {
+    "cluster": "Events",
+    "symbols": 54,
+    "frontend_total": "7",
+    "backend_total": "47",
+    "cohesion": 0.8135185667061806
+  },
+  {
+    "cluster": "Sharing",
+    "symbols": 54,
+    "frontend_total": "0",
+    "backend_total": "54",
+    "cohesion": 0.7323369017813461
+  }
+]

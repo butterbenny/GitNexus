@@ -1,0 +1,52 @@
+[
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Resource → BE:Model",
+    "count": 44,
+    "topRoute": "http-get:/api/user/accounts/*"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Resource",
+    "count": 43,
+    "topRoute": "http-get:/api/user/accounts/*"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Resource",
+    "count": 40,
+    "topRoute": "http-get:/api/user/accounts/*"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Backend",
+    "count": 37,
+    "topRoute": "http-get:/api/user/accounts/*"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Backend",
+    "count": 14,
+    "topRoute": "http-get:/api/user/accounts/*"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Resource → BE:Model",
+    "count": 9,
+    "topRoute": "http-get:/api/user/accounts/*"
+  },
+  {
+    "signature": "FE:Page → FE:Api → HTTP:GET → BE:Controller → BE:Backend",
+    "count": 8,
+    "topRoute": "http-get:/api/accounts/*/billing/plans"
+  },
+  {
+    "signature": "FE:Page → FE:Api → HTTP:GET → BE:Controller → BE:Service → BE:Model",
+    "count": 8,
+    "topRoute": "http-get:/api/accounts/*/engage-configuration"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Resource → BE:Model → BE:Backend",
+    "count": 4,
+    "topRoute": "http-get:/api/campaigns/*"
+  },
+  {
+    "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Backend",
+    "count": 4,
+    "topRoute": "http-get:/api/reporting/accounts/*/reports/*"
+  }
+]

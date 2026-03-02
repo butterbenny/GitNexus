@@ -236,12 +236,42 @@ test('MCP debug_mode: ranks auth broken loop candidates using symptom + hop evid
     'expected auth findings from debug candidates'
   );
   assert.ok(Array.isArray(debug.debug?.next_actions));
+  assert.ok(debug.debug?.prioritized_candidate, 'expected prioritized_candidate payload');
+  assert.equal(debug.debug.prioritized_candidate.source, 'converged');
+  assert.ok(Number(debug.debug.prioritized_candidate.route_alignment || 0) > 0);
+  assert.ok(Array.isArray(debug.debug.prioritized_candidate.findings));
+  assert.ok(Array.isArray(debug.debug.prioritized_candidate.fix_recipe_ids));
+  assert.ok(
+    String(debug.debug.next_actions[0] || '').startsWith('Start with converged candidate'),
+    'expected first next action to prioritize top converged candidate',
+  );
+  assert.equal(
+    String(debug.debug.prioritized_candidate.next_action || ''),
+    String(debug.debug.next_actions[0] || ''),
+    'expected prioritized candidate next action to be first next_actions entry',
+  );
   assert.ok(debug.debug.next_actions.some(step => String(step).includes('review_mode')));
   assert.ok(Array.isArray(debug.debug?.timeline), 'expected timeline output');
   assert.ok(debug.debug.timeline.length > 0, 'expected timeline steps');
+  assert.ok(
+    debug.debug.timeline.some(step => Number(step?.runtime_route_matches?.request_spans || 0) >= 1),
+    'expected timeline to include runtime route match coverage',
+  );
   assert.ok(Array.isArray(debug.debug?.coverage?.warnings), 'expected coverage warnings');
   assert.equal(debug.debug?.coverage?.runtime_observations, true, 'expected runtime observation coverage flag');
+  assert.ok(
+    Number(debug.debug?.coverage?.runtime_route_matches?.match_ratio || 0) > 0,
+    'expected runtime route matcher coverage ratio to be reported',
+  );
+  assert.ok(
+    Number(debug.debug?.coverage?.converged_candidates || 0) > 0,
+    'expected converged candidate count from route-index coverage',
+  );
   assert.ok(Array.isArray(debug.debug?.confidence_breakdown?.claims), 'expected confidence breakdown claims');
+  assert.ok(
+    debug.debug.candidates.some(c => Number(c?.route_alignment || 0) > 0),
+    'expected ranked candidates to include non-zero route alignment',
+  );
   assert.ok(
     debug.debug.candidates.every(c => Array.isArray(c?.fix_recipes)),
     'expected candidate fix recipes to be emitted',
@@ -257,9 +287,17 @@ test('MCP debug_mode: ranks auth broken loop candidates using symptom + hop evid
     ),
     'expected runtime-derived findings in debug candidates',
   );
+  assert.ok(
+    debug.debug.candidates.some(c =>
+      Array.isArray(c?.evidence?.matched_routes)
+      && c.evidence.matched_routes.some(route => String(route?.pattern || '').includes('/api/accounts/*/notifications'))
+    ),
+    'expected runtime candidates to include matched route evidence from hop route index',
+  );
   assert.equal(debug.debug?.verification_contract?.post_edit_review?.tool, 'review_mode');
   assert.equal(debug._debug_mode?.knobs?.include_precedents, true);
   assert.equal(debug._debug_mode?.knobs?.runtime_observations, true);
+  assert.ok(Number(debug._debug_mode?.knobs?.route_converged_candidates || 0) > 0);
 });
 
 test('MCP debug_mode: auto-loads runtime observations from snapshot sidecar', async () => {

@@ -1,0 +1,3271 @@
+[
+  {
+    "cluster": "Services",
+    "symbols": 2412,
+    "frontend_total": "29",
+    "backend_total": "2383",
+    "cohesion": 0.8784451775072628
+  },
+  {
+    "cluster": "Api",
+    "symbols": 2107,
+    "frontend_total": "1936",
+    "backend_total": "118",
+    "cohesion": 0.8034483314153107
+  },
+  {
+    "cluster": "Engage",
+    "symbols": 1289,
+    "frontend_total": "55",
+    "backend_total": "1234",
+    "cohesion": 0.7793650867972448
+  },
+  {
+    "cluster": "Controllers",
+    "symbols": 720,
+    "frontend_total": "29",
+    "backend_total": "684",
+    "cohesion": 0.9152028917384557
+  },
+  {
+    "cluster": "Campaign",
+    "symbols": 701,
+    "frontend_total": "15",
+    "backend_total": "686",
+    "cohesion": 0.7239090560091302
+  },
+  {
+    "cluster": "Models",
+    "symbols": 693,
+    "frontend_total": "4",
+    "backend_total": "689",
+    "cohesion": 0.8256391597510161
+  },
+  {
+    "cluster": "Traits",
+    "symbols": 548,
+    "frontend_total": "4",
+    "backend_total": "544",
+    "cohesion": 0.6890131219674592
+  },
+  {
+    "cluster": "Actions",
+    "symbols": 535,
+    "frontend_total": "13",
+    "backend_total": "522",
+    "cohesion": 0.808309965066864
+  },
+  {
+    "cluster": "Listeners",
+    "symbols": 496,
+    "frontend_total": "7",
+    "backend_total": "489",
+    "cohesion": 0.7784178561205398
+  },
+  {
+    "cluster": "Checkout",
+    "symbols": 493,
+    "frontend_total": "5",
+    "backend_total": "488",
+    "cohesion": 0.7985073593856219
+  },
+  {
+    "cluster": "Components",
+    "symbols": 458,
+    "frontend_total": "122",
+    "backend_total": "168",
+    "cohesion": 0.8338312368373777
+  },
+  {
+    "cluster": "Imports",
+    "symbols": 410,
+    "frontend_total": "47",
+    "backend_total": "363",
+    "cohesion": 0.8286011425811102
+  },
+  {
+    "cluster": "Dashboard",
+    "symbols": 407,
+    "frontend_total": "30",
+    "backend_total": "377",
+    "cohesion": 0.8679434397918506
+  },
+  {
+    "cluster": "Jobs",
+    "symbols": 393,
+    "frontend_total": "1",
+    "backend_total": "392",
+    "cohesion": 0.8969187928195603
+  },
+  {
+    "cluster": "Workflows",
+    "symbols": 383,
+    "frontend_total": "24",
+    "backend_total": "359",
+    "cohesion": 0.7932925576210319
+  },
+  {
+    "cluster": "Contacts",
+    "symbols": 383,
+    "frontend_total": "51",
+    "backend_total": "332",
+    "cohesion": 0.8044425368416184
+  },
+  {
+    "cluster": "Filters",
+    "symbols": 345,
+    "frontend_total": "254",
+    "backend_total": "91",
+    "cohesion": 0.8352628214511477
+  },
+  {
+    "cluster": "CustomHooks",
+    "symbols": 338,
+    "frontend_total": "325",
+    "backend_total": "7",
+    "cohesion": 0.6936031699301279
+  },
+  {
+    "cluster": "ModelFilters",
+    "symbols": 334,
+    "frontend_total": "2",
+    "backend_total": "332",
+    "cohesion": 0.6491621457232952
+  },
+  {
+    "cluster": "Transaction",
+    "symbols": 323,
+    "frontend_total": "3",
+    "backend_total": "320",
+    "cohesion": 0.7101239257044373
+  },
+  {
+    "cluster": "Auction",
+    "symbols": 322,
+    "frontend_total": "25",
+    "backend_total": "297",
+    "cohesion": 0.7498358309872942
+  },
+  {
+    "cluster": "Unit",
+    "symbols": 306,
+    "frontend_total": "1",
+    "backend_total": "305",
+    "cohesion": 0.720152199210019
+  },
+  {
+    "cluster": "Auctions",
+    "symbols": 305,
+    "frontend_total": "14",
+    "backend_total": "291",
+    "cohesion": 0.7795914611649567
+  },
+  {
+    "cluster": "Hooks",
+    "symbols": 304,
+    "frontend_total": "222",
+    "backend_total": "29",
+    "cohesion": 0.7270356146634765
+  },
+  {
+    "cluster": "Support",
+    "symbols": 294,
+    "frontend_total": "0",
+    "backend_total": "294",
+    "cohesion": 0.878642771626144
+  },
+  {
+    "cluster": "Contact",
+    "symbols": 289,
+    "frontend_total": "4",
+    "backend_total": "285",
+    "cohesion": 0.7497362989121599
+  },
+  {
+    "cluster": "Transactions",
+    "symbols": 266,
+    "frontend_total": "29",
+    "backend_total": "237",
+    "cohesion": 0.8512769838714841
+  },
+  {
+    "cluster": "Auth",
+    "symbols": 243,
+    "frontend_total": "1",
+    "backend_total": "242",
+    "cohesion": 0.8064248200576187
+  },
+  {
+    "cluster": "Account",
+    "symbols": 231,
+    "frontend_total": "20",
+    "backend_total": "211",
+    "cohesion": 0.6698978829650836
+  },
+  {
+    "cluster": "Exports",
+    "symbols": 223,
+    "frontend_total": "0",
+    "backend_total": "217",
+    "cohesion": 0.8924869223365809
+  },
+  {
+    "cluster": "Providers",
+    "symbols": 223,
+    "frontend_total": "5",
+    "backend_total": "171",
+    "cohesion": 0.8825478392270932
+  },
+  {
+    "cluster": "Rules",
+    "symbols": 222,
+    "frontend_total": "1",
+    "backend_total": "221",
+    "cohesion": 0.8223758512480317
+  },
+  {
+    "cluster": "API",
+    "symbols": 221,
+    "frontend_total": "20",
+    "backend_total": "201",
+    "cohesion": 0.9093703484094203
+  },
+  {
+    "cluster": "DataTransferObjects",
+    "symbols": 204,
+    "frontend_total": "0",
+    "backend_total": "204",
+    "cohesion": 0.8219403821487011
+  },
+  {
+    "cluster": "Finance",
+    "symbols": 204,
+    "frontend_total": "82",
+    "backend_total": "122",
+    "cohesion": 0.7993752425984172
+  },
+  {
+    "cluster": "Reporting",
+    "symbols": 198,
+    "frontend_total": "0",
+    "backend_total": "198",
+    "cohesion": 0.7036403153771631
+  },
+  {
+    "cluster": "Js",
+    "symbols": 198,
+    "frontend_total": "0",
+    "backend_total": "177",
+    "cohesion": 0.9051885227481377
+  },
+  {
+    "cluster": "Accounts",
+    "symbols": 195,
+    "frontend_total": "51",
+    "backend_total": "144",
+    "cohesion": 0.7882432504873096
+  },
+  {
+    "cluster": "Webhooks",
+    "symbols": 190,
+    "frontend_total": "7",
+    "backend_total": "174",
+    "cohesion": 0.9278489248367265
+  },
+  {
+    "cluster": "Campaigns",
+    "symbols": 189,
+    "frontend_total": "20",
+    "backend_total": "169",
+    "cohesion": 0.8350671527860734
+  },
+  {
+    "cluster": "Pledges",
+    "symbols": 185,
+    "frontend_total": "13",
+    "backend_total": "172",
+    "cohesion": 0.6529872928123028
+  },
+  {
+    "cluster": "Messages",
+    "symbols": 179,
+    "frontend_total": "0",
+    "backend_total": "179",
+    "cohesion": 0.862164448619101
+  },
+  {
+    "cluster": "Triggers",
+    "symbols": 166,
+    "frontend_total": "40",
+    "backend_total": "126",
+    "cohesion": 0.9322694285915591
+  },
+  {
+    "cluster": "Tools",
+    "symbols": 161,
+    "frontend_total": "0",
+    "backend_total": "161",
+    "cohesion": 0.9119905478660901
+  },
+  {
+    "cluster": "Factories",
+    "symbols": 151,
+    "frontend_total": "0",
+    "backend_total": "151",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Payments",
+    "symbols": 145,
+    "frontend_total": "0",
+    "backend_total": "145",
+    "cohesion": 0.780066218120921
+  },
+  {
+    "cluster": "Aggregator",
+    "symbols": 139,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8148656722600522
+  },
+  {
+    "cluster": "Middleware",
+    "symbols": 136,
+    "frontend_total": "0",
+    "backend_total": "136",
+    "cohesion": 0.8823114925965703
+  },
+  {
+    "cluster": "V1",
+    "symbols": 131,
+    "frontend_total": "1",
+    "backend_total": "130",
+    "cohesion": 0.892797985853283
+  },
+  {
+    "cluster": "Summary",
+    "symbols": 124,
+    "frontend_total": "0",
+    "backend_total": "124",
+    "cohesion": 0.9231987496649592
+  },
+  {
+    "cluster": "Opensearch",
+    "symbols": 123,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.7839071497608082
+  },
+  {
+    "cluster": "Filters-next",
+    "symbols": 118,
+    "frontend_total": "116",
+    "backend_total": "0",
+    "cohesion": 0.7790188724839578
+  },
+  {
+    "cluster": "Pipeline",
+    "symbols": 116,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.76312802104838
+  },
+  {
+    "cluster": "Commands",
+    "symbols": 112,
+    "frontend_total": "1",
+    "backend_total": "111",
+    "cohesion": 0.7735257168062899
+  },
+  {
+    "cluster": "Generation",
+    "symbols": 110,
+    "frontend_total": "0",
+    "backend_total": "110",
+    "cohesion": 0.6193038550241159
+  },
+  {
+    "cluster": "Schema",
+    "symbols": 110,
+    "frontend_total": "0",
+    "backend_total": "37",
+    "cohesion": 0.7741428571428574
+  },
+  {
+    "cluster": "Payout",
+    "symbols": 107,
+    "frontend_total": "0",
+    "backend_total": "107",
+    "cohesion": 0.7769686699593241
+  },
+  {
+    "cluster": "Orchestra",
+    "symbols": 106,
+    "frontend_total": "0",
+    "backend_total": "106",
+    "cohesion": 0.7048499124300741
+  },
+  {
+    "cluster": "Event",
+    "symbols": 104,
+    "frontend_total": "5",
+    "backend_total": "99",
+    "cohesion": 0.7038039082017994
+  },
+  {
+    "cluster": "Form",
+    "symbols": 102,
+    "frontend_total": "102",
+    "backend_total": "0",
+    "cohesion": 0.6453074282511734
+  },
+  {
+    "cluster": "Ledger",
+    "symbols": 98,
+    "frontend_total": "0",
+    "backend_total": "98",
+    "cohesion": 0.9039684563484159
+  },
+  {
+    "cluster": "Notifications",
+    "symbols": 92,
+    "frontend_total": "0",
+    "backend_total": "92",
+    "cohesion": 0.9246007793762606
+  },
+  {
+    "cluster": "Mobile",
+    "symbols": 90,
+    "frontend_total": "0",
+    "backend_total": "90",
+    "cohesion": 0.80399633824856
+  },
+  {
+    "cluster": "Hydrator",
+    "symbols": 89,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8822574468472038
+  },
+  {
+    "cluster": "Contracts",
+    "symbols": 87,
+    "frontend_total": "0",
+    "backend_total": "87",
+    "cohesion": 0.9043549043549045
+  },
+  {
+    "cluster": "Task",
+    "symbols": 85,
+    "frontend_total": "6",
+    "backend_total": "79",
+    "cohesion": 0.8340885689412119
+  },
+  {
+    "cluster": "Backfill",
+    "symbols": 84,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.8373850482811246
+  },
+  {
+    "cluster": "Households",
+    "symbols": 82,
+    "frontend_total": "3",
+    "backend_total": "79",
+    "cohesion": 0.7377818686561224
+  },
+  {
+    "cluster": "Extensions",
+    "symbols": 82,
+    "frontend_total": "12",
+    "backend_total": "2",
+    "cohesion": 0.7703655680341476
+  },
+  {
+    "cluster": "Kafka",
+    "symbols": 82,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.6367184899919174
+  },
+  {
+    "cluster": "Collections",
+    "symbols": 81,
+    "frontend_total": "6",
+    "backend_total": "33",
+    "cohesion": 0.7098177694885515
+  },
+  {
+    "cluster": "Mail",
+    "symbols": 79,
+    "frontend_total": "0",
+    "backend_total": "79",
+    "cohesion": 0.8757265940810245
+  },
+  {
+    "cluster": "Requests",
+    "symbols": 79,
+    "frontend_total": "2",
+    "backend_total": "77",
+    "cohesion": 0.8010482681875088
+  },
+  {
+    "cluster": "Feature",
+    "symbols": 77,
+    "frontend_total": "0",
+    "backend_total": "77",
+    "cohesion": 0.864435750990373
+  },
+  {
+    "cluster": "DataSync",
+    "symbols": 75,
+    "frontend_total": "0",
+    "backend_total": "75",
+    "cohesion": 0.7635714285714286
+  },
+  {
+    "cluster": "MailPiece",
+    "symbols": 75,
+    "frontend_total": "0",
+    "backend_total": "75",
+    "cohesion": 0.7078771816418875
+  },
+  {
+    "cluster": "Translate",
+    "symbols": 74,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9460317460317461
+  },
+  {
+    "cluster": "Scheduling",
+    "symbols": 73,
+    "frontend_total": "6",
+    "backend_total": "67",
+    "cohesion": 0.8378562576196064
+  },
+  {
+    "cluster": "Repairs",
+    "symbols": 72,
+    "frontend_total": "0",
+    "backend_total": "72",
+    "cohesion": 0.8787663498447813
+  },
+  {
+    "cluster": "Blueprint",
+    "symbols": 71,
+    "frontend_total": "3",
+    "backend_total": "68",
+    "cohesion": 0.7757066462948816
+  },
+  {
+    "cluster": "Stripe",
+    "symbols": 70,
+    "frontend_total": "1",
+    "backend_total": "69",
+    "cohesion": 0.9024646781789641
+  },
+  {
+    "cluster": "Http",
+    "symbols": 68,
+    "frontend_total": "9",
+    "backend_total": "59",
+    "cohesion": 0.8141734082910552
+  },
+  {
+    "cluster": "Methods",
+    "symbols": 67,
+    "frontend_total": "0",
+    "backend_total": "67",
+    "cohesion": 0.7983905353308338
+  },
+  {
+    "cluster": "ContactActivity",
+    "symbols": 66,
+    "frontend_total": "0",
+    "backend_total": "66",
+    "cohesion": 0.8708580691339314
+  },
+  {
+    "cluster": "Termui",
+    "symbols": 66,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.7835238472493374
+  },
+  {
+    "cluster": "Mediators",
+    "symbols": 65,
+    "frontend_total": "0",
+    "backend_total": "65",
+    "cohesion": 0.8686495726495728
+  },
+  {
+    "cluster": "Line",
+    "symbols": 65,
+    "frontend_total": "0",
+    "backend_total": "65",
+    "cohesion": 0.7145151501642373
+  },
+  {
+    "cluster": "Sanitizer",
+    "symbols": 64,
+    "frontend_total": "0",
+    "backend_total": "64",
+    "cohesion": 0.9032936569478909
+  },
+  {
+    "cluster": "BranchConditions",
+    "symbols": 61,
+    "frontend_total": "0",
+    "backend_total": "61",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Policies",
+    "symbols": 60,
+    "frontend_total": "2",
+    "backend_total": "58",
+    "cohesion": 0.8105291005291005
+  },
+  {
+    "cluster": "Integrations",
+    "symbols": 59,
+    "frontend_total": "29",
+    "backend_total": "30",
+    "cohesion": 0.7888220030242241
+  },
+  {
+    "cluster": "Service",
+    "symbols": 59,
+    "frontend_total": "0",
+    "backend_total": "59",
+    "cohesion": 0.76538808482976
+  },
+  {
+    "cluster": "Dev",
+    "symbols": 58,
+    "frontend_total": "0",
+    "backend_total": "58",
+    "cohesion": 0.792905242905243
+  },
+  {
+    "cluster": "Seeders",
+    "symbols": 57,
+    "frontend_total": "0",
+    "backend_total": "57",
+    "cohesion": 0.9769980506822613
+  },
+  {
+    "cluster": "Whisk-eval",
+    "symbols": 57,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8535039521881628
+  },
+  {
+    "cluster": "Intl-tel-input",
+    "symbols": 55,
+    "frontend_total": "0",
+    "backend_total": "54",
+    "cohesion": 0.88673578522318
+  },
+  {
+    "cluster": "Testing",
+    "symbols": 55,
+    "frontend_total": "0",
+    "backend_total": "55",
+    "cohesion": 0.965034965034965
+  },
+  {
+    "cluster": "Concerns",
+    "symbols": 55,
+    "frontend_total": "0",
+    "backend_total": "55",
+    "cohesion": 0.9930735930735931
+  },
+  {
+    "cluster": "Registry",
+    "symbols": 54,
+    "frontend_total": "2",
+    "backend_total": "52",
+    "cohesion": 0.758307947196836
+  },
+  {
+    "cluster": "Sharing",
+    "symbols": 54,
+    "frontend_total": "0",
+    "backend_total": "54",
+    "cohesion": 0.7323369017813461
+  },
+  {
+    "cluster": "Events",
+    "symbols": 54,
+    "frontend_total": "7",
+    "backend_total": "47",
+    "cohesion": 0.8135185667061805
+  },
+  {
+    "cluster": "Reports",
+    "symbols": 51,
+    "frontend_total": "15",
+    "backend_total": "34",
+    "cohesion": 0.8089169196460751
+  },
+  {
+    "cluster": "Batch",
+    "symbols": 51,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9104477611940298
+  },
+  {
+    "cluster": "Datadog",
+    "symbols": 50,
+    "frontend_total": "0",
+    "backend_total": "50",
+    "cohesion": 0.7652592592592593
+  },
+  {
+    "cluster": "Setup",
+    "symbols": 50,
+    "frontend_total": "0",
+    "backend_total": "50",
+    "cohesion": 0.7967502088554721
+  },
+  {
+    "cluster": "ModelSeeders",
+    "symbols": 49,
+    "frontend_total": "0",
+    "backend_total": "49",
+    "cohesion": 0.9407191448007775
+  },
+  {
+    "cluster": "Numbers",
+    "symbols": 48,
+    "frontend_total": "0",
+    "backend_total": "48",
+    "cohesion": 0.9493686868686869
+  },
+  {
+    "cluster": "Custom-fields",
+    "symbols": 48,
+    "frontend_total": "46",
+    "backend_total": "2",
+    "cohesion": 0.7849386724386723
+  },
+  {
+    "cluster": "Builder",
+    "symbols": 48,
+    "frontend_total": "0",
+    "backend_total": "48",
+    "cohesion": 0.9312905225019069
+  },
+  {
+    "cluster": "PaymentPlan",
+    "symbols": 47,
+    "frontend_total": "1",
+    "backend_total": "46",
+    "cohesion": 0.8337171103128549
+  },
+  {
+    "cluster": "AccessControl",
+    "symbols": 47,
+    "frontend_total": "0",
+    "backend_total": "47",
+    "cohesion": 0.8397158397158397
+  },
+  {
+    "cluster": "Table-seating",
+    "symbols": 46,
+    "frontend_total": "46",
+    "backend_total": "0",
+    "cohesion": 0.8869273783719784
+  },
+  {
+    "cluster": "Table",
+    "symbols": 45,
+    "frontend_total": "18",
+    "backend_total": "0",
+    "cohesion": 0.774239217572551
+  },
+  {
+    "cluster": "Verify",
+    "symbols": 45,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8232823403113259
+  },
+  {
+    "cluster": "Column",
+    "symbols": 45,
+    "frontend_total": "0",
+    "backend_total": "45",
+    "cohesion": 0.8618967452300788
+  },
+  {
+    "cluster": "Pools",
+    "symbols": 44,
+    "frontend_total": "0",
+    "backend_total": "44",
+    "cohesion": 0.9487673343605549
+  },
+  {
+    "cluster": "Filtering",
+    "symbols": 44,
+    "frontend_total": "0",
+    "backend_total": "44",
+    "cohesion": 0.6920193629234377
+  },
+  {
+    "cluster": "ProjectManagement",
+    "symbols": 43,
+    "frontend_total": "0",
+    "backend_total": "43",
+    "cohesion": 0.8893473368342085
+  },
+  {
+    "cluster": "Internal",
+    "symbols": 42,
+    "frontend_total": "0",
+    "backend_total": "29",
+    "cohesion": 0.8708061002178648
+  },
+  {
+    "cluster": "Domains",
+    "symbols": 42,
+    "frontend_total": "0",
+    "backend_total": "42",
+    "cohesion": 0.9489795918367344
+  },
+  {
+    "cluster": "GuideStar",
+    "symbols": 40,
+    "frontend_total": "0",
+    "backend_total": "40",
+    "cohesion": 0.8470029239766085
+  },
+  {
+    "cluster": "Queries",
+    "symbols": 40,
+    "frontend_total": "18",
+    "backend_total": "22",
+    "cohesion": 0.7804945054945056
+  },
+  {
+    "cluster": "Flow-v2",
+    "symbols": 38,
+    "frontend_total": "0",
+    "backend_total": "38",
+    "cohesion": 0.8856725146198833
+  },
+  {
+    "cluster": "Payment",
+    "symbols": 38,
+    "frontend_total": "12",
+    "backend_total": "26",
+    "cohesion": 0.8491370125719158
+  },
+  {
+    "cluster": "Pledge",
+    "symbols": 37,
+    "frontend_total": "1",
+    "backend_total": "36",
+    "cohesion": 0.7743090684267155
+  },
+  {
+    "cluster": "Lob",
+    "symbols": 37,
+    "frontend_total": "0",
+    "backend_total": "37",
+    "cohesion": 0.8538003243885598
+  },
+  {
+    "cluster": "SoftCredits",
+    "symbols": 37,
+    "frontend_total": "0",
+    "backend_total": "37",
+    "cohesion": 0.8830766250121089
+  },
+  {
+    "cluster": "UI",
+    "symbols": 36,
+    "frontend_total": "0",
+    "backend_total": "35",
+    "cohesion": 0.8930272625924799
+  },
+  {
+    "cluster": "CustomRules",
+    "symbols": 35,
+    "frontend_total": "0",
+    "backend_total": "35",
+    "cohesion": 0.9714285714285714
+  },
+  {
+    "cluster": "Sponsors",
+    "symbols": 35,
+    "frontend_total": "5",
+    "backend_total": "30",
+    "cohesion": 0.8254572940287226
+  },
+  {
+    "cluster": "Tickets",
+    "symbols": 35,
+    "frontend_total": "14",
+    "backend_total": "21",
+    "cohesion": 0.7687074829931971
+  },
+  {
+    "cluster": "Campaign-event",
+    "symbols": 34,
+    "frontend_total": "34",
+    "backend_total": "0",
+    "cohesion": 0.7873685706166524
+  },
+  {
+    "cluster": "Handlers",
+    "symbols": 34,
+    "frontend_total": "0",
+    "backend_total": "34",
+    "cohesion": 0.7059242948516304
+  },
+  {
+    "cluster": "Generator",
+    "symbols": 33,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.7876129718234981
+  },
+  {
+    "cluster": "ExceptionHandling",
+    "symbols": 33,
+    "frontend_total": "0",
+    "backend_total": "33",
+    "cohesion": 0.8636363636363635
+  },
+  {
+    "cluster": "Search",
+    "symbols": 33,
+    "frontend_total": "26",
+    "backend_total": "4",
+    "cohesion": 0.8076738076738075
+  },
+  {
+    "cluster": "Academy",
+    "symbols": 33,
+    "frontend_total": "0",
+    "backend_total": "33",
+    "cohesion": 0.9034037857567269
+  },
+  {
+    "cluster": "Explain",
+    "symbols": 32,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.6210581201334815
+  },
+  {
+    "cluster": "Pages",
+    "symbols": 32,
+    "frontend_total": "0",
+    "backend_total": "32",
+    "cohesion": 0.9375381562881563
+  },
+  {
+    "cluster": "Items",
+    "symbols": 32,
+    "frontend_total": "0",
+    "backend_total": "32",
+    "cohesion": 0.907680860805861
+  },
+  {
+    "cluster": "Package",
+    "symbols": 32,
+    "frontend_total": "0",
+    "backend_total": "32",
+    "cohesion": 0.7419848374132261
+  },
+  {
+    "cluster": "Reducers",
+    "symbols": 32,
+    "frontend_total": "32",
+    "backend_total": "0",
+    "cohesion": 0.7594696969696969
+  },
+  {
+    "cluster": "DefaultTemplates",
+    "symbols": 32,
+    "frontend_total": "0",
+    "backend_total": "32",
+    "cohesion": 0.6527576197387518
+  },
+  {
+    "cluster": "Cli",
+    "symbols": 31,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8505460131266581
+  },
+  {
+    "cluster": "ResponseTypes",
+    "symbols": 31,
+    "frontend_total": "0",
+    "backend_total": "31",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Import",
+    "symbols": 30,
+    "frontend_total": "0",
+    "backend_total": "30",
+    "cohesion": 0.511779938605066
+  },
+  {
+    "cluster": "System",
+    "symbols": 30,
+    "frontend_total": "0",
+    "backend_total": "30",
+    "cohesion": 0.9538461538461538
+  },
+  {
+    "cluster": "Flatfile",
+    "symbols": 30,
+    "frontend_total": "0",
+    "backend_total": "30",
+    "cohesion": 0.844110275689223
+  },
+  {
+    "cluster": "KeyFeatures",
+    "symbols": 29,
+    "frontend_total": "0",
+    "backend_total": "29",
+    "cohesion": 1
+  },
+  {
+    "cluster": "ScheduledExecution",
+    "symbols": 29,
+    "frontend_total": "0",
+    "backend_total": "29",
+    "cohesion": 0.6976742253511763
+  },
+  {
+    "cluster": "Console",
+    "symbols": 29,
+    "frontend_total": "0",
+    "backend_total": "29",
+    "cohesion": 0.8683385579937305
+  },
+  {
+    "cluster": "Quickbooks",
+    "symbols": 29,
+    "frontend_total": "0",
+    "backend_total": "29",
+    "cohesion": 0.8581504702194358
+  },
+  {
+    "cluster": "PaddleRaise",
+    "symbols": 29,
+    "frontend_total": "6",
+    "backend_total": "23",
+    "cohesion": 0.7857808857808857
+  },
+  {
+    "cluster": "ViewModels",
+    "symbols": 29,
+    "frontend_total": "0",
+    "backend_total": "29",
+    "cohesion": 0.8869071211520677
+  },
+  {
+    "cluster": "Sql",
+    "symbols": 28,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.727367870225013
+  },
+  {
+    "cluster": "Responses",
+    "symbols": 27,
+    "frontend_total": "0",
+    "backend_total": "27",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Foundation",
+    "symbols": 27,
+    "frontend_total": "0",
+    "backend_total": "27",
+    "cohesion": 0.9059829059829061
+  },
+  {
+    "cluster": "Eval",
+    "symbols": 27,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8685782556750298
+  },
+  {
+    "cluster": "Chart",
+    "symbols": 26,
+    "frontend_total": "0",
+    "backend_total": "1",
+    "cohesion": 0.9780219780219781
+  },
+  {
+    "cluster": "Query",
+    "symbols": 26,
+    "frontend_total": "0",
+    "backend_total": "26",
+    "cohesion": 0.66711204428326
+  },
+  {
+    "cluster": "Export",
+    "symbols": 26,
+    "frontend_total": "0",
+    "backend_total": "26",
+    "cohesion": 0.8924825174825176
+  },
+  {
+    "cluster": "CampaignItem",
+    "symbols": 26,
+    "frontend_total": "0",
+    "backend_total": "26",
+    "cohesion": 0.8333333333333334
+  },
+  {
+    "cluster": "Filter",
+    "symbols": 26,
+    "frontend_total": "0",
+    "backend_total": "26",
+    "cohesion": 0.748582995951417
+  },
+  {
+    "cluster": "MergeFields",
+    "symbols": 25,
+    "frontend_total": "0",
+    "backend_total": "25",
+    "cohesion": 0.8080808080808081
+  },
+  {
+    "cluster": "Bloomerang",
+    "symbols": 25,
+    "frontend_total": "0",
+    "backend_total": "25",
+    "cohesion": 0.9060317460317461
+  },
+  {
+    "cluster": "Facades",
+    "symbols": 25,
+    "frontend_total": "0",
+    "backend_total": "25",
+    "cohesion": 0.8971916971916972
+  },
+  {
+    "cluster": "AccountReport",
+    "symbols": 25,
+    "frontend_total": "2",
+    "backend_total": "23",
+    "cohesion": 0.7438034188034187
+  },
+  {
+    "cluster": "Monitor",
+    "symbols": 25,
+    "frontend_total": "0",
+    "backend_total": "25",
+    "cohesion": 0.7098461538461539
+  },
+  {
+    "cluster": "DTOs",
+    "symbols": 24,
+    "frontend_total": "1",
+    "backend_total": "23",
+    "cohesion": 0.8009259259259259
+  },
+  {
+    "cluster": "Rich-text-editor",
+    "symbols": 24,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8901960784313726
+  },
+  {
+    "cluster": "Workflow",
+    "symbols": 24,
+    "frontend_total": "0",
+    "backend_total": "24",
+    "cohesion": 1
+  },
+  {
+    "cluster": "DateRange",
+    "symbols": 23,
+    "frontend_total": "0",
+    "backend_total": "23",
+    "cohesion": 0.6257763975155278
+  },
+  {
+    "cluster": "Adapters",
+    "symbols": 23,
+    "frontend_total": "4",
+    "backend_total": "1",
+    "cohesion": 0.8060251768691665
+  },
+  {
+    "cluster": "Webhook",
+    "symbols": 23,
+    "frontend_total": "0",
+    "backend_total": "23",
+    "cohesion": 0.864787386526517
+  },
+  {
+    "cluster": "Items-form",
+    "symbols": 23,
+    "frontend_total": "19",
+    "backend_total": "0",
+    "cohesion": 0.6709741104679858
+  },
+  {
+    "cluster": "Widgets",
+    "symbols": 23,
+    "frontend_total": "4",
+    "backend_total": "15",
+    "cohesion": 0.8409937888198761
+  },
+  {
+    "cluster": "Bidders",
+    "symbols": 22,
+    "frontend_total": "0",
+    "backend_total": "22",
+    "cohesion": 0.9147727272727273
+  },
+  {
+    "cluster": "Checks",
+    "symbols": 22,
+    "frontend_total": "0",
+    "backend_total": "22",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Templates",
+    "symbols": 22,
+    "frontend_total": "0",
+    "backend_total": "22",
+    "cohesion": 0.9545454545454546
+  },
+  {
+    "cluster": "GetStream",
+    "symbols": 22,
+    "frontend_total": "0",
+    "backend_total": "22",
+    "cohesion": 0.9204545454545454
+  },
+  {
+    "cluster": "Invite",
+    "symbols": 22,
+    "frontend_total": "1",
+    "backend_total": "21",
+    "cohesion": 0.7637741046831955
+  },
+  {
+    "cluster": "Combobox",
+    "symbols": 22,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 0.8414688759516346
+  },
+  {
+    "cluster": "Conversations",
+    "symbols": 21,
+    "frontend_total": "0",
+    "backend_total": "21",
+    "cohesion": 0.7583732057416268
+  },
+  {
+    "cluster": "Criteria",
+    "symbols": 20,
+    "frontend_total": "0",
+    "backend_total": "20",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Payouts",
+    "symbols": 20,
+    "frontend_total": "4",
+    "backend_total": "16",
+    "cohesion": 0.6720133667502088
+  },
+  {
+    "cluster": "Enums",
+    "symbols": 20,
+    "frontend_total": "0",
+    "backend_total": "20",
+    "cohesion": 0.9714285714285715
+  },
+  {
+    "cluster": "V2",
+    "symbols": 20,
+    "frontend_total": "0",
+    "backend_total": "20",
+    "cohesion": 0.9299999999999999
+  },
+  {
+    "cluster": "Date-time",
+    "symbols": 19,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8361034164358262
+  },
+  {
+    "cluster": "Migrations",
+    "symbols": 19,
+    "frontend_total": "0",
+    "backend_total": "19",
+    "cohesion": 0.6526315789473685
+  },
+  {
+    "cluster": "Campaign-auction",
+    "symbols": 19,
+    "frontend_total": "19",
+    "backend_total": "0",
+    "cohesion": 0.7999999999999999
+  },
+  {
+    "cluster": "Config",
+    "symbols": 19,
+    "frontend_total": "0",
+    "backend_total": "13",
+    "cohesion": 0.9172932330827067
+  },
+  {
+    "cluster": "Email",
+    "symbols": 19,
+    "frontend_total": "3",
+    "backend_total": "16",
+    "cohesion": 0.928654970760234
+  },
+  {
+    "cluster": "Members",
+    "symbols": 19,
+    "frontend_total": "0",
+    "backend_total": "19",
+    "cohesion": 1
+  },
+  {
+    "cluster": "AI",
+    "symbols": 19,
+    "frontend_total": "0",
+    "backend_total": "19",
+    "cohesion": 0.699055330634278
+  },
+  {
+    "cluster": "Formatters",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 0.9047619047619049
+  },
+  {
+    "cluster": "Exception",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 0.8495370370370371
+  },
+  {
+    "cluster": "ContactDeduplication",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 0.8516081871345029
+  },
+  {
+    "cluster": "MessageStats",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 1
+  },
+  {
+    "cluster": "CalculatedFields",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 0.9135802469135803
+  },
+  {
+    "cluster": "Ledgers",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 0.9290123456790123
+  },
+  {
+    "cluster": "Exceptions",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "18",
+    "cohesion": 0.9074074074074073
+  },
+  {
+    "cluster": "Mysql",
+    "symbols": 18,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9285714285714286
+  },
+  {
+    "cluster": "Forms",
+    "symbols": 17,
+    "frontend_total": "17",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "CustomField",
+    "symbols": 17,
+    "frontend_total": "2",
+    "backend_total": "15",
+    "cohesion": 0.8284313725490197
+  },
+  {
+    "cluster": "Users",
+    "symbols": 17,
+    "frontend_total": "14",
+    "backend_total": "3",
+    "cohesion": 0.7403846153846155
+  },
+  {
+    "cluster": "Resources",
+    "symbols": 17,
+    "frontend_total": "0",
+    "backend_total": "17",
+    "cohesion": 0.8546712802768166
+  },
+  {
+    "cluster": "Auction-settings",
+    "symbols": 17,
+    "frontend_total": "17",
+    "backend_total": "0",
+    "cohesion": 0.576271186440678
+  },
+  {
+    "cluster": "Postmark",
+    "symbols": 17,
+    "frontend_total": "0",
+    "backend_total": "17",
+    "cohesion": 0.888888888888889
+  },
+  {
+    "cluster": "AccountReportTemplate",
+    "symbols": 16,
+    "frontend_total": "0",
+    "backend_total": "16",
+    "cohesion": 0.8035714285714286
+  },
+  {
+    "cluster": "Github",
+    "symbols": 16,
+    "frontend_total": "0",
+    "backend_total": "16",
+    "cohesion": 0.8173076923076922
+  },
+  {
+    "cluster": "Progress",
+    "symbols": 15,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8301886792452832
+  },
+  {
+    "cluster": "Utilities",
+    "symbols": 15,
+    "frontend_total": "0",
+    "backend_total": "15",
+    "cohesion": 0.7235772357723577
+  },
+  {
+    "cluster": "TrueNcoa",
+    "symbols": 15,
+    "frontend_total": "0",
+    "backend_total": "15",
+    "cohesion": 0.9647058823529413
+  },
+  {
+    "cluster": "AccountMembers",
+    "symbols": 15,
+    "frontend_total": "3",
+    "backend_total": "12",
+    "cohesion": 0.7357609710550885
+  },
+  {
+    "cluster": "Hatch",
+    "symbols": 15,
+    "frontend_total": "8",
+    "backend_total": "7",
+    "cohesion": 0.7027450980392157
+  },
+  {
+    "cluster": "Drivers",
+    "symbols": 15,
+    "frontend_total": "1",
+    "backend_total": "14",
+    "cohesion": 0.9076923076923076
+  },
+  {
+    "cluster": "Paddle-raise",
+    "symbols": 15,
+    "frontend_total": "14",
+    "backend_total": "1",
+    "cohesion": 0.968888888888889
+  },
+  {
+    "cluster": "Invites",
+    "symbols": 14,
+    "frontend_total": "1",
+    "backend_total": "13",
+    "cohesion": 0.8148148148148147
+  },
+  {
+    "cluster": "Plan",
+    "symbols": 14,
+    "frontend_total": "0",
+    "backend_total": "14",
+    "cohesion": 0.9202226345083488
+  },
+  {
+    "cluster": "Twilio",
+    "symbols": 14,
+    "frontend_total": "0",
+    "backend_total": "14",
+    "cohesion": 0.8109243697478992
+  },
+  {
+    "cluster": "Transformers",
+    "symbols": 14,
+    "frontend_total": "0",
+    "backend_total": "14",
+    "cohesion": 0.7666666666666667
+  },
+  {
+    "cluster": "Partials",
+    "symbols": 14,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Data-hygiene",
+    "symbols": 14,
+    "frontend_total": "14",
+    "backend_total": "0",
+    "cohesion": 0.7248677248677249
+  },
+  {
+    "cluster": "Casts",
+    "symbols": 14,
+    "frontend_total": "0",
+    "backend_total": "14",
+    "cohesion": 0.8428571428571431
+  },
+  {
+    "cluster": "Upload",
+    "symbols": 14,
+    "frontend_total": "12",
+    "backend_total": "0",
+    "cohesion": 0.8095238095238094
+  },
+  {
+    "cluster": "Time",
+    "symbols": 14,
+    "frontend_total": "0",
+    "backend_total": "14",
+    "cohesion": 0.9610389610389612
+  },
+  {
+    "cluster": "Timestamp",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "13",
+    "cohesion": 0.9230769230769231
+  },
+  {
+    "cluster": "PaymentAccount",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "13",
+    "cohesion": 0.8653846153846154
+  },
+  {
+    "cluster": "Apps",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "13",
+    "cohesion": 0.9580419580419581
+  },
+  {
+    "cluster": "Onboarding",
+    "symbols": 13,
+    "frontend_total": "13",
+    "backend_total": "0",
+    "cohesion": 0.6486486486486486
+  },
+  {
+    "cluster": "Cluster_3804",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9142857142857144
+  },
+  {
+    "cluster": "Dev-console",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Letters",
+    "symbols": 13,
+    "frontend_total": "13",
+    "backend_total": "0",
+    "cohesion": 0.7582417582417583
+  },
+  {
+    "cluster": "Plugins",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "13",
+    "cohesion": 0.7509157509157507
+  },
+  {
+    "cluster": "Client",
+    "symbols": 13,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9153069153069153
+  },
+  {
+    "cluster": "Strings",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.9193899782135077
+  },
+  {
+    "cluster": "Manage-plan",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 0.6073781291172595
+  },
+  {
+    "cluster": "Elements",
+    "symbols": 12,
+    "frontend_total": "4",
+    "backend_total": "8",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "MessageDeliveries",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 1
+  },
+  {
+    "cluster": "FieldTypes",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 1
+  },
+  {
+    "cluster": "ProductAdoption",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cache",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Mocks",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.8474747474747474
+  },
+  {
+    "cluster": "Cluster_3515",
+    "symbols": 12,
+    "frontend_total": "12",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Scripts",
+    "symbols": 12,
+    "frontend_total": "9",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Parser",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.7555555555555555
+  },
+  {
+    "cluster": "Fakes",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.9555555555555556
+  },
+  {
+    "cluster": "EventGuest",
+    "symbols": 12,
+    "frontend_total": "12",
+    "backend_total": "0",
+    "cohesion": 0.9230769230769232
+  },
+  {
+    "cluster": "Plans",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Fake",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.956140350877193
+  },
+  {
+    "cluster": "ContactDetails",
+    "symbols": 12,
+    "frontend_total": "12",
+    "backend_total": "0",
+    "cohesion": 0.834733893557423
+  },
+  {
+    "cluster": "GivingSpace",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.9090909090909091
+  },
+  {
+    "cluster": "PaymentAccounts",
+    "symbols": 12,
+    "frontend_total": "2",
+    "backend_total": "10",
+    "cohesion": 0.7567567567567567
+  },
+  {
+    "cluster": "Registrations",
+    "symbols": 12,
+    "frontend_total": "0",
+    "backend_total": "12",
+    "cohesion": 0.9537037037037037
+  },
+  {
+    "cluster": "Paddle_raise",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.8178224937118219
+  },
+  {
+    "cluster": "Cluster_3522",
+    "symbols": 11,
+    "frontend_total": "11",
+    "backend_total": "0",
+    "cohesion": 0.9599999999999999
+  },
+  {
+    "cluster": "LiveConsole",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.7407407407407408
+  },
+  {
+    "cluster": "SeatingGroups",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 1
+  },
+  {
+    "cluster": "PaymentMethod",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.9523809523809524
+  },
+  {
+    "cluster": "Labels",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.9518716577540107
+  },
+  {
+    "cluster": "Settings",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.9665071770334926
+  },
+  {
+    "cluster": "Types",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.9636363636363636
+  },
+  {
+    "cluster": "Pdf",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 0.9672727272727272
+  },
+  {
+    "cluster": "Tasks",
+    "symbols": 11,
+    "frontend_total": "3",
+    "backend_total": "8",
+    "cohesion": 0.7054545454545456
+  },
+  {
+    "cluster": "Enrich",
+    "symbols": 11,
+    "frontend_total": "0",
+    "backend_total": "11",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3511",
+    "symbols": 10,
+    "frontend_total": "10",
+    "backend_total": "0",
+    "cohesion": 0.6923076923076923
+  },
+  {
+    "cluster": "Cluster_3529",
+    "symbols": 10,
+    "frontend_total": "10",
+    "backend_total": "0",
+    "cohesion": 0.8125
+  },
+  {
+    "cluster": "Seating",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 0.8823529411764707
+  },
+  {
+    "cluster": "Upsell",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 0.6747252747252748
+  },
+  {
+    "cluster": "Sms",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3581",
+    "symbols": 10,
+    "frontend_total": "10",
+    "backend_total": "0",
+    "cohesion": 0.75
+  },
+  {
+    "cluster": "Web",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 1
+  },
+  {
+    "cluster": "LegalEntity",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Chariot",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 0.96
+  },
+  {
+    "cluster": "Track",
+    "symbols": 10,
+    "frontend_total": "0",
+    "backend_total": "10",
+    "cohesion": 0.9461538461538463
+  },
+  {
+    "cluster": "Snippet",
+    "symbols": 9,
+    "frontend_total": "9",
+    "backend_total": "0",
+    "cohesion": 0.7849927849927849
+  },
+  {
+    "cluster": "Nav-menu",
+    "symbols": 9,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.5
+  },
+  {
+    "cluster": "DomainRecord",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.7999999999999999
+  },
+  {
+    "cluster": "Mixins",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8055555555555556
+  },
+  {
+    "cluster": "Post",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Graph",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 1
+  },
+  {
+    "cluster": "HubSpot",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.8
+  },
+  {
+    "cluster": "Processing",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.782608695652174
+  },
+  {
+    "cluster": "Campaign-tools",
+    "symbols": 9,
+    "frontend_total": "8",
+    "backend_total": "1",
+    "cohesion": 0.8
+  },
+  {
+    "cluster": "Pie",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.9411764705882353
+  },
+  {
+    "cluster": "Interfaces",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Color-picker",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.8271604938271605
+  },
+  {
+    "cluster": "TrustedDevices",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3512",
+    "symbols": 9,
+    "frontend_total": "9",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "PaymentPlans",
+    "symbols": 9,
+    "frontend_total": "0",
+    "backend_total": "9",
+    "cohesion": 0.9206349206349205
+  },
+  {
+    "cluster": "Auction-categories",
+    "symbols": 8,
+    "frontend_total": "6",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Get",
+    "symbols": 8,
+    "frontend_total": "5",
+    "backend_total": "3",
+    "cohesion": 0.7916666666666667
+  },
+  {
+    "cluster": "Cards",
+    "symbols": 8,
+    "frontend_total": "8",
+    "backend_total": "0",
+    "cohesion": 0.8125
+  },
+  {
+    "cluster": "MMKVMigration",
+    "symbols": 8,
+    "frontend_total": "8",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Date-picker",
+    "symbols": 8,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9285714285714285
+  },
+  {
+    "cluster": "Telemetry",
+    "symbols": 8,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3807",
+    "symbols": 8,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.875
+  },
+  {
+    "cluster": "Stores",
+    "symbols": 8,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9333333333333335
+  },
+  {
+    "cluster": "Export-dialog",
+    "symbols": 8,
+    "frontend_total": "8",
+    "backend_total": "0",
+    "cohesion": 0.6363636363636365
+  },
+  {
+    "cluster": "Sources",
+    "symbols": 8,
+    "frontend_total": "0",
+    "backend_total": "8",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3525",
+    "symbols": 8,
+    "frontend_total": "8",
+    "backend_total": "0",
+    "cohesion": 0.8333333333333334
+  },
+  {
+    "cluster": "IDs",
+    "symbols": 8,
+    "frontend_total": "0",
+    "backend_total": "8",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Tags",
+    "symbols": 8,
+    "frontend_total": "2",
+    "backend_total": "6",
+    "cohesion": 0.5833333333333334
+  },
+  {
+    "cluster": "Nodeviews",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.9206349206349207
+  },
+  {
+    "cluster": "Devtools",
+    "symbols": 7,
+    "frontend_total": "7",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Primitives",
+    "symbols": 7,
+    "frontend_total": "7",
+    "backend_total": "0",
+    "cohesion": 0.9183673469387754
+  },
+  {
+    "cluster": "TypeTransitions",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Format",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 0.8
+  },
+  {
+    "cluster": "CampaignStaff",
+    "symbols": 7,
+    "frontend_total": "7",
+    "backend_total": "0",
+    "cohesion": 0.8095238095238094
+  },
+  {
+    "cluster": "Initiators",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 0.9183673469387755
+  },
+  {
+    "cluster": "Cluster_477",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 0.7000000000000001
+  },
+  {
+    "cluster": "CustomFields",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 0.9230769230769231
+  },
+  {
+    "cluster": "Page-loading",
+    "symbols": 7,
+    "frontend_total": "7",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Phone",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 1
+  },
+  {
+    "cluster": "RequireUniqueForRule",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Funds",
+    "symbols": 7,
+    "frontend_total": "3",
+    "backend_total": "4",
+    "cohesion": 0.7058823529411765
+  },
+  {
+    "cluster": "Transform",
+    "symbols": 7,
+    "frontend_total": "7",
+    "backend_total": "0",
+    "cohesion": 0.875
+  },
+  {
+    "cluster": "React-shared",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Migrate",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.5833333333333333
+  },
+  {
+    "cluster": "Controller",
+    "symbols": 7,
+    "frontend_total": "2",
+    "backend_total": "5",
+    "cohesion": 0.8235294117647057
+  },
+  {
+    "cluster": "AWS",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 1
+  },
+  {
+    "cluster": "QRCode",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 0.631578947368421
+  },
+  {
+    "cluster": "BidderDetail",
+    "symbols": 7,
+    "frontend_total": "7",
+    "backend_total": "0",
+    "cohesion": 0.6666666666666667
+  },
+  {
+    "cluster": "Donorsearch",
+    "symbols": 7,
+    "frontend_total": "0",
+    "backend_total": "7",
+    "cohesion": 0.6
+  },
+  {
+    "cluster": "Assets",
+    "symbols": 6,
+    "frontend_total": "2",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Util",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "Video-preview",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "AuctionItem",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.625
+  },
+  {
+    "cluster": "TicketSales",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.7999999999999999
+  },
+  {
+    "cluster": "Cluster_3856",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Servers",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "EnumUtils",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Browser",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Sortable",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Alert-notification",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_470",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "PHPStan",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "TicketListItem",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Parsers",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 0.8666666666666667
+  },
+  {
+    "cluster": "PHPUnit",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Recommended-actions",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.7142857142857143
+  },
+  {
+    "cluster": "Bidders-index",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.9090909090909091
+  },
+  {
+    "cluster": "TwoFactorAuth",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.5263157894736842
+  },
+  {
+    "cluster": "EditStaffMember",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.625
+  },
+  {
+    "cluster": "Text",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3528",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 0.8333333333333334
+  },
+  {
+    "cluster": "Queue",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Household",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 0.619047619047619
+  },
+  {
+    "cluster": "Hocs",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Subscription",
+    "symbols": 6,
+    "frontend_total": "6",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Permissions",
+    "symbols": 6,
+    "frontend_total": "3",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Database",
+    "symbols": 6,
+    "frontend_total": "0",
+    "backend_total": "6",
+    "cohesion": 0.75
+  },
+  {
+    "cluster": "Create-campaign-dialog",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.5714285714285714
+  },
+  {
+    "cluster": "Imported-recurring-plans",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.47058823529411764
+  },
+  {
+    "cluster": "Schools",
+    "symbols": 5,
+    "frontend_total": "2",
+    "backend_total": "3",
+    "cohesion": 0.909090909090909
+  },
+  {
+    "cluster": "Repair",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_480",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.7142857142857143
+  },
+  {
+    "cluster": "CampaignSupported",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.8
+  },
+  {
+    "cluster": "ConnectM2Reader",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.6153846153846154
+  },
+  {
+    "cluster": "Cluster_1006",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.9230769230769231
+  },
+  {
+    "cluster": "CI",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.888888888888889
+  },
+  {
+    "cluster": "Tips-and-fees",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.888888888888889
+  },
+  {
+    "cluster": "Mailables",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.8
+  },
+  {
+    "cluster": "Cluster_3527",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.8
+  },
+  {
+    "cluster": "App",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.47058823529411764
+  },
+  {
+    "cluster": "Cluster_3860",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Sorting",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Feed",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.7272727272727273
+  },
+  {
+    "cluster": "Dialog-route",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "ChooseSupporter",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.75
+  },
+  {
+    "cluster": "DemoTools",
+    "symbols": 5,
+    "frontend_total": "0",
+    "backend_total": "5",
+    "cohesion": 0.909090909090909
+  },
+  {
+    "cluster": "Declare-winner",
+    "symbols": 5,
+    "frontend_total": "5",
+    "backend_total": "0",
+    "cohesion": 0.5
+  },
+  {
+    "cluster": "NumberIncrementer",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Campaign-details",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.75
+  },
+  {
+    "cluster": "PHPCSFixer",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "ScheduleClassUsageRule",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Results",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.46153846153846156
+  },
+  {
+    "cluster": "Communication",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Campaign-settings",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "Context",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "Campaign-team",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "NavigationHeader",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Engage-email",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Observers",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6
+  },
+  {
+    "cluster": "User",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.75
+  },
+  {
+    "cluster": "Fraud",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Activities",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Recurring-payments",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Toast",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Resolver",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "CommandHandleReturnRule",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3510",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Cluster_3806",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.75
+  },
+  {
+    "cluster": "Exporting",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6
+  },
+  {
+    "cluster": "DomainSettings",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Dropdown-menu",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Examples",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "Cluster_3531",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Slider",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "AuctionItemList",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3533",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Address",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "Cluster_3524",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "ConfirmActionModal",
+    "symbols": 4,
+    "frontend_total": "4",
+    "backend_total": "0",
+    "cohesion": 0.8571428571428571
+  },
+  {
+    "cluster": "Cluster_3808",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "Candid",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "ImportHandlers",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 0.6666666666666666
+  },
+  {
+    "cluster": "MediaLibrary",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Sponsor",
+    "symbols": 4,
+    "frontend_total": "0",
+    "backend_total": "4",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Dialog",
+    "symbols": 3,
+    "frontend_total": "3",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_656",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3530",
+    "symbols": 3,
+    "frontend_total": "3",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Canva",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Manual",
+    "symbols": 3,
+    "frontend_total": "3",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "AcceptedPaymentMethods",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_472",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Unstyled-link",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Meter",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_1666",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Backend",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "AuctionItems",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Fixtures",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Givebutter",
+    "symbols": 3,
+    "frontend_total": "3",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Profile",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "DataEnrichment",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Values",
+    "symbols": 3,
+    "frontend_total": "0",
+    "backend_total": "3",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Connection-status",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Public",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Thankview",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "PushNotifications",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Bulk-actions",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Libs",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Paginated",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "System-info",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "M2Reader",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Skeleton",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "MustExtendFactoryBaseRule",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Auction-bidders",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "EloquentBuilders",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_2906",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Log-viewer",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_473",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Preview",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Tips-ui",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "ValueObjects",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Trace",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "NumberTicker",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3803",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "DonationStats",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Banner",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "E2e",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Email-preview",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Eloquent",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3526",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Two-factor",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Pdf-preview",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "PayPal",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "IPQualityScore",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Content",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_3640",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Input",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Welcome",
+    "symbols": 2,
+    "frontend_total": "2",
+    "backend_total": "0",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Bids",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Clients",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Connectors",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Maintenance",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  },
+  {
+    "cluster": "Cluster_471",
+    "symbols": 2,
+    "frontend_total": "0",
+    "backend_total": "2",
+    "cohesion": 1
+  }
+]

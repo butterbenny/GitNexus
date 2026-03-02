@@ -1,0 +1,1044 @@
+{
+  "report": {
+    "generatedAt": "2026-03-02T03:02:47.237Z",
+    "totalProcesses": 300,
+    "uniqueSignatures": 33,
+    "signatures": [
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Resource → BE:Model",
+        "count": 44,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user/accounts/*",
+            "count": 36
+          },
+          {
+            "route": "http-get:/api/campaigns/*",
+            "count": 6
+          },
+          {
+            "route": "http-get:/api/accounts/*/contacts/*",
+            "count": 2
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_10_transactionsdetailsf",
+            "label": "TransactionsDetailsFormDrawer → Segment",
+            "stepCount": 8,
+            "entry": {
+              "name": "TransactionsDetailsFormDrawer",
+              "filePath": "apps/dashboard/src/pages/transactions/TransactionsOfflineFormDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "Segment",
+              "filePath": "apps/backend/app/Models/Segment.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/user/accounts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Resource",
+        "count": 43,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user/accounts/*",
+            "count": 38
+          },
+          {
+            "route": "http-get:/api/events",
+            "count": 2
+          },
+          {
+            "route": "http-get:/api/accounts/*/messages/*",
+            "count": 2
+          },
+          {
+            "route": "http-get:/api/campaigns/*/auctions/*",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_17_viewpledgedrawer",
+            "label": "ViewPledgeDrawer → BuildCampaignMenuItems",
+            "stepCount": 8,
+            "entry": {
+              "name": "ViewPledgeDrawer",
+              "filePath": "apps/dashboard/src/pages/pledges/ViewPledgeDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "buildCampaignMenuItems",
+              "filePath": "apps/backend/app/Http/Resources/Dashboard/DashboardMenu.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/user/accounts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Resource",
+        "count": 40,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user/accounts/*",
+            "count": 39
+          },
+          {
+            "route": "http-get:/api/campaigns/*/auctions/*",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_71_campaignitembundlefo",
+            "label": "CampaignItemBundleFormDrawer → BuildCampaignMenuItems",
+            "stepCount": 8,
+            "entry": {
+              "name": "CampaignItemBundleFormDrawer",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-event/CampaignItemBundleFormDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "buildCampaignMenuItems",
+              "filePath": "apps/backend/app/Http/Resources/Dashboard/DashboardMenu.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/user/accounts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Backend",
+        "count": 37,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user/accounts/*",
+            "count": 16
+          },
+          {
+            "route": "http-get:/api/campaigns/*",
+            "count": 13
+          },
+          {
+            "route": "http-get:/api/accounts/*/contacts/*",
+            "count": 3
+          },
+          {
+            "route": "http-get:/api/events",
+            "count": 2
+          },
+          {
+            "route": "http-get:/api/accounts/*/messages/*",
+            "count": 2
+          },
+          {
+            "route": "http-get:/api/campaigns/*/auctions/*",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_101_lettereasysendtracki",
+            "label": "LetterEasySendTracking → Account.view",
+            "stepCount": 7,
+            "entry": {
+              "name": "LetterEasySendTracking",
+              "filePath": "apps/dashboard/src/pages/engage/letters/LetterEasySendTracking.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "account.view",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/AccountPermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/user/accounts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook",
+        "count": 28,
+        "crossStack": false,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_159_declarewinnerdrawer",
+            "label": "DeclareWinnerDrawer → GetSettingByCodeAndName",
+            "stepCount": 6,
+            "entry": {
+              "name": "DeclareWinnerDrawer",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-auction/item-details/declare-winner/DeclareWinnerDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "getSettingByCodeAndName",
+              "filePath": "apps/dashboard/src/customHooks/useCurrentCampaign.ts",
+              "type": "Function"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Component",
+        "count": 27,
+        "crossStack": false,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_120_usereorderauctionite",
+            "label": "UseReorderAuctionItemsDrawer → UseRawLocation",
+            "stepCount": 7,
+            "entry": {
+              "name": "useReorderAuctionItemsDrawer",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-auction/auction-categories/useReorderAuctionItemsDrawer.ts",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "useRawLocation",
+              "filePath": "apps/dashboard/src/components/router/rawHistoryStore.tsx",
+              "type": "Function"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Backend",
+        "count": 14,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user/accounts/*",
+            "count": 13
+          },
+          {
+            "route": "http-get:/api/campaigns/*",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_18_viewpledgedrawer",
+            "label": "ViewPledgeDrawer → Account.view",
+            "stepCount": 8,
+            "entry": {
+              "name": "ViewPledgeDrawer",
+              "filePath": "apps/dashboard/src/pages/pledges/ViewPledgeDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "account.view",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/AccountPermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/user/accounts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Resource → BE:Model",
+        "count": 9,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user/accounts/*",
+            "count": 9
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_0_quickbooksruledrawer",
+            "label": "QuickBooksRuleDrawer → Campaign",
+            "stepCount": 9,
+            "entry": {
+              "name": "QuickBooksRuleDrawer",
+              "filePath": "apps/dashboard/src/pages/account-settings/account-integrations/integrations/QuickBooks/QuickBooksRuleDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "Campaign",
+              "filePath": "apps/backend/app/Models/Campaign/Campaign.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/user/accounts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Controller → BE:Backend",
+        "count": 8,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/billing/plans",
+            "count": 4
+          },
+          {
+            "route": "http-get:/api/accounts/*/messages/*",
+            "count": 2
+          },
+          {
+            "route": "http-get:/api/accounts/*/payouts/summary",
+            "count": 1
+          },
+          {
+            "route": "http-get:/api/accounts/*/engage-configuration",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_178_paymentsdashboardcon",
+            "label": "PaymentsDashboardContent → Finance.payouts",
+            "stepCount": 6,
+            "entry": {
+              "name": "PaymentsDashboardContent",
+              "filePath": "apps/dashboard/src/pages/finance/PaymentsDashboard.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "finance.payouts",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/FinancePermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/payouts/summary"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Controller → BE:Service → BE:Model",
+        "count": 8,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/engage-configuration",
+            "count": 8
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_96_engageindex",
+            "label": "EngageIndex → QueuedRegistration",
+            "stepCount": 7,
+            "entry": {
+              "name": "EngageIndex",
+              "filePath": "apps/dashboard/src/pages/engage/EngageIndex.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "queuedRegistration",
+              "filePath": "apps/backend/app/Models/Engage/Registration.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/engage-configuration"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller → BE:Resource → BE:Model → BE:Backend",
+        "count": 4,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/campaigns/*",
+            "count": 4
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_152_campaignitembundlefo",
+            "label": "CampaignItemBundleFormDrawer → PaddleRaise",
+            "stepCount": 7,
+            "entry": {
+              "name": "CampaignItemBundleFormDrawer",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-event/CampaignItemBundleFormDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "PaddleRaise",
+              "filePath": "apps/backend/app/Domains/PaddleRaise/Models/PaddleRaise.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/campaigns/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Util",
+        "count": 4,
+        "crossStack": false,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_158_declarewinnerdrawer",
+            "label": "DeclareWinnerDrawer → ParseIntParam",
+            "stepCount": 6,
+            "entry": {
+              "name": "DeclareWinnerDrawer",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-auction/item-details/declare-winner/DeclareWinnerDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "parseIntParam",
+              "filePath": "apps/dashboard/src/helpers/params.ts",
+              "type": "Function"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Backend",
+        "count": 4,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/reporting/accounts/*/reports/*",
+            "count": 4
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_163_sharereportdialog",
+            "label": "ShareReportDialog → Reports.basic",
+            "stepCount": 6,
+            "entry": {
+              "name": "ShareReportDialog",
+              "filePath": "apps/dashboard/src/pages/reports/ShareReportDialog.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "reports.basic",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/ReportPermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/reporting/accounts/*/reports/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Resource",
+        "count": 3,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/messages/*",
+            "count": 2
+          },
+          {
+            "route": "http-get:/api/message_templates",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_188_lettereasysendtracki",
+            "label": "LetterEasySendTracking → MessageResource",
+            "stepCount": 6,
+            "entry": {
+              "name": "LetterEasySendTracking",
+              "filePath": "apps/dashboard/src/pages/engage/letters/LetterEasySendTracking.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "MessageResource",
+              "filePath": "apps/backend/app/Http/Resources/Dashboard/Engage/MessageResource.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/messages/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:FormRequest",
+        "count": 3,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/contacts/*",
+            "count": 3
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_213_contacthouseholdjoin",
+            "label": "ContactHouseholdJoinFormDrawer → AccountContactRequest",
+            "stepCount": 6,
+            "entry": {
+              "name": "ContactHouseholdJoinFormDrawer",
+              "filePath": "apps/dashboard/src/pages/contacts/ContactHouseholdJoinFormDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "AccountContactRequest",
+              "filePath": "apps/backend/app/Http/Requests/Account/AccountContactRequest.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/contacts/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Controller",
+        "count": 2,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/campaigns/*/items/*",
+            "count": 1
+          },
+          {
+            "route": "http-get:/api/user",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_160_declarewinnerdrawer",
+            "label": "DeclareWinnerDrawer → GetBundleExists",
+            "stepCount": 6,
+            "entry": {
+              "name": "DeclareWinnerDrawer",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-auction/item-details/declare-winner/DeclareWinnerDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "getBundleExists",
+              "filePath": "apps/backend/app/Http/Controllers/Dashboard/API/Campaigns/CampaignItemController.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/campaigns/*/items/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Backend",
+        "count": 2,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/reporting/accounts/*/reports/*",
+            "count": 2
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_164_sharereportdialog",
+            "label": "ShareReportDialog → ForAccountIncludingDefaults",
+            "stepCount": 6,
+            "entry": {
+              "name": "ShareReportDialog",
+              "filePath": "apps/dashboard/src/pages/reports/ShareReportDialog.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "forAccountIncludingDefaults",
+              "filePath": "apps/backend/app/Domains/Reporting/AccountReportTemplate/AccountReport.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/reporting/accounts/*/reports/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → BE:Routes → BE:Controller → BE:Backend",
+        "count": 2,
+        "crossStack": true,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_166_itemsindex",
+            "label": "ItemsIndex → DecodeMemory",
+            "stepCount": 6,
+            "entry": {
+              "name": "ItemsIndex",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-auction/items-index/ItemsIndex.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "decodeMemory",
+              "filePath": "apps/backend/app/Facades/App.php",
+              "type": "Method"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Controller → BE:Model",
+        "count": 2,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/billing/plans",
+            "count": 2
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_193_subscriptionformedit",
+            "label": "SubscriptionFormEdit → Contact",
+            "stepCount": 6,
+            "entry": {
+              "name": "SubscriptionFormEdit",
+              "filePath": "apps/dashboard/src/pages/account-settings/account-about/givebutter-plus/SubscriptionFormEdit.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "Contact",
+              "filePath": "apps/backend/app/Models/Contact/Contact.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/billing/plans"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:POST → BE:Backend",
+        "count": 2,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-post:/api/accounts/*/quickbooks/refreshMapping",
+            "count": 2
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_237_quickbooksconfigure",
+            "label": "QuickBooksConfigure → GetSetting",
+            "stepCount": 6,
+            "entry": {
+              "name": "QuickBooksConfigure",
+              "filePath": "apps/dashboard/src/pages/account-settings/account-integrations/integrations/QuickBooks/QuickBooksConfigure.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "getSetting",
+              "filePath": "apps/backend/app/Domains/Connectable/Models/Connection.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-post:/api/accounts/*/quickbooks/refreshMapping"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:POST → BE:Controller → BE:Resource → BE:Model",
+        "count": 2,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-post:/api/accounts/*/get_recurring_plans",
+            "count": 2
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_240_recurringplans",
+            "label": "RecurringPlans → PaymentMethod",
+            "stepCount": 6,
+            "entry": {
+              "name": "RecurringPlans",
+              "filePath": "apps/dashboard/src/pages/account-settings/imported-recurring-plans/RecurringPlans.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "PaymentMethod",
+              "filePath": "apps/backend/app/Models/Payment/PaymentMethod.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-post:/api/accounts/*/get_recurring_plans"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Hook → FE:Api → HTTP:GET → BE:Routes → BE:Controller",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/user",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_156_transactionsdetailsf",
+            "label": "TransactionsDetailsFormDrawer → User",
+            "stepCount": 6,
+            "entry": {
+              "name": "TransactionsDetailsFormDrawer",
+              "filePath": "apps/dashboard/src/pages/transactions/TransactionsOfflineFormDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "user",
+              "filePath": "apps/backend/app/Http/Controllers/Dashboard/UserController.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/user"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → BE:Routes → BE:Controller → BE:Model",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_167_itemsindex",
+            "label": "ItemsIndex → Auction",
+            "stepCount": 6,
+            "entry": {
+              "name": "ItemsIndex",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-auction/items-index/ItemsIndex.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "Auction",
+              "filePath": "apps/backend/app/Models/Auction/Auction.php",
+              "type": "Class"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Dashboard → FE:Hook → FE:Component",
+        "count": 1,
+        "crossStack": false,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_176_paymentsdashboardcon",
+            "label": "PaymentsDashboardContent → UseRawLocation",
+            "stepCount": 6,
+            "entry": {
+              "name": "PaymentsDashboardContent",
+              "filePath": "apps/dashboard/src/pages/finance/PaymentsDashboard.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "useRawLocation",
+              "filePath": "apps/dashboard/src/components/router/rawHistoryStore.tsx",
+              "type": "Function"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Dashboard → FE:Hook",
+        "count": 1,
+        "crossStack": false,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_177_paymentsdashboardcon",
+            "label": "PaymentsDashboardContent → UseFetchAccounts",
+            "stepCount": 6,
+            "entry": {
+              "name": "PaymentsDashboardContent",
+              "filePath": "apps/dashboard/src/pages/finance/PaymentsDashboard.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "useFetchAccounts",
+              "filePath": "apps/dashboard/src/customHooks/useFetchAccounts.ts",
+              "type": "Function"
+            },
+            "httpRoutes": []
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Service",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/payouts/summary",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_179_paymentsdashboardcon",
+            "label": "PaymentsDashboardContent → GenerateTipOptions",
+            "stepCount": 6,
+            "entry": {
+              "name": "PaymentsDashboardContent",
+              "filePath": "apps/dashboard/src/pages/finance/PaymentsDashboard.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "generateTipOptions",
+              "filePath": "apps/backend/app/Services/Payout/PayoutService.php",
+              "type": "Method"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/payouts/summary"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Routes → BE:Backend",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/campaigns/*/paddle_raise/intents/*",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_183_editintentdrawerbody",
+            "label": "EditIntentDrawerBody → Events.view",
+            "stepCount": 6,
+            "entry": {
+              "name": "EditIntentDrawerBody",
+              "filePath": "apps/dashboard/src/pages/campaign-settings/campaign-event/paddle-raise/EditIntentDrawer.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "events.view",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/EventPermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/campaigns/*/paddle_raise/intents/*"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Model",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/message_templates",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_227_messagetemplatedialo",
+            "label": "MessageTemplateDialog → MessageTemplate",
+            "stepCount": 6,
+            "entry": {
+              "name": "MessageTemplateDialog",
+              "filePath": "apps/dashboard/src/pages/engage/components/MessageTemplateDialog.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "MessageTemplate",
+              "filePath": "apps/backend/app/Models/Engage/MessageTemplate.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/message_templates"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Routes → BE:Controller → BE:Backend",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/message_templates",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_228_messagetemplatedialo",
+            "label": "MessageTemplateDialog → Content.email_templates.view",
+            "stepCount": 6,
+            "entry": {
+              "name": "MessageTemplateDialog",
+              "filePath": "apps/dashboard/src/pages/engage/components/MessageTemplateDialog.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "content.email_templates.view",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/ContentPermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/message_templates"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:GET → BE:Backend",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-get:/api/accounts/*/quickbooks/details",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_236_quickbooksconfigure",
+            "label": "QuickBooksConfigure → Finance.settings",
+            "stepCount": 6,
+            "entry": {
+              "name": "QuickBooksConfigure",
+              "filePath": "apps/dashboard/src/pages/account-settings/account-integrations/integrations/QuickBooks/QuickBooksConfigure.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "finance.settings",
+              "filePath": "apps/backend/app/Domains/AccessControl/Permissions/FinancePermission.php",
+              "type": "CodeElement"
+            },
+            "httpRoutes": [
+              "http-get:/api/accounts/*/quickbooks/details"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:POST → BE:Controller → BE:Resource → BE:Model → BE:Backend",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-post:/api/accounts/*/get_recurring_plans",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_242_recurringplans",
+            "label": "RecurringPlans → Appeal",
+            "stepCount": 6,
+            "entry": {
+              "name": "RecurringPlans",
+              "filePath": "apps/dashboard/src/pages/account-settings/imported-recurring-plans/RecurringPlans.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "Appeal",
+              "filePath": "apps/backend/app/Domains/Fundraising/Appeals/Models/Appeal.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-post:/api/accounts/*/get_recurring_plans"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "FE:Page → FE:Api → HTTP:POST → BE:Routes → BE:Controller → BE:Model",
+        "count": 1,
+        "crossStack": true,
+        "topHttpRoutes": [
+          {
+            "route": "http-post:/api/accounts/*/get_recurring_plans",
+            "count": 1
+          }
+        ],
+        "exampleProcesses": [
+          {
+            "processId": "proc_243_recurringplans",
+            "label": "RecurringPlans → TransactionPlan",
+            "stepCount": 6,
+            "entry": {
+              "name": "RecurringPlans",
+              "filePath": "apps/dashboard/src/pages/account-settings/imported-recurring-plans/RecurringPlans.tsx",
+              "type": "Function"
+            },
+            "terminal": {
+              "name": "TransactionPlan",
+              "filePath": "apps/backend/app/Models/Transaction/TransactionPlan.php",
+              "type": "Class"
+            },
+            "httpRoutes": [
+              "http-post:/api/accounts/*/get_recurring_plans"
+            ]
+          }
+        ]
+      },
+      {
+        "signature": "BE:Console → BE:Backend",
+        "count": 1,
+        "crossStack": false,
+        "topHttpRoutes": [],
+        "exampleProcesses": [
+          {
+            "processId": "proc_298_handle",
+            "label": "Handle → RequireEbsApp",
+            "stepCount": 5,
+            "entry": {
+              "name": "handle",
+              "filePath": "apps/backend/app/Console/Commands/AWS/AwsEbsDeploy.php",
+              "type": "Method"
+            },
+            "terminal": {
+              "name": "requireEbsApp",
+              "filePath": "apps/backend/app/Integrations/AWS/Orchestra/RequiresApplicationTrait.php",
+              "type": "Method"
+            },
+            "httpRoutes": []
+          }
+        ]
+      }
+    ]
+  }
+}

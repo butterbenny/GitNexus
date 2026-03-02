@@ -1,0 +1,110 @@
+[
+  {
+    "cluster": "Components",
+    "symbols": 458,
+    "frontend_total": 122,
+    "backend_total": 168,
+    "cohesion": 0.8338312368373777,
+    "mix_ratio": 0.7261904761904762,
+    "mixed_score": 332.5952380952381
+  },
+  {
+    "cluster": "Finance",
+    "symbols": 204,
+    "frontend_total": 82,
+    "backend_total": 122,
+    "cohesion": 0.7993752425984171,
+    "mix_ratio": 0.6721311475409836,
+    "mixed_score": 137.11475409836066
+  },
+  {
+    "cluster": "Api",
+    "symbols": 2107,
+    "frontend_total": 1936,
+    "backend_total": 118,
+    "cohesion": 0.8034483314153106,
+    "mix_ratio": 0.060950413223140494,
+    "mixed_score": 128.42252066115702
+  },
+  {
+    "cluster": "Filters",
+    "symbols": 345,
+    "frontend_total": 254,
+    "backend_total": 91,
+    "cohesion": 0.8352628214511477,
+    "mix_ratio": 0.35826771653543305,
+    "mixed_score": 123.6023622047244
+  },
+  {
+    "cluster": "Accounts",
+    "symbols": 195,
+    "frontend_total": 51,
+    "backend_total": 144,
+    "cohesion": 0.7882432504873096,
+    "mix_ratio": 0.3541666666666667,
+    "mixed_score": 69.0625
+  },
+  {
+    "cluster": "Contacts",
+    "symbols": 383,
+    "frontend_total": 51,
+    "backend_total": 332,
+    "cohesion": 0.8044425368416187,
+    "mix_ratio": 0.1536144578313253,
+    "mixed_score": 58.834337349397586
+  },
+  {
+    "cluster": "Engage",
+    "symbols": 1289,
+    "frontend_total": 55,
+    "backend_total": 1234,
+    "cohesion": 0.7793650867972445,
+    "mix_ratio": 0.04457050243111831,
+    "mixed_score": 57.4513776337115
+  },
+  {
+    "cluster": "Integrations",
+    "symbols": 59,
+    "frontend_total": 29,
+    "backend_total": 30,
+    "cohesion": 0.7888220030242239,
+    "mix_ratio": 0.9666666666666667,
+    "mixed_score": 57.03333333333333
+  },
+  {
+    "cluster": "Imports",
+    "symbols": 410,
+    "frontend_total": 47,
+    "backend_total": 363,
+    "cohesion": 0.8286011425811104,
+    "mix_ratio": 0.12947658402203857,
+    "mixed_score": 53.08539944903581
+  },
+  {
+    "cluster": "Triggers",
+    "symbols": 166,
+    "frontend_total": 40,
+    "backend_total": 126,
+    "cohesion": 0.9322694285915591,
+    "mix_ratio": 0.31746031746031744,
+    "mixed_score": 52.698412698412696
+  },
+  {
+    "cluster": "Hooks",
+    "symbols": 304,
+    "frontend_total": 222,
+    "backend_total": 29,
+    "cohesion": 0.7270356146634763,
+    "mix_ratio": 0.13063063063063063,
+    "mixed_score": 39.711711711711715
+  },
+  {
+    "cluster": "Transactions",
+    "symbols": 266,
+    "frontend_total": 29,
+    "backend_total": 237,
+    "cohesion": 0.851276983871484,
+    "mix_ratio": 0.12236286919831224,
+    "mixed_score": 32.54852320675106
+  }
+]
