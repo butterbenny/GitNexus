@@ -38,6 +38,38 @@ const toOptionalLineNumber = (value: unknown): number | undefined => {
   return normalized;
 };
 
+const round3 = (value: number): number => Math.round(value * 1000) / 1000;
+const IMPLEMENT_RANK_WEIGHTS = {
+  write_plan: {
+    convergence: 1,
+    carbon: 1.25,
+    precedent_bonus: 0.18,
+  },
+  companion: {
+    base: 1,
+    convergence: 0.95,
+    carbon: 1.05,
+    precedent_bonus: 0.12,
+  },
+  carbon: {
+    convergence: 42,
+    precedent: 44,
+    base: 14,
+  },
+  plan_carbon: {
+    companion_avg: 0.28,
+    write_plan_avg: 0.3,
+    companion_precedent_coverage: 0.16,
+    write_plan_precedent_coverage: 0.16,
+    query_head_signal: 0.1,
+  },
+} as const;
+const IMPLEMENT_NEXT_ACTION_RANK_WEIGHTS = {
+  rank_score: 0.62,
+  convergence: 0.22,
+  carbon: 0.16,
+} as const;
+
 export async function runImplementMode(
   deps: ImplementModeDeps,
   repo: ImplementModeRepoHandle,
@@ -106,6 +138,11 @@ export async function runImplementMode(
   const normalizePath = (value: unknown): string => normalizeRepoRelativePath(String(value || ''));
   const pathLayer = (filePath: string): string => deriveLayerTag(normalizePath(filePath));
   const safeNumber = (value: unknown): number => toFiniteNumber(value, 0);
+  const clampUnit = (value: number): number => Math.max(0, Math.min(1, value));
+  const clampPercent = (value: number): number => Math.max(0, Math.min(100, value));
+  const readinessLevel = (score: number): 'high' | 'medium' | 'low' => (
+    score >= 75 ? 'high' : score >= 50 ? 'medium' : 'low'
+  );
 
   const implementPlan = actionPlanResult?.implement_plan || {};
   const rawCompanionFiles = Array.isArray(implementPlan?.companion_set?.files)
@@ -137,12 +174,101 @@ export async function runImplementMode(
   const queryHeadSymbols = Array.isArray(queryModeResult?.query_mode?.symbols)
     ? queryModeResult.query_mode.symbols.slice(0, 16)
     : [];
+  const queryHeadSlices = Array.isArray(queryModeResult?.query_mode?.slices)
+    ? queryModeResult.query_mode.slices.slice(0, 4)
+    : [];
   const queryHeadProcesses = Array.isArray(queryModeResult?.query_mode?.processes)
     ? queryModeResult.query_mode.processes.slice(0, 4)
     : [];
   const actionHintFiles = Array.isArray(actionPlanResult?.files)
     ? actionPlanResult.files.slice(0, limitFiles)
     : [];
+  const queryHeadConvergence = (
+    queryModeResult?._query_mode?.convergence
+    && typeof queryModeResult._query_mode.convergence === 'object'
+  )
+    ? queryModeResult._query_mode.convergence
+    : null;
+  const convergenceEnabled = Boolean(queryHeadConvergence?.enabled);
+
+  const processRankById = new Map<string, number>();
+  for (let idx = 0; idx < queryHeadProcesses.length; idx += 1) {
+    const processId = String(queryHeadProcesses[idx]?.id || '').trim();
+    if (!processId || processRankById.has(processId)) continue;
+    processRankById.set(processId, idx);
+  }
+
+  const processFileRank = new Map<string, number>();
+  for (const symbol of queryHeadSymbols) {
+    const processId = String(symbol?.process_id || '').trim();
+    const filePath = normalizePath(symbol?.filePath);
+    if (!processId || !filePath) continue;
+    const processRank = processRankById.get(processId);
+    if (processRank === undefined) continue;
+    const existing = processFileRank.get(filePath);
+    if (existing === undefined || processRank < existing) {
+      processFileRank.set(filePath, processRank);
+    }
+  }
+
+  const sliceFileRank = new Map<string, number>();
+  const topSliceSeedFiles = new Set<string>();
+  for (let idx = 0; idx < queryHeadSlices.length; idx += 1) {
+    const members = Array.isArray(queryHeadSlices[idx]?.matched_members) ? queryHeadSlices[idx].matched_members : [];
+    for (const member of members) {
+      const filePath = normalizePath(member?.filePath);
+      if (!filePath) continue;
+      const existing = sliceFileRank.get(filePath);
+      if (existing === undefined || idx < existing) {
+        sliceFileRank.set(filePath, idx);
+      }
+      if (idx === 0) topSliceSeedFiles.add(filePath);
+    }
+  }
+
+  const sharesTopSliceDirectory = (filePath: string): boolean => {
+    const normalized = normalizePath(filePath);
+    if (!normalized || topSliceSeedFiles.size === 0) return false;
+    const dir = path.dirname(normalized);
+    for (const seedPath of topSliceSeedFiles) {
+      if (path.dirname(seedPath) === dir) return true;
+    }
+    return false;
+  };
+
+  const convergenceBoostForFile = (filePath: string): { boost: number; reasons: string[] } => {
+    if (!convergenceEnabled) return { boost: 0, reasons: [] };
+
+    const normalized = normalizePath(filePath);
+    if (!normalized) return { boost: 0, reasons: [] };
+
+    let boost = 0;
+    const reasons: string[] = [];
+
+    const sliceRank = sliceFileRank.get(normalized);
+    if (sliceRank !== undefined) {
+      const delta = Math.max(0, 1.4 - (sliceRank * 0.3));
+      boost += delta;
+      reasons.push(`slice-rank:${sliceRank + 1}`);
+    }
+
+    const processRank = processFileRank.get(normalized);
+    if (processRank !== undefined) {
+      const delta = Math.max(0, 1.2 - (processRank * 0.25));
+      boost += delta;
+      reasons.push(`process-rank:${processRank + 1}`);
+    }
+
+    if (reasons.length === 0 && sharesTopSliceDirectory(normalized)) {
+      boost += 0.18;
+      reasons.push('same-dir:top-slice');
+    }
+
+    return {
+      boost: round3(boost),
+      reasons,
+    };
+  };
 
   const fallbackCompanionFiles: any[] = [];
   const fallbackCompanionSeen = new Set<string>();
@@ -327,9 +453,74 @@ export async function runImplementMode(
       .slice(0, 3);
   };
 
-  let writePlan = writePlanBase.map(step => {
+  const buildFileCarbonCopyReady = (
+    matches: Array<{ score: number; reason: string }>,
+    convergenceBoost: number,
+    baseScore: number,
+    fallbackTag: string | null,
+  ): {
+    score: number;
+    level: 'high' | 'medium' | 'low';
+    reasons: string[];
+    signals: {
+      convergence: number;
+      precedent: number;
+      base: number;
+    };
+  } => {
+    const convergenceNorm = clampUnit(safeNumber(convergenceBoost) / 2.4);
+    const precedentNorm = clampUnit(
+      (matches.length > 0
+        ? Math.max(...matches.map(item => safeNumber(item?.score)))
+        : 0) / 4,
+    );
+    const baseNorm = clampUnit(safeNumber(baseScore));
+    const score = clampPercent(
+      (convergenceNorm * IMPLEMENT_RANK_WEIGHTS.carbon.convergence)
+      + (precedentNorm * IMPLEMENT_RANK_WEIGHTS.carbon.precedent)
+      + (baseNorm * IMPLEMENT_RANK_WEIGHTS.carbon.base),
+    );
+    const reasons: string[] = [];
+    if (convergenceNorm > 0) reasons.push(`convergence:${Math.round(convergenceNorm * 100)}`);
+    if (precedentNorm > 0) reasons.push(`precedent:${Math.round(precedentNorm * 100)}`);
+    if (matches[0]?.reason) reasons.push(`precedent-match:${String(matches[0].reason)}`);
+    if (fallbackTag) reasons.push(`source:${fallbackTag}`);
+    return {
+      score: round3(score),
+      level: readinessLevel(score),
+      reasons: reasons.slice(0, 6),
+      signals: {
+        convergence: round3(convergenceNorm),
+        precedent: round3(precedentNorm),
+        base: round3(baseNorm),
+      },
+    };
+  };
+
+  let writePlan = writePlanBase.map((step, sourceIndex) => {
     const filePath = normalizePath(step?.filePath);
     const matches = rankPrecedentMatches(filePath);
+    const convergence = convergenceBoostForFile(filePath);
+    const convergenceScore = convergence.boost;
+    const carbonCopyReady = buildFileCarbonCopyReady(
+      matches,
+      convergenceScore,
+      0.5,
+      usedFallbackWritePlan ? 'fallback-write-plan' : null,
+    );
+    const carbonScore = clampUnit(safeNumber(carbonCopyReady?.score) / 100);
+    const convergenceComponent = convergenceEnabled
+      ? (convergenceScore * IMPLEMENT_RANK_WEIGHTS.write_plan.convergence)
+      : 0;
+    const carbonComponent = carbonScore * IMPLEMENT_RANK_WEIGHTS.write_plan.carbon;
+    const precedentComponent = matches.length > 0
+      ? IMPLEMENT_RANK_WEIGHTS.write_plan.precedent_bonus
+      : 0;
+    const rankingScore = round3(
+      convergenceComponent
+      + carbonComponent
+      + precedentComponent,
+    );
     return {
       ...step,
       filePath,
@@ -337,12 +528,76 @@ export async function runImplementMode(
         matched: matches.length > 0,
         candidates: matches,
       },
+      ...(convergenceScore > 0
+        ? {
+            convergence: {
+              boost: convergenceScore,
+              reasons: convergence.reasons,
+            },
+          }
+        : {}),
+      carbon_copy_ready: carbonCopyReady,
+      ranking: {
+        score: rankingScore,
+        components: {
+          convergence: round3(convergenceComponent),
+          carbon: round3(carbonComponent),
+          precedent_bonus: round3(precedentComponent),
+        },
+      },
+      __rank_score: rankingScore,
+      __source_index: sourceIndex,
     };
   });
+  const writePlanOrderBefore = writePlan
+    .map(step => String(step?.uid || step?.name || step?.filePath || ''));
+  const shouldReorderWritePlan = writePlan.some(step => safeNumber(step?.__rank_score) > 0);
+  if (shouldReorderWritePlan) {
+    writePlan = writePlan
+      .slice()
+      .sort((left, right) => {
+        const leftScore = safeNumber(left?.__rank_score);
+        const rightScore = safeNumber(right?.__rank_score);
+        if (rightScore !== leftScore) return rightScore - leftScore;
+        return safeNumber(left?.__source_index) - safeNumber(right?.__source_index);
+      });
+  }
+  const writePlanOrderAfter = writePlan
+    .map(step => String(step?.uid || step?.name || step?.filePath || ''));
+  const writePlanReordered = writePlanOrderBefore.join('|') !== writePlanOrderAfter.join('|');
+  const writePlanConvergenceApplied = convergenceEnabled
+    && writePlan.some(step => safeNumber(step?.convergence?.boost) > 0);
+  writePlan = writePlan.map((step: any) => {
+    const { __rank_score, __source_index, ...rest } = step || {};
+    return rest;
+  });
 
-  let companionFilesWithPrecedents = companionFiles.map(file => {
+  let companionFilesWithPrecedents = companionFiles.map((file, sourceIndex) => {
     const filePath = normalizePath(file?.filePath);
     const matches = rankPrecedentMatches(filePath);
+    const convergence = convergenceBoostForFile(filePath);
+    const convergenceScore = convergence.boost;
+    const carbonCopyReady = buildFileCarbonCopyReady(
+      matches,
+      convergenceScore,
+      safeNumber(file?.score),
+      usedFallbackCompanion ? 'fallback-companion' : null,
+    );
+    const carbonScore = clampUnit(safeNumber(carbonCopyReady?.score) / 100);
+    const baseComponent = safeNumber(file?.score) * IMPLEMENT_RANK_WEIGHTS.companion.base;
+    const convergenceComponent = convergenceEnabled
+      ? (convergenceScore * IMPLEMENT_RANK_WEIGHTS.companion.convergence)
+      : 0;
+    const carbonComponent = carbonScore * IMPLEMENT_RANK_WEIGHTS.companion.carbon;
+    const precedentComponent = matches.length > 0
+      ? IMPLEMENT_RANK_WEIGHTS.companion.precedent_bonus
+      : 0;
+    const rankingScore = round3(
+      baseComponent
+      + convergenceComponent
+      + carbonComponent
+      + precedentComponent,
+    );
     return {
       ...file,
       filePath,
@@ -350,7 +605,49 @@ export async function runImplementMode(
         matched: matches.length > 0,
         candidates: matches,
       },
+      ...(convergenceScore > 0
+        ? {
+            convergence: {
+              boost: convergenceScore,
+              reasons: convergence.reasons,
+            },
+          }
+        : {}),
+      carbon_copy_ready: carbonCopyReady,
+      ranking: {
+        score: rankingScore,
+        components: {
+          base: round3(baseComponent),
+          convergence: round3(convergenceComponent),
+          carbon: round3(carbonComponent),
+          precedent_bonus: round3(precedentComponent),
+        },
+      },
+      __rank_score: rankingScore,
+      __source_index: sourceIndex,
     };
+  });
+  const companionOrderBefore = companionFilesWithPrecedents
+    .map(file => String(file?.filePath || file?.uid || file?.name || ''));
+  const shouldReorderCompanions = companionFilesWithPrecedents.some(file => safeNumber(file?.__rank_score) > safeNumber(file?.score));
+  if (shouldReorderCompanions) {
+    companionFilesWithPrecedents = companionFilesWithPrecedents
+      .slice()
+      .sort((left, right) => {
+        const leftScore = safeNumber(left?.__rank_score);
+        const rightScore = safeNumber(right?.__rank_score);
+        if (rightScore !== leftScore) return rightScore - leftScore;
+        return safeNumber(left?.__source_index) - safeNumber(right?.__source_index);
+      });
+  }
+  const companionOrderAfter = companionFilesWithPrecedents
+    .map(file => String(file?.filePath || file?.uid || file?.name || ''));
+  const companionReordered = companionOrderBefore.join('|') !== companionOrderAfter.join('|');
+  const companionConvergenceApplied = convergenceEnabled
+    && companionFilesWithPrecedents.some(file => safeNumber(file?.convergence?.boost) > 0);
+  companionFilesWithPrecedents = companionFilesWithPrecedents.map((file: any) => {
+    const { __rank_score, __source_index, ...rest } = file || {};
+    return rest;
   });
 
   if (companionFilesWithPrecedents.length === 0) {
@@ -490,14 +787,144 @@ export async function runImplementMode(
     warnings: coverageWarnings,
   };
 
-  const nextActions = [
+  const genericNextActions = [
     'Open the first write-plan anchor with context() and confirm callers before editing.',
     'Apply edits in write_plan order to preserve closure semantics.',
     'Run impact() on the highest-risk write anchor before touching shared utilities.',
   ];
-  if (postEditReview) {
-    nextActions.push('Run review_mode(scope=unstaged) with slice-stencil and evidence spans enabled after edits.');
-  }
+
+  const companionFilesBoosted = companionFilesWithPrecedents
+    .filter(file => safeNumber(file?.convergence?.boost) > 0)
+    .length;
+  const writePlanBoosted = writePlan
+    .filter(step => safeNumber(step?.convergence?.boost) > 0)
+    .length;
+  const companionCarbonScores = companionFilesWithPrecedents
+    .map(file => safeNumber(file?.carbon_copy_ready?.score))
+    .filter(score => score > 0);
+  const writePlanCarbonScores = writePlan
+    .map(step => safeNumber(step?.carbon_copy_ready?.score))
+    .filter(score => score > 0);
+  const avgCompanionCarbon = companionCarbonScores.length > 0
+    ? companionCarbonScores.reduce((sum, score) => sum + score, 0) / companionCarbonScores.length
+    : 0;
+  const avgWritePlanCarbon = writePlanCarbonScores.length > 0
+    ? writePlanCarbonScores.reduce((sum, score) => sum + score, 0) / writePlanCarbonScores.length
+    : 0;
+  const companionPrecedentCoverage = companionFilesWithPrecedents.length > 0
+    ? companionFilesWithPrecedents.filter(file => file?.precedent_mapping?.matched).length / companionFilesWithPrecedents.length
+    : 0;
+  const writePlanPrecedentCoverage = writePlan.length > 0
+    ? writePlan.filter(step => step?.precedent_mapping?.matched).length / writePlan.length
+    : 0;
+  const queryHeadTopSignal = safeNumber(queryHeadConvergence?.top_slice_signal?.score || queryHeadConvergence?.top_process_signal?.score);
+  const planCarbonScore = clampPercent(
+    (avgCompanionCarbon * IMPLEMENT_RANK_WEIGHTS.plan_carbon.companion_avg)
+    + (avgWritePlanCarbon * IMPLEMENT_RANK_WEIGHTS.plan_carbon.write_plan_avg)
+    + (clampUnit(companionPrecedentCoverage) * 100 * IMPLEMENT_RANK_WEIGHTS.plan_carbon.companion_precedent_coverage)
+    + (clampUnit(writePlanPrecedentCoverage) * 100 * IMPLEMENT_RANK_WEIGHTS.plan_carbon.write_plan_precedent_coverage)
+    + (clampUnit(queryHeadTopSignal) * 100 * IMPLEMENT_RANK_WEIGHTS.plan_carbon.query_head_signal),
+  );
+  const planCarbonReasons: string[] = [];
+  if (avgCompanionCarbon > 0) planCarbonReasons.push(`companion-avg:${Math.round(avgCompanionCarbon)}`);
+  if (avgWritePlanCarbon > 0) planCarbonReasons.push(`write-plan-avg:${Math.round(avgWritePlanCarbon)}`);
+  if (companionPrecedentCoverage > 0) planCarbonReasons.push(`companion-precedent:${Math.round(companionPrecedentCoverage * 100)}%`);
+  if (writePlanPrecedentCoverage > 0) planCarbonReasons.push(`write-precedent:${Math.round(writePlanPrecedentCoverage * 100)}%`);
+  if (queryHeadTopSignal > 0) planCarbonReasons.push(`query-head-signal:${Math.round(queryHeadTopSignal * 100)}`);
+  const topWriteAnchor = writePlan
+    .slice()
+    .sort((left, right) => safeNumber(right?.carbon_copy_ready?.score) - safeNumber(left?.carbon_copy_ready?.score))[0] || null;
+  const convergedWriteAnchors = writePlan
+    .filter(step => safeNumber(step?.convergence?.boost) > 0);
+  const prioritizedWriteAnchorPool = convergedWriteAnchors.length > 0 ? convergedWriteAnchors : writePlan;
+  const writeAnchorRankScale = Math.max(
+    1,
+    ...prioritizedWriteAnchorPool.map(step => safeNumber(step?.ranking?.score)),
+  );
+  const computeWriteAnchorActionRank = (step: any): number => {
+    const rankScore = clampUnit(safeNumber(step?.ranking?.score) / writeAnchorRankScale);
+    const convergenceScore = clampUnit(safeNumber(step?.carbon_copy_ready?.signals?.convergence));
+    const carbonScore = clampUnit(safeNumber(step?.carbon_copy_ready?.score) / 100);
+    return round3(
+      (rankScore * IMPLEMENT_NEXT_ACTION_RANK_WEIGHTS.rank_score)
+      + (convergenceScore * IMPLEMENT_NEXT_ACTION_RANK_WEIGHTS.convergence)
+      + (carbonScore * IMPLEMENT_NEXT_ACTION_RANK_WEIGHTS.carbon),
+    );
+  };
+  const prioritizedWriteAnchor = prioritizedWriteAnchorPool
+    .slice()
+    .sort((left, right) => {
+      const rightActionScore = computeWriteAnchorActionRank(right);
+      const leftActionScore = computeWriteAnchorActionRank(left);
+      if (rightActionScore !== leftActionScore) return rightActionScore - leftActionScore;
+      const rightConvergence = safeNumber(right?.carbon_copy_ready?.signals?.convergence);
+      const leftConvergence = safeNumber(left?.carbon_copy_ready?.signals?.convergence);
+      if (rightConvergence !== leftConvergence) return rightConvergence - leftConvergence;
+      return safeNumber(right?.carbon_copy_ready?.score) - safeNumber(left?.carbon_copy_ready?.score);
+    })[0] || null;
+  const prioritizedWriteSource: 'converged' | 'ranked' = convergedWriteAnchors.length > 0 ? 'converged' : 'ranked';
+  const prioritizedWriteAction = prioritizedWriteAnchor
+    ? (
+      prioritizedWriteSource === 'converged'
+        ? `Start with converged write anchor "${String(prioritizedWriteAnchor?.name || prioritizedWriteAnchor?.uid || prioritizedWriteAnchor?.filePath || 'write-step')}" (convergence ${Math.round(clampUnit(safeNumber(prioritizedWriteAnchor?.carbon_copy_ready?.signals?.convergence)) * 100)}).`
+        : `Start with top-ranked write anchor "${String(prioritizedWriteAnchor?.name || prioritizedWriteAnchor?.uid || prioritizedWriteAnchor?.filePath || 'write-step')}" (score ${Math.round(safeNumber(prioritizedWriteAnchor?.carbon_copy_ready?.score))}).`
+    )
+    : null;
+  const nextActions = [
+    ...(prioritizedWriteAction ? [prioritizedWriteAction] : []),
+    ...genericNextActions,
+    ...(postEditReview
+      ? ['Run review_mode(scope=unstaged) with slice-stencil and evidence spans enabled after edits.']
+      : []),
+  ];
+  const carbonCopyReady = {
+    score: round3(planCarbonScore),
+    level: readinessLevel(planCarbonScore),
+    reasons: planCarbonReasons.slice(0, 6),
+    top_anchor: topWriteAnchor
+      ? {
+          uid: String(topWriteAnchor?.uid || ''),
+          name: String(topWriteAnchor?.name || ''),
+          filePath: String(topWriteAnchor?.filePath || ''),
+          score: round3(safeNumber(topWriteAnchor?.carbon_copy_ready?.score)),
+        }
+      : null,
+    components: {
+      companion_avg: round3(avgCompanionCarbon),
+      write_plan_avg: round3(avgWritePlanCarbon),
+      companion_precedent_coverage: round3(companionPrecedentCoverage),
+      write_plan_precedent_coverage: round3(writePlanPrecedentCoverage),
+      query_head_signal: round3(queryHeadTopSignal),
+    },
+  };
+  const convergenceMeta = {
+    enabled: convergenceEnabled,
+    source_path: String(queryHeadConvergence?.source_path || queryHeadConvergence?.sourcePath || '').trim() || null,
+    matrix_cells: toFiniteNumber(queryHeadConvergence?.matrix_cells, 0),
+    companion_files_boosted: companionFilesBoosted,
+    write_plan_boosted: writePlanBoosted,
+    companion_reordered: companionReordered,
+    write_plan_reordered: writePlanReordered,
+    companion_convergence_applied: companionConvergenceApplied,
+    write_plan_convergence_applied: writePlanConvergenceApplied,
+    ranking_weights: IMPLEMENT_RANK_WEIGHTS,
+    next_action_ranking_weights: IMPLEMENT_NEXT_ACTION_RANK_WEIGHTS,
+    write_anchor_rank_scale: round3(writeAnchorRankScale),
+    prioritized_write_anchor: prioritizedWriteAnchor
+      ? {
+          source: prioritizedWriteSource,
+          uid: String(prioritizedWriteAnchor?.uid || ''),
+          name: String(prioritizedWriteAnchor?.name || ''),
+          filePath: String(prioritizedWriteAnchor?.filePath || ''),
+          action_rank_score: computeWriteAnchorActionRank(prioritizedWriteAnchor),
+          rank_score: round3(safeNumber(prioritizedWriteAnchor?.ranking?.score)),
+          carbon_score: round3(safeNumber(prioritizedWriteAnchor?.carbon_copy_ready?.score)),
+          convergence_score: round3(clampUnit(safeNumber(prioritizedWriteAnchor?.carbon_copy_ready?.signals?.convergence))),
+          next_action: prioritizedWriteAction,
+        }
+      : null,
+    carbon_copy_ready: carbonCopyReady,
+  };
 
   return {
     status: 'ok',
@@ -531,6 +958,7 @@ export async function runImplementMode(
         degraded,
         reasons: qualityReasons,
       },
+      carbon_copy_ready: carbonCopyReady,
       coverage_banner,
       hypotheses: Array.from(new Set(hypotheses)).slice(0, 6),
       next_actions: nextActions,
@@ -546,6 +974,7 @@ export async function runImplementMode(
         include_review_contract: includeReviewContract,
         path_prefixes: pathPrefixes,
       },
+      convergence: convergenceMeta,
     },
   };
 }

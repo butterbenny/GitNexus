@@ -2702,6 +2702,22 @@ export class LocalBackend {
 
     const bm25Raw = await this.bm25Search(repo, searchQuery, searchLimit);
     const bm25Results = pathPrefixes.length > 0 ? bm25Raw.filter(r => isInScope(r?.filePath || '')) : bm25Raw;
+    const adaptiveBm25Fallback = await this.runAdaptiveBm25Fallback(
+      repo,
+      searchQuery,
+      searchLimit,
+      bm25Results.length,
+      exactResults.length,
+    );
+    const adaptiveBm25ResultsRaw = adaptiveBm25Fallback.results;
+    const adaptiveBm25Results = pathPrefixes.length > 0
+      ? adaptiveBm25ResultsRaw.filter(r => isInScope(r?.filePath || ''))
+      : adaptiveBm25ResultsRaw;
+    const bm25EffectiveHits = new Set(
+      [...bm25Results, ...adaptiveBm25Results]
+        .map(item => String(item?.nodeId || item?.filePath || '').trim())
+        .filter(Boolean),
+    ).size;
 
     // Semantic search is expensive (model load) and requires embeddings/indexes.
     // Prefer BM25 for identifier-like queries and only fall back to semantic when BM25 is sparse.
@@ -2709,7 +2725,7 @@ export class LocalBackend {
     const looksLikeIdentifier = isSingleToken && /^[A-Za-z_][$A-Za-z0-9_:/.-]*$/.test(searchQuery);
     const semanticPolicy = await this.getSemanticRetrievalMode(repo);
     const semanticMode = semanticPolicy.mode;
-    const semanticEligible = !looksLikeIdentifier && bm25Results.length < Math.max(5, Math.floor(searchLimit / 3));
+    const semanticEligible = !looksLikeIdentifier && bm25EffectiveHits < Math.max(5, Math.floor(searchLimit / 3));
     const semanticIndexAvailable = semanticMode !== 'off' && semanticEligible
       ? await this.hasSemanticVectorIndex(repo)
       : false;
@@ -2744,6 +2760,18 @@ export class LocalBackend {
       const result = bm25Results[i];
       const key = result.nodeId || result.filePath;
       const rrfScore = 1 / (60 + i + 1); // rank starts at 1
+      const existing = scoreMap.get(key);
+      if (existing) {
+        existing.score += rrfScore;
+      } else {
+        scoreMap.set(key, { score: rrfScore, data: result });
+      }
+    }
+
+    for (let i = 0; i < adaptiveBm25Results.length; i++) {
+      const result = adaptiveBm25Results[i];
+      const key = result.nodeId || result.filePath;
+      const rrfScore = 1 / (120 + i + 1); // lower weight than direct BM25
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -3593,7 +3621,12 @@ export class LocalBackend {
         used: exactResults.length > 0,
       },
       retrieval: {
-        bm25_hits: bm25Results.length,
+        bm25_hits: bm25EffectiveHits,
+        bm25_primary_hits: bm25Results.length,
+        bm25_adaptive_attempted: adaptiveBm25Fallback.attempted,
+        bm25_adaptive_probe_count: adaptiveBm25Fallback.probes.length,
+        bm25_adaptive_probes: adaptiveBm25Fallback.probes,
+        bm25_adaptive_hits: adaptiveBm25Results.length,
         semantic_hits: semanticResults.length,
         semantic_attempted: shouldTrySemantic,
         semantic_used: semanticContributedResults.length > 0,
@@ -3722,29 +3755,49 @@ export class LocalBackend {
     const hasImplementationIntent = implementationIntentRe.test(combinedIntentText);
     const hasSymptomSignal = Boolean(symptomText) || failingTests.length > 0 || errorStrings.length > 0;
     const hasReviewSignal = Boolean(baseRef) || requestedMode === 'review';
+    const MODE_ROUTER_RANK_WEIGHTS = {
+      query_anchor: 3,
+      implementation_intent: 4,
+      query_present: 1,
+      review_scope_signal: 5,
+      no_query_fallback: 2,
+      symptom_signal: 6,
+      failing_tests: 1,
+      error_strings: 1,
+    } as const;
+    const modeRouterTiePriority = ['debug', 'review', 'implement', 'query'] as const;
 
     type RoutedMode = 'query' | 'implement' | 'review' | 'debug';
-    const candidateByMode = new Map<RoutedMode, { mode: RoutedMode; score: number; reasons: string[] }>([
-      ['query', { mode: 'query', score: 0, reasons: [] }],
-      ['implement', { mode: 'implement', score: 0, reasons: [] }],
-      ['review', { mode: 'review', score: 0, reasons: [] }],
-      ['debug', { mode: 'debug', score: 0, reasons: [] }],
+    type ModeRouterSignal = keyof typeof MODE_ROUTER_RANK_WEIGHTS;
+    const candidateByMode = new Map<RoutedMode, {
+      mode: RoutedMode;
+      score: number;
+      reasons: string[];
+      score_components: Partial<Record<ModeRouterSignal, number>>;
+    }>([
+      ['query', { mode: 'query', score: 0, reasons: [], score_components: {} }],
+      ['implement', { mode: 'implement', score: 0, reasons: [], score_components: {} }],
+      ['review', { mode: 'review', score: 0, reasons: [], score_components: {} }],
+      ['debug', { mode: 'debug', score: 0, reasons: [], score_components: {} }],
     ]);
-    const addCandidateSignal = (mode: RoutedMode, score: number, reason: string) => {
+    const addCandidateSignal = (mode: RoutedMode, signal: ModeRouterSignal, reason: string) => {
       const entry = candidateByMode.get(mode);
       if (!entry) return;
+      const score = toFiniteNumber(MODE_ROUTER_RANK_WEIGHTS[signal], 0);
       entry.score += score;
       if (reason) entry.reasons.push(reason);
+      const current = toFiniteNumber(entry.score_components[signal], 0);
+      entry.score_components[signal] = current + score;
     };
 
-    if (queryText) addCandidateSignal('query', 3, 'query-anchor');
-    if (hasImplementationIntent) addCandidateSignal('implement', 4, 'implementation-intent');
-    if (queryText) addCandidateSignal('implement', 1, 'query-present');
-    if (hasReviewSignal) addCandidateSignal('review', 5, 'review-scope-signal');
-    if (!queryText && !hasSymptomSignal) addCandidateSignal('review', 2, 'no-query-fallback');
-    if (hasSymptomSignal) addCandidateSignal('debug', 6, 'symptom-signal');
-    if (failingTests.length > 0) addCandidateSignal('debug', 1, 'failing-tests');
-    if (errorStrings.length > 0) addCandidateSignal('debug', 1, 'error-strings');
+    if (queryText) addCandidateSignal('query', 'query_anchor', 'query-anchor');
+    if (hasImplementationIntent) addCandidateSignal('implement', 'implementation_intent', 'implementation-intent');
+    if (queryText) addCandidateSignal('implement', 'query_present', 'query-present');
+    if (hasReviewSignal) addCandidateSignal('review', 'review_scope_signal', 'review-scope-signal');
+    if (!queryText && !hasSymptomSignal) addCandidateSignal('review', 'no_query_fallback', 'no-query-fallback');
+    if (hasSymptomSignal) addCandidateSignal('debug', 'symptom_signal', 'symptom-signal');
+    if (failingTests.length > 0) addCandidateSignal('debug', 'failing_tests', 'failing-tests');
+    if (errorStrings.length > 0) addCandidateSignal('debug', 'error_strings', 'error-strings');
 
     let selectedMode: RoutedMode;
     const routingSignals: string[] = [];
@@ -3765,7 +3818,7 @@ export class LocalBackend {
       routingSignals.push('no-query-fallback');
     }
 
-    const tiePriority: RoutedMode[] = ['debug', 'review', 'implement', 'query'];
+    const tiePriority: RoutedMode[] = [...modeRouterTiePriority];
     if (requestedMode === 'auto') {
       const ranked = Array.from(candidateByMode.values()).sort((left, right) => {
         if (right.score !== left.score) return right.score - left.score;
@@ -3999,8 +4052,13 @@ export class LocalBackend {
       })
       .map(candidate => ({
         mode: candidate.mode,
-        score: candidate.score,
+        score: round3(candidate.score),
         reasons: uniqueByKey(candidate.reasons, item => String(item || '')).slice(0, 6),
+        score_components: Object.fromEntries(
+          Object.entries(candidate.score_components)
+            .map(([key, value]) => [key, round3(value)])
+            .filter(([, value]) => toFiniteNumber(value, 0) > 0),
+        ),
       }));
 
     const fallbackApplied = requestedMode === 'auto'
@@ -4014,6 +4072,8 @@ export class LocalBackend {
       selected_mode: selectedMode,
       fallback_applied: fallbackApplied,
       candidates: routeTraceCandidates,
+      ranking_weights: MODE_ROUTER_RANK_WEIGHTS,
+      tie_priority: modeRouterTiePriority,
     };
 
     return {
@@ -4032,6 +4092,10 @@ export class LocalBackend {
           scope,
           base_ref: baseRef || null,
           path_prefixes: pathPrefixes,
+        },
+        routing: {
+          ranking_weights: MODE_ROUTER_RANK_WEIGHTS,
+          tie_priority: modeRouterTiePriority,
         },
       },
     };
@@ -4073,6 +4137,282 @@ export class LocalBackend {
   /**
    * BM25 keyword search helper - uses KuzuDB FTS for always-fresh results
    */
+  private buildAdaptiveBm25Probes(query: string): string[] {
+    const normalizedQuery = String(query || '').trim();
+    if (!normalizedQuery || !/\s/.test(normalizedQuery)) return [];
+
+    const stopWords = new Set([
+      'a', 'an', 'and', 'api', 'by', 'for', 'from', 'in', 'into', 'of',
+      'on', 'or', 'the', 'to', 'via', 'with', 'flow', 'path', 'route', 'endpoint',
+    ]);
+
+    const probes: string[] = [];
+    const seen = new Set<string>();
+    const addProbe = (value: string): void => {
+      const probe = String(value || '').trim();
+      if (!probe) return;
+      if (probe.length < 3) return;
+      const lower = probe.toLowerCase();
+      if (stopWords.has(lower)) return;
+      if (probe === normalizedQuery) return;
+      if (seen.has(lower)) return;
+      seen.add(lower);
+      probes.push(probe);
+    };
+
+    const rawTokens = normalizedQuery
+      .split(/[^A-Za-z0-9_:.\/-]+/)
+      .map(token => token.trim())
+      .filter(Boolean);
+
+    for (const token of rawTokens) {
+      const lower = token.toLowerCase();
+      if (token.length < 3) continue;
+      if (stopWords.has(lower)) continue;
+      addProbe(token);
+    }
+
+    const words = rawTokens
+      .map(token => token.replace(/[^A-Za-z0-9]/g, ''))
+      .filter(Boolean)
+      .filter(token => token.length >= 3)
+      .filter(token => !stopWords.has(token.toLowerCase()));
+
+    const toPascal = (parts: string[]): string => parts
+      .map(part => `${part[0].toUpperCase()}${part.slice(1).toLowerCase()}`)
+      .join('');
+    const toCamel = (parts: string[]): string => {
+      if (parts.length === 0) return '';
+      return `${parts[0].toLowerCase()}${parts.slice(1).map(part => `${part[0].toUpperCase()}${part.slice(1).toLowerCase()}`).join('')}`;
+    };
+
+    const maxWords = Math.min(words.length, 6);
+    for (let size = Math.min(4, maxWords); size >= 2; size--) {
+      for (let start = 0; start + size <= maxWords; start++) {
+        const span = words.slice(start, start + size);
+        if (span.length < 2) continue;
+        addProbe(toPascal(span));
+        addProbe(toCamel(span));
+      }
+    }
+
+    return probes.slice(0, 8);
+  }
+
+  private async runAdaptiveBm25Fallback(
+    repo: RepoHandle,
+    query: string,
+    limit: number,
+    primaryHits: number,
+    exactHits: number,
+  ): Promise<{ attempted: boolean; probes: string[]; results: any[] }> {
+    const normalizedQuery = String(query || '').trim();
+    const shouldAttempt = /\s/.test(normalizedQuery)
+      && exactHits === 0
+      && primaryHits < 3;
+    if (!shouldAttempt) {
+      return { attempted: false, probes: [], results: [] };
+    }
+
+    const probes = this.buildAdaptiveBm25Probes(normalizedQuery);
+    if (probes.length === 0) {
+      return { attempted: false, probes: [], results: [] };
+    }
+
+    const perProbeLimit = Math.max(8, Math.min(30, Math.floor(limit / 2)));
+    const scored = new Map<string, { score: number; data: any }>();
+
+    const probeRows = await Promise.all(
+      probes.map(async probe => ({ probe, rows: await this.bm25Search(repo, probe, perProbeLimit) })),
+    );
+
+    for (let probeIndex = 0; probeIndex < probeRows.length; probeIndex++) {
+      const { rows } = probeRows[probeIndex];
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
+        const key = String(row?.nodeId || row?.filePath || '').trim();
+        if (!key) continue;
+        const rrfScore = 1 / (120 + probeIndex * 15 + rowIndex + 1);
+        const existing = scored.get(key);
+        if (existing) {
+          existing.score += rrfScore;
+        } else {
+          scored.set(key, { score: rrfScore, data: row });
+        }
+      }
+    }
+
+    const results = Array.from(scored.values())
+      .sort((left, right) => right.score - left.score)
+      .slice(0, perProbeLimit)
+      .map(item => item.data);
+
+    return { attempted: true, probes, results };
+  }
+
+  private isTestIntentQuery(query: string): boolean {
+    const lower = String(query || '').toLowerCase();
+    if (!lower) return false;
+    return /\b(test|tests|spec|specs|phpunit|jest|vitest|cypress|playwright|e2e|integration|unit)\b/.test(lower)
+      || /\.test\b|\.spec\b|_test\b/.test(lower)
+      || /(^|\/)(__tests__|tests?|specs?|e2e)(\/|$)/.test(lower);
+  }
+
+  private isTestFilePath(filePath: string): boolean {
+    const normalized = String(filePath || '').replace(/\\/g, '/').toLowerCase();
+    if (!normalized) return false;
+    return /(^|\/)(__tests__|tests?|specs?|e2e|cypress)(\/|$)/.test(normalized)
+      || /\.test\.[a-z0-9]+$/.test(normalized)
+      || /\.spec\.[a-z0-9]+$/.test(normalized)
+      || /_test\.[a-z0-9]+$/.test(normalized);
+  }
+
+  private rebalanceTestFileResults(query: string, rows: any[], limit: number): any[] {
+    const safeLimit = clampInteger(limit, 50, 1, 500);
+    if (!Array.isArray(rows) || rows.length === 0) return [];
+    if (this.isTestIntentQuery(query)) return rows.slice(0, safeLimit);
+
+    const nonTestRows: any[] = [];
+    const testRows: any[] = [];
+    for (const row of rows) {
+      if (this.isTestFilePath(String(row?.filePath || ''))) testRows.push(row);
+      else nonTestRows.push(row);
+    }
+
+    if (nonTestRows.length === 0) return rows.slice(0, safeLimit);
+    const maxTestRows = Math.max(1, Math.min(4, Math.floor(safeLimit * 0.2)));
+    return [...nonTestRows, ...testRows.slice(0, maxTestRows)].slice(0, safeLimit);
+  }
+
+  private async bm25LexicalFallback(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+    const normalizedQuery = String(query || '').trim();
+    if (!normalizedQuery) return [];
+
+    const safeLimit = clampInteger(limit, 50, 1, 500);
+    const stopWords = new Set([
+      'a', 'an', 'and', 'api', 'by', 'for', 'from', 'in', 'into', 'of',
+      'on', 'or', 'the', 'to', 'via', 'with',
+    ]);
+    const rawTokens = normalizedQuery
+      .split(/[^A-Za-z0-9_:.\/-]+/)
+      .map(token => token.trim())
+      .filter(Boolean);
+    const tokenMeta = Array.from(
+      new Map(
+        rawTokens
+          .map(raw => {
+            const token = raw.toLowerCase();
+            if (token.length < 3) return null;
+            if (stopWords.has(token)) return null;
+            const hasStructuredShape = /[A-Z]/.test(raw) || /[._:/-]/.test(raw);
+            const isSpecific = hasStructuredShape || token.length >= 10;
+            return [token, { token, isSpecific }] as const;
+          })
+          .filter((entry): entry is readonly [string, { token: string; isSpecific: boolean }] => entry !== null),
+      ).values(),
+    ).slice(0, 6);
+
+    if (tokenMeta.length === 0) return [];
+    const tokens = tokenMeta.map(item => item.token);
+    const hasSpecificTokens = tokenMeta.some(item => item.isSpecific);
+    const minCoverage = tokens.length >= 4 ? 0.45 : tokens.length === 3 ? 0.34 : 0.5;
+    const minMatchedTokens = tokens.length >= 4 ? 2 : 1;
+
+    const tokenWhere = tokens
+      .map(token => {
+        const escaped = token.replace(/'/g, "''");
+        return `(lname CONTAINS '${escaped}' OR lpath CONTAINS '${escaped}' OR lid CONTAINS '${escaped}')`;
+      })
+      .join(' OR ');
+
+    const lexicalRows = await executeQuery(repo.id, `
+      MATCH (n)
+      WITH n,
+           lower(coalesce(n.name, '')) AS lname,
+           lower(coalesce(n.filePath, '')) AS lpath,
+           lower(coalesce(n.id, '')) AS lid
+      WHERE (${tokenWhere})
+      RETURN n.id AS nodeId,
+             n.name AS name,
+             labels(n) AS type,
+             n.filePath AS filePath,
+             n.startLine AS startLine,
+             n.endLine AS endLine,
+             lname,
+             lpath,
+             lid
+      LIMIT ${Math.max(80, Math.min(2000, safeLimit * 10))}
+    `);
+
+    const queryLower = normalizedQuery.toLowerCase();
+    const lexicalLimit = Math.min(safeLimit, tokens.length >= 3 ? 80 : 120);
+    const scored = lexicalRows
+      .map((row: any) => {
+        const nodeId = String(row?.nodeId ?? row?.[0] ?? '').trim();
+        if (!nodeId) return null;
+        const name = String(row?.name ?? row?.[1] ?? '').trim();
+        const filePath = String(row?.filePath ?? row?.[3] ?? '').trim();
+        const typeRaw = row?.type ?? row?.[2];
+        const type = Array.isArray(typeRaw) ? String(typeRaw[0] || '').trim() : String(typeRaw || '').trim();
+        const lname = String(row?.lname ?? row?.[6] ?? '').trim();
+        const lpath = String(row?.lpath ?? row?.[7] ?? '').trim();
+        const lid = String(row?.lid ?? row?.[8] ?? '').trim();
+
+        let tokenHits = 0;
+        let weightedHits = 0;
+        let nameOrIdHits = 0;
+        let specificHit = false;
+        for (const entry of tokenMeta) {
+          const token = entry.token;
+          const inName = lname.includes(token);
+          const inPath = lpath.includes(token);
+          const inId = lid.includes(token);
+          if (!inName && !inPath && !inId) continue;
+          tokenHits += 1;
+          if (inName || inId) nameOrIdHits += 1;
+          if (entry.isSpecific) specificHit = true;
+
+          const tokenWeight = entry.isSpecific ? 2.25 : 1;
+          const fieldWeight = (inName ? 0.8 : 0) + (inId ? 0.6 : 0) + (inPath ? 0.2 : 0);
+          weightedHits += tokenWeight + fieldWeight;
+        }
+        if (tokenHits < minMatchedTokens) return null;
+        if (nameOrIdHits === 0) return null; // Drop path-only weak matches.
+        if (hasSpecificTokens && !specificHit) return null;
+        const coverage = tokenHits / Math.max(1, tokens.length);
+        if (coverage < minCoverage) return null;
+
+        const exactBoost = (lname === queryLower || lid === queryLower) ? 2 : 0;
+        const phraseBoost = (lname.includes(queryLower) || lid.includes(queryLower)) ? 1 : 0;
+        const score = weightedHits + exactBoost + phraseBoost + (coverage * 2);
+
+        return {
+          nodeId,
+          name,
+          type,
+          filePath,
+          startLine: toOptionalLineNumber(row?.startLine ?? row?.[4]),
+          endLine: toOptionalLineNumber(row?.endLine ?? row?.[5]),
+          bm25Score: score,
+          score,
+        };
+      })
+      .filter((item: any) => item && item.score > 0)
+      .sort((left: any, right: any) => right.score - left.score)
+      .slice(0, lexicalLimit)
+      .map((item: any) => ({
+        nodeId: item.nodeId,
+        name: item.name,
+        type: item.type,
+        filePath: item.filePath,
+        startLine: item.startLine,
+        endLine: item.endLine,
+        bm25Score: item.bm25Score,
+      }));
+
+    return this.rebalanceTestFileResults(normalizedQuery, scored, lexicalLimit);
+  }
+
   private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
       const escapedQuery = query.replace(/'/g, "''");
@@ -4139,10 +4479,13 @@ export class LocalBackend {
         }
       }
 
-      return Array.from(scoreMap.values())
+      const ftsResults = Array.from(scoreMap.values())
         .sort((a, b) => b.score - a.score)
         .slice(0, safeLimit)
         .map(item => ({ ...item.data, bm25Score: item.bm25Score }));
+      if (ftsResults.length > 0) return this.rebalanceTestFileResults(query, ftsResults, safeLimit);
+
+      return await this.bm25LexicalFallback(repo, query, safeLimit);
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
       return [];

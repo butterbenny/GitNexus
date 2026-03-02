@@ -1,0 +1,223 @@
+{
+  "repo": "/Users/benny/monorepo",
+  "generated_at": "2026-03-02T06:08:55.250Z",
+  "canary_basis": {
+    "query_mode_before": "legacy static first-action priority (symbol > carbon_anchor > process)",
+    "implement_mode_before": "fixed-scale action ranking (rank_norm uses 2.43 cap)",
+    "after": "current code paths"
+  },
+  "query_mode": {
+    "summary": {
+      "total": 8,
+      "valid": 8,
+      "errors": 0,
+      "changed": 1,
+      "improved": 1,
+      "regressed": 0,
+      "avg_new": 0.186,
+      "avg_old": 0.17,
+      "avg_delta": 0.016
+    },
+    "rows": [
+      {
+        "scenario": "paddle-charge-flow",
+        "new_source": null,
+        "old_source": null,
+        "new_score": 0,
+        "old_score": 0,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Compare target slice with precedents() siblings before introducing a new flow shape."
+      },
+      {
+        "scenario": "custom-field-403",
+        "new_source": "symbol",
+        "old_source": "symbol",
+        "new_score": 0.495,
+        "old_score": 0.495,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Open carbon-copy symbol \"accessFile\" first (score 69)."
+      },
+      {
+        "scenario": "seating-assign",
+        "new_source": null,
+        "old_source": null,
+        "new_score": 0,
+        "old_score": 0,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Compare target slice with precedents() siblings before introducing a new flow shape."
+      },
+      {
+        "scenario": "auction-remaining-race",
+        "new_source": "symbol",
+        "old_source": "symbol",
+        "new_score": 0.487,
+        "old_score": 0.487,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Open carbon-copy symbol \"getRemainingQty\" first (score 68)."
+      },
+      {
+        "scenario": "wallet-upsell",
+        "new_source": null,
+        "old_source": null,
+        "new_score": 0,
+        "old_score": 0,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Open top-ranked symbols with context() to inspect incoming/outgoing references."
+      },
+      {
+        "scenario": "mobile-role-mapping",
+        "new_source": null,
+        "old_source": null,
+        "new_score": 0,
+        "old_score": 0,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Open top-ranked symbols with context() to inspect incoming/outgoing references."
+      },
+      {
+        "scenario": "paddle-invoice",
+        "new_source": "carbon_anchor",
+        "old_source": "symbol",
+        "new_score": 0.508,
+        "old_score": 0.375,
+        "delta": 0.133,
+        "changed_source": true,
+        "improved": true,
+        "first_action": "Carbon-copy anchor: slice \"Endpoint Slice: post:/api/campaigns/*/auctions/*/bidders/*/invoice\" (score 56)."
+      },
+      {
+        "scenario": "ticket-pdf-retry",
+        "new_source": null,
+        "old_source": null,
+        "new_score": 0,
+        "old_score": 0,
+        "delta": 0,
+        "changed_source": false,
+        "improved": false,
+        "first_action": "Compare target slice with precedents() siblings before introducing a new flow shape."
+      }
+    ]
+  },
+  "implement_mode": {
+    "summary": {
+      "total": 8,
+      "valid": 8,
+      "errors": 0,
+      "changed": 0,
+      "improved": 8,
+      "regressed": 0,
+      "avg_new": 0.501,
+      "avg_old": 0.423,
+      "avg_delta": 0.078
+    },
+    "rows": [
+      {
+        "scenario": "paddle-refund-cache",
+        "new_uid": "Function:apps/dashboard/src/pages/campaign-settings/campaign-event/paddle-raise/utils.ts:intentInvalidations",
+        "old_uid": "Function:apps/dashboard/src/pages/campaign-settings/campaign-event/paddle-raise/utils.ts:intentInvalidations",
+        "new_rank_score": 0.28,
+        "old_rank_score": 0.132,
+        "delta": 0.148,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 1,
+        "first_action": "Start with top-ranked write anchor \"intentInvalidations\" (score 18)."
+      },
+      {
+        "scenario": "custom-field-download",
+        "new_uid": "Method:apps/backend/app/Http/Controllers/Dashboard/CustomFieldResponseController.php:accessFile",
+        "old_uid": "Method:apps/backend/app/Http/Controllers/Dashboard/CustomFieldResponseController.php:accessFile",
+        "new_rank_score": 0.851,
+        "old_rank_score": 0.84,
+        "delta": 0.011,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 2.386,
+        "first_action": "Start with converged write anchor \"accessFile\" (convergence 58)."
+      },
+      {
+        "scenario": "seating-assign-opt",
+        "new_uid": "Method:apps/backend/app/Domains/Seating/SeatingService.php:deleteSeatingGroup",
+        "old_uid": "Method:apps/backend/app/Domains/Seating/SeatingService.php:deleteSeatingGroup",
+        "new_rank_score": 0.851,
+        "old_rank_score": 0.84,
+        "delta": 0.011,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 2.386,
+        "first_action": "Start with converged write anchor \"deleteSeatingGroup\" (convergence 58)."
+      },
+      {
+        "scenario": "auction-winner-fix",
+        "new_uid": "Method:apps/backend/app/Jobs/Auction/CalculateTopBid.php:handle",
+        "old_uid": "Method:apps/backend/app/Jobs/Auction/CalculateTopBid.php:handle",
+        "new_rank_score": 0.816,
+        "old_rank_score": 0.735,
+        "delta": 0.081,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 2.111,
+        "first_action": "Start with converged write anchor \"handle\" (convergence 58)."
+      },
+      {
+        "scenario": "wallet-freshness-fix",
+        "new_uid": "file:apps/backend/app/Domains/Finance/Notifications/FinanceWalletOpenedNotification.php",
+        "old_uid": "file:apps/backend/app/Domains/Finance/Notifications/FinanceWalletOpenedNotification.php",
+        "new_rank_score": 0.066,
+        "old_rank_score": 0.034,
+        "delta": 0.032,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 1,
+        "first_action": "Start with top-ranked write anchor \"FinanceWalletOpenedNotification.php\" (score 7)."
+      },
+      {
+        "scenario": "mobile-role-normalization",
+        "new_uid": "file:apps/backend/app/Domains/AccessControl/Permissions/GivebutterPermission.php",
+        "old_uid": "file:apps/backend/app/Domains/AccessControl/Permissions/GivebutterPermission.php",
+        "new_rank_score": 0.28,
+        "old_rank_score": 0.132,
+        "delta": 0.148,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 1,
+        "first_action": "Start with top-ranked write anchor \"GivebutterPermission.php\" (score 18)."
+      },
+      {
+        "scenario": "paddle-invoice-validation",
+        "new_uid": "file:apps/backend/app/Domains/Hygiene/Email/Events/EmailValidationResponse.php",
+        "old_uid": "file:apps/backend/app/Domains/Hygiene/Email/Events/EmailValidationResponse.php",
+        "new_rank_score": 0.066,
+        "old_rank_score": 0.034,
+        "delta": 0.032,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 1,
+        "first_action": "Start with top-ranked write anchor \"EmailValidationResponse.php\" (score 7)."
+      },
+      {
+        "scenario": "ticket-pdf-contract",
+        "new_uid": "Method:apps/backend/app/Services/Event/TicketService.php:generateTicketPDF",
+        "old_uid": "Method:apps/backend/app/Services/Event/TicketService.php:generateTicketPDF",
+        "new_rank_score": 0.799,
+        "old_rank_score": 0.636,
+        "delta": 0.163,
+        "changed_anchor": false,
+        "improved": true,
+        "write_anchor_rank_scale": 1.794,
+        "first_action": "Start with converged write anchor \"generateTicketPDF\" (convergence 58)."
+      }
+    ]
+  }
+}

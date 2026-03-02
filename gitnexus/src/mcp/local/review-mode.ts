@@ -1,10 +1,33 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 import { loadClosureTemplateSnapshot } from '../../core/ingestion/closure-template-store.js';
 import {
   loadEvidenceSpanSnapshot,
   getEvidenceSpanLookup,
 } from '../../core/ingestion/evidence-span-store.js';
+
+type ConvergenceMatrixCell = {
+  cluster: string;
+  signature: string;
+  score: number;
+  route: string;
+  tokenSet: Set<string>;
+  exemplarFilePaths: string[];
+};
+
+type ConvergenceMatrixSnapshot = {
+  sourcePath: string;
+  loadedAt: string;
+  cells: ConvergenceMatrixCell[];
+};
+
+type ConvergenceSignal = {
+  score: number;
+  cluster: string;
+  signature: string;
+  route: string;
+};
 
 export interface ReviewModeRepoHandle {
   id: string;
@@ -61,6 +84,7 @@ type ReviewModeDeps = {
   missingRequiredSlotSeverity: (missingRequiredSlots: string[], deterministic?: boolean, pattern?: boolean) => 'low' | 'medium' | 'high';
   GIT_NAME_LIST_MAX_BUFFER: number;
   GIT_PATCH_MAX_BUFFER: number;
+  loadConvergenceMatrix?: (repo: ReviewModeRepoHandle) => Promise<ConvergenceMatrixSnapshot | null>;
 };
 
 const round3 = (value: unknown): number => {
@@ -75,6 +99,194 @@ const normalizeConfidence = (value: unknown, fallback = 0): number => {
   if (n < 0) return 0;
   if (n > 1) return 1;
   return n;
+};
+
+const REVIEW_CONVERGENCE_RANK_WEIGHTS = {
+  suggested_tests: {
+    base_score: 1,
+    convergence_score: 1,
+    reason_overlap: 0.22,
+    changed_test_file_bonus: 0.18,
+  },
+  findings: {
+    severity: 1,
+    confidence: 0.2,
+    convergence: 0.15,
+  },
+} as const;
+
+const convergenceMatrixCache = new Map<string, { mtimeMs: number; snapshot: ConvergenceMatrixSnapshot | null }>();
+const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../');
+
+const tokenizeConvergence = (value: unknown): string[] => {
+  return String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter(token => token.length >= 2);
+};
+
+const overlapCount = (left: Set<string>, right: Set<string>): number => {
+  let overlap = 0;
+  for (const token of left) {
+    if (right.has(token)) overlap += 1;
+  }
+  return overlap;
+};
+
+const pathAffinity = (leftPath: string, rightPath: string): number => {
+  const left = String(leftPath || '').split('/').filter(Boolean);
+  const right = String(rightPath || '').split('/').filter(Boolean);
+  if (left.length === 0 || right.length === 0) return 0;
+
+  let common = 0;
+  const upper = Math.min(left.length, right.length);
+  while (common < upper && left[common] === right[common]) common += 1;
+  if (common < 2) return 0;
+
+  return common / Math.max(left.length, right.length);
+};
+
+const normalizeRepoRelativePath = (value: unknown, repoPath: string): string => {
+  const normalized = String(value || '').trim().replace(/\\/g, '/');
+  if (!normalized) return '';
+  const root = String(repoPath || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (root && normalized.startsWith(`${root}/`)) {
+    return normalized.slice(root.length + 1);
+  }
+  return normalized.replace(/^\.\/+/, '').replace(/^\/+/, '');
+};
+
+const resolveConvergenceMatrixPaths = (repo: ReviewModeRepoHandle): string[] => {
+  const repoPattern = `${String(repo.name || '').trim() || 'repo'}-patterns`;
+  const cwd = process.cwd();
+  return Array.from(new Set([
+    path.resolve(path.join(repo.repoPath, '.gitnexus', 'lamination_matrix.json')),
+    path.resolve(path.join(repo.repoPath, '.gitnexus', 'brain', 'lamination_matrix.json')),
+    path.resolve(path.join(MODULE_ROOT, 'reports', repoPattern, 'pass-2', 'lamination_matrix.json')),
+    path.resolve(path.join(cwd, 'reports', repoPattern, 'pass-2', 'lamination_matrix.json')),
+    path.resolve(path.join(cwd, '..', 'reports', repoPattern, 'pass-2', 'lamination_matrix.json')),
+  ]));
+};
+
+const parseConvergenceMatrix = (raw: any, sourcePath: string, repoPath: string): ConvergenceMatrixSnapshot | null => {
+  const rawCells = Array.isArray(raw?.topCells)
+    ? raw.topCells
+    : (Array.isArray(raw?.matrix) ? raw.matrix : []);
+  if (rawCells.length === 0) return null;
+
+  const cells: ConvergenceMatrixCell[] = [];
+  for (const item of rawCells.slice(0, 120)) {
+    const score = Number(item?.carbonCopyReadyScore ?? item?.score ?? 0);
+    if (!Number.isFinite(score) || score <= 0) continue;
+
+    const cluster = String(item?.cluster || '').trim();
+    const signature = String(item?.signature || '').trim();
+    const route = String(item?.signatureTopRoute || '').trim();
+    const exemplarRows = Array.isArray(item?.exemplarSlices) ? item.exemplarSlices : [];
+    const exemplarFilePaths: string[] = Array.from(
+      new Set<string>(
+        exemplarRows
+          .flatMap((row: any) => [
+            normalizeRepoRelativePath(row?.entryFile, repoPath),
+            normalizeRepoRelativePath(row?.terminalFile, repoPath),
+          ])
+          .filter((value): value is string => typeof value === 'string' && value.length > 0),
+      ),
+    ).slice(0, 10);
+
+    const tokenSet = new Set<string>([
+      ...tokenizeConvergence(cluster),
+      ...tokenizeConvergence(signature),
+      ...tokenizeConvergence(route),
+      ...exemplarRows.flatMap((row: any) => tokenizeConvergence(row?.label || '')),
+      ...exemplarFilePaths.flatMap(filePath => tokenizeConvergence(filePath)),
+    ]);
+
+    cells.push({
+      cluster,
+      signature,
+      score: Math.max(0, Math.min(100, score)),
+      route,
+      tokenSet,
+      exemplarFilePaths,
+    });
+  }
+
+  if (cells.length === 0) return null;
+  return {
+    sourcePath,
+    loadedAt: new Date().toISOString(),
+    cells,
+  };
+};
+
+const loadConvergenceMatrixSnapshot = async (repo: ReviewModeRepoHandle): Promise<ConvergenceMatrixSnapshot | null> => {
+  const candidates = resolveConvergenceMatrixPaths(repo);
+  for (const sourcePath of candidates) {
+    try {
+      const stat = await fs.stat(sourcePath);
+      if (!stat.isFile()) continue;
+
+      const cached = convergenceMatrixCache.get(sourcePath);
+      if (cached && cached.mtimeMs === stat.mtimeMs) {
+        return cached.snapshot;
+      }
+
+      const rawText = await fs.readFile(sourcePath, 'utf8');
+      const parsed = parseConvergenceMatrix(JSON.parse(rawText), sourcePath, repo.repoPath);
+      convergenceMatrixCache.set(sourcePath, { mtimeMs: stat.mtimeMs, snapshot: parsed });
+      if (parsed) return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+};
+
+const computeConvergenceSignal = (
+  matrix: ConvergenceMatrixSnapshot,
+  reviewTokenSet: Set<string>,
+  itemTokenSet: Set<string>,
+  itemFilePaths: string[],
+): ConvergenceSignal | null => {
+  if (!matrix?.cells?.length) return null;
+  if (itemTokenSet.size === 0 && itemFilePaths.length === 0) return null;
+
+  let best: ConvergenceSignal | null = null;
+  for (const cell of matrix.cells) {
+    const normalizedCellScore = Math.max(0, Math.min(1, cell.score / 100));
+    const tokenOverlap = overlapCount(itemTokenSet, cell.tokenSet);
+    const tokenCoverage = tokenOverlap > 0
+      ? tokenOverlap / Math.max(1, Math.min(itemTokenSet.size, 8))
+      : 0;
+    const reviewOverlap = overlapCount(reviewTokenSet, cell.tokenSet);
+    const reviewFactor = reviewOverlap > 0 ? 1.1 : 1;
+    const tokenSignal = tokenCoverage * normalizedCellScore * 0.55 * reviewFactor;
+
+    let fileSignal = 0;
+    if (itemFilePaths.length > 0 && cell.exemplarFilePaths.length > 0) {
+      for (const itemFilePath of itemFilePaths) {
+        for (const exemplarFilePath of cell.exemplarFilePaths) {
+          const affinity = pathAffinity(itemFilePath, exemplarFilePath);
+          if (affinity <= 0) continue;
+          fileSignal = Math.max(fileSignal, affinity * normalizedCellScore * 0.9);
+        }
+      }
+    }
+
+    const combined = Math.max(tokenSignal, fileSignal);
+    if (!best || combined > best.score) {
+      best = {
+        score: round3(combined),
+        cluster: cell.cluster,
+        signature: cell.signature,
+        route: cell.route,
+      };
+    }
+  }
+
+  return best;
 };
 
 export async function runReviewMode(
@@ -102,6 +314,7 @@ export async function runReviewMode(
     missingRequiredSlotSeverity,
     GIT_NAME_LIST_MAX_BUFFER,
     GIT_PATCH_MAX_BUFFER,
+    loadConvergenceMatrix,
   } = deps;
     await ensureInitialized(repo.id);
 
@@ -128,6 +341,9 @@ export async function runReviewMode(
       repoPath: repo.repoPath,
       extraPaths: runtimeObservationPaths,
     });
+    const convergenceMatrix = loadConvergenceMatrix
+      ? await loadConvergenceMatrix(repo)
+      : await loadConvergenceMatrixSnapshot(repo);
 
     const normalizePath = (value: string): string => {
       return String(value || '')
@@ -189,6 +405,12 @@ export async function runReviewMode(
       summary: string;
       reason: string;
       confidence: number;
+      convergence?: {
+        score: number;
+        cluster?: string;
+        signature?: string;
+        route?: string;
+      };
       evidence: {
         filePath: string;
         symbol?: {
@@ -1239,6 +1461,27 @@ export async function runReviewMode(
       const fp = normalizePath(String(file?.filePath || ''));
       if (fp) changedFilePathSet.add(fp);
     }
+    const reviewTokenSet = new Set<string>();
+    for (const fp of changedFilePathSet) {
+      for (const token of tokenizeConvergence(fp)) reviewTokenSet.add(token);
+      const base = path.basename(fp, path.extname(fp));
+      for (const token of tokenizeConvergence(base)) reviewTokenSet.add(token);
+    }
+    for (const sym of analysisSymbols) {
+      for (const token of tokenizeConvergence(String(sym?.name || ''))) reviewTokenSet.add(token);
+      for (const token of tokenizeConvergence(String(sym?.kind || ''))) reviewTokenSet.add(token);
+    }
+
+    const getConvergenceSignal = (filePath: string, context: Array<unknown> = []): ConvergenceSignal | null => {
+      if (!convergenceMatrix) return null;
+      const normalizedFilePath = normalizePath(String(filePath || ''));
+      if (!normalizedFilePath) return null;
+      const itemTokenSet = new Set<string>([
+        ...tokenizeConvergence(normalizedFilePath),
+        ...context.flatMap(value => tokenizeConvergence(value)),
+      ]);
+      return computeConvergenceSignal(convergenceMatrix, reviewTokenSet, itemTokenSet, [normalizedFilePath]);
+    };
 
     const suggestedTestsAgg = new Map<string, { score: number; reasons: string[] }>();
     const addSuggestedTest = (filePath: string, scoreDelta: number, reason: string): void => {
@@ -1575,15 +1818,84 @@ export async function runReviewMode(
       addSuggestedTest(changedTestFilePath, 1.05, 'changed test file in diff');
     }
 
-    const suggested_tests = Array.from(suggestedTestsAgg.entries())
-      .sort((a, b) => b[1].score - a[1].score)
+    const suggestedTestsEntries = Array.from(suggestedTestsAgg.entries())
+      .map(([filePath, meta], sourceIndex) => {
+        const signal = getConvergenceSignal(filePath, meta.reasons);
+        const convergenceScore = toFiniteNumber(signal?.score, 0);
+        const reasonTokenSet = new Set<string>(meta.reasons.flatMap(reason => tokenizeConvergence(reason)));
+        const reasonOverlapCount = reasonTokenSet.size > 0
+          ? overlapCount(reviewTokenSet, reasonTokenSet)
+          : 0;
+        const reasonOverlapScore = reasonOverlapCount > 0
+          ? reasonOverlapCount / Math.max(1, Math.min(reviewTokenSet.size, 8))
+          : 0;
+        const changedTestBonus = changedTestFileSet.has(filePath) ? 1 : 0;
+        const rank = round3(
+          (meta.score * REVIEW_CONVERGENCE_RANK_WEIGHTS.suggested_tests.base_score)
+          + (convergenceScore * REVIEW_CONVERGENCE_RANK_WEIGHTS.suggested_tests.convergence_score)
+          + (reasonOverlapScore * REVIEW_CONVERGENCE_RANK_WEIGHTS.suggested_tests.reason_overlap)
+          + (changedTestBonus * REVIEW_CONVERGENCE_RANK_WEIGHTS.suggested_tests.changed_test_file_bonus),
+        );
+        return {
+          filePath,
+          meta,
+          sourceIndex,
+          signal,
+          rank,
+          rank_components: {
+            base_score: round3(meta.score),
+            convergence_score: round3(convergenceScore),
+            reason_overlap: round3(reasonOverlapScore),
+            changed_test_file_bonus: round3(changedTestBonus * REVIEW_CONVERGENCE_RANK_WEIGHTS.suggested_tests.changed_test_file_bonus),
+          },
+        };
+      });
+    const suggestedTestsBaseOrder = suggestedTestsEntries
+      .slice()
+      .sort((left, right) => {
+        if (right.meta.score !== left.meta.score) return right.meta.score - left.meta.score;
+        return left.sourceIndex - right.sourceIndex;
+      })
+      .map(item => item.filePath);
+    const suggestedTestsRanked = suggestedTestsEntries
+      .slice()
+      .sort((left, right) => {
+        if (right.rank !== left.rank) return right.rank - left.rank;
+        if (right.meta.score !== left.meta.score) return right.meta.score - left.meta.score;
+        return left.sourceIndex - right.sourceIndex;
+      });
+    const suggestedTestsRankedOrder = suggestedTestsRanked.map(item => item.filePath);
+    const suggestedTestsBoosted = suggestedTestsEntries
+      .filter(item => toFiniteNumber(item?.signal?.score, 0) > 0)
+      .length;
+    const suggestedTestsReordered = suggestedTestsBaseOrder.join('|') !== suggestedTestsRankedOrder.join('|');
+
+    const suggested_tests = suggestedTestsRanked
       .slice(0, limitTests)
-      .map(([filePath, meta]) => ({
-        filePath,
-        score: round3(meta.score),
-        reasons: meta.reasons,
-        ...buildSuggestedTestCommand(filePath),
-      }));
+      .map(entry => {
+        const filePath = entry.filePath;
+        const convergenceScore = toFiniteNumber(entry?.signal?.score, 0);
+        return {
+          filePath,
+          score: round3(entry.rank),
+          reasons: entry.meta.reasons,
+          ranking: {
+            score: round3(entry.rank),
+            components: entry.rank_components,
+          },
+          ...(convergenceScore > 0
+            ? {
+                convergence: {
+                  score: round3(convergenceScore),
+                  cluster: String(entry?.signal?.cluster || '').trim(),
+                  signature: String(entry?.signal?.signature || '').trim(),
+                  route: String(entry?.signal?.route || '').trim(),
+                },
+              }
+            : {}),
+          ...buildSuggestedTestCommand(filePath),
+        };
+      });
 
     const test_commands = Array.from(new Map(
       suggested_tests.map(test => {
@@ -3712,7 +4024,7 @@ export async function runReviewMode(
       });
     };
 
-    const reviewFindings: ReviewFinding[] = [];
+    let reviewFindings: ReviewFinding[] = [];
     const findingDedupe = new Set<string>();
 
     for (const filePath of productUntrackedFiles) {
@@ -4012,12 +4324,92 @@ export async function runReviewMode(
     });
 
     const severityRank: Record<ReviewFindingSeverity, number> = { high: 3, medium: 2, low: 1 };
-    reviewFindings.sort((left, right) => {
+    const compareFindingsRisk = (left: ReviewFinding, right: ReviewFinding): number => {
       const leftRank = severityRank[left.severity] || 0;
       const rightRank = severityRank[right.severity] || 0;
       if (rightRank !== leftRank) return rightRank - leftRank;
       if (right.confidence !== left.confidence) return right.confidence - left.confidence;
+      return 0;
+    };
+    const compareFindingsLegacy = (left: ReviewFinding, right: ReviewFinding): number => {
+      const risk = compareFindingsRisk(left, right);
+      if (risk !== 0) return risk;
       return left.summary.localeCompare(right.summary);
+    };
+    const findingKey = (finding: ReviewFinding): string => {
+      return [
+        String(finding?.code || '').trim(),
+        normalizePath(String(finding?.evidence?.filePath || '')),
+        String(finding?.summary || '').trim(),
+      ].join('|');
+    };
+    const findingsWithSignals = reviewFindings
+      .map((finding, sourceIndex) => {
+        const filePath = normalizePath(String(finding?.evidence?.filePath || ''));
+        const signal = getConvergenceSignal(filePath, [
+          finding.summary,
+          finding.reason,
+          finding.code,
+          finding.evidence?.symbol?.name || '',
+        ]);
+        const convergenceScore = round3(toFiniteNumber(signal?.score, 0));
+        const severityScore = toFiniteNumber(severityRank[finding.severity], 0);
+        const confidenceScore = normalizeConfidence(finding.confidence, 0);
+        const rankScore = round3(
+          (severityScore * REVIEW_CONVERGENCE_RANK_WEIGHTS.findings.severity)
+          + (confidenceScore * REVIEW_CONVERGENCE_RANK_WEIGHTS.findings.confidence)
+          + (convergenceScore * REVIEW_CONVERGENCE_RANK_WEIGHTS.findings.convergence),
+        );
+        return {
+          ...finding,
+          ranking: {
+            score: rankScore,
+            components: {
+              severity: round3(severityScore),
+              confidence: round3(confidenceScore),
+              convergence: convergenceScore,
+            },
+          },
+          ...(convergenceScore > 0
+            ? {
+                convergence: {
+                  score: convergenceScore,
+                  cluster: String(signal?.cluster || '').trim(),
+                  signature: String(signal?.signature || '').trim(),
+                  route: String(signal?.route || '').trim(),
+                },
+              }
+            : {}),
+          __convergence_score: convergenceScore,
+          __rank_score: rankScore,
+          __source_index: sourceIndex,
+        };
+      });
+    const findingsBaseOrder = findingsWithSignals
+      .slice()
+      .sort((left, right) => compareFindingsLegacy(left, right))
+      .map(finding => findingKey(finding));
+    findingsWithSignals.sort((left, right) => {
+      const leftRank = toFiniteNumber((left as any)?.__rank_score, 0);
+      const rightRank = toFiniteNumber((right as any)?.__rank_score, 0);
+      if (rightRank !== leftRank) return rightRank - leftRank;
+      const base = compareFindingsRisk(left, right);
+      if (base !== 0) return base;
+      const leftConvergence = toFiniteNumber((left as any)?.__convergence_score, 0);
+      const rightConvergence = toFiniteNumber((right as any)?.__convergence_score, 0);
+      if (rightConvergence !== leftConvergence) return rightConvergence - leftConvergence;
+      const summarySort = String(left?.summary || '').localeCompare(String(right?.summary || ''));
+      if (summarySort !== 0) return summarySort;
+      return toFiniteNumber((left as any)?.__source_index, 0) - toFiniteNumber((right as any)?.__source_index, 0);
+    });
+    const findingsRankedOrder = findingsWithSignals.map(finding => findingKey(finding));
+    const findingsBoosted = findingsWithSignals
+      .filter(finding => toFiniteNumber((finding as any)?.__convergence_score, 0) > 0)
+      .length;
+    const findingsReordered = findingsBaseOrder.join('|') !== findingsRankedOrder.join('|');
+    reviewFindings = findingsWithSignals.map((finding: any) => {
+      const { __convergence_score, __rank_score, __source_index, ...rest } = finding || {};
+      return rest;
     });
 
     if (reviewFindings.length > 0) {
@@ -4030,6 +4422,12 @@ export async function runReviewMode(
       medium: reviewFindings.filter(finding => finding.severity === 'medium').length,
       low: reviewFindings.filter(finding => finding.severity === 'low').length,
     };
+    if (findingsBoosted > 0 && Array.isArray(review_kernel.next_actions)) {
+      review_kernel.next_actions = [
+        'Start with convergence-prioritized findings and tests to mirror strongest in-repo implementation patterns.',
+        ...review_kernel.next_actions,
+      ].slice(0, 8);
+    }
 
     const symbolizedFileSet = new Set(
       analysisSymbols
@@ -4056,6 +4454,16 @@ export async function runReviewMode(
       runtimeGeneratedAt: runtimeSnapshot.generatedAt || '',
       runtimeSourceFiles: runtimeSnapshot.source_files,
     });
+    const convergenceMeta = {
+      enabled: Boolean(convergenceMatrix),
+      source_path: convergenceMatrix?.sourcePath || null,
+      matrix_cells: Array.isArray(convergenceMatrix?.cells) ? convergenceMatrix.cells.length : 0,
+      suggested_tests_boosted: suggestedTestsBoosted,
+      suggested_tests_reordered: suggestedTestsReordered,
+      findings_boosted: findingsBoosted,
+      findings_reordered: findingsReordered,
+      ranking_weights: REVIEW_CONVERGENCE_RANK_WEIGHTS,
+    };
 
     return {
       status: 'ok',
@@ -4142,6 +4550,7 @@ export async function runReviewMode(
           runtime_source: runtimeSource,
           runtime_source_files: runtimeSnapshot.source_files,
         },
+        convergence: convergenceMeta,
       },
     };
 }

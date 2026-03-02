@@ -41,6 +41,13 @@ type DebugModeDeps = {
   normalizeConfidence: (value: unknown, fallback?: number) => number;
 };
 
+const DEBUG_CANDIDATE_RANK_WEIGHTS = {
+  base_score: 0.5,
+  symptom_fit: 0.2,
+  confidence: 0.15,
+  route_alignment: 0.15,
+} as const;
+
 export async function runDebugMode(
   deps: DebugModeDeps,
   repo: DebugModeRepoHandle,
@@ -1370,19 +1377,55 @@ export async function runDebugMode(
       const matchedRouteBoost = matchedRoutes.length > 0 ? Math.min(0.15, matchedRoutes.length * 0.03) : 0;
       return round3(normalizeConfidence(Math.min(1, Math.max(...coverageScores) + matchedRouteBoost), 0));
     };
+    const maxRawScore = Math.max(
+      1,
+      ...candidateLoops.map(candidate => toFiniteNumber(candidate?.score, 0)),
+    );
+    const maxSymptomFit = Math.max(
+      1,
+      ...candidateLoops.map(candidate => toFiniteNumber(candidate?.symptom_fit, 0)),
+    );
     const rankedCandidates = Array.from(new Map(
       candidateLoops
-      .map(candidate => ({
-        ...candidate,
-        route_alignment: scoreCandidateRouteAlignment(candidate),
-      }))
+      .map(candidate => {
+        const routeAlignment = scoreCandidateRouteAlignment(candidate);
+        const rawScore = toFiniteNumber(candidate?.score, 0);
+        const rawSymptomFit = toFiniteNumber(candidate?.symptom_fit, 0);
+        const baseScoreNorm = Math.min(1, rawScore / maxRawScore);
+        const symptomFitNorm = Math.min(1, rawSymptomFit / maxSymptomFit);
+        const confidenceScore = normalizeConfidence(candidate?.confidence, 0);
+        const rankScore = round3(
+          (baseScoreNorm * DEBUG_CANDIDATE_RANK_WEIGHTS.base_score)
+          + (symptomFitNorm * DEBUG_CANDIDATE_RANK_WEIGHTS.symptom_fit)
+          + (confidenceScore * DEBUG_CANDIDATE_RANK_WEIGHTS.confidence)
+          + (routeAlignment * DEBUG_CANDIDATE_RANK_WEIGHTS.route_alignment),
+        );
+
+        return {
+          ...candidate,
+          route_alignment: routeAlignment,
+          ranking: {
+            score: rankScore,
+            components: {
+              raw_score: round3(rawScore),
+              raw_symptom_fit: round3(rawSymptomFit),
+              base_score_norm: round3(baseScoreNorm),
+              symptom_fit_norm: round3(symptomFitNorm),
+              confidence: round3(confidenceScore),
+              route_alignment: round3(routeAlignment),
+            },
+          },
+        };
+      })
       .sort((left, right) => {
-        if (right.score !== left.score) return right.score - left.score;
-        if (right.symptom_fit !== left.symptom_fit) return right.symptom_fit - left.symptom_fit;
+        const rightRank = toFiniteNumber(right?.ranking?.score, 0);
+        const leftRank = toFiniteNumber(left?.ranking?.score, 0);
+        if (rightRank !== leftRank) return rightRank - leftRank;
         if (toFiniteNumber(right.route_alignment, 0) !== toFiniteNumber(left.route_alignment, 0)) {
           return toFiniteNumber(right.route_alignment, 0) - toFiniteNumber(left.route_alignment, 0);
         }
         if (right.confidence !== left.confidence) return right.confidence - left.confidence;
+        if (right.score !== left.score) return right.score - left.score;
         return left.summary.localeCompare(right.summary);
       })
       .map(candidate => [`${String(candidate.kind || '')}|${String(candidate.summary || '')}`, candidate]),
@@ -1450,9 +1493,11 @@ export async function runDebugMode(
         kind: candidate.kind,
         summary: candidate.summary,
         score: round3(toFiniteNumber(candidate.score, 0)),
+        rank_score: round3(toFiniteNumber(candidate?.ranking?.score, 0)),
         symptom_fit: round3(toFiniteNumber(candidate.symptom_fit, 0)),
         confidence: round3(normalizeConfidence(candidate.confidence, 0)),
         route_alignment: round3(normalizeConfidence(candidate.route_alignment, 0)),
+        ranking: candidate?.ranking || null,
         findings: Array.isArray(candidate.findings) ? candidate.findings.slice(0, 8) : [],
         fix_recipe_ids: Array.isArray(candidate.fix_recipes) ? candidate.fix_recipes.map((item: any) => String(item?.id || '').trim()).filter(Boolean).slice(0, 8) : [],
         endpoint: selectedEndpoint ? {
@@ -1534,7 +1579,7 @@ export async function runDebugMode(
     }
 
     const nextActions: string[] = [];
-    if (prioritizedCandidate?.source === 'converged' && String(prioritizedCandidate?.next_action || '').trim()) {
+    if (String(prioritizedCandidate?.next_action || '').trim()) {
       nextActions.push(String(prioritizedCandidate.next_action));
     }
     nextActions.push(
@@ -1762,6 +1807,10 @@ export async function runDebugMode(
           route_index_patterns: runtimeRoutePatterns.length,
           route_match_ratio: round3(runtimeRouteMatchRatio),
           route_converged_candidates: convergedCandidateCount,
+        },
+        ranking: {
+          candidate_weights: DEBUG_CANDIDATE_RANK_WEIGHTS,
+          top_candidate_rank_score: round3(toFiniteNumber(prioritizedCandidate?.rank_score, 0)),
         },
       },
     };

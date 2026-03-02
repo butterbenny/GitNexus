@@ -219,6 +219,25 @@ test('MCP query_mode: packages top slices, symbols, and action hints for focused
   assert.ok(Array.isArray(result.query_mode?.action_hints?.hops));
   assert.ok(Array.isArray(result.query_mode?.next_actions));
   assert.ok(result.query_mode.next_actions.some(step => String(step).includes('review_mode')));
+  assert.ok(result.query_mode?.carbon_copy_ready, 'expected carbon_copy_ready summary');
+  assert.ok(typeof result.query_mode.carbon_copy_ready.score === 'number');
+  assert.ok(Array.isArray(result.query_mode.carbon_copy_ready.reasons));
+  assert.ok(
+    result.query_mode.slices.every(slice => !slice?.carbon_copy_ready || typeof slice.carbon_copy_ready.score === 'number'),
+    'expected optional per-slice carbon_copy_ready scores',
+  );
+  assert.ok(
+    result.query_mode.processes.every(proc => !proc?.carbon_copy_ready || typeof proc.carbon_copy_ready.score === 'number'),
+    'expected optional per-process carbon_copy_ready scores',
+  );
+  assert.ok(result._query_mode?.convergence?.top_carbon_copy || result.query_mode?.carbon_copy_ready);
+  assert.ok((result._query_mode?.convergence?.next_action_ranking_weights?.score || 0) > 0);
+  if (result._query_mode?.convergence?.prioritized_next_action?.action) {
+    assert.equal(
+      result._query_mode.convergence.prioritized_next_action.action,
+      result.query_mode?.next_actions?.[0],
+    );
+  }
   assert.equal(result._query_mode?.knobs?.include_precedents, true);
   assert.equal(result._query_mode?.knobs?.include_action_hints, true);
 });

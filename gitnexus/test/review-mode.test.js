@@ -332,6 +332,8 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
     !String(fooPageSuggestedTest.command).startsWith('pnpm test'),
     'expected dashboard test command to avoid pnpm test'
   );
+  assert.ok(Number(fooPageSuggestedTest?.ranking?.score || 0) > 0);
+  assert.ok(Number(fooPageSuggestedTest?.ranking?.components?.base_score || 0) > 0);
 
   const doThingCard = (result.symbols || []).find(s => s?.symbol?.filePath === 'src/doThing.ts' && s?.symbol?.name === 'doThing');
   assert.ok(doThingCard, 'expected symbols[] to include doThing review card');
@@ -456,6 +458,8 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.equal(result.summary.suggested_test_commands, result.test_commands.length);
   assert.equal(result._review_mode?.knobs?.include_evidence_spans, true);
   assert.equal(result._review_mode?.knobs?.include_slice_stencil, true);
+  assert.ok((result._review_mode?.convergence?.ranking_weights?.suggested_tests?.convergence_score || 0) > 0);
+  assert.ok((result._review_mode?.convergence?.ranking_weights?.findings?.severity || 0) > 0);
 
   const noStencil = runTool('review_mode', { repo: repoPath, scope: 'unstaged', include_slice_stencil: false }, env);
   assert.equal(noStencil.status, 'ok');

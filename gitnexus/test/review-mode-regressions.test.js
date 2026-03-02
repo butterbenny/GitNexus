@@ -137,3 +137,219 @@ test('review_mode internals: slot normalization and severity gating for missing 
   assert.equal(internals.missingRequiredSlotSeverity(["'anchor'"], true, false), 'high');
   assert.equal(internals.missingRequiredSlotSeverity(['authorization'], false, true), 'low');
 });
+
+test('MCP review_mode: convergence prioritizes suggested tests and findings', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-review-convergence-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'tests'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, 'src/marker.ts'),
+    [
+      'export const marker = 1;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  await fs.writeFile(
+    path.join(repoPath, 'tests/a-first.test.ts'),
+    [
+      'export const aFirst = 1;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  await fs.writeFile(
+    path.join(repoPath, 'tests/z-focus.test.ts'),
+    [
+      'export const zFocus = 1;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output1 = runAnalyze(repoPath, env);
+  assert.match(output1, ANALYZE_READY_RE);
+
+  await fs.writeFile(
+    path.join(repoPath, 'tests/a-first.test.ts'),
+    [
+      'export const aFirst = 2;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  await fs.writeFile(
+    path.join(repoPath, 'tests/z-focus.test.ts'),
+    [
+      'export const zFocus = 2;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  await fs.writeFile(
+    path.join(repoPath, 'src/a-note.ts'),
+    [
+      'export const aNote = true;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  await fs.writeFile(
+    path.join(repoPath, 'src/z-focus-impl.ts'),
+    [
+      'export const zFocusImpl = true;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  await fs.mkdir(path.join(repoPath, '.gitnexus'), { recursive: true });
+  await fs.writeFile(
+    path.join(repoPath, '.gitnexus/lamination_matrix.json'),
+    JSON.stringify({
+      topCells: [
+        {
+          cluster: 'Focus',
+          signature: 'z focus impl',
+          carbonCopyReadyScore: 100,
+          signatureTopRoute: '',
+          exemplarSlices: [
+            {
+              label: 'z focus impl',
+              entryFile: 'src/z-focus-impl.ts',
+              terminalFile: 'tests/z-focus.test.ts',
+            },
+          ],
+        },
+      ],
+    }, null, 2),
+    'utf-8',
+  );
+
+  const result = runTool('review_mode', {
+    repo: repoPath,
+    scope: 'unstaged',
+    include_ui_contracts: false,
+    include_evidence_spans: false,
+    include_slice_stencil: false,
+  }, env);
+  assert.equal(result.status, 'ok');
+  assert.equal(result._review_mode?.convergence?.enabled, true);
+  assert.ok(Number(result._review_mode?.convergence?.matrix_cells || 0) >= 1);
+  assert.ok(Number(result._review_mode?.convergence?.suggested_tests_boosted || 0) >= 1);
+  assert.ok(Number(result._review_mode?.convergence?.findings_boosted || 0) >= 1);
+  assert.ok((result._review_mode?.convergence?.ranking_weights?.suggested_tests?.convergence_score || 0) > 0);
+  assert.ok((result._review_mode?.convergence?.ranking_weights?.findings?.severity || 0) > 0);
+
+  const aFirstSuggested = (result.suggested_tests || []).find(test => test?.filePath === 'tests/a-first.test.ts');
+  const zFocusSuggested = (result.suggested_tests || []).find(test => test?.filePath === 'tests/z-focus.test.ts');
+  assert.ok(aFirstSuggested, 'expected a-first suggested test');
+  assert.ok(zFocusSuggested, 'expected z-focus suggested test');
+  assert.ok(
+    Number(zFocusSuggested?.score || 0) > Number(aFirstSuggested?.score || 0),
+    'expected convergence to boost z-focus suggested test score above a-first',
+  );
+  assert.equal(result.suggested_tests?.[0]?.filePath, 'tests/z-focus.test.ts');
+  assert.ok(Number(result.suggested_tests?.[0]?.ranking?.score || 0) > 0);
+  assert.ok(Number(result.suggested_tests?.[0]?.ranking?.components?.convergence_score || 0) > 0);
+
+  const untrackedFindings = (result.review_kernel?.findings || []).filter(finding => finding?.code === 'untracked-file');
+  assert.ok(untrackedFindings.length >= 2, 'expected untracked findings for both files');
+  assert.equal(String(untrackedFindings[0]?.evidence?.filePath || ''), 'src/z-focus-impl.ts');
+  assert.ok(Number(untrackedFindings[0]?.convergence?.score || 0) > 0);
+  assert.ok(Number(untrackedFindings[0]?.ranking?.score || 0) > 0);
+});
+
+test('MCP review_mode: convergence matrix loads from reports fallback path', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-review-convergence-fallback-'));
+  const repoName = 'lamination-fallback-repo';
+  const repoPath = path.join(tmpRoot, repoName);
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'tests'), { recursive: true });
+
+  const reportsRoot = path.join(process.cwd(), 'reports', `${repoName}-patterns`, 'pass-2');
+  const reportsMatrixPath = path.join(reportsRoot, 'lamination_matrix.json');
+
+  await fs.writeFile(
+    path.join(repoPath, 'src/fallback-focus.ts'),
+    [
+      'export const fallbackFocus = 1;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  await fs.writeFile(
+    path.join(repoPath, 'tests/fallback-focus.test.ts'),
+    [
+      'export const fallbackFocusTest = 1;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output1 = runAnalyze(repoPath, env);
+  assert.match(output1, ANALYZE_READY_RE);
+
+  await fs.writeFile(
+    path.join(repoPath, 'tests/fallback-focus.test.ts'),
+    [
+      'export const fallbackFocusTest = 2;',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  await fs.mkdir(reportsRoot, { recursive: true });
+  await fs.writeFile(
+    reportsMatrixPath,
+    JSON.stringify({
+      topCells: [
+        {
+          cluster: 'Fallback',
+          signature: 'fallback focus',
+          carbonCopyReadyScore: 96,
+          signatureTopRoute: '',
+          exemplarSlices: [
+            {
+              label: 'fallback focus',
+              entryFile: 'src/fallback-focus.ts',
+              terminalFile: 'tests/fallback-focus.test.ts',
+            },
+          ],
+        },
+      ],
+    }, null, 2),
+    'utf-8',
+  );
+
+  try {
+    const result = runTool('review_mode', {
+      repo: repoPath,
+      scope: 'unstaged',
+      include_ui_contracts: false,
+      include_evidence_spans: false,
+      include_slice_stencil: false,
+    }, env);
+    assert.equal(result.status, 'ok');
+    assert.equal(result._review_mode?.convergence?.enabled, true);
+    assert.equal(result._review_mode?.convergence?.source_path, reportsMatrixPath);
+  } finally {
+    await fs.rm(path.join(process.cwd(), 'reports', `${repoName}-patterns`), { recursive: true, force: true });
+  }
+});

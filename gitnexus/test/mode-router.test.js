@@ -220,6 +220,12 @@ test('MCP mode_router: auto-routes and explicit-routes to kernel modes', async (
   assert.ok(autoDebug.mode_router.unified?.risk, 'expected unified risk payload');
   assert.ok(Array.isArray(autoDebug.mode_router.route_trace?.candidates), 'expected route_trace candidates');
   assert.equal(autoDebug.mode_router.route_trace?.selected_mode, 'debug');
+  assert.ok(autoDebug.mode_router.route_trace?.ranking_weights, 'expected route_trace ranking weights');
+  assert.ok(Array.isArray(autoDebug.mode_router.route_trace?.tie_priority), 'expected route_trace tie priority');
+  const autoDebugTopCandidate = autoDebug.mode_router.route_trace?.candidates?.[0];
+  assert.ok(autoDebugTopCandidate, 'expected top route candidate');
+  assert.equal(autoDebugTopCandidate.mode, 'debug');
+  assert.ok((autoDebugTopCandidate?.score_components?.symptom_signal || 0) > 0);
 
   const episodeAfterAutoDebug = runTool('episode_state', { limit: 25 }, env);
   assert.equal(episodeAfterAutoDebug.status, 'ok');
@@ -262,6 +268,10 @@ test('MCP mode_router: auto-routes and explicit-routes to kernel modes', async (
   assert.equal(autoNoQuery.mode_router?.route_trace?.fallback_applied, true);
   assert.ok(Array.isArray(autoNoQuery.mode_router?.route_trace?.candidates), 'expected no-query route candidates');
   assert.ok(autoNoQuery.mode_router?.result?.review_kernel, 'expected no-query auto route to run review_mode');
+  const noQueryTopCandidate = autoNoQuery.mode_router?.route_trace?.candidates?.[0];
+  assert.ok(noQueryTopCandidate, 'expected no-query top candidate');
+  assert.equal(noQueryTopCandidate.mode, 'review');
+  assert.ok((noQueryTopCandidate?.score_components?.no_query_fallback || 0) > 0);
 
   const explicitImplement = runTool('mode_router', {
     mode: 'implement',
@@ -283,4 +293,6 @@ test('MCP mode_router: auto-routes and explicit-routes to kernel modes', async (
   assert.ok(Array.isArray(explicitReview.mode_router?.unified?.next_actions));
   assert.ok(Array.isArray(explicitReview.mode_router?.unified?.top_findings));
   assert.equal(explicitReview._mode_router?.knobs?.requested_mode, 'review');
+  assert.ok(explicitReview._mode_router?.routing?.ranking_weights, 'expected _mode_router routing weights');
+  assert.ok(Array.isArray(explicitReview._mode_router?.routing?.tie_priority), 'expected _mode_router tie priority');
 });

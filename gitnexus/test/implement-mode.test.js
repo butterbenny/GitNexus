@@ -223,6 +223,17 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
   assert.ok(result.implement_mode?.quality, 'expected quality block');
   assert.ok(typeof result.implement_mode.quality.score === 'number');
   assert.ok(typeof result.implement_mode.quality.degraded === 'boolean');
+  assert.ok(result.implement_mode?.carbon_copy_ready, 'expected carbon_copy_ready block');
+  assert.ok(typeof result.implement_mode.carbon_copy_ready.score === 'number');
+  assert.ok(Array.isArray(result.implement_mode.carbon_copy_ready.reasons));
+  assert.ok(
+    result.implement_mode.companion_files.every(file => !file?.carbon_copy_ready || typeof file.carbon_copy_ready.score === 'number'),
+    'expected companion-level carbon_copy_ready scores',
+  );
+  assert.ok(
+    result.implement_mode.write_plan.every(step => !step?.carbon_copy_ready || typeof step.carbon_copy_ready.score === 'number'),
+    'expected write-plan-level carbon_copy_ready scores',
+  );
   assert.ok(result.implement_mode?.coverage_banner, 'expected coverage banner');
   assert.ok(result.implement_mode.coverage_banner.freshness);
   assert.ok(result.implement_mode.coverage_banner.coverage);
@@ -231,6 +242,15 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
   assert.equal(result.implement_mode?.post_edit_review?.tool, 'review_mode');
   assert.ok(Array.isArray(result.implement_mode?.post_edit_review?.verification_contract?.pass_gates));
   assert.ok(Array.isArray(result.implement_mode?.post_edit_review?.verification_contract?.fail_gates));
+  assert.ok(result._implement_mode?.convergence?.carbon_copy_ready, 'expected convergence carbon_copy_ready metadata');
+  assert.ok((result._implement_mode?.convergence?.next_action_ranking_weights?.rank_score || 0) > 0);
+  assert.ok(Number(result._implement_mode?.convergence?.write_anchor_rank_scale || 0) > 0);
+  if (result._implement_mode?.convergence?.prioritized_write_anchor?.next_action) {
+    assert.equal(
+      result._implement_mode.convergence.prioritized_write_anchor.next_action,
+      result.implement_mode?.next_actions?.[0],
+    );
+  }
   assert.equal(result._implement_mode?.knobs?.include_query_head, true);
   assert.equal(result._implement_mode?.knobs?.include_review_contract, true);
 });

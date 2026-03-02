@@ -273,6 +273,14 @@ test('MCP debug_mode: ranks auth broken loop candidates using symptom + hop evid
     'expected ranked candidates to include non-zero route alignment',
   );
   assert.ok(
+    debug.debug.candidates.every(c => Number(c?.ranking?.score || 0) > 0),
+    'expected ranked candidates to include weighted ranking scores',
+  );
+  assert.ok(
+    debug.debug.candidates.some(c => Number(c?.ranking?.components?.route_alignment || 0) > 0),
+    'expected ranking components to include convergence alignment contributions',
+  );
+  assert.ok(
     debug.debug.candidates.every(c => Array.isArray(c?.fix_recipes)),
     'expected candidate fix recipes to be emitted',
   );
@@ -298,6 +306,8 @@ test('MCP debug_mode: ranks auth broken loop candidates using symptom + hop evid
   assert.equal(debug._debug_mode?.knobs?.include_precedents, true);
   assert.equal(debug._debug_mode?.knobs?.runtime_observations, true);
   assert.ok(Number(debug._debug_mode?.knobs?.route_converged_candidates || 0) > 0);
+  assert.ok((debug._debug_mode?.ranking?.candidate_weights?.route_alignment || 0) > 0);
+  assert.ok(Number(debug._debug_mode?.ranking?.top_candidate_rank_score || 0) > 0);
 });
 
 test('MCP debug_mode: auto-loads runtime observations from snapshot sidecar', async () => {
@@ -364,6 +374,13 @@ test('MCP debug_mode: auto-loads runtime observations from snapshot sidecar', as
   assert.equal(debug.debug?.coverage?.runtime_observations, true);
   assert.equal(debug.debug?.runtime_observations?.source, 'snapshot');
   assert.equal(debug._debug_mode?.knobs?.runtime_source, 'snapshot');
+  assert.ok(debug.debug?.prioritized_candidate, 'expected prioritized candidate output');
+  assert.equal(
+    String(debug.debug?.next_actions?.[0] || ''),
+    String(debug.debug?.prioritized_candidate?.next_action || ''),
+    'expected first next action to mirror prioritized candidate guidance',
+  );
+  assert.ok(Number(debug.debug?.candidates?.[0]?.ranking?.score || 0) > 0);
   assert.ok(
     Array.isArray(debug.debug?.candidates)
       && debug.debug.candidates.some(c => Array.isArray(c?.findings) && (
