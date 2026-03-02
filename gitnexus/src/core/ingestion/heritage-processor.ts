@@ -52,7 +52,6 @@ export const processHeritage = async (
 
     // 3. Get AST
     let tree = astCache.get(file.path);
-    let wasReparsed = false;
 
     if (!tree) {
       // Use larger bufferSize for files > 32KB
@@ -63,7 +62,6 @@ export const processHeritage = async (
         // Skip files that can't be parsed
         continue;
       }
-      wasReparsed = true;
       // Cache re-parsed tree for potential future use
       astCache.set(file.path, tree);
     }

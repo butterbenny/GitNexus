@@ -23,7 +23,7 @@ const normalizeRelativePath = (relativePath: string): string => {
 };
 
 const listRepositoryFilesViaGit = async (repoPath: string): Promise<string[] | null> => {
-  return await new Promise(resolve => {
+  return new Promise(resolve => {
     const child = spawn(
       'git',
       ['-C', repoPath, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
@@ -114,5 +114,5 @@ export const walkRepository = async (
   onProgress?: (current: number, total: number, filePath: string) => void
 ): Promise<FileEntry[]> => {
   const filtered = await listRepositoryFiles(repoPath);
-  return await readRepositoryFiles(repoPath, filtered, onProgress);
+  return readRepositoryFiles(repoPath, filtered, onProgress);
 };

@@ -238,8 +238,6 @@ async function installSkillsTo(targetDir: string): Promise<string[]> {
     try {
       // Try directory-based skill first (skills/{name}/SKILL.md)
       const dirSource = path.join(skillsRoot, skillName);
-      const dirSkillFile = path.join(dirSource, 'SKILL.md');
-
       let isDirectory = false;
       try {
         const stat = await fs.stat(dirSource);

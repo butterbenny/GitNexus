@@ -19,7 +19,6 @@ import {
   closeWikiDb,
   getFilesWithExports,
   getAllFiles,
-  getInterFileCallEdges,
   getIntraModuleCallEdges,
   getInterModuleCallEdges,
   getProcessesForFiles,
@@ -92,7 +91,6 @@ const GIT_NAME_LIST_MAX_BUFFER = 64 * 1024 * 1024; // 64MB for large change sets
 
 export class WikiGenerator {
   private repoPath: string;
-  private storagePath: string;
   private wikiDir: string;
   private kuzuPath: string;
   private llmConfig: LLMConfig;
@@ -111,7 +109,6 @@ export class WikiGenerator {
     onProgress?: ProgressCallback,
   ) {
     this.repoPath = repoPath;
-    this.storagePath = storagePath;
     this.wikiDir = path.join(storagePath, WIKI_DIR);
     this.kuzuPath = kuzuPath;
     this.options = options;
@@ -860,7 +857,7 @@ export class WikiGenerator {
     let running = 0;
     let idx = 0;
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const next = () => {
         while (running < activeConcurrency && idx < items.length) {
           const item = items[idx++];

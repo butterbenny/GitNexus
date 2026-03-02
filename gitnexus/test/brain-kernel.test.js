@@ -168,3 +168,41 @@ test('BrainKernel: promoted planner policy from prior manifest is applied', asyn
 
   await fs.rm(tempRoot, { recursive: true, force: true });
 });
+
+test('BrainKernel: planner failure keeps downstream stages placeholder', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-brain-kernel-planner-fail-'));
+  const repoPath = path.join(tempRoot, 'repo');
+  const storagePath = path.join(repoPath, '.gitnexus');
+  await fs.mkdir(storagePath, { recursive: true });
+  await fs.mkdir(path.join(storagePath, 'manifests'), { recursive: true });
+
+  const kernel = new BrainKernel();
+  kernel.plannerEngine = {
+    plan() {
+      throw new Error('forced planner failure');
+    },
+  };
+
+  const result = await kernel.tick({
+    reason: 'analyze',
+    repoPath,
+    storagePath,
+    repoFingerprint: 'planner-failure-1',
+    graphVersion: '1',
+    changedPaths: ['src/index.ts'],
+  });
+
+  const plannerStep = result.steps.find(step => step.step === 'planner-engine');
+  assert.equal(plannerStep?.status, 'error');
+  assert.equal(plannerStep?.detail, 'forced planner failure');
+
+  const runtimeStep = result.steps.find(step => step.step === 'runtime-truth-graph');
+  const bridgeStep = result.steps.find(step => step.step === 'graph-model-bridge');
+  assert.equal(runtimeStep?.status, 'placeholder');
+  assert.equal(runtimeStep?.detail, 'Planner output unavailable');
+  assert.equal(bridgeStep?.status, 'placeholder');
+  assert.equal(bridgeStep?.detail, 'Planner output unavailable');
+  assert.ok(result.warnings.some(item => item.includes('planner-engine: forced planner failure')));
+
+  await fs.rm(tempRoot, { recursive: true, force: true });
+});

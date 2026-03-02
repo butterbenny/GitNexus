@@ -131,7 +131,7 @@ const PRECISION_SCHEMA_VERSION = 1;
 const DEFAULT_OVERLAY_PATH = '.gitnexus/precision-overlay.json';
 const DEFAULT_MODE: PrecisionOverlayMode = 'auto';
 const DEFAULT_RUNNER: CommandRunner = async (command, args, cwd) => {
-  return await new Promise(resolve => {
+  return new Promise(resolve => {
     const child = spawn(command, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],

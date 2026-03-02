@@ -8,7 +8,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
-import { findRepo, loadMeta } from '../storage/repo-manager.js';
+import { findRepo } from '../storage/repo-manager.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { initKuzu, executeQuery } from '../core/kuzu/kuzu-adapter.js';
 import { NODE_TABLES } from '../core/kuzu/schema.js';

@@ -157,7 +157,6 @@ export const processCalls = async (
 
     // 3. Get AST (Try Cache First)
     let tree = astCache.get(file.path);
-    let wasReparsed = false;
 
     if (!tree) {
       // Cache Miss: Re-parse
@@ -169,7 +168,6 @@ export const processCalls = async (
         // Skip files that can't be parsed
         continue;
       }
-      wasReparsed = true;
       // Cache re-parsed tree so heritage phase gets hits
       astCache.set(file.path, tree);
     }

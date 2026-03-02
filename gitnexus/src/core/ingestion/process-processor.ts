@@ -10,7 +10,7 @@
  * Processes help agents understand how features work through the codebase.
  */
 
-import { KnowledgeGraph, GraphNode, GraphRelationship, NodeLabel } from '../graph/types.js';
+import { KnowledgeGraph, GraphNode, NodeLabel } from '../graph/types.js';
 import { CommunityMembership } from './community-processor.js';
 import { calculateEntryPointScore, isTestFile } from './entry-point-scoring.js';
 
@@ -337,7 +337,6 @@ const traceFromEntryPoint = (
   // BFS with path tracking
   // Each queue item: [currentNodeId, pathSoFar]
   const queue: [string, string[]][] = [[entryId, [entryId]]];
-  const visited = new Set<string>();
   
   while (queue.length > 0 && traces.length < config.maxBranching * 3) {
     const [currentId, path] = queue.shift()!;

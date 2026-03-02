@@ -39,6 +39,64 @@ const normalizePath = (value: unknown): string => {
 
 const dedupe = <T>(items: T[]): T[] => Array.from(new Set(items));
 
+const RUNTIME_TARGET_FAMILY_SET = new Set<RuntimeTargetFamily>([
+  'http',
+  'auth',
+  'cache',
+  'shape',
+  'event',
+  'db',
+  'exception',
+]);
+
+const normalizeStringList = (items: unknown): string[] => {
+  if (!Array.isArray(items)) return [];
+  return dedupe(
+    items
+      .map(item => String(item || '').trim())
+      .filter(Boolean),
+  ).sort((left, right) => left.localeCompare(right));
+};
+
+const normalizeTargetFamilies = (items: unknown): RuntimeTargetFamily[] => {
+  const normalized = normalizeStringList(items);
+  return normalized.filter((item): item is RuntimeTargetFamily => RUNTIME_TARGET_FAMILY_SET.has(item as RuntimeTargetFamily));
+};
+
+const normalizeProbeScope = (scope: ProbeRequest['scope'] | undefined): ProbeRequest['scope'] => {
+  const tests = normalizeStringList(scope?.tests);
+  const endpoints = normalizeStringList(scope?.endpoints);
+  const files = normalizeStringList(scope?.files);
+  return {
+    ...(tests.length > 0 ? { tests } : {}),
+    ...(endpoints.length > 0 ? { endpoints } : {}),
+    ...(files.length > 0 ? { files } : {}),
+  };
+};
+
+const normalizeProbeRequest = (probe: ProbeRequest): ProbeRequest => {
+  return {
+    reason: probe.reason,
+    anchors: normalizeStringList(probe.anchors),
+    targetFamilies: normalizeTargetFamilies(probe.targetFamilies),
+    scope: normalizeProbeScope(probe.scope),
+    ttlMinutes: Math.max(0, Number(probe.ttlMinutes || 0)),
+  };
+};
+
+const dedupeProbeRequests = (items: ProbeRequest[]): ProbeRequest[] => {
+  const deduped: ProbeRequest[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const normalized = normalizeProbeRequest(item);
+    const key = JSON.stringify(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(normalized);
+  }
+  return deduped;
+};
+
 const toRuleCatalog = (): ConstraintRule[] => {
   return [
     {
@@ -387,7 +445,7 @@ export const compileConstraintGraph = async (
     }
   }
 
-  const dedupedProbes = dedupe(requestedProbes.map(probe => JSON.stringify(probe))).map(item => JSON.parse(item));
+  const dedupedProbes = dedupeProbeRequests(requestedProbes);
   const dedupedTests = dedupe(requestedTests);
   const sortedViolations = violations
     .sort((a, b) => toSeverityRank(b.severity) - toSeverityRank(a.severity))

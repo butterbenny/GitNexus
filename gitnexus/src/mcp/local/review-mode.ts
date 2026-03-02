@@ -56,7 +56,6 @@ type ReviewModeDeps = {
   toNonNegativeInteger: (value: unknown, fallback?: number) => number;
   toOptionalLineNumber: (value: unknown) => number | undefined;
   toOptionalNonNegativeInteger: (value: unknown) => number | undefined;
-  primaryNodeLabel: (value: unknown) => string;
   parseStringList: (value: unknown) => string[];
   normalizeSliceStencilTokens: (value: unknown) => string[];
   missingRequiredSlotSeverity: (missingRequiredSlots: string[], deterministic?: boolean, pattern?: boolean) => 'low' | 'medium' | 'high';
@@ -98,7 +97,6 @@ export async function runReviewMode(
     toNonNegativeInteger,
     toOptionalLineNumber,
     toOptionalNonNegativeInteger,
-    primaryNodeLabel,
     parseStringList,
     normalizeSliceStencilTokens,
     missingRequiredSlotSeverity,

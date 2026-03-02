@@ -111,6 +111,17 @@ const placeholderSteps = [
   'compact-and-forget',
 ];
 
+const plannerDependentSteps = [
+  'runtime-truth-graph',
+  'experience-governor',
+  'constraint-graph',
+  'context-compiler',
+  'eval-graph',
+  'distillation-engine',
+  'toolsmith',
+  'graph-model-bridge',
+];
+
 const appendPlaceholderSteps = (steps: BrainStepResult[]): void => {
   for (const step of placeholderSteps) {
     steps.push({
@@ -118,6 +129,51 @@ const appendPlaceholderSteps = (steps: BrainStepResult[]): void => {
       status: 'placeholder',
       detail: 'Phase A scaffold',
     });
+  }
+};
+
+const appendPlannerUnavailableSteps = (steps: BrainStepResult[]): void => {
+  for (const step of plannerDependentSteps) {
+    steps.push({
+      step,
+      status: 'placeholder',
+      detail: 'Planner output unavailable',
+    });
+  }
+};
+
+interface BrainStageSummary {
+  status: BrainStepResult['status'];
+  detail: string;
+  warnings?: string[];
+}
+
+const runBrainStage = async <T>(
+  step: string,
+  steps: BrainStepResult[],
+  warnings: string[],
+  runner: () => Promise<T>,
+  summarize: (value: T) => BrainStageSummary,
+): Promise<T | undefined> => {
+  try {
+    const value = await runner();
+    const summary = summarize(value);
+    if (summary.warnings && summary.warnings.length > 0) warnings.push(...summary.warnings);
+    steps.push({
+      step,
+      status: summary.status,
+      detail: summary.detail,
+    });
+    return value;
+  } catch (error) {
+    const message = toErrorMessage(error);
+    warnings.push(`${step}: ${message}`);
+    steps.push({
+      step,
+      status: 'error',
+      detail: message,
+    });
+    return undefined;
   }
 };
 
@@ -266,221 +322,137 @@ export class BrainKernel {
     }
 
     if (planEnvelope) {
-      try {
-        runtimeTruth = await compileRuntimeTruthGraph(input, planEnvelope);
-        warnings.push(...runtimeTruth.warnings);
-        steps.push({
-          step: 'runtime-truth-graph',
-          status: runtimeTruth.compressed.witnessCards > 0 ? 'ok' : 'placeholder',
-          detail: `probes=${runtimeTruth.probePlan.length} witnesses=${runtimeTruth.compressed.witnessCards}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`runtime-truth-graph: ${message}`);
-        steps.push({
-          step: 'runtime-truth-graph',
-          status: 'error',
-          detail: message,
-        });
-      }
+      const activePlan = planEnvelope;
+      runtimeTruth = await runBrainStage(
+        'runtime-truth-graph',
+        steps,
+        warnings,
+        () => compileRuntimeTruthGraph(input, activePlan),
+        value => ({
+          status: value.compressed.witnessCards > 0 ? 'ok' : 'placeholder',
+          detail: `probes=${value.probePlan.length} witnesses=${value.compressed.witnessCards}`,
+          warnings: value.warnings,
+        }),
+      );
 
-      try {
-        experienceGovernor = await runExperienceGovernor(input, planEnvelope, runtimeTruth);
-        warnings.push(...experienceGovernor.warnings);
-        steps.push({
-          step: 'experience-governor',
-          status: experienceGovernor.retrievedCards.length > 0 ? 'ok' : 'placeholder',
-          detail: `cards=${experienceGovernor.totals.cards} retrieved=${experienceGovernor.retrievedCards.length}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`experience-governor: ${message}`);
-        steps.push({
-          step: 'experience-governor',
-          status: 'error',
-          detail: message,
-        });
-      }
+      experienceGovernor = await runBrainStage(
+        'experience-governor',
+        steps,
+        warnings,
+        () => runExperienceGovernor(input, activePlan, runtimeTruth),
+        value => ({
+          status: value.retrievedCards.length > 0 ? 'ok' : 'placeholder',
+          detail: `cards=${value.totals.cards} retrieved=${value.retrievedCards.length}`,
+          warnings: value.warnings,
+        }),
+      );
 
-      try {
-        constraintGraph = await compileConstraintGraph(input, planEnvelope, runtimeTruth);
-        warnings.push(...constraintGraph.warnings);
-        steps.push({
-          step: 'constraint-graph',
-          status: constraintGraph.violations.length > 0 ? 'ok' : 'placeholder',
-          detail: `violations=${constraintGraph.violations.length} blocked=${constraintGraph.patchGate.blocked} warned=${constraintGraph.patchGate.warned}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`constraint-graph: ${message}`);
-        steps.push({
-          step: 'constraint-graph',
-          status: 'error',
-          detail: message,
-        });
-      }
+      constraintGraph = await runBrainStage(
+        'constraint-graph',
+        steps,
+        warnings,
+        () => compileConstraintGraph(input, activePlan, runtimeTruth),
+        value => ({
+          status: value.violations.length > 0 ? 'ok' : 'placeholder',
+          detail: `violations=${value.violations.length} blocked=${value.patchGate.blocked} warned=${value.patchGate.warned}`,
+          warnings: value.warnings,
+        }),
+      );
 
-      try {
-        const compiled = await this.contextCompiler.compile(input, planEnvelope, runtimeTruth, experienceGovernor, constraintGraph);
-        brainPacket = compiled.packet;
-        contextTelemetry = compiled.telemetrySummary;
-        contextTelemetryEntry = compiled.telemetryEntry;
-        steps.push({
-          step: 'context-compiler',
+      const compiledContext = await runBrainStage(
+        'context-compiler',
+        steps,
+        warnings,
+        () => this.contextCompiler.compile(input, activePlan, runtimeTruth, experienceGovernor, constraintGraph),
+        value => ({
           status: 'ok',
-          detail: `${compiled.packet.mode}:${compiled.packet.anchors.length} anchors`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`context-compiler: ${message}`);
-        steps.push({
-          step: 'context-compiler',
-          status: 'error',
-          detail: message,
-        });
+          detail: `${value.packet.mode}:${value.packet.anchors.length} anchors`,
+        }),
+      );
+      if (compiledContext) {
+        brainPacket = compiledContext.packet;
+        contextTelemetry = compiledContext.telemetrySummary;
+        contextTelemetryEntry = compiledContext.telemetryEntry;
       }
 
-      try {
-        evalGraph = await runEvalGraph(
+      evalGraph = await runBrainStage(
+        'eval-graph',
+        steps,
+        warnings,
+        () => runEvalGraph(
           input,
-          planEnvelope,
+          activePlan,
           runtimeTruth,
           experienceGovernor,
           constraintGraph,
           brainPacket,
           contextTelemetryEntry,
           contextTelemetry,
-        );
-        warnings.push(...evalGraph.warnings);
-        steps.push({
-          step: 'eval-graph',
-          status: evalGraph.canaryHarness.runCount > 0 ? 'ok' : 'placeholder',
-          detail: `score=${evalGraph.canaryHarness.lastScore} passRate=${evalGraph.canaryHarness.passRate} regressions=${evalGraph.regressionTracking.openRegressions}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`eval-graph: ${message}`);
-        steps.push({
-          step: 'eval-graph',
-          status: 'error',
-          detail: message,
-        });
-      }
+        ),
+        value => ({
+          status: value.canaryHarness.runCount > 0 ? 'ok' : 'placeholder',
+          detail: `score=${value.canaryHarness.lastScore} passRate=${value.canaryHarness.passRate} regressions=${value.regressionTracking.openRegressions}`,
+          warnings: value.warnings,
+        }),
+      );
 
-      try {
-        distillationEngine = await runDistillationEngine(
+      distillationEngine = await runBrainStage(
+        'distillation-engine',
+        steps,
+        warnings,
+        () => runDistillationEngine(
           input,
-          planEnvelope,
+          activePlan,
           runtimeTruth,
           experienceGovernor,
           constraintGraph,
           evalGraph,
           brainPacket,
           contextTelemetry,
-        );
-        warnings.push(...distillationEngine.warnings);
-        steps.push({
-          step: 'distillation-engine',
-          status: distillationEngine.runCount > 0 ? 'ok' : 'placeholder',
-          detail: `reward=${distillationEngine.plannerBandit.expectedReward} promoted=${distillationEngine.promotion.promoted}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`distillation-engine: ${message}`);
-        steps.push({
-          step: 'distillation-engine',
-          status: 'error',
-          detail: message,
-        });
-      }
+        ),
+        value => ({
+          status: value.runCount > 0 ? 'ok' : 'placeholder',
+          detail: `reward=${value.plannerBandit.expectedReward} promoted=${value.promotion.promoted}`,
+          warnings: value.warnings,
+        }),
+      );
 
-      try {
-        toolsmith = await runToolsmith(
+      toolsmith = await runBrainStage(
+        'toolsmith',
+        steps,
+        warnings,
+        () => runToolsmith(
           input,
-          planEnvelope,
+          activePlan,
           evalGraph,
           constraintGraph,
           brainPacket,
-        );
-        warnings.push(...toolsmith.warnings);
-        steps.push({
-          step: 'toolsmith',
-          status: toolsmith.runCount > 0 ? 'ok' : 'placeholder',
-          detail: `candidates=${toolsmith.synthesis.candidatesGenerated} promoted=${toolsmith.promotion.promoted}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`toolsmith: ${message}`);
-        steps.push({
-          step: 'toolsmith',
-          status: 'error',
-          detail: message,
-        });
-      }
+        ),
+        value => ({
+          status: value.runCount > 0 ? 'ok' : 'placeholder',
+          detail: `candidates=${value.synthesis.candidatesGenerated} promoted=${value.promotion.promoted}`,
+          warnings: value.warnings,
+        }),
+      );
 
-      try {
-        graphModelBridge = await runGraphModelBridge(
+      graphModelBridge = await runBrainStage(
+        'graph-model-bridge',
+        steps,
+        warnings,
+        () => runGraphModelBridge(
           input,
-          planEnvelope,
+          activePlan,
           brainPacket,
           constraintGraph,
-        );
-        warnings.push(...graphModelBridge.warnings);
-        steps.push({
-          step: 'graph-model-bridge',
-          status: graphModelBridge.packetCount > 0 ? 'ok' : 'placeholder',
-          detail: `packets=${graphModelBridge.packetCount} learnedReady=${graphModelBridge.promotion.learnedCandidateReady}`,
-        });
-      } catch (error) {
-        const message = toErrorMessage(error);
-        warnings.push(`graph-model-bridge: ${message}`);
-        steps.push({
-          step: 'graph-model-bridge',
-          status: 'error',
-          detail: message,
-        });
-      }
+        ),
+        value => ({
+          status: value.packetCount > 0 ? 'ok' : 'placeholder',
+          detail: `packets=${value.packetCount} learnedReady=${value.promotion.learnedCandidateReady}`,
+          warnings: value.warnings,
+        }),
+      );
     } else {
-      steps.push({
-        step: 'runtime-truth-graph',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'experience-governor',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'constraint-graph',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'context-compiler',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'eval-graph',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'distillation-engine',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'toolsmith',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
-      steps.push({
-        step: 'graph-model-bridge',
-        status: 'placeholder',
-        detail: 'Planner output unavailable',
-      });
+      appendPlannerUnavailableSteps(steps);
     }
 
     appendPlaceholderSteps(steps);

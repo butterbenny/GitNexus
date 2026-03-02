@@ -104,6 +104,14 @@ test('source guard: git diff/status callsites use explicit maxBuffer for large r
     path.join(process.cwd(), 'src/mcp/local/local-backend.ts'),
     'utf-8',
   );
+  const detectChangesSource = await fs.readFile(
+    path.join(process.cwd(), 'src/mcp/local/detect-changes.ts'),
+    'utf-8',
+  );
+  const reviewModeSource = await fs.readFile(
+    path.join(process.cwd(), 'src/mcp/local/review-mode.ts'),
+    'utf-8',
+  );
   const storageGitSource = await fs.readFile(
     path.join(process.cwd(), 'src/storage/git.ts'),
     'utf-8',
@@ -111,9 +119,9 @@ test('source guard: git diff/status callsites use explicit maxBuffer for large r
 
   assert.match(localBackendSource, /const GIT_NAME_LIST_MAX_BUFFER = 64 \* 1024 \* 1024/);
   assert.match(localBackendSource, /const GIT_PATCH_MAX_BUFFER = 128 \* 1024 \* 1024/);
-  assert.match(localBackendSource, /execFileSync\('git', buildDiffArgs\(false\), \{[\s\S]*?maxBuffer: GIT_NAME_LIST_MAX_BUFFER/);
-  assert.match(localBackendSource, /execFileSync\('git', \['status', '--porcelain'\], \{[\s\S]*?maxBuffer: GIT_NAME_LIST_MAX_BUFFER/);
-  assert.match(localBackendSource, /execFileSync\('git', buildDiffArgs\(true, effectiveScope\), \{[\s\S]*?maxBuffer: GIT_PATCH_MAX_BUFFER/);
+  assert.match(detectChangesSource, /execFileSync\('git', buildDiffArgs\(\), \{[\s\S]*?maxBuffer: GIT_NAME_LIST_MAX_BUFFER/);
+  assert.match(detectChangesSource, /execFileSync\('git', \['status', '--porcelain'\], \{[\s\S]*?maxBuffer: GIT_NAME_LIST_MAX_BUFFER/);
+  assert.match(reviewModeSource, /execFileSync\('git', buildDiffArgs\(true, effectiveScope\), \{[\s\S]*?maxBuffer: GIT_PATCH_MAX_BUFFER/);
 
   assert.match(storageGitSource, /const GIT_NAME_LIST_MAX_BUFFER = 64 \* 1024 \* 1024/);
   assert.match(storageGitSource, /execFileSync\('git', \['diff', '--name-status', '-M', `\$\{fromCommit\}\.\.\$\{toCommit\}`\], \{[\s\S]*?maxBuffer: GIT_NAME_LIST_MAX_BUFFER/);

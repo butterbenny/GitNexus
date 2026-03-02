@@ -184,7 +184,6 @@ const processParsingWithWorkers = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
   symbolTable: SymbolTable,
-  astCache: ASTCache,
   workerPool: WorkerPool,
   onFileProgress?: FileProgressCallback
 ): Promise<WorkerExtractedData> => {
@@ -445,7 +444,7 @@ export const processParsing = async (
 ): Promise<WorkerExtractedData | null> => {
   if (workerPool) {
     try {
-      return await processParsingWithWorkers(graph, files, symbolTable, astCache, workerPool, onFileProgress);
+      return processParsingWithWorkers(graph, files, symbolTable, workerPool, onFileProgress);
     } catch (err) {
       console.warn('Worker pool parsing failed, falling back to sequential:', err);
     }

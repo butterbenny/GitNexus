@@ -515,8 +515,6 @@ export const analyzeCommand = async (
     const PERMISSIONS_CONFIG_PATH_RE = /(^|\/)config\/permissions\.php$/i;
     const permissionsConfigPath = rebuildFiles.find(fp => PERMISSIONS_CONFIG_PATH_RE.test(fp)) || null;
 
-    const rebuildSet = rebuildFilesSet;
-
     bar.update(5, { phase: `Incremental: ${rebuildFiles.length} changed, ${deletedFiles.size} deleted` });
 
     // Open existing KuzuDB (in-place update)

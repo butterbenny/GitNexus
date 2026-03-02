@@ -52,11 +52,6 @@ const getArrayInitializerKey = (node: any): any | null => {
   return node.namedChildren?.[0] ?? null;
 };
 
-const getArrayInitializerValue = (node: any): any | null => {
-  if (!isArrayKeyValueInitializer(node)) return null;
-  return node.namedChildren?.[1] ?? null;
-};
-
 const peelExpression = (node: any): any | null => {
   let current = node;
   while (current) {
@@ -439,4 +434,3 @@ export const processLaravelEloquentLoadEdges = async (
 
   return { edgesAdded };
 };
-

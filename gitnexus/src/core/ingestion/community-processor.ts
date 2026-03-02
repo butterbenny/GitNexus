@@ -116,7 +116,6 @@ export const processCommunities = async (
   // Step 3: Create community nodes with heuristic labels
   const communityNodes = createCommunityNodes(
     details.communities as Record<string, number>,
-    details.count,
     graph,
     knowledgeGraph
   );
@@ -206,7 +205,6 @@ const buildGraphologyGraph = (knowledgeGraph: KnowledgeGraph): any => {
  */
 const createCommunityNodes = (
   communities: Record<string, number>,
-  communityCount: number,
   graph: any,
   knowledgeGraph: KnowledgeGraph
 ): CommunityNode[] => {

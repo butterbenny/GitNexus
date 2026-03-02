@@ -10,7 +10,7 @@
  */
 
 import { initEmbedder, embedBatch, embedText, embeddingToArray, isEmbedderReady } from './embedder.js';
-import { generateBatchEmbeddingTexts, generateEmbeddingText } from './text-generator.js';
+import { generateBatchEmbeddingTexts } from './text-generator.js';
 import {
   type EmbeddingProgress,
   type EmbeddingConfig,
@@ -409,4 +409,3 @@ export const semanticSearchWithContext = async (
     relationType: null,
   }));
 };
-

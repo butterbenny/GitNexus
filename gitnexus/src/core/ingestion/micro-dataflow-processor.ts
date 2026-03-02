@@ -25,8 +25,6 @@ export interface MicroDataflowResult {
   };
 }
 
-const normalizePath = (value: string): string => String(value || '').replace(/\\/g, '/');
-
 const sanitizeReasonSegment = (value: string): string => {
   return String(value || '')
     .trim()
