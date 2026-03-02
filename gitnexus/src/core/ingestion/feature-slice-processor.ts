@@ -104,9 +104,32 @@ const normalizeNodeName = (node: GraphNode): string => {
   return String(node.properties?.name || '').trim();
 };
 
+const parseNodeIdPrefixedValue = (nodeId: string, prefix: string): string | null => {
+  const normalizedId = String(nodeId || '').trim();
+  const token = `${prefix}:`;
+  if (!normalizedId.startsWith(token)) return null;
+  return String(normalizedId.slice(token.length)).trim() || null;
+};
+
+const parseEndpointKey = (node: GraphNode): string | null => {
+  const nodeName = normalizeNodeName(node);
+  if (nodeName.startsWith('endpoint:')) {
+    return String(nodeName.slice('endpoint:'.length)).trim() || null;
+  }
+  return parseNodeIdPrefixedValue(String(node.id || ''), 'CodeElement:endpoint');
+};
+
+const parsePermissionKey = (node: GraphNode): string | null => {
+  const nodeName = normalizeNodeName(node);
+  if (nodeName.startsWith('permission:')) {
+    return String(nodeName.slice('permission:'.length)).trim() || null;
+  }
+  return parseNodeIdPrefixedValue(String(node.id || ''), 'CodeElement:permission');
+};
+
 const isPermissionNode = (node: GraphNode | undefined): boolean => {
   if (!node || node.label !== 'CodeElement') return false;
-  return normalizeNodeName(node).startsWith('permission:');
+  return Boolean(parsePermissionKey(node));
 };
 
 const hasAuthorizationReason = (reason: string): boolean => {
@@ -128,34 +151,32 @@ const buildAnchors = (knowledgeGraph: KnowledgeGraph): FeatureSliceAnchor[] => {
 
   for (const node of knowledgeGraph.nodes) {
     const nodeName = normalizeNodeName(node);
-    if (!nodeName) continue;
 
-    if (node.label === 'CodeElement' && nodeName.startsWith('endpoint:')) {
-      const endpointKey = nodeName.slice('endpoint:'.length).trim();
+    if (node.label === 'CodeElement') {
+      const endpointKey = parseEndpointKey(node);
       if (endpointKey) {
         putAnchor({
           nodeId: node.id,
-          nodeName,
+          nodeName: nodeName || `endpoint:${endpointKey}`,
           sliceType: 'endpoint',
           sliceKey: endpointKey,
         });
+        continue;
       }
-      continue;
-    }
 
-    if (node.label === 'CodeElement' && nodeName.startsWith('permission:')) {
-      const permissionKey = nodeName.slice('permission:'.length).trim();
+      const permissionKey = parsePermissionKey(node);
       if (permissionKey) {
         putAnchor({
           nodeId: node.id,
-          nodeName,
+          nodeName: nodeName || `permission:${permissionKey}`,
           sliceType: 'permission',
           sliceKey: permissionKey,
         });
+        continue;
       }
-      continue;
     }
 
+    if (!nodeName) continue;
     if ((node.label === 'Function' || node.label === 'Method' || node.label === 'CodeElement') && looksLikeQueryKeyFactory(node)) {
       putAnchor({
         nodeId: node.id,
@@ -244,6 +265,15 @@ const collectMembersForAnchor = (
 
     if (anchor.sliceType === 'permission') {
       pickRole(memberRoles, edge.targetId, 'authorization_consumer');
+      continue;
+    }
+
+    if (anchor.sliceType === 'query_key') {
+      if ((edge.reason || '').startsWith('react-query:key-to-query-fn')) {
+        pickRole(memberRoles, edge.targetId, 'query_consumer');
+      } else {
+        pickRole(memberRoles, edge.targetId, 'supporting');
+      }
       continue;
     }
 

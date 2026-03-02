@@ -2651,6 +2651,9 @@ export async function runReviewMode(
       confidence: number;
       reason: string;
     }> = [];
+    const getRouteFirstSegment = (routeValue: string): string => {
+      return normalizeObservedRoute(routeValue).replace(/^\/+/, '').split('/').find(Boolean) || '';
+    };
     const routePatternSeen = new Set<string>();
     for (const routeEntry of route_targets) {
       const routeFilePath = String(routeEntry?.route_file || '').trim();
@@ -2678,12 +2681,38 @@ export async function runReviewMode(
       }
     }
     const routePatternsByMethod = new Map<string, Array<(typeof routePatterns)[number]>>();
+    const routePatternsByMethodAndSegment = new Map<string, Map<string, Array<(typeof routePatterns)[number]>>>();
+    const routePatternsByMethodGeneric = new Map<string, Array<(typeof routePatterns)[number]>>();
     for (const routePattern of routePatterns) {
       const list = routePatternsByMethod.get(routePattern.method) || [];
       list.push(routePattern);
       routePatternsByMethod.set(routePattern.method, list);
+
+      const firstSegment = getRouteFirstSegment(routePattern.pattern);
+      if (!firstSegment) {
+        const genericList = routePatternsByMethodGeneric.get(routePattern.method) || [];
+        genericList.push(routePattern);
+        routePatternsByMethodGeneric.set(routePattern.method, genericList);
+        continue;
+      }
+
+      const methodSegments = routePatternsByMethodAndSegment.get(routePattern.method) || new Map<string, Array<(typeof routePatterns)[number]>>();
+      const segmentList = methodSegments.get(firstSegment) || [];
+      segmentList.push(routePattern);
+      methodSegments.set(firstSegment, segmentList);
+      routePatternsByMethodAndSegment.set(routePattern.method, methodSegments);
     }
     const routeMatchCache = new Map<string, any[]>();
+    const collectRouteCandidates = (method: string, observedRoute: string): Array<(typeof routePatterns)[number]> => {
+      const firstSegment = getRouteFirstSegment(observedRoute);
+      const methodSegments = routePatternsByMethodAndSegment.get(method);
+      const segmentCandidates = firstSegment && methodSegments
+        ? (methodSegments.get(firstSegment) || [])
+        : [];
+      const genericCandidates = routePatternsByMethodGeneric.get(method) || [];
+      const merged = [...segmentCandidates, ...genericCandidates];
+      return merged.length > 0 ? merged : (routePatternsByMethod.get(method) || []);
+    };
     const findMatchedRoutes = (methodHint: string, observedRoute: string): any[] => {
       const normalizedRoute = String(observedRoute || '').trim();
       if (!normalizedRoute) return [];
@@ -2693,14 +2722,15 @@ export async function runReviewMode(
       if (cached) return cached;
       const candidates = (() => {
         if (!normalizedMethod) return routePatterns;
-        const byMethod = routePatternsByMethod.get(normalizedMethod) || [];
+        const byMethod = collectRouteCandidates(normalizedMethod, normalizedRoute);
         if (normalizedMethod !== 'HEAD') return byMethod;
-        const getRoutes = routePatternsByMethod.get('GET') || [];
+        const getRoutes = collectRouteCandidates('GET', normalizedRoute);
         return [...byMethod, ...getRoutes];
       })();
       const matches = candidates
         .filter(routePattern => routePattern.matcher.test(normalizedRoute))
         .map(routePattern => ({
+          method: routePattern.method,
           route_file: routePattern.route_file,
           pattern: routePattern.pattern,
           confidence: routePattern.confidence,
@@ -2710,7 +2740,7 @@ export async function runReviewMode(
       const deduped = Array.from(new Map(
         matches.map(item => {
           const controllerUid = String(item?.controller?.uid || '').trim();
-          const key = `${String(item?.pattern || '')}|${String(item?.route_file || '')}|${controllerUid}`;
+          const key = `${String(item?.method || '').trim().toUpperCase()}|${String(item?.pattern || '')}|${String(item?.route_file || '')}|${controllerUid}`;
           return [key, item];
         }),
       ).values());
@@ -3070,6 +3100,27 @@ export async function runReviewMode(
 
     const runtimeEvidenceFocusRoute = '/seating_groups/assign';
     const runtimeEvidenceFocusRoutes = runtimeEvidenceRoutes.filter(item => String(item?.route || '').includes(runtimeEvidenceFocusRoute));
+    const runtimeEvidenceByKey = new Map<string, any>();
+    const runtimeEvidenceByMethodPattern = new Map<string, any>();
+    for (const item of runtimeEvidenceRoutes) {
+      const method = String(item?.method || '').trim().toUpperCase();
+      const pattern = normalizeObservedRoute(String(item?.pattern || item?.route || ''));
+      const routeFilePath = normalizePath(String(item?.route_file || ''));
+      const controllerUid = String(item?.controller?.uid || '').trim();
+      const key = routeEvidenceKey(method, pattern, routeFilePath, controllerUid);
+      const methodPatternKey = `${method}|${pattern}`;
+      const score = toFiniteNumber(item?.score, 0);
+
+      const existingByKey = runtimeEvidenceByKey.get(key);
+      if (!existingByKey || toFiniteNumber(existingByKey?.score, 0) < score) {
+        runtimeEvidenceByKey.set(key, item);
+      }
+
+      const existingByMethodPattern = runtimeEvidenceByMethodPattern.get(methodPatternKey);
+      if (!existingByMethodPattern || toFiniteNumber(existingByMethodPattern?.score, 0) < score) {
+        runtimeEvidenceByMethodPattern.set(methodPatternKey, item);
+      }
+    }
     const runtime_evidence = {
       focus_route: runtimeEvidenceFocusRoute,
       routes: runtimeEvidenceRoutes.slice(0, 25),
@@ -3144,8 +3195,13 @@ export async function runReviewMode(
         ? payloadShape.keys.map(item => String(item || '').trim()).filter(Boolean)
         : [];
       for (const matchedRoute of matchedRoutes) {
-        const methodHint = String((matchedRoute?.reason || '').split(':')[1] || '').toUpperCase();
-        const key = routeEvidenceKey(methodHint, String(matchedRoute.pattern || shapePath), String(matchedRoute.route_file || ''), String(matchedRoute?.controller?.uid || ''));
+        const methodHint = String(matchedRoute?.method || (matchedRoute?.reason || '').split(':')[1] || '').toUpperCase();
+        const key = routeEvidenceKey(
+          methodHint,
+          String(matchedRoute.pattern || shapePath),
+          String(matchedRoute.route_file || ''),
+          String(matchedRoute?.controller?.uid || ''),
+        );
         const existing = payloadShapesByRouteKey.get(key) || new Set<string>();
         for (const field of keys) existing.add(field);
         payloadShapesByRouteKey.set(key, existing);
@@ -3171,17 +3227,13 @@ export async function runReviewMode(
         if (row.type === 'READS_FIELD' && reason.includes('request')) requestFields.add(fieldName);
         if (row.type === 'WRITES_FIELD' && reason.includes('response')) responseFields.add(fieldName);
       }
-      const runtimeRouteMetric = runtimeEvidenceRoutes.find(item => (
-        routeEvidenceKey(
-          String(item?.method || method),
-          String(item?.pattern || pattern),
-          String(item?.route_file || routeFilePath),
-          String(item?.controller?.uid || controllerUid),
-        ) === key
-      ));
-      const runtimePayloadKeys = Array.from(payloadShapesByRouteKey.get(key) || new Set<string>()).sort();
+      const runtimeRouteMetric = runtimeEvidenceByKey.get(key)
+        || runtimeEvidenceByMethodPattern.get(`${method}|${pattern}`)
+        || (method === 'HEAD' ? runtimeEvidenceByMethodPattern.get(`GET|${pattern}`) : undefined);
+      const runtimePayloadKeySet = payloadShapesByRouteKey.get(key) || new Set<string>();
+      const runtimePayloadKeys = Array.from(runtimePayloadKeySet).sort();
       const runtimeStatuses = Array.isArray(runtimeRouteMetric?.statuses) ? runtimeRouteMetric.statuses : [];
-      const missingInRuntime = Array.from(requestFields).filter(field => !runtimePayloadKeys.includes(field)).slice(0, 20);
+      const missingInRuntime = Array.from(requestFields).filter(field => !runtimePayloadKeySet.has(field)).slice(0, 20);
       const extraInRuntime = runtimePayloadKeys.filter(field => !requestFields.has(field)).slice(0, 20);
       const has5xxStatus = runtimeStatuses.some((status: number) => status >= 500);
       const hasErrorOnly = runtimeStatuses.length > 0 && runtimeStatuses.every((status: number) => status >= 400);
@@ -3344,75 +3396,127 @@ export async function runReviewMode(
       }
 
       const checksByController = new Map<string, Map<string, any>>();
-      const seenSlugsByCheck = new Map<string, Set<string>>();
-      for (const row of authRows) {
-        const controllerId = String(row.controllerId || row[0] || '').trim();
-        if (!controllerId) continue;
-        const targetUid = String(row.targetId || row[1] || '').trim();
-        if (!targetUid) continue;
-        const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
-        const authReason = String(row.authReason || row[5] || '').trim();
-        const checkKey = `${targetUid}|${authReason}`;
-        const controllerChecks = checksByController.get(controllerId) || new Map<string, any>();
-        let check = controllerChecks.get(checkKey);
-        if (!check) {
-          check = {
-            target: {
-              uid: targetUid,
-              name: row.targetName || row[2] || '',
-              kind: targetKind,
-              filePath: row.targetFilePath || row[4] || '',
-            },
-            source: {
-              kind: 'controller',
-            },
-            edge: {
-              reason: row.authReason || row[5] || '',
-              confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
-            },
-          };
-          controllerChecks.set(checkKey, check);
-          checksByController.set(controllerId, controllerChecks);
+      const seenSlugsByController = new Map<string, Set<string>>();
+      const normalizePermissionSlug = (value: string): string => {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        if (raw.startsWith('permission:')) {
+          return String(raw.slice('permission:'.length)).trim();
         }
-        const directPermissionSlug = targetUid.startsWith('CodeElement:permission:')
-          ? String(row.targetName || row[2] || '').trim()
-          : '';
-        if (directPermissionSlug) {
-          const slugKey = `${checkKey}|direct|${directPermissionSlug}`;
-          const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
-          if (!seen.has(slugKey)) {
-            seen.add(slugKey);
-            seenSlugsByCheck.set(controllerId, seen);
-            if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
-            check.permission_slugs.push({
-              name: directPermissionSlug,
-              filePath: String(row.targetFilePath || row[4] || '').trim(),
-              edge: {
-                reason: authReason,
-                confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
-              },
-            });
-          }
-        }
-        const slugName = String(row.slugName || row[8] || '').trim();
-        if (!slugName || (targetKind !== 'Const' && !targetUid.startsWith('Const:'))) continue;
-        const slugId = String(row.slugId || row[7] || '').trim();
-        const slugReason = String(row.slugReason || row[10] || '').trim();
-        const slugFilePath = String(row.slugFilePath || row[9] || '').trim();
-        const slugKey = `${checkKey}|${slugId}|${slugName}|${slugReason}`;
-        const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
-        if (seen.has(slugKey)) continue;
+        return raw;
+      };
+      const getControllerChecks = (controllerId: string): Map<string, any> => {
+        const existing = checksByController.get(controllerId);
+        if (existing) return existing;
+        const created = new Map<string, any>();
+        checksByController.set(controllerId, created);
+        return created;
+      };
+      const getSeenSlugSet = (controllerId: string): Set<string> => {
+        const existing = seenSlugsByController.get(controllerId);
+        if (existing) return existing;
+        const created = new Set<string>();
+        seenSlugsByController.set(controllerId, created);
+        return created;
+      };
+      const getOrCreateAuthCheck = (
+        controllerId: string,
+        checkKey: string,
+        row: any,
+        source: any,
+        targetUid: string,
+        targetKind: string,
+      ): any => {
+        const controllerChecks = getControllerChecks(controllerId);
+        const existing = controllerChecks.get(checkKey);
+        if (existing) return existing;
+        const created = {
+          target: {
+            uid: targetUid,
+            name: String(row.targetName || row[2] || '').trim(),
+            kind: targetKind,
+            filePath: String(row.targetFilePath || row[4] || '').trim(),
+          },
+          source,
+          edge: {
+            reason: String(row.authReason || row[5] || '').trim(),
+            confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
+          },
+        };
+        controllerChecks.set(checkKey, created);
+        return created;
+      };
+      const addPermissionSlugToCheck = (
+        controllerId: string,
+        checkKey: string,
+        check: any,
+        input: {
+          mode: 'direct' | 'derived';
+          id: string;
+          name: string;
+          filePath: string;
+          reason: string;
+          confidence: number;
+        },
+      ): void => {
+        const slugName = normalizePermissionSlug(String(input.name || ''));
+        if (!slugName) return;
+        const stableId = input.mode === 'direct'
+          ? `direct:${slugName}`
+          : `${String(input.id || '').trim()}|${slugName}|${String(input.reason || '').trim()}`;
+        const slugKey = `${checkKey}|${stableId}`;
+        const seen = getSeenSlugSet(controllerId);
+        if (seen.has(slugKey)) return;
         seen.add(slugKey);
-        seenSlugsByCheck.set(controllerId, seen);
         if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
         check.permission_slugs.push({
           name: slugName,
-          filePath: slugFilePath,
+          filePath: String(input.filePath || '').trim(),
           edge: {
-            reason: slugReason,
-            confidence: normalizeConfidence(row.slugConfidence ?? row[11], 1.0),
+            reason: String(input.reason || '').trim(),
+            confidence: normalizeConfidence(input.confidence, 1.0),
           },
         });
+      };
+      const processAuthRowForController = (
+        controllerId: string,
+        row: any,
+        source: any,
+        checkKeyPrefix = '',
+      ): void => {
+        const targetUid = String(row.targetId || row[1] || '').trim();
+        if (!targetUid) return;
+        const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
+        const authReason = String(row.authReason || row[5] || '').trim();
+        const checkKey = `${checkKeyPrefix}${targetUid}|${authReason}`;
+        const check = getOrCreateAuthCheck(controllerId, checkKey, row, source, targetUid, targetKind);
+
+        if (targetUid.startsWith('CodeElement:permission:')) {
+          addPermissionSlugToCheck(controllerId, checkKey, check, {
+            mode: 'direct',
+            id: targetUid,
+            name: String(row.targetName || row[2] || '').trim(),
+            filePath: String(row.targetFilePath || row[4] || '').trim(),
+            reason: authReason,
+            confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
+          });
+        }
+
+        const slugName = String(row.slugName || row[8] || '').trim();
+        if (!slugName || (targetKind !== 'Const' && !targetUid.startsWith('Const:'))) return;
+        addPermissionSlugToCheck(controllerId, checkKey, check, {
+          mode: 'derived',
+          id: String(row.slugId || row[7] || '').trim(),
+          name: slugName,
+          filePath: String(row.slugFilePath || row[9] || '').trim(),
+          reason: String(row.slugReason || row[10] || '').trim(),
+          confidence: normalizeConfidence(row.slugConfidence ?? row[11], 1.0),
+        });
+      };
+      for (const row of authRows) {
+        const controllerId = String(row.controllerId || row[0] || '').trim();
+        if (!controllerId) continue;
+        processAuthRowForController(controllerId, row, { kind: 'controller' });
       }
 
       const endpointNames = Array.from(endpointControllersByName.keys());
@@ -3449,75 +3553,15 @@ export async function runReviewMode(
           if (!targetUid) continue;
           const controllerIds = endpointControllersByName.get(endpointName) || new Set<string>();
           if (controllerIds.size === 0) continue;
-            const targetKind = pickPrimaryKindLabel(row.targetKind || row[3] || '');
-            const authReason = String(row.authReason || row[5] || '').trim();
-            const routePatternsForEndpoint = Array.from(endpointRoutePatternsByName.get(endpointName) || new Set<string>());
+          const routePatternsForEndpoint = Array.from(endpointRoutePatternsByName.get(endpointName) || new Set<string>());
+          const source = {
+            kind: 'endpoint',
+            name: endpointName,
+            route_patterns: routePatternsForEndpoint.slice(0, 3),
+          };
 
           for (const controllerId of controllerIds) {
-            const checkKey = `endpoint:${endpointName}|${targetUid}|${authReason}`;
-            const controllerChecks = checksByController.get(controllerId) || new Map<string, any>();
-            let check = controllerChecks.get(checkKey);
-            if (!check) {
-              check = {
-                target: {
-                  uid: targetUid,
-                  name: row.targetName || row[2] || '',
-                  kind: targetKind,
-                  filePath: row.targetFilePath || row[4] || '',
-                },
-                source: {
-                  kind: 'endpoint',
-                  name: endpointName,
-                  route_patterns: routePatternsForEndpoint.slice(0, 3),
-                },
-                edge: {
-                  reason: row.authReason || row[5] || '',
-                  confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
-                },
-              };
-              controllerChecks.set(checkKey, check);
-              checksByController.set(controllerId, controllerChecks);
-            }
-            const directPermissionSlug = targetUid.startsWith('CodeElement:permission:')
-              ? String(row.targetName || row[2] || '').trim()
-              : '';
-            if (directPermissionSlug) {
-              const slugKey = `${checkKey}|direct|${directPermissionSlug}`;
-              const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
-              if (!seen.has(slugKey)) {
-                seen.add(slugKey);
-                seenSlugsByCheck.set(controllerId, seen);
-                if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
-                check.permission_slugs.push({
-                  name: directPermissionSlug,
-                  filePath: String(row.targetFilePath || row[4] || '').trim(),
-                  edge: {
-                    reason: authReason,
-                    confidence: normalizeConfidence(row.authConfidence ?? row[6], 1.0),
-                  },
-                });
-              }
-            }
-
-            const slugName = String(row.slugName || row[8] || '').trim();
-            if (!slugName || (targetKind !== 'Const' && !targetUid.startsWith('Const:'))) continue;
-            const slugId = String(row.slugId || row[7] || '').trim();
-            const slugReason = String(row.slugReason || row[10] || '').trim();
-            const slugFilePath = String(row.slugFilePath || row[9] || '').trim();
-            const slugKey = `${checkKey}|${slugId}|${slugName}|${slugReason}`;
-            const seen = seenSlugsByCheck.get(controllerId) || new Set<string>();
-            if (seen.has(slugKey)) continue;
-            seen.add(slugKey);
-            seenSlugsByCheck.set(controllerId, seen);
-            if (!Array.isArray(check.permission_slugs)) check.permission_slugs = [];
-            check.permission_slugs.push({
-              name: slugName,
-              filePath: slugFilePath,
-              edge: {
-                reason: slugReason,
-                confidence: normalizeConfidence(row.slugConfidence ?? row[11], 1.0),
-              },
-            });
+            processAuthRowForController(controllerId, row, source, `endpoint:${endpointName}|`);
           }
         }
       }

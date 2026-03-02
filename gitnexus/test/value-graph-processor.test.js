@@ -187,3 +187,48 @@ test('Value graph: guards malformed and unresolved signals', async () => {
   assert.equal(result.stats.routeSegmentValues, 1);
   assert.ok(result.stats.skippedMalformed >= 1);
 });
+
+test('Value graph: extracts UI anatomy values from dashboard File nodes', async () => {
+  const graph = createKnowledgeGraph();
+  const fileId = 'File:apps/dashboard/src/pages/settings/ProfilePage.tsx';
+
+  graph.addNode({
+    id: fileId,
+    label: 'File',
+    properties: {
+      name: 'ProfilePage.tsx',
+      filePath: 'apps/dashboard/src/pages/settings/ProfilePage.tsx',
+      content: `
+        const ThemeContext = createContext(null);
+        export const ProfilePage = () => {
+          const theme = useContext(ThemeContext);
+          return (
+            <ThemeContext.Provider value={theme}>
+              <Button isLoading size="sm">Save</Button>
+              <div className="flex gap-2 text-sm bg-white" />
+            </ThemeContext.Provider>
+          );
+        };
+      `,
+    },
+  });
+
+  const result = await processValueGraph(graph);
+
+  assert.equal(result.stats.tailwindClassValues, 4);
+  assert.equal(result.stats.componentPropValues, 2);
+  assert.equal(result.stats.reactContextValues, 1);
+  assert.equal(result.stats.providerSurfaceValues, 1);
+
+  const tailwindEdge = result.edges.find(edge => edge.reason === 'value-graph:tailwind_class');
+  const componentPropEdge = result.edges.find(edge => edge.reason === 'value-graph:component_prop');
+  const contextEdge = result.edges.find(edge => edge.reason === 'value-graph:react_context');
+  const providerEdge = result.edges.find(edge => edge.reason === 'value-graph:provider_surface');
+
+  assert.ok(tailwindEdge);
+  assert.ok(componentPropEdge);
+  assert.ok(contextEdge);
+  assert.ok(providerEdge);
+  assert.equal(tailwindEdge.sourceId, fileId);
+  assert.ok(result.values.some(value => value.valueType === 'component_prop' && value.valueRaw === 'Button.isLoading'));
+});

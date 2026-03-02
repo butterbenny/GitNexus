@@ -33,6 +33,10 @@ export interface ValueGraphResult {
     routeSegmentValues: number;
     tableNameValues: number;
     tableColumnValues: number;
+    tailwindClassValues: number;
+    componentPropValues: number;
+    reactContextValues: number;
+    providerSurfaceValues: number;
     skippedDuplicates: number;
     skippedMalformed: number;
   };
@@ -161,6 +165,90 @@ const parseTableColumn = (node: GraphNode): string | null => {
   return `${tableName}.${columnName}`;
 };
 
+const UI_FILE_PATH_RE = /(^|\/)apps\/dashboard\/src\/.*\.(tsx|jsx|ts|js)$/i;
+const CLASSNAME_LITERAL_RE = /className\s*=\s*(?:"([^"]+)"|'([^']+)')/g;
+const TAILWIND_TOKEN_RE = /^[a-z0-9!_\-:[\]\/.%]+$/i;
+const JSX_COMPONENT_RE = /<([A-Z][A-Za-z0-9_.]*)\b([^>]*)>/g;
+const JSX_PROP_NAME_RE = /\s([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|\b)/g;
+const CONTEXT_DECL_RE = /\b([A-Za-z0-9_$]+Context)\s*=\s*createContext\b/g;
+const CONTEXT_USAGE_RE = /\buseContext\s*\(\s*([A-Za-z0-9_$.]+)\s*\)/g;
+const PROVIDER_USAGE_RE = /<([A-Za-z0-9_$.]+(?:\.Provider|Provider))\b/g;
+
+const isUiCandidateFile = (filePath: string): boolean => UI_FILE_PATH_RE.test(String(filePath || ''));
+
+const extractTailwindClassTokens = (content: string): string[] => {
+  const values = new Set<string>();
+  CLASSNAME_LITERAL_RE.lastIndex = 0;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = CLASSNAME_LITERAL_RE.exec(content)) !== null) {
+    const literal = String(match[1] || match[2] || '').trim();
+    if (!literal) continue;
+    for (const token of literal.split(/\s+/g)) {
+      const normalized = String(token || '').trim();
+      if (!normalized || normalized.length < 2 || normalized.includes('${')) continue;
+      if (!TAILWIND_TOKEN_RE.test(normalized)) continue;
+      values.add(normalized);
+    }
+  }
+
+  return Array.from(values);
+};
+
+const extractComponentProps = (content: string): string[] => {
+  const values = new Set<string>();
+  JSX_COMPONENT_RE.lastIndex = 0;
+  let componentMatch: RegExpExecArray | null = null;
+
+  while ((componentMatch = JSX_COMPONENT_RE.exec(content)) !== null) {
+    const componentName = String(componentMatch[1] || '').trim();
+    const attributeSource = String(componentMatch[2] || '');
+    if (!componentName || !attributeSource) continue;
+
+    JSX_PROP_NAME_RE.lastIndex = 0;
+    let propMatch: RegExpExecArray | null = null;
+    while ((propMatch = JSX_PROP_NAME_RE.exec(attributeSource)) !== null) {
+      const propName = String(propMatch[1] || '').trim();
+      if (!propName) continue;
+      if (propName === 'key' || propName === 'ref') continue;
+      values.add(`${componentName}.${propName}`);
+    }
+  }
+
+  return Array.from(values);
+};
+
+const extractReactContextNames = (content: string): string[] => {
+  const values = new Set<string>();
+  CONTEXT_DECL_RE.lastIndex = 0;
+  CONTEXT_USAGE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = CONTEXT_DECL_RE.exec(content)) !== null) {
+    const contextName = String(match[1] || '').trim();
+    if (contextName) values.add(contextName);
+  }
+  while ((match = CONTEXT_USAGE_RE.exec(content)) !== null) {
+    const contextName = String(match[1] || '').trim();
+    if (contextName) values.add(contextName);
+  }
+
+  return Array.from(values);
+};
+
+const extractProviderSurfaces = (content: string): string[] => {
+  const values = new Set<string>();
+  PROVIDER_USAGE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = PROVIDER_USAGE_RE.exec(content)) !== null) {
+    const providerName = String(match[1] || '').trim();
+    if (providerName) values.add(providerName);
+  }
+
+  return Array.from(values);
+};
+
 const addUnique = <T>(map: Map<string, T>, key: string, value: T): T => {
   const existing = map.get(key);
   if (existing) return existing;
@@ -204,6 +292,10 @@ export const processValueGraph = async (
   let routeSegmentValues = 0;
   let tableNameValues = 0;
   let tableColumnValues = 0;
+  let tailwindClassValues = 0;
+  let componentPropValues = 0;
+  let reactContextValues = 0;
+  let providerSurfaceValues = 0;
 
   const addValueNode = (valueType: string, rawValue: string): ValueGraphNode | null => {
     const valueRaw = normalizeValue(rawValue);
@@ -410,6 +502,36 @@ export const processValueGraph = async (
       if (!valueNode) continue;
       addEdge(node.id, valueNode, 0.99, 'value-graph:table_column');
     }
+
+    if (node.label === 'File') {
+      const filePath = normalizeValue(String(node.properties?.filePath || ''));
+      const content = String((node.properties as any)?.content || '');
+      if (!isUiCandidateFile(filePath) || !content) continue;
+
+      for (const token of extractTailwindClassTokens(content)) {
+        const valueNode = addValueNode('tailwind_class', token);
+        if (!valueNode) continue;
+        addEdge(node.id, valueNode, 0.9, 'value-graph:tailwind_class');
+      }
+
+      for (const componentProp of extractComponentProps(content)) {
+        const valueNode = addValueNode('component_prop', componentProp);
+        if (!valueNode) continue;
+        addEdge(node.id, valueNode, 0.86, 'value-graph:component_prop');
+      }
+
+      for (const contextName of extractReactContextNames(content)) {
+        const valueNode = addValueNode('react_context', contextName);
+        if (!valueNode) continue;
+        addEdge(node.id, valueNode, 0.9, 'value-graph:react_context');
+      }
+
+      for (const providerSurface of extractProviderSurfaces(content)) {
+        const valueNode = addValueNode('provider_surface', providerSurface);
+        if (!valueNode) continue;
+        addEdge(node.id, valueNode, 0.86, 'value-graph:provider_surface');
+      }
+    }
   }
 
   onProgress?.('Extracting route-name and segment literal graph...', 55);
@@ -449,6 +571,10 @@ export const processValueGraph = async (
     if (valueNode.valueType === 'route_segment') routeSegmentValues++;
     if (valueNode.valueType === 'table_name') tableNameValues++;
     if (valueNode.valueType === 'table_column') tableColumnValues++;
+    if (valueNode.valueType === 'tailwind_class') tailwindClassValues++;
+    if (valueNode.valueType === 'component_prop') componentPropValues++;
+    if (valueNode.valueType === 'react_context') reactContextValues++;
+    if (valueNode.valueType === 'provider_surface') providerSurfaceValues++;
   }
 
   onProgress?.('ValueGraph materialization complete.', 100);
@@ -476,6 +602,10 @@ export const processValueGraph = async (
       routeSegmentValues,
       tableNameValues,
       tableColumnValues,
+      tailwindClassValues,
+      componentPropValues,
+      reactContextValues,
+      providerSurfaceValues,
       skippedDuplicates: skipped.duplicates,
       skippedMalformed: skipped.malformed,
     },

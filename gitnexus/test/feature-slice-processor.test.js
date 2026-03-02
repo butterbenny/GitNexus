@@ -21,7 +21,7 @@ test('Feature slices: materializes endpoint/query_key/permission slices with clo
   graph.addNode({
     id: permissionNodeId,
     label: 'CodeElement',
-    properties: { name: 'permission:orders.view', filePath: 'app/Domains/AccessControl/Permissions/OrderPermission.php' },
+    properties: { name: 'orders.view', filePath: 'app/Domains/AccessControl/Permissions/OrderPermission.php' },
   });
   graph.addNode({
     id: handlerNodeId,
@@ -105,4 +105,42 @@ test('Feature slices: materializes endpoint/query_key/permission slices with clo
 
   const hasEndpointMembership = result.memberships.some(m => m.nodeId === uiCallerNodeId && m.sliceId === endpointSlice.id);
   assert.ok(hasEndpointMembership);
+});
+
+test('Feature slices: query_key closes query_consumer from react-query key-to-query-fn edges', async () => {
+  const graph = createKnowledgeGraph();
+
+  const queryKeyNodeId = 'Function:apps/dashboard/src/queries/account-query-keys.ts:accountQueryKeys.users';
+  const queryFnNodeId = 'Function:apps/dashboard/src/api/users.ts:fetchUsers';
+
+  graph.addNode({
+    id: queryKeyNodeId,
+    label: 'Function',
+    properties: { name: 'accountQueryKeys.users', filePath: 'apps/dashboard/src/queries/account-query-keys.ts' },
+  });
+  graph.addNode({
+    id: queryFnNodeId,
+    label: 'Function',
+    properties: { name: 'fetchUsers', filePath: 'apps/dashboard/src/api/users.ts' },
+  });
+
+  graph.addRelationship({
+    id: 'rel-query-key-to-query-fn',
+    type: 'CALLS',
+    sourceId: queryKeyNodeId,
+    targetId: queryFnNodeId,
+    confidence: 0.95,
+    reason: 'react-query:key-to-query-fn',
+  });
+
+  const result = await processFeatureSlices(graph);
+  const querySlice = result.slices.find(slice => slice.sliceType === 'query_key' && slice.anchorId === queryKeyNodeId);
+  assert.ok(querySlice);
+  assert.ok(querySlice.closedSlots.includes('query_consumer'));
+
+  const consumerMembership = result.memberships.find(
+    membership => membership.nodeId === queryFnNodeId && membership.sliceId === querySlice.id,
+  );
+  assert.ok(consumerMembership);
+  assert.equal(consumerMembership.role, 'query_consumer');
 });

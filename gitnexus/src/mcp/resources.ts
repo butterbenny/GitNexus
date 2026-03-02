@@ -885,13 +885,13 @@ async function getClustersResource(backend: LocalBackend, repoName?: string): Pr
  */
 async function getProcessesResource(backend: LocalBackend, repoName?: string): Promise<string> {
   try {
-    const result = await backend.queryProcesses(repoName, 50);
+    const result = await backend.queryProcesses(repoName, 200);
 
     if (!result.processes || result.processes.length === 0) {
       return 'processes: []\n# No processes detected. Run: gitnexus analyze';
     }
 
-    const displayLimit = 20;
+    const displayLimit = 40;
     const lines: string[] = ['processes:'];
     const toShow = result.processes.slice(0, displayLimit);
 

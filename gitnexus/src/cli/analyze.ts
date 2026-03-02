@@ -405,6 +405,10 @@ export const analyzeCommand = async (
       routeSegmentValues: number;
       tableNameValues: number;
       tableColumnValues: number;
+      tailwindClassValues: number;
+      componentPropValues: number;
+      reactContextValues: number;
+      providerSurfaceValues: number;
       skippedDuplicates: number;
       skippedMalformed: number;
     };
@@ -1125,6 +1129,10 @@ export const analyzeCommand = async (
       routeSegmentValues: number;
       tableNameValues: number;
       tableColumnValues: number;
+      tailwindClassValues: number;
+      componentPropValues: number;
+      reactContextValues: number;
+      providerSurfaceValues: number;
       skippedDuplicates: number;
       skippedMalformed: number;
     } | undefined;
@@ -1271,7 +1279,8 @@ export const analyzeCommand = async (
                    '' AS filePath,
                    n.keyName AS keyName,
                    '' AS tableName,
-                   '' AS columnName
+                   '' AS columnName,
+                   '' AS content
           `;
         } else if (label === 'DBTable') {
           variantQuery = `
@@ -1281,7 +1290,8 @@ export const analyzeCommand = async (
                    n.sourceFilePath AS filePath,
                    '' AS keyName,
                    n.tableName AS tableName,
-                   '' AS columnName
+                   '' AS columnName,
+                   '' AS content
           `;
         } else if (label === 'DBColumn') {
           variantQuery = `
@@ -1291,7 +1301,19 @@ export const analyzeCommand = async (
                    n.sourceFilePath AS filePath,
                    '' AS keyName,
                    n.tableName AS tableName,
-                   n.columnName AS columnName
+                   n.columnName AS columnName,
+                   '' AS content
+          `;
+        } else if (label === 'File') {
+          variantQuery = `
+            MATCH (n:${cypherLabel})
+            RETURN n.id AS id,
+                   n.name AS name,
+                   n.filePath AS filePath,
+                   '' AS keyName,
+                   '' AS tableName,
+                   '' AS columnName,
+                   n.content AS content
           `;
         } else {
           variantQuery = `
@@ -1301,7 +1323,8 @@ export const analyzeCommand = async (
                    n.filePath AS filePath,
                    '' AS keyName,
                    '' AS tableName,
-                   '' AS columnName
+                   '' AS columnName,
+                   '' AS content
           `;
         }
       } else if (variant === 'slice') {
@@ -2284,7 +2307,13 @@ export const analyzeCommand = async (
 
         const valueGraphInput = createKnowledgeGraph();
         const valueGraphNodeIds = new Set<string>();
-        const valueGraphNodeLabels = ['File', ...flowNodeLabels, 'CacheKey', 'DBTable', 'DBColumn'] as const;
+        const valueGraphNodeLabels = Array.from(new Set([
+          'File',
+          ...flowNodeLabels,
+          'CacheKey',
+          'DBTable',
+          'DBColumn',
+        ]));
 
         for (const label of valueGraphNodeLabels) {
           const rows = await loadIncrementalNodeRows(String(label), 'value');
@@ -2302,6 +2331,7 @@ export const analyzeCommand = async (
                 keyName: String(row.keyName ?? row[4] ?? '').trim(),
                 tableName: String(row.tableName ?? row[5] ?? '').trim(),
                 columnName: String(row.columnName ?? row[6] ?? '').trim(),
+                content: String(row.content ?? row[7] ?? ''),
               },
             });
             valueGraphNodeIds.add(id);
@@ -2360,6 +2390,10 @@ export const analyzeCommand = async (
           routeSegmentValues: valueGraphResult.stats.routeSegmentValues,
           tableNameValues: valueGraphResult.stats.tableNameValues,
           tableColumnValues: valueGraphResult.stats.tableColumnValues,
+          tailwindClassValues: valueGraphResult.stats.tailwindClassValues,
+          componentPropValues: valueGraphResult.stats.componentPropValues,
+          reactContextValues: valueGraphResult.stats.reactContextValues,
+          providerSurfaceValues: valueGraphResult.stats.providerSurfaceValues,
           skippedDuplicates: valueGraphResult.stats.skippedDuplicates,
           skippedMalformed: valueGraphResult.stats.skippedMalformed,
         };
@@ -2987,7 +3021,7 @@ export const analyzeCommand = async (
       }
       if (inc.valueGraph) {
         console.log(
-          `  Value graph: ${inc.valueGraph.valueCount} values / ${inc.valueGraph.edgeCount} edges (permission ${inc.valueGraph.permissionValues}, endpoint ${inc.valueGraph.endpointValues}, role ${inc.valueGraph.roleValues}, feature-flag ${inc.valueGraph.featureFlagValues}, config ${inc.valueGraph.configKeyValues}, env ${inc.valueGraph.envVarValues}, queue ${inc.valueGraph.queueNameValues}, broadcast ${inc.valueGraph.broadcastChannelValues}, event ${inc.valueGraph.eventNameValues}, command ${inc.valueGraph.commandNameValues}, i18n ${inc.valueGraph.i18nKeyValues}, route ${inc.valueGraph.routeNameValues}, route-segment ${inc.valueGraph.routeSegmentValues}, cache ${inc.valueGraph.cacheKeyValues}, query-family ${inc.valueGraph.queryKeyFamilyValues}, table ${inc.valueGraph.tableNameValues}, table-column ${inc.valueGraph.tableColumnValues})`,
+          `  Value graph: ${inc.valueGraph.valueCount} values / ${inc.valueGraph.edgeCount} edges (permission ${inc.valueGraph.permissionValues}, endpoint ${inc.valueGraph.endpointValues}, role ${inc.valueGraph.roleValues}, feature-flag ${inc.valueGraph.featureFlagValues}, config ${inc.valueGraph.configKeyValues}, env ${inc.valueGraph.envVarValues}, queue ${inc.valueGraph.queueNameValues}, broadcast ${inc.valueGraph.broadcastChannelValues}, event ${inc.valueGraph.eventNameValues}, command ${inc.valueGraph.commandNameValues}, i18n ${inc.valueGraph.i18nKeyValues}, route ${inc.valueGraph.routeNameValues}, route-segment ${inc.valueGraph.routeSegmentValues}, cache ${inc.valueGraph.cacheKeyValues}, query-family ${inc.valueGraph.queryKeyFamilyValues}, table ${inc.valueGraph.tableNameValues}, table-column ${inc.valueGraph.tableColumnValues}, tailwind ${inc.valueGraph.tailwindClassValues}, props ${inc.valueGraph.componentPropValues}, context ${inc.valueGraph.reactContextValues}, providers ${inc.valueGraph.providerSurfaceValues})`,
         );
       }
       if (inc.provenance) {
@@ -3364,7 +3398,7 @@ export const analyzeCommand = async (
   if (pipelineResult.valueGraphResult) {
     const valueGraph = pipelineResult.valueGraphResult.stats;
     console.log(
-      `  Value graph: ${valueGraph.valueCount} values / ${valueGraph.edgeCount} edges (permission ${valueGraph.permissionValues}, endpoint ${valueGraph.endpointValues}, role ${valueGraph.roleValues}, feature-flag ${valueGraph.featureFlagValues}, config ${valueGraph.configKeyValues}, env ${valueGraph.envVarValues}, queue ${valueGraph.queueNameValues}, broadcast ${valueGraph.broadcastChannelValues}, event ${valueGraph.eventNameValues}, command ${valueGraph.commandNameValues}, i18n ${valueGraph.i18nKeyValues}, route ${valueGraph.routeNameValues}, route-segment ${valueGraph.routeSegmentValues}, cache ${valueGraph.cacheKeyValues}, query-family ${valueGraph.queryKeyFamilyValues}, table ${valueGraph.tableNameValues}, table-column ${valueGraph.tableColumnValues})`,
+      `  Value graph: ${valueGraph.valueCount} values / ${valueGraph.edgeCount} edges (permission ${valueGraph.permissionValues}, endpoint ${valueGraph.endpointValues}, role ${valueGraph.roleValues}, feature-flag ${valueGraph.featureFlagValues}, config ${valueGraph.configKeyValues}, env ${valueGraph.envVarValues}, queue ${valueGraph.queueNameValues}, broadcast ${valueGraph.broadcastChannelValues}, event ${valueGraph.eventNameValues}, command ${valueGraph.commandNameValues}, i18n ${valueGraph.i18nKeyValues}, route ${valueGraph.routeNameValues}, route-segment ${valueGraph.routeSegmentValues}, cache ${valueGraph.cacheKeyValues}, query-family ${valueGraph.queryKeyFamilyValues}, table ${valueGraph.tableNameValues}, table-column ${valueGraph.tableColumnValues}, tailwind ${valueGraph.tailwindClassValues}, props ${valueGraph.componentPropValues}, context ${valueGraph.reactContextValues}, providers ${valueGraph.providerSurfaceValues})`,
     );
   }
   if (pipelineResult.provenanceResult) {

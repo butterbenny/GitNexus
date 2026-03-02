@@ -47,6 +47,7 @@ export type NodeLabel =
 export type NodeProperties = {
   name: string,
   filePath: string,
+  content?: string,
   startLine?: number,
   endLine?: number,
   language?: string,

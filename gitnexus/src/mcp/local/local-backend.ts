@@ -5256,10 +5256,10 @@ export class LocalBackend {
    * Query processes directly from graph.
    * Used by getProcessesResource — avoids legacy overview() dispatch.
    */
-  async queryProcesses(repoName?: string, limit = 50): Promise<{ processes: any[] }> {
+  async queryProcesses(repoName?: string, limit = 200): Promise<{ processes: any[] }> {
     const repo = this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
-    const safeLimit = clampInteger(limit, 50, 1, 500);
+    const safeLimit = clampInteger(limit, 200, 1, 500);
 
     try {
       const processes = await executeQuery(repo.id, `
