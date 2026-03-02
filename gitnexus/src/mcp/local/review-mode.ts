@@ -1484,11 +1484,28 @@ export async function runReviewMode(
     };
 
     const suggestedTestsAgg = new Map<string, { score: number; reasons: string[] }>();
-    const addSuggestedTest = (filePath: string, scoreDelta: number, reason: string): void => {
+    const isRunnableSuggestedTestFile = (filePath: string): boolean => {
+      const fp = normalizePath(String(filePath || '')).toLowerCase();
+      if (!fp) return false;
+      if (/\.test\.[a-z0-9]+$/.test(fp) || /\.spec\.[a-z0-9]+$/.test(fp) || /_test\.[a-z0-9]+$/.test(fp)) {
+        return true;
+      }
+      if (fp.endsWith('.php')) {
+        return /(^|\/)tests?\//.test(fp) && /test\.php$/.test(fp);
+      }
+      return false;
+    };
+    const addSuggestedTest = (
+      filePath: string,
+      scoreDelta: number,
+      reason: string,
+      options: { allowOutOfScope?: boolean } = {},
+    ): void => {
       const fp = normalizePath(filePath);
       if (!fp) return;
       if (!isTestFilePath(fp)) return;
-      if (pathPrefixes.length > 0 && !isInScope(fp)) return;
+      if (!isRunnableSuggestedTestFile(fp)) return;
+      if (!options.allowOutOfScope && pathPrefixes.length > 0 && !isInScope(fp)) return;
 
       const current = suggestedTestsAgg.get(fp) || { score: 0, reasons: [] as string[] };
       const safeScore = Number.isFinite(scoreDelta) ? Math.max(0.05, scoreDelta) : 0.05;
@@ -1694,9 +1711,11 @@ export async function runReviewMode(
         'apps', 'app', 'src', 'lib', 'utils', 'shared', 'common', 'components',
         'services', 'service', 'controllers', 'controller', 'index', 'test', 'tests',
         'spec', 'feature', 'unit', 'backend', 'dashboard', 'gitnexus', 'local',
+        'domains', 'domain', 'php', 'http', 'api',
       ]);
       const tokenize = (value: string): string[] => {
         return String(value || '')
+          .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
           .toLowerCase()
           .split(/[^a-z0-9]+/g)
           .map(token => token.trim())
@@ -1714,6 +1733,29 @@ export async function runReviewMode(
       }
 
       if (changedTokens.size > 0) {
+        const matchesChangedToken = (token: string): boolean => {
+          const hasSharedNgram = (left: string, right: string): boolean => {
+            if (left.length < 8 || right.length < 8) return false;
+            const n = 4;
+            const grams = new Set<string>();
+            for (let i = 0; i <= left.length - n; i += 1) grams.add(left.slice(i, i + n));
+            let overlap = 0;
+            for (let i = 0; i <= right.length - n; i += 1) {
+              if (grams.has(right.slice(i, i + n))) {
+                overlap += 1;
+                if (overlap >= 3) return true;
+              }
+            }
+            return false;
+          };
+          if (changedTokens.has(token)) return true;
+          for (const changedToken of changedTokens) {
+            if (token.length < 4 && changedToken.length < 4) continue;
+            if (token.includes(changedToken) || changedToken.includes(token)) return true;
+            if (hasSharedNgram(token, changedToken)) return true;
+          }
+          return false;
+        };
         try {
           const fileRows = await executeQuery(repo.id, `
             MATCH (f:File)
@@ -1730,11 +1772,12 @@ export async function runReviewMode(
             .map((row: any) => normalizePath(String(row.filePath ?? row[0] ?? '')))
             .filter(Boolean)
             .filter(filePath => isTestFilePath(filePath))
+            .filter(filePath => isRunnableSuggestedTestFile(filePath))
             .filter(filePath => pathPrefixes.length === 0 || isInScope(filePath));
 
           const ranked = candidates
             .map(filePath => {
-              const overlap = Array.from(new Set(tokenize(filePath).filter(token => changedTokens.has(token))));
+              const overlap = Array.from(new Set(tokenize(filePath).filter(token => matchesChangedToken(token))));
               if (overlap.length === 0) return null;
               return {
                 filePath,
@@ -1747,11 +1790,138 @@ export async function runReviewMode(
             .slice(0, limitTests);
 
           for (const hit of ranked) {
+            addSuggestedTest(hit.filePath, hit.score, hit.reason, { allowOutOfScope: true });
+          }
+        } catch {
+          // best-effort fallback
+        }
+      }
+    }
+
+    // Fallback tier 4: if scoped prefixes are too narrow, suggest nearest global tests.
+    if (suggestedTestsAgg.size === 0 && pathPrefixes.length > 0 && changedFilePathSet.size > 0) {
+      const stopTokens = new Set([
+        'apps', 'app', 'src', 'lib', 'utils', 'shared', 'common', 'components',
+        'services', 'service', 'controllers', 'controller', 'index', 'test', 'tests',
+        'spec', 'feature', 'unit', 'backend', 'dashboard', 'gitnexus', 'local',
+        'domains', 'domain', 'php', 'http', 'api',
+      ]);
+      const tokenize = (value: string): string[] => {
+        return String(value || '')
+          .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+          .toLowerCase()
+          .split(/[^a-z0-9]+/g)
+          .map(token => token.trim())
+          .filter(token => token.length >= 3 && !stopTokens.has(token));
+      };
+
+      const changedTokens = new Set<string>();
+      for (const fp of changedFilePathSet) {
+        for (const token of tokenize(fp)) changedTokens.add(token);
+        const base = path.basename(fp, path.extname(fp));
+        for (const token of tokenize(base)) changedTokens.add(token);
+      }
+      for (const sym of analysisSymbols) {
+        for (const token of tokenize(String(sym?.name || ''))) changedTokens.add(token);
+      }
+
+      if (changedTokens.size > 0) {
+        const matchesChangedToken = (token: string): boolean => {
+          const hasSharedNgram = (left: string, right: string): boolean => {
+            if (left.length < 8 || right.length < 8) return false;
+            const n = 4;
+            const grams = new Set<string>();
+            for (let i = 0; i <= left.length - n; i += 1) grams.add(left.slice(i, i + n));
+            let overlap = 0;
+            for (let i = 0; i <= right.length - n; i += 1) {
+              if (grams.has(right.slice(i, i + n))) {
+                overlap += 1;
+                if (overlap >= 3) return true;
+              }
+            }
+            return false;
+          };
+          if (changedTokens.has(token)) return true;
+          for (const changedToken of changedTokens) {
+            if (token.length < 4 && changedToken.length < 4) continue;
+            if (token.includes(changedToken) || changedToken.includes(token)) return true;
+            if (hasSharedNgram(token, changedToken)) return true;
+          }
+          return false;
+        };
+        try {
+          const fileRows = await executeQuery(repo.id, `
+            MATCH (f:File)
+            WHERE (
+              lower(f.filePath) CONTAINS '/test/'
+              OR lower(f.filePath) CONTAINS '/tests/'
+              OR lower(f.filePath) CONTAINS '.test.'
+              OR lower(f.filePath) CONTAINS '.spec.'
+            )
+            RETURN f.filePath AS filePath
+            LIMIT 20000
+          `);
+          const candidates = fileRows
+            .map((row: any) => normalizePath(String(row.filePath ?? row[0] ?? '')))
+            .filter(Boolean)
+            .filter(filePath => isTestFilePath(filePath))
+            .filter(filePath => isRunnableSuggestedTestFile(filePath));
+
+          const ranked = candidates
+            .map(filePath => {
+              const overlap = Array.from(new Set(tokenize(filePath).filter(token => matchesChangedToken(token))));
+              if (overlap.length === 0) return null;
+              return {
+                filePath,
+                score: 0.3 * overlap.length,
+                reason: `scope fallback token proximity: ${overlap.slice(0, 4).join(', ')}`,
+              };
+            })
+            .filter((item): item is { filePath: string; score: number; reason: string } => item !== null)
+            .sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath))
+            .slice(0, limitTests);
+
+          for (const hit of ranked) {
             addSuggestedTest(hit.filePath, hit.score, hit.reason);
           }
         } catch {
           // best-effort fallback
         }
+      }
+    }
+
+    // Fallback tier 5: deterministic scoped escape hatch when lexical overlap is absent.
+    if (suggestedTestsAgg.size === 0 && pathPrefixes.length > 0) {
+      try {
+        const fileRows = await executeQuery(repo.id, `
+          MATCH (f:File)
+          WHERE (
+            lower(f.filePath) CONTAINS '/test/'
+            OR lower(f.filePath) CONTAINS '/tests/'
+            OR lower(f.filePath) CONTAINS '.test.'
+            OR lower(f.filePath) CONTAINS '.spec.'
+          )
+          RETURN f.filePath AS filePath
+          ORDER BY f.filePath
+          LIMIT ${Math.max(limitTests * 20, 100)}
+        `);
+        const candidates = fileRows
+          .map((row: any) => normalizePath(String(row.filePath ?? row[0] ?? '')))
+          .filter(Boolean)
+          .filter(filePath => isTestFilePath(filePath))
+          .filter(filePath => isRunnableSuggestedTestFile(filePath))
+          .slice(0, limitTests);
+
+        for (const filePath of candidates) {
+          addSuggestedTest(
+            filePath,
+            0.05,
+            'scope fallback token proximity: broad fallback (no lexical overlap)',
+            { allowOutOfScope: true },
+          );
+        }
+      } catch {
+        // best-effort fallback
       }
     }
 
@@ -1904,6 +2074,9 @@ export async function runReviewMode(
         return [`${cwd}::${command}`, { cwd, command }];
       }),
     ).values());
+    const scopeFallbackSuggestedTests = suggested_tests
+      .filter(test => (Array.isArray(test?.reasons) ? test.reasons : []).some((reason: string) => String(reason).includes('scope fallback token proximity')))
+      .length;
     const isRegressionCandidateTest = (test: any): boolean => {
       const filePath = normalizePath(String(test?.filePath || ''));
       if (changedTestFileSet.has(filePath)) return true;
@@ -4301,6 +4474,35 @@ export async function runReviewMode(
       }, findingDedupe);
     }
 
+    const hasScopeChangeSignals = changedFileObjs.length > 0
+      || changedSymbolCountTotal > 0
+      || runtime_hotspots.length > 0
+      || contract_parity.length > 0
+      || perf_backend_findings.length > 0;
+    if (reviewFindings.length === 0 && hasScopeChangeSignals) {
+      const fallbackFilePath = normalizePath(String(changedFileObjs[0]?.filePath || analysisSymbols[0]?.filePath || ''));
+      if (fallbackFilePath) {
+        addReviewFinding(reviewFindings, {
+          code: 'low-signal-review-fallback',
+          severity: 'low',
+          summary: `Low-signal review fallback for ${fallbackFilePath}; no high-confidence risk findings were emitted.`,
+          reason: 'no-high-confidence-findings',
+          confidence: 0.62,
+          evidence: {
+            filePath: fallbackFilePath,
+            symbol: analysisSymbols[0]
+              ? {
+                  uid: String(analysisSymbols[0]?.uid || '').trim() || undefined,
+                  name: String(analysisSymbols[0]?.name || '').trim() || undefined,
+                  kind: String(analysisSymbols[0]?.kind || '').trim() || undefined,
+                  startLine: toOptionalLineNumber(analysisSymbols[0]?.startLine),
+                }
+              : undefined,
+          },
+        }, findingDedupe);
+      }
+    }
+
     const review_kernel: any = buildReviewKernel({
       changed_files: changedFileObjs.length,
       untracked_files: productUntrackedFiles.length,
@@ -4415,6 +4617,9 @@ export async function runReviewMode(
     if (reviewFindings.length > 0) {
       review_kernel.top_findings = Array.from(new Set(reviewFindings.map(finding => finding.summary))).slice(0, 8);
     }
+    const lowSignalFallbackFindingCount = reviewFindings
+      .filter(finding => String(finding?.code || '') === 'low-signal-review-fallback')
+      .length;
     review_kernel.findings = reviewFindings.slice(0, 30);
     review_kernel.findings_summary = {
       total: reviewFindings.length,
@@ -4460,8 +4665,10 @@ export async function runReviewMode(
       matrix_cells: Array.isArray(convergenceMatrix?.cells) ? convergenceMatrix.cells.length : 0,
       suggested_tests_boosted: suggestedTestsBoosted,
       suggested_tests_reordered: suggestedTestsReordered,
+      suggested_tests_scope_fallback: scopeFallbackSuggestedTests,
       findings_boosted: findingsBoosted,
       findings_reordered: findingsReordered,
+      low_signal_fallback_findings: lowSignalFallbackFindingCount,
       ranking_weights: REVIEW_CONVERGENCE_RANK_WEIGHTS,
     };
 

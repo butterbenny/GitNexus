@@ -1,0 +1,194 @@
+{
+  "repo": "/Users/benny/monorepo",
+  "generated_at": "2026-03-02T06:54:15.541Z",
+  "score_formulas": {
+    "review_mode": "0.40*top_finding_rank + 0.25*proof_signal + 0.20*suggested_test_signal + 0.15*actionability_signal",
+    "debug_mode": "0.45*rank_score + 0.20*route_alignment + 0.20*root_cause_confidence + 0.15*evidence_coverage"
+  },
+  "review_mode": {
+    "summary": {
+      "total": 4,
+      "coverage_present": 1,
+      "coverage_pct": 25,
+      "avg_new": 0.203,
+      "p90_new": 0.454
+    },
+    "rows": [
+      {
+        "scenario": "seating-rules-all",
+        "score": 0.454,
+        "coverage_present": true,
+        "changed_files": 3,
+        "changed_symbols": 10,
+        "findings_count": 0,
+        "top_finding_code": null,
+        "top_finding_rank_score": 0,
+        "suggested_tests": 12,
+        "proof_symbols": 10,
+        "proof_edges": 0,
+        "risk_level": "low",
+        "risk_score": 2
+      },
+      {
+        "scenario": "seating-rules-items",
+        "score": 0.13,
+        "coverage_present": false,
+        "changed_files": 1,
+        "changed_symbols": 4,
+        "findings_count": 0,
+        "top_finding_code": null,
+        "top_finding_rank_score": 0,
+        "suggested_tests": 0,
+        "proof_symbols": 4,
+        "proof_edges": 0,
+        "risk_level": "low",
+        "risk_score": 2
+      },
+      {
+        "scenario": "seating-rules-tickets",
+        "score": 0.13,
+        "coverage_present": false,
+        "changed_files": 1,
+        "changed_symbols": 4,
+        "findings_count": 0,
+        "top_finding_code": null,
+        "top_finding_rank_score": 0,
+        "suggested_tests": 0,
+        "proof_symbols": 4,
+        "proof_edges": 0,
+        "risk_level": "low",
+        "risk_score": 2
+      },
+      {
+        "scenario": "seating-rules-seat-number",
+        "score": 0.099,
+        "coverage_present": false,
+        "changed_files": 1,
+        "changed_symbols": 2,
+        "findings_count": 0,
+        "top_finding_code": null,
+        "top_finding_rank_score": 0,
+        "suggested_tests": 0,
+        "proof_symbols": 2,
+        "proof_edges": 0,
+        "risk_level": "low",
+        "risk_score": 2
+      }
+    ]
+  },
+  "debug_mode": {
+    "summary": {
+      "total": 8,
+      "coverage_present": 5,
+      "coverage_pct": 62.5,
+      "avg_new": 0.404,
+      "p90_new": 0.671
+    },
+    "rows": [
+      {
+        "scenario": "seating-assign-slow",
+        "score": 0.671,
+        "coverage_present": true,
+        "classification": "performance",
+        "candidates_count": 3,
+        "prioritized_source": "ranked",
+        "prioritized_rank_score": 0.811,
+        "prioritized_confidence": 0.74,
+        "route_alignment": 0,
+        "runtime_observations": true,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "custom-field-403",
+        "score": 0.554,
+        "coverage_present": true,
+        "classification": "auth",
+        "candidates_count": 1,
+        "prioritized_source": "ranked",
+        "prioritized_rank_score": 0.617,
+        "prioritized_confidence": 0.78,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "auction-remaining-race",
+        "score": 0.09,
+        "coverage_present": false,
+        "classification": "cache",
+        "candidates_count": 0,
+        "prioritized_source": null,
+        "prioritized_rank_score": 0,
+        "prioritized_confidence": 0,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "wallet-freshness",
+        "score": 0.09,
+        "coverage_present": false,
+        "classification": "cache",
+        "candidates_count": 0,
+        "prioritized_source": null,
+        "prioritized_rank_score": 0,
+        "prioritized_confidence": 0,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "mobile-role-mapping",
+        "score": 0.09,
+        "coverage_present": false,
+        "classification": "unknown",
+        "candidates_count": 0,
+        "prioritized_source": null,
+        "prioritized_rank_score": 0,
+        "prioritized_confidence": 0,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "paddle-invoice-validation",
+        "score": 0.593,
+        "coverage_present": true,
+        "classification": "shape",
+        "candidates_count": 1,
+        "prioritized_source": "ranked",
+        "prioritized_rank_score": 0.639,
+        "prioritized_confidence": 0.925,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "ticket-pdf-retry",
+        "score": 0.568,
+        "coverage_present": true,
+        "classification": "unknown",
+        "candidates_count": 3,
+        "prioritized_source": "ranked",
+        "prioritized_rank_score": 0.629,
+        "prioritized_confidence": 0.86,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      },
+      {
+        "scenario": "paddle-charge-flow",
+        "score": 0.574,
+        "coverage_present": true,
+        "classification": "routing",
+        "candidates_count": 3,
+        "prioritized_source": "ranked",
+        "prioritized_rank_score": 0.629,
+        "prioritized_confidence": 0.86,
+        "route_alignment": 0,
+        "runtime_observations": false,
+        "runtime_match_ratio": 0
+      }
+    ]
+  }
+}

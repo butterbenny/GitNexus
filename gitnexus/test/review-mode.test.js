@@ -473,6 +473,12 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(scoped.changed_files.every(f => String(f.filePath || '').startsWith('src/')));
   assert.ok(!scoped.changed_files.some(f => f.filePath === 'apps/dashboard/src/pages/FooPage.tsx'));
   assert.ok(scoped.semantic_diffs, 'expected scoped semantic_diffs payload');
+  assert.ok(Array.isArray(scoped.suggested_tests) && scoped.suggested_tests.length > 0, 'expected scope fallback suggested tests');
+  assert.ok(
+    scoped.suggested_tests.some(test => (Array.isArray(test?.reasons) ? test.reasons : []).some(reason => String(reason).includes('scope fallback token proximity'))),
+    'expected scope fallback reason on scoped suggested tests',
+  );
+  assert.ok(Number(scoped._review_mode?.convergence?.suggested_tests_scope_fallback || 0) > 0);
 });
 
 test('MCP review_mode: falls back when direct test callers are missing', async () => {

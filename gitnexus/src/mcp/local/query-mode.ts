@@ -112,11 +112,22 @@ const QUERY_SYMBOL_RANK_WEIGHTS = {
   process_source_boost: 0.08,
   lexical_floor: 0.04,
 } as const;
-const QUERY_TOP_SYMBOL_ACTION_MIN_SCORE = 50;
-const QUERY_NEXT_ACTION_RANK_WEIGHTS = {
-  score: 0.72,
-  convergence: 0.28,
+const QUERY_NEXT_ACTION_GATES = {
+  symbol_base: 50,
+  symbol_floor: 32,
+  carbon_base: 55,
+  carbon_floor: 36,
+  process_base: 0.08,
+  process_floor: 0.03,
 } as const;
+const QUERY_NEXT_ACTION_RANK_WEIGHTS = {
+  score: 0.58,
+  convergence: 0.28,
+  confidence: 0.14,
+} as const;
+
+const computeAdaptiveGate = (base: number, floor: number, retrievalSignal: number): number =>
+  floor + ((base - floor) * clampUnit(retrievalSignal));
 
 const resolveConvergenceMatrixPaths = (repo: QueryModeRepoHandle): string[] => {
   const repoPattern = `${String(repo.name || '').trim() || 'repo'}-patterns`;
@@ -427,6 +438,9 @@ export async function runQueryMode(
       actionPlanResult = null;
     }
   }
+  const actionHintFiles = Array.isArray(actionPlanResult?.files) ? actionPlanResult.files.slice(0, 8) : [];
+  const actionHintChecks = Array.isArray(actionPlanResult?.checks) ? actionPlanResult.checks.slice(0, 8) : [];
+  const actionHintHops = Array.isArray(actionPlanResult?.hops) ? actionPlanResult.hops.slice(0, limitHops) : [];
 
   const hypotheses: string[] = [];
   const topGapSignals = topSlice?.gap_signals || null;
@@ -586,6 +600,7 @@ export async function runQueryMode(
     rank: number;
     score: number;
     readiness: number;
+    convergence: number;
   }>();
   for (let idx = 0; idx < slicesWithReadiness.length; idx += 1) {
     const sliceItem = slicesWithReadiness[idx] || {};
@@ -596,6 +611,7 @@ export async function runQueryMode(
       (slicesWithReadiness.length - idx) / Math.max(1, slicesWithReadiness.length),
     );
     const readinessSignal = clampUnit(toFiniteNumber(sliceItem?.carbon_copy_ready?.score, 0) / 100);
+    const convergenceSignal = clampUnit(toFiniteNumber(sliceItem?.carbon_copy_ready?.convergence?.score, 0));
     const score = clampUnit((rankSignal * 0.45) + (readinessSignal * 0.55));
     for (const member of members) {
       const filePath = toRepoRelativePath(member?.filePath, repo.repoPath);
@@ -608,6 +624,7 @@ export async function runQueryMode(
           rank: idx,
           score: round3(score),
           readiness: round3(readinessSignal),
+          convergence: round3(convergenceSignal),
         });
       }
     }
@@ -630,10 +647,12 @@ export async function runQueryMode(
       ? 0
       : clampUnit((processesWithReadiness.length - processRank) / Math.max(1, processesWithReadiness.length));
     const processReadinessSignal = clampUnit(toFiniteNumber(processReadinessById.get(processId)?.score, 0) / 100);
+    const processConvergenceSignal = clampUnit(toFiniteNumber(processReadinessById.get(processId)?.convergence?.score, 0));
 
     const sliceSignal = sliceSignalByFilePath.get(filePath);
     const sliceRankSignal = sliceSignal ? clampUnit((slicesWithReadiness.length - sliceSignal.rank) / Math.max(1, slicesWithReadiness.length)) : 0;
     const sliceReadinessSignal = sliceSignal ? clampUnit(sliceSignal.readiness) : 0;
+    const sliceConvergenceSignal = sliceSignal ? clampUnit(sliceSignal.convergence) : 0;
     const readinessSignal = Math.max(processReadinessSignal, sliceReadinessSignal);
     const symbolTokenSet = new Set<string>([
       ...tokenize(symbol?.name || ''),
@@ -647,6 +666,12 @@ export async function runQueryMode(
     const lexicalSignal = lexicalOverlap > 0
       ? clampUnit(lexicalOverlap / Math.max(1, Math.min(queryTokenSet.size, 6)))
       : 0;
+    const convergenceSignal = clampUnit(Math.max(
+      processConvergenceSignal,
+      sliceConvergenceSignal,
+      readinessSignal * 0.65,
+      lexicalSignal * 0.45,
+    ));
     const sourceBoost = processId ? QUERY_SYMBOL_RANK_WEIGHTS.process_source_boost : 0;
     const lexicalFloor = lexicalSignal > 0 ? QUERY_SYMBOL_RANK_WEIGHTS.lexical_floor : 0;
     const score = clampUnit(
@@ -663,6 +688,7 @@ export async function runQueryMode(
     if (processRank !== undefined) reasons.push(`process-rank:${processRank + 1}`);
     if (sliceSignal?.uid) reasons.push(`slice:${sliceSignal.uid}`);
     if (lexicalSignal > 0) reasons.push(`lexical:${Math.round(lexicalSignal * 100)}`);
+    if (convergenceSignal > 0) reasons.push(`convergence:${Math.round(convergenceSignal * 100)}`);
     if (processId) reasons.push(`process:${processId}`);
 
     const hintScore = clampPercent(score * 100);
@@ -674,6 +700,7 @@ export async function runQueryMode(
         score: round3(hintScore),
         level: readinessLevel(hintScore),
         reasons: reasons.slice(0, 6),
+        convergence: round3(convergenceSignal),
         ...(processId ? { process_id: processId } : {}),
         ...(sliceSignal?.uid ? { slice_uid: sliceSignal.uid, slice_label: sliceSignal.label } : {}),
       },
@@ -745,67 +772,206 @@ export async function runQueryMode(
     .sort((left, right) => toFiniteNumber(right.readiness?.score, 0) - toFiniteNumber(left.readiness?.score, 0))[0] || null;
   type QueryNextActionCandidate = {
     source: 'symbol' | 'carbon_anchor' | 'process';
+    candidate_origin:
+      | 'symbol_threshold'
+      | 'carbon_threshold'
+      | 'process_threshold'
+      | 'action_hint_hop'
+      | 'fallback_symbol'
+      | 'fallback_carbon'
+      | 'fallback_process';
+    reason_code: string;
     label: string;
     score: number;
     convergence: number;
+    confidence: number;
     rank_score: number;
     action: string;
   };
+  const topActionHintHop = actionHintHops
+    .slice()
+    .sort((left, right) => toFiniteNumber(right?.http?.confidence, 0) - toFiniteNumber(left?.http?.confidence, 0))
+    .find(hop => toFiniteNumber(hop?.http?.confidence, 0) > 0) || null;
+  const topActionHintConfidence = clampUnit(toFiniteNumber(topActionHintHop?.http?.confidence, 0));
+  const retrievalSignal = clampUnit(Math.max(
+    toFiniteNumber(topSymbolSignal?.hint?.score, 0) / 100,
+    toFiniteNumber(topCarbonCopy?.readiness?.score, 0) / 100,
+    toFiniteNumber(topProcessSignal?.signal?.score, 0),
+    toFiniteNumber(topSliceSignal?.score, 0),
+    topActionHintConfidence,
+  ));
+  const symbolGateFloor = round3(computeAdaptiveGate(
+    QUERY_NEXT_ACTION_GATES.symbol_base,
+    QUERY_NEXT_ACTION_GATES.symbol_floor,
+    retrievalSignal,
+  ));
+  const carbonGateFloor = round3(computeAdaptiveGate(
+    QUERY_NEXT_ACTION_GATES.carbon_base,
+    QUERY_NEXT_ACTION_GATES.carbon_floor,
+    retrievalSignal,
+  ));
+  const processGateFloor = round3(computeAdaptiveGate(
+    QUERY_NEXT_ACTION_GATES.process_base,
+    QUERY_NEXT_ACTION_GATES.process_floor,
+    retrievalSignal,
+  ));
+  const computeNextActionRank = (score: number, convergence: number, confidence: number): number => round3(
+    (clampUnit(score) * QUERY_NEXT_ACTION_RANK_WEIGHTS.score)
+    + (clampUnit(convergence) * QUERY_NEXT_ACTION_RANK_WEIGHTS.convergence)
+    + (clampUnit(confidence) * QUERY_NEXT_ACTION_RANK_WEIGHTS.confidence),
+  );
   const nextActionCandidates: QueryNextActionCandidate[] = [];
-  if (topSymbolSignal && toFiniteNumber(topSymbolSignal?.hint?.score, 0) >= QUERY_TOP_SYMBOL_ACTION_MIN_SCORE) {
-    const topSymbolName = String(topSymbolSignal?.symbol?.name || topSymbolSignal?.symbol?.uid || 'top symbol');
-    const score = clampUnit(toFiniteNumber(topSymbolSignal?.hint?.score, 0) / 100);
-    const convergence = 0;
-    const rankScore = round3(
-      (score * QUERY_NEXT_ACTION_RANK_WEIGHTS.score)
-      + (convergence * QUERY_NEXT_ACTION_RANK_WEIGHTS.convergence),
-    );
+  const addNextActionCandidate = (candidate: Omit<QueryNextActionCandidate, 'rank_score'>): void => {
     nextActionCandidates.push({
+      ...candidate,
+      rank_score: computeNextActionRank(candidate.score, candidate.convergence, candidate.confidence),
+    });
+  };
+  const topSymbolScore = clampUnit(toFiniteNumber(topSymbolSignal?.hint?.score, 0) / 100);
+  const topSymbolConvergence = clampUnit(toFiniteNumber(topSymbolSignal?.hint?.convergence, 0));
+  const topCarbonScore = clampUnit(toFiniteNumber(topCarbonCopy?.readiness?.score, 0) / 100);
+  const topCarbonConvergence = clampUnit(toFiniteNumber(topCarbonCopy?.readiness?.convergence?.score, 0));
+  const topProcessScore = clampUnit(toFiniteNumber(topProcessSignal?.signal?.score, 0));
+  const topProcessConvergence = topProcessScore;
+  const symbolGatePassed = Boolean(topSymbolSignal && (toFiniteNumber(topSymbolSignal?.hint?.score, 0) >= symbolGateFloor));
+  const carbonGatePassed = Boolean(topCarbonCopy && (toFiniteNumber(topCarbonCopy?.readiness?.score, 0) >= carbonGateFloor));
+  const processGatePassed = Boolean(topProcessSignal && (toFiniteNumber(topProcessSignal?.signal?.score, 0) >= processGateFloor));
+  if (symbolGatePassed && topSymbolSignal) {
+    const topSymbolName = String(topSymbolSignal?.symbol?.name || topSymbolSignal?.symbol?.uid || 'top symbol');
+    const confidence = clampUnit((topSymbolScore * 0.62) + (topSymbolConvergence * 0.38));
+    addNextActionCandidate({
       source: 'symbol',
+      candidate_origin: 'symbol_threshold',
+      reason_code: 'symbol_passed_adaptive_gate',
       label: topSymbolName,
-      score: round3(score),
-      convergence: round3(convergence),
-      rank_score: rankScore,
+      score: round3(topSymbolScore),
+      convergence: round3(topSymbolConvergence),
+      confidence: round3(confidence),
       action: `Open carbon-copy symbol "${topSymbolName}" first (score ${Math.round(toFiniteNumber(topSymbolSignal?.hint?.score, 0))}).`,
     });
   }
-  if (topCarbonCopy && toFiniteNumber(topCarbonCopy.readiness?.score, 0) >= 55) {
-    const score = clampUnit(toFiniteNumber(topCarbonCopy.readiness?.score, 0) / 100);
-    const convergence = clampUnit(toFiniteNumber(topCarbonCopy.readiness?.convergence?.score, 0));
-    const rankScore = round3(
-      (score * QUERY_NEXT_ACTION_RANK_WEIGHTS.score)
-      + (convergence * QUERY_NEXT_ACTION_RANK_WEIGHTS.convergence),
-    );
-    nextActionCandidates.push({
+  if (carbonGatePassed && topCarbonCopy) {
+    const confidence = clampUnit((topCarbonScore * 0.56) + (topCarbonConvergence * 0.44));
+    addNextActionCandidate({
       source: 'carbon_anchor',
+      candidate_origin: 'carbon_threshold',
+      reason_code: 'carbon_anchor_passed_adaptive_gate',
       label: `${topCarbonCopy.type}:${topCarbonCopy.label}`,
-      score: round3(score),
-      convergence: round3(convergence),
-      rank_score: rankScore,
+      score: round3(topCarbonScore),
+      convergence: round3(topCarbonConvergence),
+      confidence: round3(confidence),
       action: `Carbon-copy anchor: ${topCarbonCopy.type} "${topCarbonCopy.label}" (score ${Math.round(toFiniteNumber(topCarbonCopy.readiness?.score, 0))}).`,
     });
   }
-  if (topProcessSignal && toFiniteNumber(topProcessSignal.signal?.score, 0) > 0) {
+  if (processGatePassed && topProcessSignal) {
     const processSummary = String(topProcessSignal.process?.summary || topProcessSignal.process?.id || 'top process');
-    const score = clampUnit(toFiniteNumber(topProcessSignal.signal?.score, 0));
-    const convergence = score;
-    const rankScore = round3(
-      (score * QUERY_NEXT_ACTION_RANK_WEIGHTS.score)
-      + (convergence * QUERY_NEXT_ACTION_RANK_WEIGHTS.convergence),
-    );
-    nextActionCandidates.push({
+    const confidence = clampUnit((topProcessScore * 0.45) + (topProcessConvergence * 0.55));
+    addNextActionCandidate({
       source: 'process',
+      candidate_origin: 'process_threshold',
+      reason_code: 'process_passed_adaptive_gate',
       label: processSummary,
+      score: round3(topProcessScore),
+      convergence: round3(topProcessConvergence),
+      confidence: round3(confidence),
+      action: `Start with converged process "${processSummary}" (alignment ${Math.round(topProcessScore * 100)}) to mirror strongest in-repo anatomy.`,
+    });
+  }
+  if (topActionHintHop) {
+    const hopRoute = String(topActionHintHop?.http?.reason || topActionHintHop?.endpoint?.name || '').trim();
+    const hopUi = String(topActionHintHop?.ui?.name || topActionHintHop?.ui?.uid || 'ui').trim();
+    const hopController = String(topActionHintHop?.controller?.name || topActionHintHop?.controller?.uid || 'controller').trim();
+    const score = clampUnit((topActionHintConfidence * 0.62) + (retrievalSignal * 0.38));
+    const convergence = clampUnit(Math.max(topProcessScore, topActionHintConfidence * 0.85));
+    const confidence = clampUnit((topActionHintConfidence * 0.7) + (score * 0.3));
+    addNextActionCandidate({
+      source: 'process',
+      candidate_origin: 'action_hint_hop',
+      reason_code: 'action_hint_hop_available',
+      label: hopRoute || `hop:${hopController}`,
       score: round3(score),
       convergence: round3(convergence),
-      rank_score: rankScore,
-      action: `Start with converged process "${processSummary}" (alignment ${Math.round(score * 100)}) to mirror strongest in-repo anatomy.`,
+      confidence: round3(confidence),
+      action: `Follow top HTTP hop "${hopRoute || 'route'}" (${hopUi} -> ${hopController}) first (confidence ${Math.round(topActionHintConfidence * 100)}).`,
     });
+  }
+  let nextActionCoverageReason = 'ranked_candidate_available';
+  let fallbackUsed = false;
+  if (nextActionCandidates.length === 0) {
+    fallbackUsed = true;
+    if (topSymbolSignal) {
+      const topSymbolName = String(topSymbolSignal?.symbol?.name || topSymbolSignal?.symbol?.uid || 'top symbol');
+      const score = clampUnit(Math.max(topSymbolScore, 0.18));
+      const convergence = clampUnit(Math.max(topSymbolConvergence, retrievalSignal * 0.45));
+      const confidence = clampUnit(Math.max(0.35, (score * 0.58) + (convergence * 0.42)));
+      addNextActionCandidate({
+        source: 'symbol',
+        candidate_origin: 'fallback_symbol',
+        reason_code: 'below_adaptive_gate_fallback_symbol',
+        label: topSymbolName,
+        score: round3(score),
+        convergence: round3(convergence),
+        confidence: round3(confidence),
+        action: `Open top lexical symbol "${topSymbolName}" first (fallback path).`,
+      });
+      nextActionCoverageReason = 'fallback_symbol';
+    } else if (topCarbonCopy) {
+      const score = clampUnit(Math.max(topCarbonScore, 0.2));
+      const convergence = clampUnit(Math.max(topCarbonConvergence, retrievalSignal * 0.5));
+      const confidence = clampUnit(Math.max(0.34, (score * 0.6) + (convergence * 0.4)));
+      addNextActionCandidate({
+        source: 'carbon_anchor',
+        candidate_origin: 'fallback_carbon',
+        reason_code: 'below_adaptive_gate_fallback_carbon',
+        label: `${topCarbonCopy.type}:${topCarbonCopy.label}`,
+        score: round3(score),
+        convergence: round3(convergence),
+        confidence: round3(confidence),
+        action: `Start from top carbon-copy anchor "${topCarbonCopy.label}" (fallback path).`,
+      });
+      nextActionCoverageReason = 'fallback_carbon';
+    } else if (topProcessSignal) {
+      const processSummary = String(topProcessSignal.process?.summary || topProcessSignal.process?.id || 'top process');
+      const score = clampUnit(Math.max(topProcessScore, 0.2));
+      const convergence = clampUnit(Math.max(topProcessConvergence, retrievalSignal * 0.5));
+      const confidence = clampUnit(Math.max(0.33, (score * 0.52) + (convergence * 0.48)));
+      addNextActionCandidate({
+        source: 'process',
+        candidate_origin: 'fallback_process',
+        reason_code: 'below_adaptive_gate_fallback_process',
+        label: processSummary,
+        score: round3(score),
+        convergence: round3(convergence),
+        confidence: round3(confidence),
+        action: `Start from top process "${processSummary}" (fallback path).`,
+      });
+      nextActionCoverageReason = 'fallback_process';
+    } else if (symbols.length > 0) {
+      const firstSymbol = symbols[0] || {};
+      const firstSymbolName = String(firstSymbol?.name || firstSymbol?.uid || 'top symbol');
+      const score = clampUnit(Math.max(toFiniteNumber(firstSymbol?.carbon_copy_hint?.score, 0) / 100, 0.16));
+      const convergence = clampUnit(Math.max(toFiniteNumber(firstSymbol?.carbon_copy_hint?.convergence, 0), 0.12));
+      const confidence = clampUnit(Math.max(0.32, (score * 0.6) + (convergence * 0.4)));
+      addNextActionCandidate({
+        source: 'symbol',
+        candidate_origin: 'fallback_symbol',
+        reason_code: 'no_ranked_candidates_fallback_symbol_list',
+        label: firstSymbolName,
+        score: round3(score),
+        convergence: round3(convergence),
+        confidence: round3(confidence),
+        action: `Open top returned symbol "${firstSymbolName}" first (fallback path).`,
+      });
+      nextActionCoverageReason = 'fallback_symbol_list';
+    } else {
+      nextActionCoverageReason = 'no_candidates_available';
+    }
   }
   const prioritizedNextAction = nextActionCandidates
     .slice()
     .sort((left, right) => {
       if (right.rank_score !== left.rank_score) return right.rank_score - left.rank_score;
+      if (right.confidence !== left.confidence) return right.confidence - left.confidence;
       if (right.convergence !== left.convergence) return right.convergence - left.convergence;
       if (right.score !== left.score) return right.score - left.score;
       return left.label.localeCompare(right.label);
@@ -861,13 +1027,31 @@ export async function runQueryMode(
           level: String(topCarbonCopy.readiness?.level || readinessLevel(toFiniteNumber(topCarbonCopy.readiness?.score, 0))),
         }
       : null,
+    next_action_gates: {
+      retrieval_signal: round3(retrievalSignal),
+      symbol_floor: round3(symbolGateFloor),
+      carbon_floor: round3(carbonGateFloor),
+      process_floor: round3(processGateFloor),
+      symbol_passed: symbolGatePassed,
+      carbon_passed: carbonGatePassed,
+      process_passed: processGatePassed,
+      hint_hop_available: Boolean(topActionHintHop),
+    },
+    first_action_coverage: {
+      prioritized_action_present: Boolean(prioritizedNextAction),
+      fallback_used: fallbackUsed,
+      reason_code: nextActionCoverageReason,
+    },
     next_action_ranking_weights: QUERY_NEXT_ACTION_RANK_WEIGHTS,
     prioritized_next_action: prioritizedNextAction
       ? {
           source: prioritizedNextAction.source,
+          candidate_origin: prioritizedNextAction.candidate_origin,
+          reason_code: prioritizedNextAction.reason_code,
           label: prioritizedNextAction.label,
           score: prioritizedNextAction.score,
           convergence: prioritizedNextAction.convergence,
+          confidence: prioritizedNextAction.confidence,
           rank_score: prioritizedNextAction.rank_score,
           action: prioritizedNextAction.action,
         }
@@ -888,9 +1072,9 @@ export async function runQueryMode(
         : [],
       action_hints: includeActionHints
         ? {
-            files: Array.isArray(actionPlanResult?.files) ? actionPlanResult.files.slice(0, 8) : [],
-            checks: Array.isArray(actionPlanResult?.checks) ? actionPlanResult.checks.slice(0, 8) : [],
-            hops: Array.isArray(actionPlanResult?.hops) ? actionPlanResult.hops.slice(0, limitHops) : [],
+            files: actionHintFiles,
+            checks: actionHintChecks,
+            hops: actionHintHops,
           }
         : null,
       hypotheses: Array.from(new Set(hypotheses)).slice(0, 6),

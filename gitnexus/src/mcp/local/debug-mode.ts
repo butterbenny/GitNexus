@@ -643,7 +643,7 @@ export async function runDebugMode(
     };
 
     const candidateLoops: Array<{
-      kind: 'http_loop' | 'cache_loop' | 'slice_gap' | 'runtime_loop' | 'perf_loop';
+      kind: 'http_loop' | 'cache_loop' | 'slice_gap' | 'runtime_loop' | 'perf_loop' | 'fallback_anchor';
       score: number;
       symptom_fit: number;
       confidence: number;
@@ -1377,6 +1377,73 @@ export async function runDebugMode(
       const matchedRouteBoost = matchedRoutes.length > 0 ? Math.min(0.15, matchedRoutes.length * 0.03) : 0;
       return round3(normalizeConfidence(Math.min(1, Math.max(...coverageScores) + matchedRouteBoost), 0));
     };
+    const fallbackAnchorSymbol = (() => {
+      const processSymbols = Array.isArray(queryResult?.process_symbols) ? queryResult.process_symbols : [];
+      const definitionSymbols = Array.isArray(queryResult?.definitions) ? queryResult.definitions : [];
+      const first = processSymbols[0] || definitionSymbols[0] || null;
+      if (!first) return null;
+      const symbolFilePath = normalizeRepoRelativePath(String(first?.filePath || ''));
+      return {
+        uid: String(first?.id || first?.uid || '').trim() || undefined,
+        name: String(first?.name || '').trim() || undefined,
+        kind: String(first?.kind || first?.type || '').trim() || undefined,
+        filePath: symbolFilePath || undefined,
+        startLine: toOptionalNonNegativeInteger(first?.startLine),
+      };
+    })();
+    const fallbackAnchorProcess = (() => {
+      const process = Array.isArray(queryResult?.processes) ? queryResult.processes[0] : null;
+      if (!process) return null;
+      return {
+        id: String(process?.id || '').trim() || undefined,
+        summary: String(process?.summary || process?.id || '').trim() || undefined,
+      };
+    })();
+    const fallbackAnchorFile = (() => {
+      const fileEntry = Array.isArray(actionPlanResult?.files) ? actionPlanResult.files[0] : null;
+      const filePath = normalizeRepoRelativePath(String(fileEntry?.filePath || ''));
+      return filePath || '';
+    })();
+    const fallbackAnchorLabel = String(
+      fallbackAnchorSymbol?.name
+      || fallbackAnchorProcess?.summary
+      || fallbackAnchorFile
+      || seedQuery
+      || 'target',
+    ).trim();
+    const fallbackAnchorSummary = fallbackAnchorProcess?.summary
+      ? `${fallbackAnchorProcess.summary}`
+      : fallbackAnchorSymbol?.filePath
+        ? `${fallbackAnchorLabel} (${fallbackAnchorSymbol.filePath})`
+        : fallbackAnchorLabel;
+    const fallbackAnchorEvidenceFilePath = String(
+      fallbackAnchorSymbol?.filePath
+      || fallbackAnchorFile
+      || '',
+    ).trim();
+    let fallbackCandidateInjected = false;
+    if (candidateLoops.length === 0) {
+      fallbackCandidateInjected = true;
+      candidateLoops.push({
+        kind: 'fallback_anchor',
+        score: 1.2,
+        symptom_fit: symptomSignal.family === 'unknown' ? 0.6 : 1.2,
+        confidence: Number(normalizeConfidence(
+          0.38 + (symptomSignal.family === 'unknown' ? 0.08 : 0.16),
+          0.38,
+        ).toFixed(3)),
+        confidence_reason: 'Fallback candidate synthesized from query/process anchors because no high-confidence loop candidates were found.',
+        symptom_fit_reasons: ['fallback-anchor'],
+        summary: `Fallback anchor for "${fallbackAnchorSummary}"`,
+        findings: ['low-signal-fallback-anchor'],
+        fix_recipes: [],
+        evidence: {
+          filePath: fallbackAnchorEvidenceFilePath || undefined,
+          symbol: fallbackAnchorSymbol || undefined,
+          process: fallbackAnchorProcess || undefined,
+        },
+      });
+    }
     const maxRawScore = Math.max(
       1,
       ...candidateLoops.map(candidate => toFiniteNumber(candidate?.score, 0)),
@@ -1472,7 +1539,16 @@ export async function runDebugMode(
       ).trim();
       return `Start with top-ranked candidate: open context() for ${targetLabel} and validate evidence before patching.`;
     };
-    const buildPrioritizedCandidate = (candidate: any, source: 'converged' | 'ranked'): any => {
+    const buildFallbackAction = (candidate: any): string => {
+      const targetLabel = String(
+        candidate?.evidence?.symbol?.name
+        || candidate?.evidence?.filePath
+        || candidate?.summary
+        || 'fallback anchor',
+      ).trim();
+      return `Start with fallback candidate: open context() for ${targetLabel}, confirm closest route/symbol ownership, then tighten the symptom anchor and rerun debug_mode.`;
+    };
+    const buildPrioritizedCandidate = (candidate: any, source: 'converged' | 'ranked' | 'fallback'): any => {
       if (!candidate) return null;
       const candidateIndex = rankedCandidates.findIndex((entry: any) =>
         String(entry?.kind || '') === String(candidate?.kind || '')
@@ -1486,7 +1562,9 @@ export async function runDebugMode(
       const selectedEndpoint = topMatchedRoute?.endpoint || hopEndpoint || null;
       const nextAction = source === 'converged'
         ? buildConvergedAction(candidate)
-        : buildRankedAction(candidate);
+        : source === 'fallback'
+          ? buildFallbackAction(candidate)
+          : buildRankedAction(candidate);
       return {
         source,
         candidate_index: candidateIndex >= 0 ? candidateIndex : 0,
@@ -1523,7 +1601,12 @@ export async function runDebugMode(
     };
     const prioritizedCandidate = topConvergedCandidate
       ? buildPrioritizedCandidate(topConvergedCandidate, 'converged')
-      : (topRankedCandidate ? buildPrioritizedCandidate(topRankedCandidate, 'ranked') : null);
+      : (topRankedCandidate
+        ? buildPrioritizedCandidate(
+            topRankedCandidate,
+            String(topRankedCandidate?.kind || '').trim() === 'fallback_anchor' ? 'fallback' : 'ranked',
+          )
+        : null);
 
     const siblingDiff = (() => {
       const precedents = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
@@ -1593,6 +1676,9 @@ export async function runDebugMode(
     }
     if (!hasRuntimeObservations) {
       nextActions.push('Attach runtime_observations (request spans, DB timings, lock waits) for stronger root-cause ranking.');
+    }
+    if (fallbackCandidateInjected) {
+      nextActions.push('No high-confidence candidates were found; narrow query/symptom with an explicit symbol or route, then rerun debug_mode.');
     }
     if (!hasPrecedentResults() && includePrecedents) {
       nextActions.push('Precedent retrieval returned empty; rely on action_plan hops + context() before editing.');
@@ -1664,6 +1750,9 @@ export async function runDebugMode(
     }
     if (scannedPerfFiles.length === 0) {
       coverageWarnings.push('Static hot-path scan found no strong loop/query/write signals in scanned files.');
+    }
+    if (fallbackCandidateInjected) {
+      coverageWarnings.push('Fallback candidate was used because no high-confidence ranked candidates were found.');
     }
 
     const hopOwnershipConfidence = hops.length > 0
@@ -1782,6 +1871,8 @@ export async function runDebugMode(
           route_index_patterns: runtimeRoutePatterns.length,
           hops_with_runtime_matches: hopsWithRuntimeMatches,
           converged_candidates: convergedCandidateCount,
+          fallback_candidate_used: fallbackCandidateInjected,
+          prioritized_candidate_source: String(prioritizedCandidate?.source || ''),
           runtime_route_matches: {
             request_spans_with_route: runtimeRouteMatcherStats.request_spans_with_route,
             request_spans_matched: runtimeRouteMatcherStats.request_spans_matched,
@@ -1807,6 +1898,7 @@ export async function runDebugMode(
           route_index_patterns: runtimeRoutePatterns.length,
           route_match_ratio: round3(runtimeRouteMatchRatio),
           route_converged_candidates: convergedCandidateCount,
+          fallback_candidate_used: fallbackCandidateInjected,
         },
         ranking: {
           candidate_weights: DEBUG_CANDIDATE_RANK_WEIGHTS,

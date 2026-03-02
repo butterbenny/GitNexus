@@ -144,10 +144,33 @@ test('runQueryMode reranks slices/processes using convergence matrix signals', a
   assert.ok((result._query_mode?.convergence?.top_symbol_signal?.score || 0) > 0);
   assert.ok((result._query_mode?.convergence?.symbol_ranking_weights?.lexical || 0) > 0);
   assert.ok((result._query_mode?.convergence?.next_action_ranking_weights?.score || 0) > 0);
-  assert.equal(result._query_mode?.convergence?.prioritized_next_action?.source, 'process');
+  assert.ok(
+    ['symbol', 'carbon_anchor', 'process'].includes(String(result._query_mode?.convergence?.prioritized_next_action?.source || '')),
+    'expected prioritized next action source',
+  );
+  assert.ok(
+    typeof result._query_mode?.convergence?.prioritized_next_action?.candidate_origin === 'string',
+    'expected prioritized next action candidate origin',
+  );
+  assert.ok(
+    typeof result._query_mode?.convergence?.prioritized_next_action?.reason_code === 'string',
+    'expected prioritized next action reason code',
+  );
+  assert.ok(
+    typeof result._query_mode?.convergence?.prioritized_next_action?.confidence === 'number',
+    'expected prioritized next action confidence',
+  );
   assert.equal(
     result._query_mode?.convergence?.prioritized_next_action?.action,
     result.query_mode?.next_actions?.[0],
+  );
+  assert.ok(
+    typeof result._query_mode?.convergence?.next_action_gates?.retrieval_signal === 'number',
+    'expected next action gate diagnostics',
+  );
+  assert.equal(
+    typeof result._query_mode?.convergence?.first_action_coverage?.prioritized_action_present,
+    'boolean',
   );
   assert.ok(result.query_mode?.carbon_copy_ready, 'expected carbon_copy_ready summary');
   assert.ok((result.query_mode?.carbon_copy_ready?.score || 0) > 0);
@@ -207,16 +230,65 @@ test('runQueryMode uses lexical fallback for symbol ranking when convergence is 
   assert.ok((result.query_mode.symbols[0]?.carbon_copy_hint?.score || 0) > 0);
   assert.ok((result._query_mode?.convergence?.symbols_boosted || 0) > 0);
   assert.equal(result._query_mode?.convergence?.enabled, false);
-  if (result._query_mode?.convergence?.prioritized_next_action?.action) {
-    assert.equal(result._query_mode?.convergence?.prioritized_next_action?.source, 'symbol');
-    assert.equal(
-      result._query_mode?.convergence?.prioritized_next_action?.action,
-      result.query_mode?.next_actions?.[0],
-    );
-  } else {
-    assert.equal(
-      result.query_mode?.next_actions?.[0],
-      'Open top-ranked symbols with context() to inspect incoming/outgoing references.',
-    );
-  }
+  assert.ok(result._query_mode?.convergence?.prioritized_next_action?.action);
+  assert.equal(result._query_mode?.convergence?.prioritized_next_action?.source, 'symbol');
+  assert.equal(
+    result._query_mode?.convergence?.prioritized_next_action?.action,
+    result.query_mode?.next_actions?.[0],
+  );
+  assert.equal(result._query_mode?.convergence?.first_action_coverage?.prioritized_action_present, true);
+  assert.ok(
+    typeof result._query_mode?.convergence?.first_action_coverage?.reason_code === 'string',
+    'expected first-action coverage reason code',
+  );
+});
+
+test('runQueryMode emits fallback prioritized action when adaptive thresholds reject all primary candidates', async () => {
+  const repo = {
+    name: 'monorepo',
+    repoPath: '/Users/benny/monorepo',
+  };
+
+  const queryResult = {
+    query_plan: {
+      exact_lookup: { hits: 0, used: false },
+    },
+    slice_cards: [],
+    processes: [],
+    process_symbols: [
+      {
+        process_id: '',
+        filePath: 'apps/backend/app/Services/LowSignalService.php',
+        name: 'fallbackCandidate',
+      },
+    ],
+    definitions: [],
+  };
+
+  const result = await runQueryMode(
+    {
+      query: async () => queryResult,
+      precedents: async () => ({ precedents: [] }),
+      actionPlan: async () => ({ files: [], checks: [], hops: [] }),
+      parsePathPrefixes: () => [],
+      clampInteger,
+      toFiniteNumber,
+      loadConvergenceMatrix: async () => null,
+    },
+    repo,
+    {
+      query: 'fallback candidate',
+      include_precedents: false,
+      include_action_hints: true,
+    },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.ok(result._query_mode?.convergence?.prioritized_next_action?.action);
+  assert.equal(result._query_mode?.convergence?.prioritized_next_action?.source, 'symbol');
+  assert.ok(
+    String(result._query_mode?.convergence?.prioritized_next_action?.candidate_origin || '').startsWith('fallback_'),
+    'expected fallback candidate origin',
+  );
+  assert.equal(result._query_mode?.convergence?.first_action_coverage?.prioritized_action_present, true);
 });

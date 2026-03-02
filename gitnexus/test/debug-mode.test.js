@@ -391,3 +391,49 @@ test('MCP debug_mode: auto-loads runtime observations from snapshot sidecar', as
     'expected runtime snapshot findings in candidates',
   );
 });
+
+test('MCP debug_mode: emits fallback prioritized candidate when ranked pool is sparse', async () => {
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-debug-mode-fallback-candidate-'));
+  const repoPath = path.join(tmpRoot, 'repo');
+
+  await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
+  await fs.writeFile(
+    path.join(repoPath, 'src/plainPath.ts'),
+    [
+      'export const plainPath = (): number => 1;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  runGit(repoPath, ['init']);
+  runGit(repoPath, ['config', 'user.email', 'test@example.com']);
+  runGit(repoPath, ['config', 'user.name', 'GitNexus Test']);
+  runGit(repoPath, ['add', '.']);
+  runGit(repoPath, ['commit', '-m', 'init']);
+
+  const env = { GITNEXUS_HOME: path.join(tmpRoot, 'global'), GITNEXUS_DISABLE_CLAUDE_HOOK: '1' };
+  const output = runAnalyze(repoPath, env);
+  assert.match(output, /Repository indexed successfully/i);
+
+  const debug = runTool('debug_mode', {
+    query: 'plainPath',
+    symptom: 'intermittent unknown behavior',
+  }, env);
+
+  assert.equal(debug.status, 'ok');
+  assert.ok(Array.isArray(debug.debug?.candidates) && debug.debug.candidates.length > 0, 'expected fallback candidate in candidate list');
+  assert.ok(debug.debug?.prioritized_candidate, 'expected prioritized fallback candidate');
+  assert.equal(debug.debug.prioritized_candidate.source, 'fallback');
+  assert.ok(
+    Array.isArray(debug.debug?.prioritized_candidate?.findings)
+      && debug.debug.prioritized_candidate.findings.includes('low-signal-fallback-anchor'),
+    'expected low-signal fallback finding',
+  );
+  assert.ok(
+    String(debug.debug?.next_actions?.[0] || '').startsWith('Start with fallback candidate'),
+    'expected first next action to use fallback candidate guidance',
+  );
+  assert.equal(debug.debug?.coverage?.fallback_candidate_used, true);
+  assert.equal(debug._debug_mode?.knobs?.fallback_candidate_used, true);
+});

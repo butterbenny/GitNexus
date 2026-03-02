@@ -86,16 +86,27 @@ const CYPHER_WRITE_KEYWORD_RE = new RegExp(
  */
 function isTestFilePath(filePath: string): boolean {
   const p = filePath.toLowerCase().replace(/\\/g, '/');
+  const hasExplicitTestSuffix = (
+    p.includes('.test.')
+    || p.includes('.spec.')
+    || p.endsWith('_test.go')
+    || p.endsWith('_test.py')
+    || p.includes('/test_')
+    || p.includes('/conftest.')
+  );
+  if (hasExplicitTestSuffix) return true;
+
+  if (!/\.(php|js|jsx|ts|tsx|mjs|cjs|py|go|rb|java|kt|rs|cs|swift|scala|svelte|vue)$/i.test(p)) {
+    return false;
+  }
+
   return (
-    p.includes('.test.') || p.includes('.spec.') ||
     p.startsWith('__tests__/') || p.includes('/__tests__/') ||
     p.startsWith('__mocks__/') || p.includes('/__mocks__/') ||
     p.startsWith('test/') || p.includes('/test/') ||
     p.startsWith('tests/') || p.includes('/tests/') ||
     p.startsWith('testing/') || p.includes('/testing/') ||
-    p.startsWith('fixtures/') || p.includes('/fixtures/') ||
-    p.endsWith('_test.go') || p.endsWith('_test.py') ||
-    p.includes('/test_') || p.includes('/conftest.')
+    p.startsWith('fixtures/') || p.includes('/fixtures/')
   );
 }
 
