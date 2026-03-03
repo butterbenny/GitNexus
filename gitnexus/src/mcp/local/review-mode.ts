@@ -4349,7 +4349,17 @@ export async function runReviewMode(
     }
 
     const frontendHygieneSignals: Array<{
-      code: 'prop-drilling-score' | 'nested-component-declaration' | 'signature-too-many-args' | 'inline-param-type-object';
+      code:
+        | 'prop-drilling-score'
+        | 'nested-component-declaration'
+        | 'signature-too-many-args'
+        | 'inline-param-type-object'
+        | 'default-export'
+        | 'todo-comment'
+        | 'react-fc'
+        | 'react-usecontext'
+        | 'react-context-provider'
+        | 'tailwind-space-class';
       filePath: string;
       line: number;
       summary: string;
@@ -4476,6 +4486,12 @@ export async function runReviewMode(
     const nestedComponentFnRegex = /\bfunction\s+([A-Z][A-Za-z0-9_]*)\s*\(/;
     const nestedComponentConstRegex = /\bconst\s+([A-Z][A-Za-z0-9_]*)\b[^=]*=\s*\(/;
     const inlineParamObjectRegex = /:\s*\{/;
+    const defaultExportRegex = /\bexport\s+default\b/;
+    const todoCommentRegex = /(?:\/\/|\/\*).*?\b(?:TODO|FIXME)\b/i;
+    const reactFcRegex = /\bReact\.(?:FC|FunctionComponent)\b/;
+    const useContextRegex = /\buseContext\s*\(/;
+    const providerJsxRegex = /<\s*[A-Za-z_$][\w$]*\.Provider\b/;
+    const tailwindSpaceRegex = /\bspace-(?:x|y)-/;
 
     for (const filePath of frontendScanTargets) {
       const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
@@ -4704,6 +4720,113 @@ export async function runReviewMode(
             confidence: 0.84,
             reason: 'typescript-inline-param-object-type',
             summary: `Inline object type in parameter list at line ${inlineParamType.line} (${inlineParamType.name}). Prefer a named type/interface.`,
+          });
+        }
+      }
+
+      // Monorepo conventions (heuristic): avoid default exports, TODO/FIXME, React.FC, legacy Context APIs, and Tailwind space-*.
+      {
+        let defaultExportLine = 0;
+        let todoLine = 0;
+        let reactFcLine = 0;
+        let useContextLine = 0;
+        let providerLine = 0;
+        let tailwindSpaceLine = 0;
+
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const lineNo = idx + 1;
+          if (!lineNearChanged(lineNo)) continue;
+
+          const rawLine = String(lines[idx] || '');
+          const codeLine = rawLine.replace(/\/\/.*$/g, '');
+
+          if (!defaultExportLine && defaultExportRegex.test(codeLine)) defaultExportLine = lineNo;
+          if (!todoLine && todoCommentRegex.test(rawLine)) todoLine = lineNo;
+          if (!reactFcLine && reactFcRegex.test(codeLine)) reactFcLine = lineNo;
+          if (!useContextLine && useContextRegex.test(codeLine)) useContextLine = lineNo;
+          if (!providerLine && isJsxFile && providerJsxRegex.test(codeLine)) providerLine = lineNo;
+          if (!tailwindSpaceLine && tailwindSpaceRegex.test(codeLine)) tailwindSpaceLine = lineNo;
+
+          if (
+            defaultExportLine
+            && todoLine
+            && reactFcLine
+            && useContextLine
+            && (!isJsxFile || (providerLine && tailwindSpaceLine))
+          ) {
+            break;
+          }
+        }
+
+        if (defaultExportLine) {
+          frontendHygieneSignals.push({
+            code: 'default-export',
+            filePath,
+            line: defaultExportLine,
+            severity: 'medium',
+            confidence: 0.96,
+            reason: 'frontend-default-export',
+            summary: `Default export detected near line ${defaultExportLine}. Prefer named exports (monorepo convention).`,
+          });
+        }
+
+        if (todoLine) {
+          frontendHygieneSignals.push({
+            code: 'todo-comment',
+            filePath,
+            line: todoLine,
+            severity: 'medium',
+            confidence: 0.92,
+            reason: 'frontend-todo-comment',
+            summary: `TODO/FIXME comment detected near line ${todoLine}. Prefer resolving before merge or filing a ticket.`,
+          });
+        }
+
+        if (reactFcLine) {
+          frontendHygieneSignals.push({
+            code: 'react-fc',
+            filePath,
+            line: reactFcLine,
+            severity: 'low',
+            confidence: 0.9,
+            reason: 'frontend-react-fc',
+            summary: `React.FC usage detected near line ${reactFcLine}. Prefer explicit props types without React.FC (monorepo convention).`,
+          });
+        }
+
+        if (useContextLine) {
+          frontendHygieneSignals.push({
+            code: 'react-usecontext',
+            filePath,
+            line: useContextLine,
+            severity: 'low',
+            confidence: 0.8,
+            reason: 'frontend-react-usecontext',
+            summary: `useContext(...) detected near line ${useContextLine}. Prefer React 19 use(Context) when available (monorepo convention).`,
+          });
+        }
+
+        if (providerLine) {
+          frontendHygieneSignals.push({
+            code: 'react-context-provider',
+            filePath,
+            line: providerLine,
+            severity: 'low',
+            confidence: 0.8,
+            reason: 'frontend-react-context-provider',
+            summary: `<Context.Provider ...> detected near line ${providerLine}. Prefer React 19 <Context value={...}> when available (monorepo convention).`,
+          });
+        }
+
+        if (tailwindSpaceLine) {
+          frontendHygieneSignals.push({
+            code: 'tailwind-space-class',
+            filePath,
+            line: tailwindSpaceLine,
+            severity: 'low',
+            confidence: 0.86,
+            reason: 'frontend-tailwind-space-class',
+            summary: `Tailwind space-* class detected near line ${tailwindSpaceLine}. Prefer explicit gap/margin (monorepo convention).`,
           });
         }
       }

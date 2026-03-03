@@ -48,7 +48,10 @@ export const computeEmbeddingTextHash = (text: string, meta: EmbeddingCacheMeta)
 };
 
 export const encodeEmbeddingBase64 = (embedding: number[]): string => {
-  const arr = new Float32Array(embedding.map(value => Number(value) || 0));
+  const arr = new Float32Array(embedding.length);
+  for (let i = 0; i < embedding.length; i += 1) {
+    arr[i] = Number(embedding[i]) || 0;
+  }
   return Buffer.from(arr.buffer).toString('base64');
 };
 

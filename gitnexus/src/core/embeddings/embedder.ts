@@ -269,6 +269,17 @@ export const embedBatchToArrays = async (texts: string[]): Promise<number[][]> =
   const dimensions = DEFAULT_EMBEDDING_CONFIG.dimensions;
   const embeddings: number[][] = new Array(texts.length);
 
+  // Fast-path: typed arrays support subarray without building per-element JS arrays manually.
+  if (ArrayBuffer.isView(data) && typeof (data as any).subarray === 'function') {
+    const typed = data as unknown as { subarray: (start: number, end: number) => ArrayLike<number> };
+    for (let i = 0; i < texts.length; i++) {
+      const start = i * dimensions;
+      const end = start + dimensions;
+      embeddings[i] = Array.from(typed.subarray(start, end) as any);
+    }
+    return embeddings;
+  }
+
   for (let i = 0; i < texts.length; i++) {
     const start = i * dimensions;
     const embedding = new Array<number>(dimensions);

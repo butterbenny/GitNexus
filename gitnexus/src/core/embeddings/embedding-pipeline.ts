@@ -190,93 +190,19 @@ export const runEmbeddingPipeline = async (
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
   const cacheMeta = { modelId: finalConfig.modelId, dimensions: finalConfig.dimensions };
   const cachePath = String(options?.cachePath || '').trim();
-  const cacheEnabled = Boolean(cachePath);
+  const cacheEnabledRequested = Boolean(cachePath);
   const expectedEmbeddingBase64Length = Math.ceil((Math.max(0, finalConfig.dimensions) * 4) / 3) * 4;
-  const { byHash: embeddingCache, loadedVersion: embeddingCacheVersion } = cacheEnabled
-    ? await loadEmbeddingCache(cachePath, cacheMeta)
-    : { byHash: new Map<string, string>(), loadedVersion: 0 };
+  let cacheEnabledForRun = cacheEnabledRequested;
+  let embeddingCache = new Map<string, string>();
+  let embeddingCacheVersion = 0;
   let cacheWrites = 0;
 
   try {
-    if (cacheEnabled && embeddingCache.size === 0) {
-      try {
-        for (const label of EMBEDDABLE_LABELS) {
-          let query: string;
-          if (label === 'File') {
-            query = `
-              MATCH (n:File)
-              MATCH (e:CodeEmbedding {nodeId: n.id})
-              RETURN n.id AS id, n.name AS name, 'File' AS label,
-                     n.filePath AS filePath, n.content AS content,
-                     e.embedding AS embedding
-            `;
-          } else {
-            query = `
-              MATCH (n:${label})
-              MATCH (e:CodeEmbedding {nodeId: n.id})
-              RETURN n.id AS id, n.name AS name, '${label}' AS label,
-                     n.filePath AS filePath, n.content AS content,
-                     n.startLine AS startLine, n.endLine AS endLine,
-                     e.embedding AS embedding
-            `;
-          }
-
-          const rows = await executeQuery(query);
-          if (!Array.isArray(rows) || rows.length === 0) continue;
-
-          const nodesForText: EmbeddableNode[] = [];
-          const embeddingsForNode: number[][] = [];
-          for (const row of rows as any[]) {
-            const id = row.id ?? row[0];
-            if (!id) continue;
-            const embedding = row.embedding ?? (label === 'File' ? row[5] : row[7]);
-            if (!embedding) continue;
-            const embeddingArray = Array.isArray(embedding)
-              ? embedding.map(Number)
-              : Array.from(embedding as any).map(Number);
-            if (finalConfig.dimensions > 0 && embeddingArray.length !== finalConfig.dimensions) continue;
-
-            nodesForText.push({
-              id,
-              name: row.name ?? row[1],
-              label: row.label ?? row[2],
-              filePath: row.filePath ?? row[3],
-              content: row.content ?? row[4] ?? '',
-              startLine: label === 'File' ? undefined : (row.startLine ?? row[5]),
-              endLine: label === 'File' ? undefined : (row.endLine ?? row[6]),
-            });
-            embeddingsForNode.push(embeddingArray);
-          }
-          if (nodesForText.length === 0) continue;
-
-          for (let start = 0; start < nodesForText.length; start += 512) {
-            const chunkNodes = nodesForText.slice(start, Math.min(nodesForText.length, start + 512));
-            const chunkEmbeddings = embeddingsForNode.slice(start, Math.min(embeddingsForNode.length, start + 512));
-            const texts = generateBatchEmbeddingTexts(chunkNodes, finalConfig);
-            for (let i = 0; i < chunkNodes.length; i += 1) {
-              const node = chunkNodes[i];
-              const embedding = chunkEmbeddings[i];
-              if (!node?.id || !embedding) continue;
-              const text = texts[i] || '';
-              const hash = computeEmbeddingTextHash(text, cacheMeta);
-              const embeddingBase64 = encodeEmbeddingBase64(embedding);
-              if (!hash || !embeddingBase64 || embeddingBase64.length !== expectedEmbeddingBase64Length) continue;
-              if (embeddingCache.has(hash)) continue;
-              embeddingCache.set(hash, embeddingBase64);
-              cacheWrites += 1;
-            }
-          }
-        }
-      } catch {
-        // best-effort: cache warm is optional
-      }
-    }
-
     if (isDev) {
       console.log('🔍 Querying embeddable nodes...');
     }
 
-    // Phase 1: Query embeddable nodes (avoid loading model if there's nothing to embed)
+    // Phase 1: Query embeddable nodes (avoid loading model/cache if there's nothing to embed)
     let nodes = await queryEmbeddableNodes(executeQuery);
 
     const totalNodes = nodes.length;
@@ -293,6 +219,27 @@ export const runEmbeddingPipeline = async (
         totalNodes: 0,
       });
       return;
+    }
+
+    // Only load the embedding cache when we're doing a cold embedding build (no embeddings exist yet).
+    // Incremental runs almost always miss the cache (content hashes changed) and paying to parse a large cache
+    // file can dominate runtime on big repos.
+    if (cacheEnabledRequested) {
+      let hasAnyEmbeddings = false;
+      try {
+        const rows = await executeQuery(`MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId LIMIT 1`);
+        hasAnyEmbeddings = Array.isArray(rows) && rows.length > 0;
+      } catch {
+        hasAnyEmbeddings = false;
+      }
+
+      if (hasAnyEmbeddings) {
+        cacheEnabledForRun = false;
+      } else {
+        const loaded = await loadEmbeddingCache(cachePath, cacheMeta);
+        embeddingCache = loaded.byHash;
+        embeddingCacheVersion = loaded.loadedVersion;
+      }
     }
 
     // Phase 2: Load embedding model only when needed.
@@ -357,7 +304,7 @@ export const runEmbeddingPipeline = async (
       const missTexts: string[] = [];
       const missHashes: string[] = [];
 
-      if (cacheEnabled && embeddingCache.size > 0) {
+      if (cacheEnabledForRun && embeddingCache.size > 0) {
         for (let i = 0; i < batch.length; i += 1) {
           const node = batch[i];
           const text = texts[i] || '';
@@ -385,7 +332,9 @@ export const runEmbeddingPipeline = async (
         // No cache: embed all nodes in this batch.
         missNodes.push(...batch);
         missTexts.push(...texts);
-        missHashes.push(...texts.map(text => computeEmbeddingTextHash(text, cacheMeta)));
+        if (cacheEnabledForRun) {
+          missHashes.push(...texts.map(text => computeEmbeddingTextHash(text, cacheMeta)));
+        }
       }
 
       let embeddedUpdates: Array<{ id: string; embedding: number[] }> = [];
@@ -422,7 +371,7 @@ export const runEmbeddingPipeline = async (
           embedding: embeddings[i],
         }));
 
-        if (cacheEnabled) {
+        if (cacheEnabledForRun) {
           for (let i = 0; i < embeddedUpdates.length; i += 1) {
             const update = embeddedUpdates[i];
             const hash = missHashes[i] || computeEmbeddingTextHash(missTexts[i] || '', cacheMeta);
@@ -469,7 +418,7 @@ export const runEmbeddingPipeline = async (
 
     await createVectorIndex(executeQuery);
 
-    if (cacheEnabled && embeddingCache.size > 0 && (cacheWrites > 0 || embeddingCacheVersion === 1)) {
+    if (cacheEnabledForRun && embeddingCache.size > 0 && (cacheWrites > 0 || embeddingCacheVersion === 1)) {
       try {
         await saveEmbeddingCache(cachePath, cacheMeta, embeddingCache);
       } catch (error) {

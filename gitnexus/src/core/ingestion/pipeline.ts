@@ -27,6 +27,7 @@ import { processBladeTemplates } from './blade-template-processor.js';
 import { processBladeAuthorization } from './blade-auth-processor.js';
 import { processMjmlIncludes } from './mjml-template-processor.js';
 import { processPatternCatalogTemplates } from './pattern-catalog-processor.js';
+import { processAgentDocs } from './agent-docs-processor.js';
 import { processTemplateMethodCallWiring } from './template-method-call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -117,6 +118,7 @@ export const runPipelineFromRepo = async (
     processStructure(graph, filePaths);
 
     processPatternCatalogTemplates(graph, files, allFilePathSet);
+    processAgentDocs(graph, files, allFilePathSet);
     processBladeTemplates(graph, files);
     processMjmlIncludes(graph, files, allFilePathSet);
 

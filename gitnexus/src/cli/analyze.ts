@@ -253,12 +253,19 @@ export const analyzeCommand = async (
       }
     }
   } else if (monorepoProfile) {
-    // Default (monorepo): prefer global cache only when it already exists (avoid cold-cache full recompute).
+    // Default (monorepo): use the global embedding cache so worktrees share embeddings.
+    // Best-effort seed from the repo cache to avoid re-embedding when a worktree already has a cache.
+    embeddingCachePath = globalEmbeddingCachePath;
     try {
       await fs.access(globalEmbeddingCachePath);
-      embeddingCachePath = globalEmbeddingCachePath;
     } catch {
-      embeddingCachePath = repoEmbeddingCachePath;
+      try {
+        await fs.access(repoEmbeddingCachePath);
+        await fs.mkdir(path.dirname(globalEmbeddingCachePath), { recursive: true });
+        await fs.copyFile(repoEmbeddingCachePath, globalEmbeddingCachePath);
+      } catch {
+        // best-effort
+      }
     }
   } else {
     embeddingCachePath = repoEmbeddingCachePath;
