@@ -140,7 +140,7 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 | `archetypes`     | Flow signatures + exemplar processes (“more than a map”)          | Optional       |
 | `precedents`     | Precedent/template finder: exemplars with similar anatomy         | Optional       |
 
-> When only one repo is indexed, the `repo` parameter is optional. With multiple repos, specify which one: `query({query: "auth", repo: "my-app"})`.
+> When only one repo is indexed, the `repo` parameter is optional. With multiple repos/worktrees, prefer absolute-path routing: `query({query: "auth", repo: "/abs/path/to/repo"})` (copy `repo_param` from `gitnexus://repos`).
 
 **Resources** for instant context:
 
@@ -153,6 +153,8 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 | `gitnexus://repo/{name}/processes`      | All execution flows                                  |
 | `gitnexus://repo/{name}/process/{name}` | Full process trace with steps                        |
 | `gitnexus://repo/{name}/schema`         | Graph schema for Cypher queries                      |
+
+> Worktrees: `{name}` can be a repo name or a URL-encoded absolute path. Prefer the path-encoded URIs shown in `gitnexus://repos` (see `mcp_uri_context`).
 
 **2 MCP prompts** for guided workflows:
 
@@ -173,6 +175,8 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 ## Multi-Repo MCP Architecture
 
 GitNexus uses a **global registry** so one MCP server can serve multiple indexed repos. No per-project MCP config needed — set it up once and it works everywhere.
+
+Worktrees do **not** share index state: each worktree stores its index at `<repo>/.gitnexus/`. The global registry (`~/.gitnexus/registry.json`) is discovery-only; repo names can collide across worktrees, so route by absolute path (or path-encoded MCP URIs from `gitnexus://repos`).
 
 ```mermaid
 flowchart TD

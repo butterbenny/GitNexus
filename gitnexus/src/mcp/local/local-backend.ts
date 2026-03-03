@@ -301,6 +301,18 @@ function extractBacktickFilePaths(line: string): string[] {
   return out;
 }
 
+function extractPatternCatalogCategory(content: string): string {
+  const lines = String(content || '').split('\n');
+  for (const line of lines.slice(0, 4)) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed) continue;
+    const match = /^category:\s*(.+)$/i.exec(trimmed);
+    if (match) return String(match[1] || '').trim();
+    break;
+  }
+  return '';
+}
+
 function parsePatternCatalogMarkdown(content: string): PatternCatalogSection[] {
   const lines = String(content || '').split('\n');
   const sections: PatternCatalogSection[] = [];
@@ -379,6 +391,82 @@ function parsePatternCatalogMarkdown(content: string): PatternCatalogSection[] {
 
   finalizeCurrent();
   return sections;
+}
+
+async function loadPatternCatalogSectionsFromGraph(repoId: string): Promise<{ relativePath: string; sections: PatternCatalogSection[] } | null> {
+  const catalogPath = '.agents/review/pattern-catalog.md';
+  try {
+    const sectionRows = await executeQuery(repoId, `
+      MATCH (s:CodeElement)
+      WHERE s.filePath = '${catalogPath}'
+        AND s.id STARTS WITH 'CodeElement:pattern-catalog:'
+      RETURN s.id AS sectionId, s.name AS title, s.content AS content
+    `);
+
+    const sectionsById = new Map<string, PatternCatalogSection>();
+    for (const row of sectionRows) {
+      const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+      const title = String((row as any).title ?? (row as any)[1] ?? '').trim();
+      const content = String((row as any).content ?? (row as any)[2] ?? '').trim();
+      if (!sectionId || !title) continue;
+      sectionsById.set(sectionId, {
+        category: extractPatternCatalogCategory(content),
+        title,
+        templateFiles: [],
+        alsoGoodFiles: [],
+        otherFiles: [],
+        tokenSet: new Set<string>(),
+      });
+    }
+    if (sectionsById.size === 0) return null;
+
+    const edgeRows = await executeQuery(repoId, `
+      MATCH (s:CodeElement)-[r:CodeRelation {type: 'USES'}]->(f:File)
+      WHERE s.filePath = '${catalogPath}'
+        AND s.id STARTS WITH 'CodeElement:pattern-catalog:'
+      RETURN s.id AS sectionId, f.filePath AS filePath, r.reason AS reason
+    `);
+
+    for (const row of edgeRows) {
+      const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+      if (!sectionId) continue;
+      const section = sectionsById.get(sectionId);
+      if (!section) continue;
+
+      const filePath = normalizeRepoRelativePath(String((row as any).filePath ?? (row as any)[1] ?? '').trim());
+      if (!filePath) continue;
+
+      const reason = String((row as any).reason ?? (row as any)[2] ?? '').trim().toLowerCase();
+      if (reason === 'pattern-catalog:template') {
+        section.templateFiles.push(filePath);
+        continue;
+      }
+      if (reason === 'pattern-catalog:also-good') {
+        section.alsoGoodFiles.push(filePath);
+        continue;
+      }
+      if (reason === 'pattern-catalog:other') {
+        section.otherFiles.push(filePath);
+      }
+    }
+
+    const dedupe = (items: string[]) => Array.from(new Set(items.map(item => normalizeRepoRelativePath(item)).filter(Boolean)));
+    for (const section of sectionsById.values()) {
+      section.templateFiles = dedupe(section.templateFiles);
+      section.alsoGoodFiles = dedupe(section.alsoGoodFiles);
+      section.otherFiles = dedupe(section.otherFiles);
+      section.tokenSet = new Set<string>([
+        ...tokenizePatternCatalogText(section.category),
+        ...tokenizePatternCatalogText(section.title),
+        ...section.templateFiles.flatMap(tokenizePatternCatalogText),
+        ...section.alsoGoodFiles.flatMap(tokenizePatternCatalogText),
+      ]);
+    }
+
+    return { relativePath: catalogPath, sections: Array.from(sectionsById.values()) };
+  } catch {
+    return null;
+  }
 }
 
 async function loadPatternCatalogSections(repoPath: string): Promise<{ relativePath: string; sections: PatternCatalogSection[] } | null> {
@@ -812,15 +900,15 @@ export class LocalBackend {
    * - If 0 or multiple without param, throw with helpful message
    */
   resolveRepo(repoParam?: string): RepoHandle {
+    const formatRepoChoices = (handles: RepoHandle[] = [...this.repos.values()]): string => {
+      return handles
+        .map(h => `- ${h.id}: ${h.repoPath} (name: ${h.name})`)
+        .join('\n');
+    };
+
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
-      // Match by id
-      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
-      // Match by name (case-insensitive)
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase() === paramLower) return handle;
-      }
-      // Match by path (substring)
+      // Match by exact path
       const resolved = path.resolve(repoParam);
       for (const handle of this.repos.values()) {
         if (handle.repoPath === resolved) return handle;
@@ -831,17 +919,34 @@ export class LocalBackend {
       const loaded = this.tryLoadRepoFromDisk(repoParam);
       if (loaded) return loaded;
 
+      // Match by name (case-insensitive), but require disambiguation on collisions (worktrees).
+      const exactNameMatches = [...this.repos.values()].filter(h => h.name.toLowerCase() === paramLower);
+      if (exactNameMatches.length === 1) return exactNameMatches[0];
+      if (exactNameMatches.length > 1) {
+        throw new Error(
+          `Repository "${repoParam}" is ambiguous. Multiple indexed repos share this name.\n\nMatches:\n${formatRepoChoices(exactNameMatches)}\n\nTip: pass "repo" as an absolute path (recommended), or use the repo id shown above. You can also read gitnexus://repos to copy a path-encoded MCP resource URI.`
+        );
+      }
+
+      // Match by id
+      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
+
       // Match by partial name
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase().includes(paramLower)) return handle;
+      const partialMatches = [...this.repos.values()].filter(h => h.name.toLowerCase().includes(paramLower));
+      if (partialMatches.length === 1) return partialMatches[0];
+      if (partialMatches.length > 1) {
+        throw new Error(
+          `Repository "${repoParam}" is ambiguous. Multiple indexed repos match this partial name.\n\nMatches:\n${formatRepoChoices(partialMatches)}\n\nTip: pass "repo" as an absolute path (recommended), or use the repo id shown above.`
+        );
       }
 
       if (this.repos.size === 0) {
         throw new Error('No indexed repositories. Run: gitnexus analyze');
       }
 
-      const names = [...this.repos.values()].map(h => h.name);
-      throw new Error(`Repository "${repoParam}" not found. Available: ${names.join(', ')}`);
+      throw new Error(
+        `Repository "${repoParam}" not found. Available:\n${formatRepoChoices()}\n\nTip: pass "repo" as an absolute path (recommended), or use the repo id shown above.`
+      );
     }
 
     if (this.repos.size === 0) {
@@ -852,9 +957,8 @@ export class LocalBackend {
       return this.repos.values().next().value!;
     }
 
-    const names = [...this.repos.values()].map(h => h.name);
     throw new Error(
-      `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${names.join(', ')}`
+      `Multiple repositories indexed. Specify which one with the "repo" parameter.\n\nAvailable:\n${formatRepoChoices()}\n\nTip: pass "repo" as an absolute path (recommended), or use the repo id shown above.`
     );
   }
 
@@ -904,8 +1008,9 @@ export class LocalBackend {
   /**
    * List all registered repos with their metadata.
    */
-  listRepos(): Array<{ name: string; path: string; indexedAt: string; lastCommit: string; stats?: any }> {
+  listRepos(): Array<{ id: string; name: string; path: string; indexedAt: string; lastCommit: string; stats?: any }> {
     return [...this.repos.values()].map(h => ({
+      id: h.id,
       name: h.name,
       path: h.repoPath,
       indexedAt: h.indexedAt,
@@ -2673,7 +2778,7 @@ export class LocalBackend {
     let patternCatalogDiagnostics: any | null = null;
     if (queryTokens.length > 0) {
       const queryTokenSet = new Set<string>(queryTokens);
-      const catalog = await loadPatternCatalogSections(repo.repoPath);
+      const catalog = await loadPatternCatalogSectionsFromGraph(repo.id) || await loadPatternCatalogSections(repo.repoPath);
       if (catalog && catalog.sections.length > 0) {
         const maxPatterns = Math.min(3, Math.max(limit, 2));
         const scored = catalog.sections

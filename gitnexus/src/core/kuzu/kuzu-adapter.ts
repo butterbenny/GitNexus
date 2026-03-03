@@ -536,7 +536,8 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
 
 export const executeWithReusedStatement = async (
   cypher: string,
-  paramsList: Array<Record<string, any>>
+  paramsList: Array<Record<string, any>>,
+  options?: { throwOnError?: boolean },
 ): Promise<void> => {
   if (!conn) {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');
@@ -544,6 +545,7 @@ export const executeWithReusedStatement = async (
   if (paramsList.length === 0) return;
 
   const SUB_BATCH_SIZE = 200;
+  const throwOnError = Boolean(options?.throwOnError);
 
   let stmt = preparedStatementCache.get(cypher);
   if (!stmt) {
@@ -557,12 +559,16 @@ export const executeWithReusedStatement = async (
 
   for (let i = 0; i < paramsList.length; i += SUB_BATCH_SIZE) {
     const subBatch = paramsList.slice(i, i + SUB_BATCH_SIZE);
-
-    for (const params of subBatch) {
+    for (let j = 0; j < subBatch.length; j += 1) {
+      const params = subBatch[j];
       try {
         const execResult = await conn.execute(stmt, params);
         await closeQueryResults(execResult);
       } catch (e) {
+        if (throwOnError) {
+          const msg = e instanceof Error ? e.message : String(e || '');
+          throw new Error(`Batch execution error (idx=${i + j}): ${msg}`);
+        }
         // Best effort: keep going for the rest of the batch.
         console.warn('Batch execution error:', e);
       }

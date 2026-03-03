@@ -3,6 +3,10 @@
  * 
  * Provides structured on-demand data to AI agents.
  * All resources use repo-scoped URIs: gitnexus://repo/{name}/context
+ *
+ * Note: {name} can be either:
+ * - a repo name (often the directory basename), or
+ * - a URL-encoded absolute path (recommended for worktrees and multi-repo setups)
  */
 
 import type { LocalBackend } from './local/local-backend.js';
@@ -52,7 +56,7 @@ export function getResourceTemplates(): ResourceTemplate[] {
     {
       uriTemplate: 'gitnexus://repo/{name}/context',
       name: 'Repo Overview',
-      description: 'Codebase stats, staleness check, and available tools',
+      description: 'Codebase stats, staleness check, and available tools. Tip: {name} may be a URL-encoded absolute repo path.',
       mimeType: 'text/yaml',
     },
     {
@@ -216,8 +220,15 @@ function getReposResource(backend: LocalBackend): string {
 
   const lines: string[] = ['repos:'];
   for (const repo of repos) {
-    lines.push(`  - name: "${repo.name}"`);
-    lines.push(`    path: "${repo.path}"`);
+    const safeName = String(repo.name || '').replace(/"/g, '\\"');
+    const safePath = String(repo.path || '').replace(/"/g, '\\"');
+    const safeId = String(repo.id || '').replace(/"/g, '\\"');
+    const uriSegment = encodeURIComponent(repo.path);
+    lines.push(`  - id: "${safeId}"`);
+    lines.push(`    name: "${safeName}"`);
+    lines.push(`    path: "${safePath}"`);
+    lines.push(`    repo_param: "${safePath}"`);
+    lines.push(`    mcp_uri_context: "gitnexus://repo/${uriSegment}/context"`);
     lines.push(`    indexed: "${repo.indexedAt}"`);
     lines.push(`    commit: "${repo.lastCommit?.slice(0, 7) || 'unknown'}"`);
     if (repo.stats) {
@@ -229,8 +240,9 @@ function getReposResource(backend: LocalBackend): string {
 
   if (repos.length > 1) {
     lines.push('');
-    lines.push('# Multiple repos indexed. Use repo parameter in tool calls:');
-    lines.push(`# query({query: "auth", repo: "${repos[0].name}"})`);
+    lines.push('# Multiple repos indexed. Prefer absolute-path repo routing:');
+    lines.push(`# query({query: "auth", repo: "${String(repos[0].path || '').replace(/\"/g, '\\\\\"')}"})`);
+    lines.push('# MCP resources also support path-encoded URIs (see mcp_uri_context above).');
   }
 
   return lines.join('\n');
@@ -253,8 +265,17 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   const lastCommit = repo.lastCommit || 'HEAD';
   const staleness = repoPath ? checkStaleness(repoPath, lastCommit) : { isStale: false, commitsBehind: 0 };
   
+  const safeRepoName = String(repo.name || context.projectName || '').replace(/"/g, '\\"');
+  const safeRepoPath = String(repo.repoPath || '').replace(/"/g, '\\"');
+  const safeRepoId = String(repo.id || '').replace(/"/g, '\\"');
+  const repoUriSegment = encodeURIComponent(repo.repoPath || repo.name);
+
   const lines: string[] = [
     `project: ${context.projectName}`,
+    `repo_id: "${safeRepoId}"`,
+    `repo_name: "${safeRepoName}"`,
+    `repo_path: "${safeRepoPath}"`,
+    `mcp_uri_context: "gitnexus://repo/${repoUriSegment}/context"`,
   ];
   
   if (staleness.isStale && staleness.hint) {
@@ -295,17 +316,17 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('');
   lines.push('resources_available:');
   lines.push('  - gitnexus://repos: All indexed repositories');
-  lines.push(`  - gitnexus://repo/${context.projectName}/clusters: All functional areas`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/brain: BrainKernel manifest`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/processes: All execution flows`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/archetypes: Derived flow signatures + exemplars`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/schema: Graph schema for Cypher`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/episode: EpisodeGraph sidecar state`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/evidence: EvidenceSpan sidecar summary`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/summaries: Structured summary overlays`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/closure-templates: Closure-template overlays`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/cluster/{name}: Module details`);
-  lines.push(`  - gitnexus://repo/${context.projectName}/process/{name}: Process trace`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/clusters: All functional areas`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/brain: BrainKernel manifest`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/processes: All execution flows`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/archetypes: Derived flow signatures + exemplars`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/schema: Graph schema for Cypher`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/episode: EpisodeGraph sidecar state`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/evidence: EvidenceSpan sidecar summary`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/summaries: Structured summary overlays`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/closure-templates: Closure-template overlays`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/cluster/{name}: Module details`);
+  lines.push(`  - gitnexus://repo/${repoUriSegment}/process/{name}: Process trace`);
   
   return lines.join('\n');
 }
@@ -1128,11 +1149,14 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
   const sections: string[] = [];
   
   for (const repo of repos) {
+    const repoUriSegment = encodeURIComponent(repo.path);
     const stats = repo.stats || {};
     const lines = [
       `# GitNexus MCP — ${repo.name}`,
       '',
       `This project is indexed by GitNexus as **${repo.name}** (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows).`,
+      '',
+      `Repo path: \`${repo.path}\``,
       '',
       '## Tools',
       '',
@@ -1155,15 +1179,15 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '',
       '## Resources',
       '',
-      `- \`gitnexus://repo/${repo.name}/context\` — Stats, staleness check`,
-      `- \`gitnexus://repo/${repo.name}/clusters\` — All functional areas`,
-      `- \`gitnexus://repo/${repo.name}/brain\` — BrainKernel manifest`,
-      `- \`gitnexus://repo/${repo.name}/processes\` — All execution flows`,
-      `- \`gitnexus://repo/${repo.name}/archetypes\` — Derived flow signatures + exemplar processes`,
-      `- \`gitnexus://repo/${repo.name}/schema\` — Graph schema for Cypher`,
-      `- \`gitnexus://repo/${repo.name}/evidence\` — EvidenceSpan sidecar summary`,
-      `- \`gitnexus://repo/${repo.name}/summaries\` — Structured summary overlays`,
-      `- \`gitnexus://repo/${repo.name}/closure-templates\` — Closure-template overlays`,
+      `- \`gitnexus://repo/${repoUriSegment}/context\` — Stats, staleness check`,
+      `- \`gitnexus://repo/${repoUriSegment}/clusters\` — All functional areas`,
+      `- \`gitnexus://repo/${repoUriSegment}/brain\` — BrainKernel manifest`,
+      `- \`gitnexus://repo/${repoUriSegment}/processes\` — All execution flows`,
+      `- \`gitnexus://repo/${repoUriSegment}/archetypes\` — Derived flow signatures + exemplar processes`,
+      `- \`gitnexus://repo/${repoUriSegment}/schema\` — Graph schema for Cypher`,
+      `- \`gitnexus://repo/${repoUriSegment}/evidence\` — EvidenceSpan sidecar summary`,
+      `- \`gitnexus://repo/${repoUriSegment}/summaries\` — Structured summary overlays`,
+      `- \`gitnexus://repo/${repoUriSegment}/closure-templates\` — Closure-template overlays`,
     ];
     sections.push(lines.join('\n'));
   }

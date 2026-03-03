@@ -228,7 +228,7 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
         name: 'generate_map',
         description: 'Generate architecture documentation from the knowledge graph. Creates a codebase overview with execution flows and mermaid diagrams.',
         arguments: [
-          { name: 'repo', description: 'Repository name (omit if only one indexed)', required: false },
+          { name: 'repo', description: 'Repository id, name, or absolute path (recommended for worktrees). Omit if only one indexed.', required: false },
         ],
       },
     ],

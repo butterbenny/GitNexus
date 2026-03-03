@@ -12,10 +12,20 @@ export interface FileEntry {
 
 const READ_CONCURRENCY = 32;
 
-const hasDotPathSegment = (relativePath: string): boolean => {
+const ALLOWED_DOT_PATH_SEGMENTS = new Set([
+  // Monorepo-local agent docs + skills that we want indexed for template/pattern lamination.
+  '.agents',
+  '.claude',
+]);
+
+const hasDisallowedDotPathSegment = (relativePath: string): boolean => {
   return relativePath
     .split('/')
-    .some(part => part.startsWith('.') && part !== '.' && part !== '..');
+    .some(part => {
+      if (!part.startsWith('.')) return false;
+      if (part === '.' || part === '..') return false;
+      return !ALLOWED_DOT_PATH_SEGMENTS.has(part);
+    });
 };
 
 const normalizeRelativePath = (relativePath: string): string => {
@@ -60,17 +70,29 @@ const listRepositoryFilesViaGit = async (repoPath: string): Promise<string[] | n
 export const listRepositoryFiles = async (repoPath: string): Promise<string[]> => {
   const filesFromGit = await listRepositoryFilesViaGit(repoPath);
 
-  const files = filesFromGit ?? await glob('**/*', {
+  const baseFiles = filesFromGit ?? await glob('**/*', {
     cwd: repoPath,
     nodir: true,
     dot: false,
     ignore: DEFAULT_IGNORE_PATH_SEGMENTS.map(segment => `**/${segment}/**`),
   });
 
+  const allowlistedDotFiles = (await Promise.all(
+    Array.from(ALLOWED_DOT_PATH_SEGMENTS).map(dotSegment =>
+      glob(`${dotSegment}/**/*`, {
+        cwd: repoPath,
+        nodir: true,
+        dot: true,
+        ignore: DEFAULT_IGNORE_PATH_SEGMENTS.map(segment => `**/${segment}/**`),
+      })
+    )
+  )).flat();
+
+  const files = Array.from(new Set([...baseFiles, ...allowlistedDotFiles].map(normalizeRelativePath)));
+
   return files
-    .map(normalizeRelativePath)
     .filter(Boolean)
-    .filter(file => !hasDotPathSegment(file))
+    .filter(file => !hasDisallowedDotPathSegment(file))
     .filter(file => !shouldIgnorePath(file));
 };
 

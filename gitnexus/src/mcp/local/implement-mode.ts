@@ -161,6 +161,38 @@ export async function runImplementMode(
   const precedents = (precedentsFromPlan.length > 0 ? precedentsFromPlan : precedentsFromQuery)
     .slice(0, limitPrecedents);
 
+  const patternCatalogTemplateCompanions: any[] = (() => {
+    const out: any[] = [];
+    const seen = new Set<string>();
+    const push = (filePathRaw: unknown, score: number) => {
+      const filePath = normalizePath(filePathRaw);
+      if (!filePath || seen.has(filePath)) return;
+      seen.add(filePath);
+      out.push({
+        filePath,
+        score,
+        reasons: ['template:pattern-catalog'],
+        anchors: [],
+      });
+    };
+
+    for (const precedent of precedents) {
+      if (String(precedent?.kind || '').trim() !== 'pattern-catalog') continue;
+      const anchor = precedent?.anchor;
+      if (anchor && typeof anchor === 'object') {
+        push((anchor as any)?.catalog_path || (anchor as any)?.catalogPath, 0.92);
+        push((anchor as any)?.filePath, 0.88);
+      }
+      const examples = Array.isArray(precedent?.examples) ? precedent.examples : [];
+      for (const example of examples.slice(0, 4)) {
+        push(example?.filePath, 0.78);
+      }
+      if (out.length >= 8) break;
+    }
+
+    return out.slice(0, 8);
+  })();
+
   const rawChecks = Array.isArray(actionPlanResult?.checks)
     ? actionPlanResult.checks.slice(0, limitChecks)
     : [];
@@ -305,8 +337,23 @@ export async function runImplementMode(
     }
   }
   const usedFallbackCompanion = rawCompanionFiles.length === 0 && fallbackCompanionFiles.length > 0;
-  let companionFiles = (rawCompanionFiles.length > 0 ? rawCompanionFiles : fallbackCompanionFiles)
-    .slice(0, limitFiles);
+  const baseCompanionFiles = rawCompanionFiles.length > 0 ? rawCompanionFiles : fallbackCompanionFiles;
+  const dedupeCompanionFiles = (items: any[]): any[] => {
+    const out: any[] = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      const filePath = normalizePath(item?.filePath);
+      if (!filePath || seen.has(filePath)) continue;
+      seen.add(filePath);
+      out.push({ ...item, filePath });
+    }
+    return out;
+  };
+
+  let companionFiles = dedupeCompanionFiles([
+    ...patternCatalogTemplateCompanions,
+    ...baseCompanionFiles,
+  ]).slice(0, limitFiles);
 
   const buildFallbackWritePlan = (): any[] => {
     const steps: any[] = [];

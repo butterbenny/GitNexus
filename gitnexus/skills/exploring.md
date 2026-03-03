@@ -16,7 +16,7 @@ description: Navigate unfamiliar code using GitNexus knowledge graph
 
 ```
 1. READ gitnexus://repos                           → Discover indexed repos
-2. READ gitnexus://repo/{name}/context              → Codebase overview, check staleness
+2. READ (mcp_uri_context from gitnexus://repos)     → Codebase overview, check staleness (worktree-safe)
 3. (Optional) READ gitnexus://repo/{name}/archetypes → Find common flow signatures + exemplars ("more than a map")
 4. query({query: "<what you want to understand>"})  → Find related execution flows
 5. context({name: "<symbol>"})                      → Deep dive on specific symbol
@@ -24,6 +24,8 @@ description: Navigate unfamiliar code using GitNexus knowledge graph
 ```
 
 > If step 2 says "Index is stale" → run `gitnexus analyze` in terminal.
+>
+> Worktrees: repo names can collide across worktrees. Prefer the path-encoded URIs shown in `gitnexus://repos` (see `mcp_uri_context`).
 
 ## Checklist
 
@@ -41,7 +43,7 @@ description: Navigate unfamiliar code using GitNexus knowledge graph
 
 | Resource | What you get |
 |----------|-------------|
-| `gitnexus://repo/{name}/context` | Stats, staleness warning (~150 tokens) |
+| `gitnexus://repo/{name}/context` | Stats, staleness warning (~150 tokens). `{name}` may be a URL-encoded absolute repo path. |
 | `gitnexus://repo/{name}/clusters` | All functional areas with cohesion scores (~300 tokens) |
 | `gitnexus://repo/{name}/cluster/{name}` | Area members with file paths (~500 tokens) |
 | `gitnexus://repo/{name}/process/{name}` | Step-by-step execution trace (~200 tokens) |

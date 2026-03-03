@@ -16,6 +16,7 @@ description: Analyze blast radius before making code changes
 ## Workflow
 
 ```
+0. READ gitnexus://repos                                   → Pick repo (copy repo_param + mcp_uri_context)
 1. impact({name: "X", direction: "upstream"})             → What depends on this
 2. READ gitnexus://repo/{name}/processes                   → Check affected execution flows
 3. detect_changes()                                        → Map current git changes to affected flows
@@ -23,6 +24,8 @@ description: Analyze blast radius before making code changes
 ```
 
 > If "Index is stale" → run `gitnexus analyze` in terminal.
+>
+> Worktrees/multi-repo: pass `repo: "<repo_param>"` (absolute path) on tool calls, and prefer path-encoded MCP URIs from `gitnexus://repos` (see `mcp_uri_context`).
 
 ## Checklist
 

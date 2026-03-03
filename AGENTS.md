@@ -11,9 +11,12 @@ GitNexus provides a knowledge graph over this codebase — call chains, blast ra
 
 For any task involving code understanding, debugging, impact analysis, or refactoring, you must:
 
-1. **Read `gitnexus://repo/{name}/context`** — codebase overview + check index freshness
-2. **Match your task to a skill below** and **read that skill file**
-3. **Follow the skill's workflow and checklist**
+1. **Read `gitnexus://repos`** — discover indexed repos (worktree-safe routing)
+2. **Read the repo context** (`mcp_uri_context` from `gitnexus://repos`) — codebase overview + check index freshness
+3. **Match your task to a skill below** and **read that skill file**
+4. **Follow the skill's workflow and checklist**
+
+> Worktrees: each worktree stores its own index at `<repo>/.gitnexus/` (no overwrites). The shared global registry (`~/.gitnexus/registry.json`) is discovery-only; repo names can collide across worktrees, so route by absolute path (or path-encoded MCP URIs from `gitnexus://repos`).
 
 > If step 1 warns the index is stale, refresh via the local build (avoid `npx gitnexus@...` which won’t include this fork’s monorepo/PHP features):
 > - `CODEX_HOME="${CODEX_HOME:-$HOME/.codex}" "$CODEX_HOME/skills/nexus-maintenance/scripts/refresh_index.sh" /path/to/repo`
@@ -53,6 +56,8 @@ Lightweight reads (~100-500 tokens) for navigation:
 | `gitnexus://repo/{name}/processes` | All execution flows |
 | `gitnexus://repo/{name}/process/{processName}` | Step-by-step trace |
 | `gitnexus://repo/{name}/schema` | Graph schema for Cypher |
+
+> Worktrees: `{name}` can be a repo name or a URL-encoded absolute path. Prefer the path-encoded URIs shown in `gitnexus://repos` (see `mcp_uri_context`).
 
 ## Graph Schema
 

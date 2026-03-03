@@ -569,6 +569,7 @@ export async function runReviewMode(
       untracked_artifacts: number;
       changed_symbols: number;
       suggested_tests: number;
+      frontend_hygiene_findings: number;
       ui_contracts: number;
       route_files: number;
       authz_controllers: number;
@@ -602,6 +603,7 @@ export async function runReviewMode(
       const untrackedArtifacts = toFiniteNumber(input.untracked_artifacts, 0);
       const changedSymbols = toFiniteNumber(input.changed_symbols, 0);
       const suggestedTests = toFiniteNumber(input.suggested_tests, 0);
+      const frontendHygieneFindings = toFiniteNumber(input.frontend_hygiene_findings, 0);
       const uiContracts = toFiniteNumber(input.ui_contracts, 0);
       const routeFiles = toFiniteNumber(input.route_files, 0);
       const authzControllers = toFiniteNumber(input.authz_controllers, 0);
@@ -658,6 +660,9 @@ export async function runReviewMode(
       }
       if (uiContracts > 0) {
         top_findings.push(`UI contract diffs available (${uiContracts}).`);
+      }
+      if (frontendHygieneFindings > 0) {
+        top_findings.push(`Frontend hygiene findings detected (${frontendHygieneFindings}).`);
       }
       if (runtimeHotspots > 0) {
         top_findings.push(`Runtime hotspots overlap changed surfaces (${runtimeHotspots}).`);
@@ -721,6 +726,9 @@ export async function runReviewMode(
       if (uiContracts > 0) {
         next_actions.push('Inspect ui_contract diffs to verify mutation side-effects and cache triggers.');
       }
+      if (frontendHygieneFindings > 0) {
+        next_actions.push('Review frontend hygiene findings (prop drilling, nested components, signature shape) before approving UI changes.');
+      }
       if (suggestedTests > 0) {
         next_actions.push('Run suggested tests first, then expand coverage only if failures indicate wider drift.');
       }
@@ -759,6 +767,7 @@ export async function runReviewMode(
             runtime_focus_routes: runtimeFocusRoutes,
             contract_parity_low: contractParityLow,
             perf_backend_findings: perfBackendFindings,
+            frontend_hygiene_findings: frontendHygieneFindings,
           },
         },
         top_findings: top_findings.slice(0, 8),
@@ -956,6 +965,7 @@ export async function runReviewMode(
         untracked_artifacts: 0,
         changed_symbols: 0,
         suggested_tests: 0,
+        frontend_hygiene_findings: 0,
         ui_contracts: 0,
         route_files: 0,
         authz_controllers: 0,
@@ -2063,14 +2073,11 @@ export async function runReviewMode(
       const filePath = normalizePath(String(entry?.filePath || ''));
       if (!filePath) return false;
       if (changedTestFileSet.has(filePath)) return true;
-      const metaScore = toFiniteNumber(entry?.meta?.score, 0);
-      if (metaScore >= 1.5) return true;
       const reasons = Array.isArray(entry?.meta?.reasons) ? entry.meta.reasons : [];
       return reasons.some((reason: string) => {
         const text = String(reason || '').toLowerCase();
         return text.includes('direct caller')
-          || text.includes('imports changed file')
-          || text.includes('low-confidence caller');
+          || text.includes('imports changed file');
       });
     };
 
@@ -2145,8 +2152,7 @@ export async function runReviewMode(
       return reasons.some(reason => {
         const text = String(reason || '').toLowerCase();
         return text.includes('direct caller')
-          || text.includes('imports changed file')
-          || text.includes('low-confidence caller');
+          || text.includes('imports changed file');
       });
     };
     const regressionCandidateTests = suggested_tests
@@ -4142,6 +4148,15 @@ export async function runReviewMode(
       confidence: number;
       severity: ReviewFindingSeverity;
     }> = [];
+    const validation_boundary_findings: Array<{
+      code: 'post-validate-sanitize-loop';
+      filePath: string;
+      line: number;
+      summary: string;
+      snippet: string;
+      confidence: number;
+      severity: ReviewFindingSeverity;
+    }> = [];
     const changedRangeByFile = new Map<string, Array<{ start: number; end: number }>>();
     for (const changedFile of changedFileObjs) {
       const filePath = normalizePath(String(changedFile?.filePath || ''));
@@ -4172,6 +4187,40 @@ export async function runReviewMode(
     const linearLookupRegex = /\.(?:find|findIndex|some|filter)\s*\(|->(?:find|findOrFail|firstWhere|first)\s*\(|\barray_filter\s*\(/;
     const writeInLoopRegex = /->(?:save|update|delete)\s*\(|::(?:create|update|delete|upsert|insert)\s*\(|\bDB::(?:insert|update|delete|statement)\s*\(/;
     const noOpWriteRegex = /->(?:save|update)\s*\(\s*(?:\[\s*\])?\s*\)/;
+    const validateBoundaryRegex = /->validateWithBag\s*\(|->validate\s*\(|\$this->validate\s*\(|->validated\s*\(|->safe\s*\(/;
+
+    const validationBoundariesByFileAndLine = new Map<string, Map<number, { reason: string; snippet: string }>>();
+    try {
+      const filePathsCypher = JSON.stringify(backendScanTargets);
+      const boundaryRows = await executeQuery(repo.id, `
+        MATCH (b:CodeElement)
+        WHERE b.id STARTS WITH 'CodeElement:laravel-validation-boundary:'
+          AND b.filePath IN ${filePathsCypher}
+        RETURN b.filePath AS filePath, b.startLine AS startLine, b.name AS name, b.content AS content
+        ORDER BY b.filePath ASC, b.startLine ASC
+        LIMIT ${Math.max(200, Math.min(12000, backendScanTargets.length * 80))}
+      `);
+      for (const row of boundaryRows) {
+        const filePath = normalizePath(String(row.filePath ?? row[0] ?? '').trim());
+        const startLine = toNonNegativeInteger(row.startLine ?? row[1] ?? 0, 0);
+        if (!filePath || startLine <= 0) continue;
+
+        const name = String(row.name ?? row[2] ?? '').trim();
+        const content = String(row.content ?? row[3] ?? '').trim();
+        const reasonFromContent = content.match(/\bReason:\s*([^\n]+)/)?.[1]?.trim() || '';
+        const reasonFromName = name.match(/\(([^)]+)\)/)?.[1]?.trim() || '';
+        const reason = reasonFromContent || reasonFromName || '';
+        const snippet = content.match(/\bSnippet:\s*([^\n]+)/)?.[1]?.trim() || '';
+        if (!reason) continue;
+
+        const byLine = validationBoundariesByFileAndLine.get(filePath) || new Map<number, { reason: string; snippet: string }>();
+        if (!validationBoundariesByFileAndLine.has(filePath)) validationBoundariesByFileAndLine.set(filePath, byLine);
+        if (!byLine.has(startLine)) byLine.set(startLine, { reason, snippet });
+      }
+    } catch {
+      // Ignore: graph boundaries are optional; fallback to file scan
+    }
+
     for (const filePath of backendScanTargets) {
       const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
       if (!resolved) continue;
@@ -4189,20 +4238,79 @@ export async function runReviewMode(
 
       const lines = content.split('\n');
       let loopWindow = 0;
+      let validateWindow = 0;
+      let validateBoundaryLine = 0;
+      let validateBoundaryReason: string | null = null;
+      let validateVar: string | null = null;
+      let emittedValidateFinding = false;
+      const boundariesForFile = validationBoundariesByFileAndLine.get(filePath) || new Map<number, { reason: string; snippet: string }>();
       for (let idx = 0; idx < lines.length; idx++) {
         const lineNo = idx + 1;
         const rawLine = String(lines[idx] || '');
         const codeLine = rawLine.replace(/\/\/.*$/g, '').trim();
         if (!codeLine) {
           if (loopWindow > 0) loopWindow -= 1;
+          if (validateWindow > 0) validateWindow -= 1;
           continue;
+        }
+        const boundaryAtLine = boundariesForFile.get(lineNo);
+        if (boundaryAtLine) {
+          validateWindow = Math.max(validateWindow, 16);
+          validateBoundaryLine = lineNo;
+          validateBoundaryReason = boundaryAtLine.reason || null;
+
+          const assignmentMatch = /\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]*(?:->validateWithBag|->validate|\$this->validate|->validated|->safe)\b/.exec(codeLine);
+          if (assignmentMatch?.[1]) validateVar = assignmentMatch[1];
+        } else if (validateBoundaryRegex.test(codeLine)) {
+          // Prefer precision-first: once a request payload is validated, treat additional cleanup passes as suspect
+          // unless contract evidence proves they are required.
+          const assignmentMatch = /\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]*(?:->validateWithBag|->validate|\$this->validate|->validated|->safe)\b/.exec(codeLine);
+          validateVar = assignmentMatch?.[1] ? assignmentMatch[1] : null;
+          validateWindow = Math.max(validateWindow, 16);
+          validateBoundaryLine = lineNo;
+          validateBoundaryReason = null;
         }
         if (loopLineRegex.test(codeLine)) {
           loopWindow = Math.max(loopWindow, 8);
           continue;
         }
         if (loopWindow > 0) loopWindow -= 1;
-        if (loopWindow <= 0 || !lineNearChanged(lineNo)) continue;
+        if (validateWindow > 0) validateWindow -= 1;
+
+        const nearChanged = lineNearChanged(lineNo);
+        if (!nearChanged) continue;
+
+        if (validateWindow > 0 && !emittedValidateFinding) {
+          const candidateVars = new Set<string>();
+          if (validateVar) candidateVars.add(validateVar);
+          if (codeLine.includes('$validated')) candidateVars.add('validated');
+
+          for (const varName of candidateVars) {
+            const needle = `$${varName}`;
+            if (!codeLine.includes(needle)) continue;
+            const isCleanup = (
+              (codeLine.includes('array_filter(') && codeLine.includes(needle))
+              || (codeLine.includes('collect(') && codeLine.includes('->filter') && codeLine.includes(needle))
+              || (codeLine.includes('collect(') && codeLine.includes('->reject') && codeLine.includes(needle))
+              || (codeLine.includes('unset(') && codeLine.includes(needle))
+            );
+            if (!isCleanup) continue;
+
+            validation_boundary_findings.push({
+              code: 'post-validate-sanitize-loop',
+              filePath,
+              line: lineNo,
+              summary: `Post-validate cleanup detected near line ${lineNo} (${needle} after validate boundary at line ${validateBoundaryLine}${validateBoundaryReason ? ` (${validateBoundaryReason})` : ''}). Prefer trusting validated input unless a contract requires cleanup.`,
+              snippet: codeLine.slice(0, 220),
+              confidence: 0.78,
+              severity: 'low',
+            });
+            emittedValidateFinding = true;
+            break;
+          }
+        }
+
+        if (loopWindow <= 0) continue;
 
         if (linearLookupRegex.test(codeLine) && perf_backend_findings.length < 80) {
           perf_backend_findings.push({
@@ -4665,6 +4773,23 @@ export async function runReviewMode(
       }, findingDedupe);
     }
 
+    for (const signal of validation_boundary_findings.slice(0, 40)) {
+      addReviewFinding(reviewFindings, {
+        code: signal.code,
+        severity: signal.severity,
+        summary: signal.summary,
+        reason: signal.snippet || signal.code,
+        confidence: signal.confidence,
+        evidence: {
+          filePath: signal.filePath,
+          symbol: {
+            kind: 'Line',
+            startLine: signal.line,
+          },
+        },
+      }, findingDedupe);
+    }
+
     for (const hotspot of runtime_hotspots.slice(0, 20)) {
       const matchedRoute = Array.isArray(hotspot?.evidence?.matched_routes) ? hotspot.evidence.matched_routes[0] : null;
       const fileHint = Array.isArray(hotspot?.evidence?.span?.file_path_hints)
@@ -4950,6 +5075,7 @@ export async function runReviewMode(
       untracked_artifacts: toolingArtifactDetails.length,
       changed_symbols: changedSymbolCountTotal,
       suggested_tests: suggested_tests.length,
+      frontend_hygiene_findings: frontendHygieneSignals.length,
       ui_contracts: ui_contracts.length,
       route_files: route_targets.length,
       authz_controllers: authz.length,

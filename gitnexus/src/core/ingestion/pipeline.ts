@@ -26,6 +26,7 @@ import { processLaravelNotifications } from './laravel-notification-processor.js
 import { processBladeTemplates } from './blade-template-processor.js';
 import { processBladeAuthorization } from './blade-auth-processor.js';
 import { processMjmlIncludes } from './mjml-template-processor.js';
+import { processPatternCatalogTemplates } from './pattern-catalog-processor.js';
 import { processTemplateMethodCallWiring } from './template-method-call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -53,6 +54,7 @@ export interface PipelineRunOptions {
   precisionOverlayScipJson?: string;
   graphExpectationPath?: string;
   graphExpectationJson?: string;
+  skipCochange?: boolean;
 }
 
 export const runPipelineFromRepo = async (
@@ -114,6 +116,7 @@ export const runPipelineFromRepo = async (
     const allFilePathSet = new Set<string>(filePaths);
     processStructure(graph, filePaths);
 
+    processPatternCatalogTemplates(graph, files, allFilePathSet);
     processBladeTemplates(graph, files);
     processMjmlIncludes(graph, files, allFilePathSet);
 
@@ -358,6 +361,10 @@ export const runPipelineFromRepo = async (
           endLine: testCase.endLine,
         },
       });
+    });
+
+    shapeResult.codeElements.forEach(node => {
+      graph.addNode(node);
     });
 
     shapeResult.edges.forEach(edge => {
@@ -734,22 +741,31 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const cochangeResult = await processGitHistoryCochange(
-      repoPath,
-      filePaths,
-      (message) => {
-        onProgress({
-          phase: 'cochange',
-          percent: 99,
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-    );
+    if (options?.skipCochange) {
+      onProgress({
+        phase: 'cochange',
+        percent: 99,
+        message: 'Skipping git-history cochange graph (profile)...',
+        stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+      });
+    } else {
+      const cochangeResult = await processGitHistoryCochange(
+        repoPath,
+        filePaths,
+        (message) => {
+          onProgress({
+            phase: 'cochange',
+            percent: 99,
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+      );
 
-    cochangeResult.edges.forEach(edge => {
-      graph.addRelationship(edge);
-    });
+      cochangeResult.edges.forEach(edge => {
+        graph.addRelationship(edge);
+      });
+    }
 
     onProgress({
       phase: 'complete',

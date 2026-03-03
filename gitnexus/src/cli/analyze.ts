@@ -7,9 +7,10 @@
 import path from 'path';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, loadCachedEmbeddings, deleteNodesForFile, deleteOutgoingRelationshipsForFile, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
+import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, deleteNodesForFile, deleteOutgoingRelationshipsForFile, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
 import { runEmbeddingPipeline } from '../core/embeddings/embedding-pipeline.js';
 import { disposeEmbedder } from '../core/embeddings/embedder.js';
+import { resolveDefaultEmbeddingCachePath } from '../core/embeddings/embedding-cache.js';
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
 import { getCurrentCommit, isGitRepo, getGitRoot, getCommittedFileChanges, getWorkingTreeFileChanges, mergeGitFileChanges } from '../storage/git.js';
 import { KUZU_SCHEMA_VERSION } from '../core/kuzu/schema.js';
@@ -66,13 +67,19 @@ import { processLaravelNotifications } from '../core/ingestion/laravel-notificat
 import { processLaravelTacticianDispatch } from '../core/ingestion/laravel-tactician-dispatch-processor.js';
 import { processBladeTemplatesIncremental } from '../core/ingestion/blade-template-processor.js';
 import { processMjmlIncludes } from '../core/ingestion/mjml-template-processor.js';
+import { processPatternCatalogTemplates } from '../core/ingestion/pattern-catalog-processor.js';
 import { processBladeAuthorization } from '../core/ingestion/blade-auth-processor.js';
 import { getLanguageFromFilename } from '../core/ingestion/utils.js';
 import { BrainKernel } from '../core/brain/kernel.js';
 
+type AnalyzeProfile = 'default' | 'monorepo';
+
 export interface AnalyzeOptions {
   force?: boolean;
   skipEmbeddings?: boolean;
+  profile?: string;
+  withCochange?: boolean;
+  withBrain?: boolean;
   registry?: boolean;
   hooks?: boolean;
   writeContext?: boolean;
@@ -136,6 +143,42 @@ const PHASE_LABELS: Record<string, string> = {
   done: 'Done',
 };
 
+const ANALYZE_PROFILE_ENV = 'GITNEXUS_ANALYZE_PROFILE';
+
+const parseAnalyzeProfile = (value: unknown): AnalyzeProfile | null => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || normalized === 'auto') return null;
+  if (normalized === 'default' || normalized === 'standard') return 'default';
+  if (normalized === 'monorepo') return 'monorepo';
+  return null;
+};
+
+const detectMonorepoProfile = async (repoPath: string): Promise<boolean> => {
+  const base = path.basename(repoPath.replace(/\/+$/, ''));
+  if (base === 'monorepo') return true;
+
+  try {
+    await fs.access(path.join(repoPath, '.agents', 'review', 'pattern-catalog.md'));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const resolveAnalyzeProfile = async (
+  repoPath: string,
+  options?: AnalyzeOptions,
+): Promise<{ profile: AnalyzeProfile; source: string }> => {
+  const fromCli = parseAnalyzeProfile((options as any)?.profile);
+  if (fromCli) return { profile: fromCli, source: 'cli' };
+
+  const fromEnv = parseAnalyzeProfile(process.env[ANALYZE_PROFILE_ENV]);
+  if (fromEnv) return { profile: fromEnv, source: 'env' };
+
+  if (await detectMonorepoProfile(repoPath)) return { profile: 'monorepo', source: 'auto-detect' };
+  return { profile: 'default', source: 'default' };
+};
+
 export const analyzeCommand = async (
   inputPath?: string,
   options?: AnalyzeOptions
@@ -161,7 +204,29 @@ export const analyzeCommand = async (
     return;
   }
 
+  const profileResolution = await resolveAnalyzeProfile(repoPath, options);
+  const analyzeProfile = profileResolution.profile;
+  const monorepoProfile = analyzeProfile === 'monorepo';
+  const profileWarnings: string[] = [];
+
+  if (monorepoProfile && options?.skipEmbeddings) {
+    profileWarnings.push('Monorepo profile: ignoring --skip-embeddings (precision-first).');
+  }
+
+  const skipEmbeddingsRequested = Boolean(options?.skipEmbeddings);
+  const skipEmbeddings = !monorepoProfile && skipEmbeddingsRequested;
+  const skipCochange = monorepoProfile && options?.withCochange !== true;
+  const runBrainTick = !monorepoProfile || options?.withBrain === true;
+
+  if (monorepoProfile && options?.withCochange !== true) {
+    profileWarnings.push('Monorepo profile: skipping git-history cochange graph (pass --with-cochange to enable).');
+  }
+  if (monorepoProfile && options?.withBrain !== true) {
+    profileWarnings.push('Monorepo profile: skipping BrainKernel tick (pass --with-brain to enable).');
+  }
+
   const { storagePath, kuzuPath } = getStoragePaths(repoPath);
+  const embeddingCachePath = resolveDefaultEmbeddingCachePath(storagePath);
   const currentCommit = getCurrentCommit(repoPath);
   const existingMeta = await loadMeta(storagePath);
   const existingSchemaVersion = existingMeta?.kuzuSchemaVersion ?? 1;
@@ -220,13 +285,18 @@ export const analyzeCommand = async (
 
   const filterIndexablePaths = (paths: string[]): string[] => {
     const unique = Array.from(new Set(paths.map(p => p.replace(/\\/g, '/').trim()).filter(Boolean)));
-    const hasDotPathSegment = (relativePath: string): boolean => {
+    const allowedDotPathSegments = new Set(['.agents', '.claude']);
+    const hasDisallowedDotPathSegment = (relativePath: string): boolean => {
       return relativePath
         .split('/')
-        .some(part => part.startsWith('.') && part !== '.' && part !== '..');
+        .some(part => {
+          if (!part.startsWith('.')) return false;
+          if (part === '.' || part === '..') return false;
+          return !allowedDotPathSegments.has(part);
+        });
     };
     return unique
-      .filter(p => !hasDotPathSegment(p))
+      .filter(p => !hasDisallowedDotPathSegment(p))
       .filter(p => !shouldIgnorePath(p));
   };
 
@@ -543,6 +613,30 @@ export const analyzeCommand = async (
       refreshEdgeFiles.add(fp);
     }
 
+    const PATTERN_CATALOG_PATH = '.agents/review/pattern-catalog.md';
+    const patternCatalogExists = allRepoFileSet.has(PATTERN_CATALOG_PATH) && !shouldIgnorePath(PATTERN_CATALOG_PATH);
+    const patternCatalogTouched = rebuildFilesSet.has(PATTERN_CATALOG_PATH) || deletedFiles.has(PATTERN_CATALOG_PATH);
+    let shouldRefreshPatternCatalog = patternCatalogTouched;
+    if (!shouldRefreshPatternCatalog && patternCatalogExists) {
+      try {
+        const escapedCatalogPath = PATTERN_CATALOG_PATH.replace(/'/g, "''");
+        const rows = await executeQuery(`
+          MATCH (n:CodeElement)
+          WHERE n.filePath = '${escapedCatalogPath}'
+            AND n.id STARTS WITH 'CodeElement:pattern-catalog:'
+          RETURN count(n) AS cnt
+        `);
+        const raw = (rows[0] as any)?.cnt ?? (rows[0] as any)?.[0] ?? 0;
+        const count = Number(raw) || 0;
+        if (count === 0) shouldRefreshPatternCatalog = true;
+      } catch {
+        // best-effort
+      }
+    }
+    if (shouldRefreshPatternCatalog && patternCatalogExists && !impactedSet.has(PATTERN_CATALOG_PATH)) {
+      refreshEdgeFiles.add(PATTERN_CATALOG_PATH);
+    }
+
     // If permissions config changed, include the referenced Permission enums so we can
     // build role→permission edges (and slug contract edges) without forcing a full reindex.
     const permissionEnumFiles = new Set<string>();
@@ -702,6 +796,9 @@ export const analyzeCommand = async (
     // Files that may receive new derived nodes even when their content did not change.
     // Keep this set small to avoid turning incremental updates into full reloads.
     const nodeInsertFiles = new Set<string>(rebuildFiles);
+    if (shouldRefreshPatternCatalog && patternCatalogExists) {
+      nodeInsertFiles.add(PATTERN_CATALOG_PATH);
+    }
 
     // If permissions config changed, we may re-emit permission slug nodes that already exist
     // (e.g. ticket.view) alongside new ones (e.g. ticket.edit). Kuzu COPY with IGNORE_ERRORS
@@ -718,6 +815,21 @@ export const analyzeCommand = async (
           MATCH (n:CodeElement)
           WHERE n.filePath IN [${escapedEnumPaths}]
             AND n.id STARTS WITH 'CodeElement:permission:'
+          DETACH DELETE n
+        `);
+      } catch {
+        // best-effort
+      }
+    }
+
+    if (shouldRefreshPatternCatalog) {
+      bar.update(11, { phase: 'Incremental: clearing pattern catalog nodes...' });
+      try {
+        const escapedCatalogPath = PATTERN_CATALOG_PATH.replace(/'/g, "''");
+        await executeQuery(`
+          MATCH (n:CodeElement)
+          WHERE n.filePath = '${escapedCatalogPath}'
+            AND n.id STARTS WITH 'CodeElement:pattern-catalog:'
           DETACH DELETE n
         `);
       } catch {
@@ -781,6 +893,7 @@ export const analyzeCommand = async (
       const normalized = filePath.replace(/\\/g, '/');
       if (normalized.includes('/Http/Requests/')) return true;
       if (normalized.includes('/Http/Resources/')) return true;
+      if (normalized.includes('/Http/Controllers/')) return true;
       if (TEST_FILE_RE.test(normalized)) return true;
       if (/(^|\/)database\/migrations\/.+\.php$/i.test(normalized)) return true;
       return false;
@@ -809,6 +922,17 @@ export const analyzeCommand = async (
       filePath: fp,
       content: contentByPath.get(fp) || '',
     }));
+    if (shouldRefreshPatternCatalog && patternCatalogExists && !rebuildFilesSet.has(PATTERN_CATALOG_PATH)) {
+      const catalogContent = contentByPath.get(PATTERN_CATALOG_PATH);
+      if (catalogContent !== undefined) {
+        fileUpserts.push({
+          id: `File:${PATTERN_CATALOG_PATH}`,
+          name: path.posix.basename(PATTERN_CATALOG_PATH),
+          filePath: PATTERN_CATALOG_PATH,
+          content: catalogContent,
+        });
+      }
+    }
     await executeWithReusedStatement(
       `MERGE (n:File {id: $id}) SET n.name = $name, n.filePath = $filePath, n.content = $content`,
       fileUpserts,
@@ -865,6 +989,9 @@ export const analyzeCommand = async (
       }
     );
     processMjmlIncludes(workGraph, processedEntries, allRepoFileSet);
+    if (shouldRefreshPatternCatalog && patternCatalogExists) {
+      processPatternCatalogTemplates(workGraph, processedEntries, allRepoFileSet);
+    }
 
     // Imports (fast path: uses worker-extracted imports)
     bar.update(58, { phase: 'Incremental: resolving imports...' });
@@ -1082,7 +1209,7 @@ export const analyzeCommand = async (
     // Ensure FTS only when schema/metadata indicates it is missing.
     const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
 
-    const kuzuWarnings = [...kuzuResult.warnings];
+    const kuzuWarnings = [...kuzuResult.warnings, ...profileWarnings];
     if (incrementalDerivedFastDeprecated) {
       kuzuWarnings.push('Incremental derived mode "fast" is deprecated; running as "full".');
     }
@@ -2118,7 +2245,9 @@ export const analyzeCommand = async (
           const normalized = filePath.replace(/\\/g, '/');
           if (normalized.includes('/Http/Requests/')) return true;
           if (normalized.includes('/Http/Resources/')) return true;
+          if (normalized.includes('/Http/Controllers/')) return true;
           if (TEST_FILE_RE.test(normalized)) return true;
+          if (/(^|\/)database\/migrations\/.+\.php$/i.test(normalized)) return true;
           if (JS_TS_FILE_RE.test(normalized) && !normalized.endsWith('.d.ts')) return true;
           return false;
         });
@@ -2171,6 +2300,26 @@ export const analyzeCommand = async (
           });
         }
 
+        const methodRows = await executeQuery(`
+          MATCH (m:Method)
+          WHERE m.filePath CONTAINS '/Http/Controllers/'
+          RETURN m.id AS id, m.name AS name, m.filePath AS filePath, m.startLine AS startLine, m.endLine AS endLine
+        `);
+        for (const row of methodRows) {
+          const id = String(row.id ?? row[0] ?? '').trim();
+          if (!id) continue;
+          shapeInputGraph.addNode({
+            id,
+            label: 'Method',
+            properties: {
+              name: String(row.name ?? row[1] ?? '').trim(),
+              filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              startLine: Math.max(0, Math.floor(Number(row.startLine ?? row[3] ?? 0) || 0)),
+              endLine: Math.max(0, Math.floor(Number(row.endLine ?? row[4] ?? 0) || 0)),
+            },
+          });
+        }
+
         const shapeFiles = await readRepositoryFiles(repoPath, shapeFilePaths);
         const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
           if (progress % 20 !== 0 && progress !== 100) return;
@@ -2183,6 +2332,7 @@ export const analyzeCommand = async (
         await executeQuery(`MATCH (c:DBColumn) DETACH DELETE c`);
         await executeQuery(`MATCH (t:DBTable) DETACH DELETE t`);
         await executeQuery(`MATCH (t:TestCase) DETACH DELETE t`);
+        await executeQuery(`MATCH (e:CodeElement) WHERE e.id STARTS WITH 'CodeElement:laravel-validation-boundary:' DETACH DELETE e`);
 
         const shapeInsertGraph = createKnowledgeGraph();
         for (const shape of shapeResult.shapes) {
@@ -2271,6 +2421,10 @@ export const analyzeCommand = async (
               endLine: testCase.endLine,
             },
           });
+        }
+
+        for (const node of shapeResult.codeElements) {
+          shapeInsertGraph.addNode(node);
         }
 
         for (const edge of shapeResult.edges) {
@@ -2526,8 +2680,19 @@ export const analyzeCommand = async (
     }
     markPassTiming('provenance', provenancePassStartedAt);
 
-    const shouldRecomputeCochange = incrementalDerivedMode === 'full' || fileChangesTotal >= 200;
-    if (!shouldRecomputeCochange) {
+    const shouldRecomputeCochange = !skipCochange && (incrementalDerivedMode === 'full' || fileChangesTotal >= 200);
+    if (skipCochange) {
+      skipDerivedPass('cochange');
+      const cochangePassStartedAt = Date.now();
+      bar.update(89, { phase: 'Incremental: removing git-history cochange graph (profile)...' });
+      try {
+        await executeQuery(`MATCH ()-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->() DELETE r`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        kuzuWarnings.push(`Incremental: unable to clear cochange graph (${msg.slice(0, 120)})`);
+      }
+      markPassTiming('cochange', cochangePassStartedAt);
+    } else if (!shouldRecomputeCochange) {
       skipDerivedPass('cochange');
     } else {
       const cochangePassStartedAt = Date.now();
@@ -2624,21 +2789,23 @@ export const analyzeCommand = async (
         `);
 
         let cochangeRows: any[] = [];
-        try {
-          const cochangeLimit = Math.max(5000, Math.min(50000, allRepoFiles.length * 20));
-          cochangeRows = await executeQuery(`
-            MATCH (a:File)-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->(b:File)
-            WHERE r.confidence >= 0.5
-            RETURN a.id AS sourceId,
-                   b.id AS targetId,
-                   r.type AS type,
-                   r.confidence AS confidence,
-                   r.reason AS reason,
-                   r.step AS step
-            LIMIT ${cochangeLimit}
-          `);
-        } catch {
-          cochangeRows = [];
+        if (!skipCochange) {
+          try {
+            const cochangeLimit = Math.max(5000, Math.min(50000, allRepoFiles.length * 20));
+            cochangeRows = await executeQuery(`
+              MATCH (a:File)-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->(b:File)
+              WHERE r.confidence >= 0.5
+              RETURN a.id AS sourceId,
+                     b.id AS targetId,
+                     r.type AS type,
+                     r.confidence AS confidence,
+                     r.reason AS reason,
+                     r.step AS step
+              LIMIT ${cochangeLimit}
+            `);
+          } catch {
+            cochangeRows = [];
+          }
         }
 
         postDerivedSummaryRelationRows = [...baseRows, ...cochangeRows];
@@ -2833,7 +3000,7 @@ export const analyzeCommand = async (
     let embeddingSkipped = false;
     let embeddingSkipReason = '';
 
-    if (options?.skipEmbeddings) {
+    if (skipEmbeddings) {
       embeddingSkipped = true;
       embeddingSkipReason = 'skipped (--skip-embeddings)';
     }
@@ -2844,13 +3011,14 @@ export const analyzeCommand = async (
       try {
         await runEmbeddingPipeline(
           executeQuery,
-          executeWithReusedStatement,
+          (cypher, paramsList) => executeWithReusedStatement(cypher, paramsList, { throwOnError: true }),
           (progress) => {
             const scaled = 90 + Math.round((progress.percent / 100) * 8);
             const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
             bar.update(scaled, { phase: label });
           },
           {},
+          { cachePath: embeddingCachePath },
         );
         embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
       } catch (e) {
@@ -2921,9 +3089,14 @@ export const analyzeCommand = async (
       }
     }
 
-    bar.update(99, { phase: 'Running BrainKernel tick...' });
-    const fastWarnings: string[] = [];
-    const brainManifestPath = await runBrainKernelTick(meta, fastWarnings, []);
+    const fastWarnings: string[] = [...profileWarnings];
+    let brainManifestPath: string | null = null;
+    if (runBrainTick) {
+      bar.update(99, { phase: 'Running BrainKernel tick...' });
+      brainManifestPath = await runBrainKernelTick(meta, fastWarnings, []);
+    } else {
+      bar.update(99, { phase: 'Skipping BrainKernel tick (profile)...' });
+    }
 
     bar.update(100, { phase: 'Done' });
     bar.stop();
@@ -2988,12 +3161,17 @@ export const analyzeCommand = async (
         ? await generateAIContextFiles(repoPath, storagePath, projectName, meta.stats || {})
         : { files: [] as string[] };
 
-      bar.update(99, { phase: 'Running BrainKernel tick...' });
-      const brainManifestPath = await runBrainKernelTick(
-        meta,
-        inc.kuzuWarnings,
-        [...fileChanges.changed, ...fileChanges.deleted],
-      );
+      let brainManifestPath: string | null = null;
+      if (runBrainTick) {
+        bar.update(99, { phase: 'Running BrainKernel tick...' });
+        brainManifestPath = await runBrainKernelTick(
+          meta,
+          inc.kuzuWarnings,
+          [...fileChanges.changed, ...fileChanges.deleted],
+        );
+      } else {
+        bar.update(99, { phase: 'Skipping BrainKernel tick (profile)...' });
+      }
 
       await closeKuzu();
       await disposeEmbedder();
@@ -3113,22 +3291,8 @@ export const analyzeCommand = async (
     }
   }
 
-  // ── Cache embeddings from existing index before rebuild ────────────
-  let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
-
-  if (existingMeta && !options?.force) {
-    try {
-      bar.update(0, { phase: 'Caching embeddings...' });
-      await initKuzu(kuzuPath);
-      const cached = await loadCachedEmbeddings();
-      cachedEmbeddings = cached.embeddings;
-      await closeKuzu();
-    } catch {
-      try { await closeKuzu(); } catch {}
-    }
-  }
-
   // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
+  const t0Pipeline = Date.now();
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
@@ -3138,7 +3302,9 @@ export const analyzeCommand = async (
     precisionOverlayPath: options?.precisionOverlayPath,
     precisionOverlayForce: options?.precisionOverlayForce,
     graphExpectationPath: options?.graphExpectationPath,
+    skipCochange,
   });
+  const pipelineTime = ((Date.now() - t0Pipeline) / 1000).toFixed(1);
 
   let fullEvidenceSpanSummary: {
     nodeEvidenceCount: number;
@@ -3181,13 +3347,15 @@ export const analyzeCommand = async (
     bar.update(progress, { phase: msg });
   });
   const kuzuTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
-  const kuzuWarnings = kuzuResult.warnings;
+  const kuzuWarnings = [...kuzuResult.warnings, ...profileWarnings];
   if (incrementalDerivedFastDeprecated) {
     kuzuWarnings.push('Incremental derived mode "fast" is deprecated; running as "full".');
   }
 
+  let evidenceTime = '0.0';
   try {
     bar.update(84, { phase: 'Materializing evidence spans...' });
+    const t0Evidence = Date.now();
     const evidenceSnapshot = await processEvidenceSpans(
       pipelineResult.graph,
       (message, progress) => {
@@ -3196,6 +3364,7 @@ export const analyzeCommand = async (
       },
     );
     await saveEvidenceSpanSnapshot(storagePath, evidenceSnapshot);
+    evidenceTime = ((Date.now() - t0Evidence) / 1000).toFixed(1);
     fullEvidenceSpanSummary = {
       nodeEvidenceCount: evidenceSnapshot.stats.nodeEvidenceCount,
       edgeEvidenceCount: evidenceSnapshot.stats.edgeEvidenceCount,
@@ -3209,8 +3378,10 @@ export const analyzeCommand = async (
     kuzuWarnings.push(`Unable to refresh evidence spans (${msg.slice(0, 120)})`);
   }
 
+  let summariesTime = '0.0';
   try {
     bar.update(84, { phase: 'Materializing structured summaries...' });
+    const t0Summaries = Date.now();
     const summarySnapshot = await processStructuredSummaryOverlay(
       pipelineResult.graph,
       (message, progress) => {
@@ -3242,6 +3413,7 @@ export const analyzeCommand = async (
       totalCoveredSlots: closureTemplateSnapshot.stats.totalCoveredSlots,
       totalRoleExpectations: closureTemplateSnapshot.stats.totalRoleExpectations,
     };
+    summariesTime = ((Date.now() - t0Summaries) / 1000).toFixed(1);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     kuzuWarnings.push(`Unable to refresh structured summaries (${msg.slice(0, 120)})`);
@@ -3252,29 +3424,13 @@ export const analyzeCommand = async (
 
   const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
 
-  // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
-  if (cachedEmbeddings.length > 0) {
-    bar.update(88, { phase: `Restoring ${cachedEmbeddings.length} cached embeddings...` });
-    const EMBED_BATCH = 200;
-    for (let i = 0; i < cachedEmbeddings.length; i += EMBED_BATCH) {
-      const batch = cachedEmbeddings.slice(i, i + EMBED_BATCH);
-      const paramsList = batch.map(e => ({ nodeId: e.nodeId, embedding: e.embedding }));
-      try {
-        await executeWithReusedStatement(
-          `CREATE (e:CodeEmbedding {nodeId: $nodeId, embedding: $embedding})`,
-          paramsList,
-        );
-      } catch { /* some may fail if node was removed, that's fine */ }
-    }
-  }
-
   // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
   const stats = await getKuzuStats();
   let embeddingTime = '0.0';
   let embeddingSkipped = false;
   let embeddingSkipReason = '';
 
-  if (options?.skipEmbeddings) {
+  if (skipEmbeddings) {
     embeddingSkipped = true;
     embeddingSkipReason = 'skipped (--skip-embeddings)';
   }
@@ -3285,13 +3441,14 @@ export const analyzeCommand = async (
     try {
       await runEmbeddingPipeline(
         executeQuery,
-        executeWithReusedStatement,
+        (cypher, paramsList) => executeWithReusedStatement(cypher, paramsList, { throwOnError: true }),
         (progress) => {
           const scaled = 90 + Math.round((progress.percent / 100) * 8);
           const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
           bar.update(scaled, { phase: label });
         },
         {},
+        { cachePath: embeddingCachePath },
       );
       embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
     } catch (e) {
@@ -3363,12 +3520,17 @@ export const analyzeCommand = async (
     })
     : { files: [] as string[] };
 
-  bar.update(99, { phase: 'Running BrainKernel tick...' });
-  const brainManifestPath = await runBrainKernelTick(
-    meta,
-    kuzuWarnings,
-    [...fileChanges.changed, ...fileChanges.deleted],
-  );
+  let brainManifestPath: string | null = null;
+  if (runBrainTick) {
+    bar.update(99, { phase: 'Running BrainKernel tick...' });
+    brainManifestPath = await runBrainKernelTick(
+      meta,
+      kuzuWarnings,
+      [...fileChanges.changed, ...fileChanges.deleted],
+    );
+  } else {
+    bar.update(99, { phase: 'Skipping BrainKernel tick (profile)...' });
+  }
 
   await closeKuzu();
   await disposeEmbedder();
@@ -3379,10 +3541,10 @@ export const analyzeCommand = async (
   bar.stop();
 
   // ── Summary ───────────────────────────────────────────────────────
-  const embeddingsCached = cachedEmbeddings.length > 0;
-  console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
+  console.log(`\n  Repository indexed successfully (${totalTime}s)\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
   console.log(`  KuzuDB ${kuzuTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
+  console.log(`  Pipeline ${pipelineTime}s | Evidence ${evidenceTime}s | Summaries ${summariesTime}s`);
   if (pipelineResult.precisionOverlayResult) {
     const precision = pipelineResult.precisionOverlayResult.stats;
     const producerBits: string[] = [];

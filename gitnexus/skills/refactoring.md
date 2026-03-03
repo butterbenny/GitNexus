@@ -15,6 +15,7 @@ description: Plan safe refactors using blast radius and dependency mapping
 ## Workflow
 
 ```
+0. READ gitnexus://repos                                   → Pick repo (copy repo_param + mcp_uri_context)
 1. (Optional) READ gitnexus://repo/{name}/archetypes        → Find a proven refactor "shape" to mirror
 2. impact({name: "X", direction: "upstream"})               → Map all dependents
 3. query({query: "X"})                                      → Find execution flows involving X
@@ -23,6 +24,8 @@ description: Plan safe refactors using blast radius and dependency mapping
 ```
 
 > If "Index is stale" → run `gitnexus analyze` in terminal.
+>
+> Worktrees/multi-repo: pass `repo: "<repo_param>"` (absolute path) on tool calls, and prefer path-encoded MCP URIs from `gitnexus://repos` (see `mcp_uri_context`).
 
 ## Checklists
 

@@ -80,6 +80,7 @@ export interface ContractShapeResult {
   dbTables: DBTableNode[];
   dbColumns: DBColumnNode[];
   testCases: TestCaseNode[];
+  codeElements: GraphNode[];
   edges: ShapeEdge[];
   stats: {
     shapeCount: number;
@@ -88,6 +89,7 @@ export interface ContractShapeResult {
     dbTableCount: number;
     dbColumnCount: number;
     testCaseCount: number;
+    codeElementCount: number;
     edgeCount: number;
     validatedFieldEdges: number;
     serializedFieldEdges: number;
@@ -266,7 +268,28 @@ const splitTopLevelSegments = (text: string): string[] => {
   return segments;
 };
 
-const extractPhpMethodBody = (content: string, methodName: string): string | null => {
+const countNewlinesUpTo = (text: string, idx: number): number => {
+  const end = Math.max(0, Math.min(text.length, idx));
+  let count = 0;
+  for (let i = 0; i < end; i++) {
+    if (text[i] === '\n') count++;
+  }
+  return count;
+};
+
+const extractLineAroundIndex = (text: string, idx: number): string => {
+  const safeIdx = Math.max(0, Math.min(text.length, idx));
+  const start = text.lastIndexOf('\n', safeIdx);
+  const end = text.indexOf('\n', safeIdx);
+  const sliceStart = start >= 0 ? start + 1 : 0;
+  const sliceEnd = end >= 0 ? end : text.length;
+  return text.slice(sliceStart, sliceEnd).trim();
+};
+
+const extractPhpMethodBodySpan = (
+  content: string,
+  methodName: string,
+): { body: string; openBraceIdx: number; closeBraceIdx: number } | null => {
   const regex = new RegExp(String.raw`function\s+${methodName}\s*\([^)]*\)\s*(?::\s*[^{]+)?\{`, 'g');
   const match = regex.exec(content);
   if (!match) return null;
@@ -275,7 +298,15 @@ const extractPhpMethodBody = (content: string, methodName: string): string | nul
   const closeBraceIdx = findBalancedEnd(content, openBraceIdx, '{', '}');
   if (closeBraceIdx <= openBraceIdx) return null;
 
-  return content.slice(openBraceIdx + 1, closeBraceIdx);
+  return {
+    body: content.slice(openBraceIdx + 1, closeBraceIdx),
+    openBraceIdx,
+    closeBraceIdx,
+  };
+};
+
+const extractPhpMethodBody = (content: string, methodName: string): string | null => {
+  return extractPhpMethodBodySpan(content, methodName)?.body ?? null;
 };
 
 const extractPhpArrayFieldKeys = (methodBody: string): string[] => {
@@ -393,6 +424,104 @@ const extractLaravelInlineValidationKeysFromMethodBody = (methodBody: string): {
   }
 
   return { keys: Array.from(keys).sort(), reason };
+};
+
+type LaravelValidationBoundary = {
+  index: number;
+  reason: string;
+  keys: string[];
+  snippet: string;
+};
+
+const extractLaravelValidationBoundariesFromMethodBody = (methodBody: string): LaravelValidationBoundary[] => {
+  const boundaries: LaravelValidationBoundary[] = [];
+  const seen = new Set<string>();
+
+  const scanMethodCall = (needle: string, reasonHint: string, extraSkip?: (at: number) => boolean): void => {
+    for (let idx = 0; idx < methodBody.length;) {
+      const at = methodBody.indexOf(needle, idx);
+      if (at < 0) break;
+      idx = at + needle.length;
+      if (extraSkip?.(at)) continue;
+
+      const after = methodBody.slice(at + needle.length, at + needle.length + 1);
+      if (after && /[A-Za-z0-9_]/.test(after)) continue;
+
+      const openParenIdx = methodBody.indexOf('(', idx);
+      if (openParenIdx < 0) continue;
+      const closeParenIdx = findBalancedEnd(methodBody, openParenIdx, '(', ')');
+      if (closeParenIdx <= openParenIdx) continue;
+
+      const argsText = methodBody.slice(openParenIdx + 1, closeParenIdx).trim();
+      const segments = argsText ? splitTopLevelSegments(argsText) : [];
+      const arraySegment = segments.find(segment => segment.trim().startsWith('['));
+      const keys = arraySegment ? extractPhpBracketArrayKeys(arraySegment) : [];
+
+      const boundaryKey = `${reasonHint}|${at}`;
+      if (seen.has(boundaryKey)) continue;
+      seen.add(boundaryKey);
+
+      boundaries.push({
+        index: at,
+        reason: reasonHint,
+        keys: Array.from(new Set(keys)).sort(),
+        snippet: extractLineAroundIndex(methodBody, at),
+      });
+
+      idx = closeParenIdx + 1;
+    }
+  };
+
+  scanMethodCall('->validateWithBag', 'laravel-request:validate-with-bag');
+  scanMethodCall('->validate', 'laravel-request:validate', (at) => (
+    methodBody.startsWith('->validateWithBag', at)
+    || methodBody.startsWith('->validated', at)
+  ));
+  scanMethodCall('$this->validate', 'laravel-controller:validate-helper');
+  scanMethodCall('->validated', 'laravel-request:validated');
+  scanMethodCall('->safe', 'laravel-request:safe');
+
+  // Common Laravel inline validation pattern:
+  //   Validator::make($data, [...])->validate();
+  for (let idx = 0; idx < methodBody.length;) {
+    const at = methodBody.indexOf('Validator::make', idx);
+    if (at < 0) break;
+    idx = at + 'Validator::make'.length;
+
+    const openParenIdx = methodBody.indexOf('(', idx);
+    if (openParenIdx < 0) continue;
+    const closeParenIdx = findBalancedEnd(methodBody, openParenIdx, '(', ')');
+    if (closeParenIdx <= openParenIdx) continue;
+
+    const tail = methodBody.slice(closeParenIdx, Math.min(methodBody.length, closeParenIdx + 160));
+    if (!tail.includes('->validate')) {
+      idx = closeParenIdx + 1;
+      continue;
+    }
+
+    const argsText = methodBody.slice(openParenIdx + 1, closeParenIdx).trim();
+    const segments = argsText ? splitTopLevelSegments(argsText) : [];
+    const rulesSegment = segments.length >= 2 ? segments[1] : '';
+    const keys = String(rulesSegment || '').trim().startsWith('[')
+      ? extractPhpBracketArrayKeys(rulesSegment)
+      : [];
+
+    const reasonHint = 'laravel-validator:make-validate';
+    const boundaryKey = `${reasonHint}|${at}`;
+    if (!seen.has(boundaryKey)) {
+      seen.add(boundaryKey);
+      boundaries.push({
+        index: at,
+        reason: reasonHint,
+        keys: Array.from(new Set(keys)).sort(),
+        snippet: extractLineAroundIndex(methodBody, at),
+      });
+    }
+
+    idx = closeParenIdx + 1;
+  }
+
+  return boundaries.sort((a, b) => a.index - b.index);
 };
 
 const extractObjectPropertyExpression = (objectBody: string, propertyName: string): string | null => {
@@ -846,12 +975,18 @@ export const processContractShapes = async (
   const dbColumnsByName = new Map<string, DBColumnNode[]>();
   const dbColumnsByTableAndName = new Map<string, DBColumnNode>();
   const testCaseNodeMap = new Map<string, TestCaseNode>();
+  const codeElementNodeMap = new Map<string, GraphNode>();
   const edgeMap = new Map<string, ShapeEdge>();
   const cacheKeyIdBySourceNodeId = new Map<string, string>();
 
   const addEdge = (edge: ShapeEdge) => {
     if (!edge.sourceId || !edge.targetId) return;
     if (!edgeMap.has(edge.id)) edgeMap.set(edge.id, edge);
+  };
+
+  const addCodeElementNode = (node: GraphNode) => {
+    if (!node?.id) return;
+    if (!codeElementNodeMap.has(node.id)) codeElementNodeMap.set(node.id, node);
   };
 
   const ensureShape = (
@@ -1089,10 +1224,76 @@ export const processContractShapes = async (
       const methodName = String(methodNode.properties.name || '').trim();
       if (!methodName) continue;
 
-      const methodBody = extractPhpMethodBody(file.content, methodName);
-      if (!methodBody) continue;
+      const methodSpan = extractPhpMethodBodySpan(file.content, methodName);
+      if (!methodSpan) continue;
+      const methodBody = methodSpan.body;
 
+      const boundaries = extractLaravelValidationBoundariesFromMethodBody(methodBody);
       const inlineValidation = extractLaravelInlineValidationKeysFromMethodBody(methodBody);
+      if (boundaries.length === 0 && inlineValidation.keys.length === 0) continue;
+
+      const fileNodeId = generateId('File', filePath);
+      const methodBodyStartLine = 1 + countNewlinesUpTo(file.content, methodSpan.openBraceIdx + 1);
+
+      for (const boundary of boundaries) {
+        const boundaryLine = methodBodyStartLine + countNewlinesUpTo(methodBody, boundary.index);
+        const boundaryId = generateId(
+          'CodeElement',
+          `laravel-validation-boundary:${filePath}:${methodName}:${boundaryLine}:${boundary.reason}`
+        );
+
+        addCodeElementNode({
+          id: boundaryId,
+          label: 'CodeElement',
+          properties: {
+            name: `Validation boundary (${boundary.reason})`,
+            filePath,
+            startLine: boundaryLine,
+            endLine: boundaryLine,
+            isExported: false,
+            content: [
+              `Kind: laravel-validation-boundary`,
+              `Reason: ${boundary.reason}`,
+              `Method: ${methodName}`,
+              `Snippet: ${boundary.snippet || '<unknown>'}`,
+              boundary.keys.length > 0 ? `Keys:\n- ${boundary.keys.join('\n- ')}` : `Keys: <unknown>`,
+            ].join('\n'),
+          },
+        });
+
+        addEdge({
+          id: generateId('DEFINES', `${fileNodeId}->${boundaryId}`),
+          type: 'DEFINES',
+          sourceId: fileNodeId,
+          targetId: boundaryId,
+          confidence: 0.92,
+          reason: 'laravel-validation-boundary:in-file',
+        });
+        addEdge({
+          id: generateId('DEFINES', `${methodNode.id}->${boundaryId}`),
+          type: 'DEFINES',
+          sourceId: methodNode.id,
+          targetId: boundaryId,
+          confidence: 0.92,
+          reason: `laravel-validation-boundary:in-method:${boundary.reason}`,
+        });
+
+        if (boundary.keys.length === 0) continue;
+        const shape = ensureShape('controller_validation', methodNode);
+        for (const fieldName of boundary.keys) {
+          const field = ensureField(fieldName, shape);
+          addEdge({
+            id: generateId('VALIDATES_FIELD', `${boundaryId}:${field.id}`),
+            type: 'VALIDATES_FIELD',
+            sourceId: boundaryId,
+            targetId: field.id,
+            confidence: 0.9,
+            reason: boundary.reason,
+          });
+          validatedFieldEdges++;
+        }
+      }
+
       if (inlineValidation.keys.length === 0) continue;
 
       const shape = ensureShape('controller_validation', methodNode);
@@ -1329,6 +1530,7 @@ export const processContractShapes = async (
     dbTables: Array.from(dbTableNodeMap.values()),
     dbColumns: Array.from(dbColumnNodeMap.values()),
     testCases: Array.from(testCaseNodeMap.values()),
+    codeElements: Array.from(codeElementNodeMap.values()),
     edges: Array.from(edgeMap.values()),
     stats: {
       shapeCount: shapeNodeMap.size,
@@ -1337,6 +1539,7 @@ export const processContractShapes = async (
       dbTableCount: dbTableNodeMap.size,
       dbColumnCount: dbColumnNodeMap.size,
       testCaseCount: testCaseNodeMap.size,
+      codeElementCount: codeElementNodeMap.size,
       edgeCount: edgeMap.size,
       validatedFieldEdges,
       serializedFieldEdges,

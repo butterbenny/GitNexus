@@ -39,6 +39,7 @@ program
 program
   .command('analyze [path]')
   .description('Index a repository (full analysis)')
+  .option('--profile <name>', 'Analyze profile: auto|monorepo|default', 'auto')
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--skip-embeddings', 'Skip embedding generation (reduces semantic ranking precision)')
   .option('--incremental-max-changes <n>', 'Override incremental change limit (0 disables incremental)', (value) => parseInt(value, 10))
@@ -53,6 +54,8 @@ program
   .option('--no-hooks', 'Do not register Claude Code hooks')
   .option('--write-context', 'Write GitNexus context into AGENTS.md/CLAUDE.md (and install .claude skills)')
   .option('--update-gitignore', 'Add .gitnexus to the repo .gitignore')
+  .option('--with-cochange', 'Run git-history cochange pass even in monorepo profile')
+  .option('--with-brain', 'Run BrainKernel tick even in monorepo profile')
   .action(analyzeCommand);
 
 program

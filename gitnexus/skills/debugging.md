@@ -15,6 +15,7 @@ description: Trace bugs through call chains using knowledge graph
 ## Workflow
 
 ```
+0. READ gitnexus://repos                                      → Pick repo (copy repo_param + mcp_uri_context)
 1. query({query: "<error or symptom>"})                     → Find related execution flows
 2. context({name: "<suspect>"})                             → See callers/callees/processes
 3. READ gitnexus://repo/{name}/process/{name}                → Trace execution flow
@@ -22,6 +23,8 @@ description: Trace bugs through call chains using knowledge graph
 ```
 
 > If "Index is stale" → run `gitnexus analyze` in terminal.
+>
+> Worktrees/multi-repo: pass `repo: "<repo_param>"` (absolute path) on tool calls, and prefer path-encoded MCP URIs from `gitnexus://repos` (see `mcp_uri_context`).
 
 ## Checklist
 

@@ -11,6 +11,7 @@
 
 import { initEmbedder, embedBatchToArrays, embedText, embeddingToArray, isEmbedderReady } from './embedder.js';
 import { generateBatchEmbeddingTexts } from './text-generator.js';
+import { computeEmbeddingTextHash, decodeEmbeddingBase64, encodeEmbeddingBase64, loadEmbeddingCache, saveEmbeddingCache } from './embedding-cache.js';
 import {
   type EmbeddingProgress,
   type EmbeddingConfig,
@@ -135,9 +136,17 @@ const batchInsertEmbeddings = async (
   ) => Promise<void>,
   updates: Array<{ id: string; embedding: number[] }>
 ): Promise<void> => {
-  // INSERT into separate embedding table - much more memory efficient!
-  const cypher = `CREATE (e:CodeEmbedding {nodeId: $nodeId, embedding: $embedding})`;
-  const paramsList = updates.map(u => ({ nodeId: u.id, embedding: u.embedding }));
+  if (updates.length === 0) return;
+
+  // Insert embeddings in batches with a single query per chunk (UNWIND).
+  // This avoids 1 execute() call per row and is significantly faster on large repos.
+  const cypher = `UNWIND $rows AS row CREATE (e:CodeEmbedding {nodeId: row.nodeId, embedding: row.embedding})`;
+  const rowsPerQuery = 200;
+  const paramsList: Array<Record<string, any>> = [];
+  for (let start = 0; start < updates.length; start += rowsPerQuery) {
+    const rows = updates.slice(start, start + rowsPerQuery).map(u => ({ nodeId: u.id, embedding: u.embedding }));
+    paramsList.push({ rows });
+  }
   await executeWithReusedStatement(cypher, paramsList);
 };
 
@@ -169,16 +178,100 @@ const createVectorIndex = async (
  * @param executeWithReusedStatement - Function to execute with reused prepared statement
  * @param onProgress - Callback for progress updates
  * @param config - Optional configuration override
+ * @param options - Optional pipeline options
  */
 export const runEmbeddingPipeline = async (
   executeQuery: (cypher: string) => Promise<any[]>,
   executeWithReusedStatement: (cypher: string, paramsList: Array<Record<string, any>>) => Promise<void>,
   onProgress: EmbeddingProgressCallback,
   config: Partial<EmbeddingConfig> = {},
+  options?: { cachePath?: string },
 ): Promise<void> => {
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
+  const cacheMeta = { modelId: finalConfig.modelId, dimensions: finalConfig.dimensions };
+  const cachePath = String(options?.cachePath || '').trim();
+  const cacheEnabled = Boolean(cachePath);
+  const expectedEmbeddingBase64Length = Math.ceil((Math.max(0, finalConfig.dimensions) * 4) / 3) * 4;
+  const { byHash: embeddingCache, loadedVersion: embeddingCacheVersion } = cacheEnabled
+    ? await loadEmbeddingCache(cachePath, cacheMeta)
+    : { byHash: new Map<string, string>(), loadedVersion: 0 };
+  let cacheWrites = 0;
 
   try {
+    if (cacheEnabled && embeddingCache.size === 0) {
+      try {
+        for (const label of EMBEDDABLE_LABELS) {
+          let query: string;
+          if (label === 'File') {
+            query = `
+              MATCH (n:File)
+              MATCH (e:CodeEmbedding {nodeId: n.id})
+              RETURN n.id AS id, n.name AS name, 'File' AS label,
+                     n.filePath AS filePath, n.content AS content,
+                     e.embedding AS embedding
+            `;
+          } else {
+            query = `
+              MATCH (n:${label})
+              MATCH (e:CodeEmbedding {nodeId: n.id})
+              RETURN n.id AS id, n.name AS name, '${label}' AS label,
+                     n.filePath AS filePath, n.content AS content,
+                     n.startLine AS startLine, n.endLine AS endLine,
+                     e.embedding AS embedding
+            `;
+          }
+
+          const rows = await executeQuery(query);
+          if (!Array.isArray(rows) || rows.length === 0) continue;
+
+          const nodesForText: EmbeddableNode[] = [];
+          const embeddingsForNode: number[][] = [];
+          for (const row of rows as any[]) {
+            const id = row.id ?? row[0];
+            if (!id) continue;
+            const embedding = row.embedding ?? (label === 'File' ? row[5] : row[7]);
+            if (!embedding) continue;
+            const embeddingArray = Array.isArray(embedding)
+              ? embedding.map(Number)
+              : Array.from(embedding as any).map(Number);
+            if (finalConfig.dimensions > 0 && embeddingArray.length !== finalConfig.dimensions) continue;
+
+            nodesForText.push({
+              id,
+              name: row.name ?? row[1],
+              label: row.label ?? row[2],
+              filePath: row.filePath ?? row[3],
+              content: row.content ?? row[4] ?? '',
+              startLine: label === 'File' ? undefined : (row.startLine ?? row[5]),
+              endLine: label === 'File' ? undefined : (row.endLine ?? row[6]),
+            });
+            embeddingsForNode.push(embeddingArray);
+          }
+          if (nodesForText.length === 0) continue;
+
+          for (let start = 0; start < nodesForText.length; start += 512) {
+            const chunkNodes = nodesForText.slice(start, Math.min(nodesForText.length, start + 512));
+            const chunkEmbeddings = embeddingsForNode.slice(start, Math.min(embeddingsForNode.length, start + 512));
+            const texts = generateBatchEmbeddingTexts(chunkNodes, finalConfig);
+            for (let i = 0; i < chunkNodes.length; i += 1) {
+              const node = chunkNodes[i];
+              const embedding = chunkEmbeddings[i];
+              if (!node?.id || !embedding) continue;
+              const text = texts[i] || '';
+              const hash = computeEmbeddingTextHash(text, cacheMeta);
+              const embeddingBase64 = encodeEmbeddingBase64(embedding);
+              if (!hash || !embeddingBase64 || embeddingBase64.length !== expectedEmbeddingBase64Length) continue;
+              if (embeddingCache.has(hash)) continue;
+              embeddingCache.set(hash, embeddingBase64);
+              cacheWrites += 1;
+            }
+          }
+        }
+      } catch {
+        // best-effort: cache warm is optional
+      }
+    }
+
     if (isDev) {
       console.log('🔍 Querying embeddable nodes...');
     }
@@ -202,32 +295,46 @@ export const runEmbeddingPipeline = async (
       return;
     }
 
-    // Phase 2: Load embedding model
-    onProgress({
-      phase: 'loading-model',
-      percent: 0,
-      modelDownloadPercent: 0,
-    });
-
-    await initEmbedder((modelProgress: ModelProgress) => {
-      const downloadPercent = modelProgress.progress ?? 0;
+    // Phase 2: Load embedding model only when needed.
+    // Note: we intentionally avoid a full pre-scan "needsEmbeddingModel" pass here because it would
+    // generate embedding texts twice (once for the scan, once per batch). We instead lazy-load the
+    // model on the first cache miss encountered during batching.
+    let embedderReady = false;
+    const ensureEmbedderReady = async (percent: number): Promise<void> => {
+      if (embedderReady) return;
       onProgress({
         phase: 'loading-model',
-        percent: Math.round(downloadPercent * 0.2),
-        modelDownloadPercent: downloadPercent,
+        percent,
+        modelDownloadPercent: 0,
       });
-    }, finalConfig);
 
-    onProgress({
-      phase: 'loading-model',
-      percent: 20,
-      modelDownloadPercent: 100,
-    });
+      await initEmbedder((modelProgress: ModelProgress) => {
+        const downloadPercent = modelProgress.progress ?? 0;
+        onProgress({
+          phase: 'loading-model',
+          percent,
+          modelDownloadPercent: downloadPercent,
+        });
+      }, finalConfig);
+
+      onProgress({
+        phase: 'loading-model',
+        percent,
+        modelDownloadPercent: 100,
+      });
+      embedderReady = true;
+    };
 
     // Phase 3: Batch embed nodes
-    const batchSize = finalConfig.batchSize;
-    const totalBatches = Math.ceil(totalNodes / batchSize);
+    // Default batch sizes can be too aggressive for some CPU/WASM environments.
+    // We treat OOM-like failures as a signal to reduce batch size and retry.
+    const totalBatchesForSize = (size: number): number =>
+      Math.ceil(totalNodes / Math.max(1, Math.floor(size)));
+
+    let batchSize = Math.max(1, Math.floor(finalConfig.batchSize));
+    let totalBatches = totalBatchesForSize(batchSize);
     let processedNodes = 0;
+    let currentBatch = 0;
 
     onProgress({
       phase: 'embedding',
@@ -238,26 +345,103 @@ export const runEmbeddingPipeline = async (
       totalBatches,
     });
 
-    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-      const start = batchIndex * batchSize;
+    for (let start = 0; start < totalNodes;) {
       const end = Math.min(start + batchSize, totalNodes);
       const batch = nodes.slice(start, end);
 
       // Generate texts for this batch
       const texts = generateBatchEmbeddingTexts(batch, finalConfig);
 
-      // Embed the batch
-      const embeddings = await embedBatchToArrays(texts);
+      const cachedUpdates: Array<{ id: string; embedding: number[] }> = [];
+      const missNodes: EmbeddableNode[] = [];
+      const missTexts: string[] = [];
+      const missHashes: string[] = [];
+
+      if (cacheEnabled && embeddingCache.size > 0) {
+        for (let i = 0; i < batch.length; i += 1) {
+          const node = batch[i];
+          const text = texts[i] || '';
+          const hash = computeEmbeddingTextHash(text, cacheMeta);
+          const base64 = String(embeddingCache.get(hash) || '');
+
+          if (!base64 || base64.length !== expectedEmbeddingBase64Length) {
+            missNodes.push(node);
+            missTexts.push(text);
+            missHashes.push(hash);
+            continue;
+          }
+
+          const embedding = decodeEmbeddingBase64(base64, finalConfig.dimensions);
+          if (!embedding) {
+            missNodes.push(node);
+            missTexts.push(text);
+            missHashes.push(hash);
+            continue;
+          }
+
+          cachedUpdates.push({ id: node.id, embedding });
+        }
+      } else {
+        // No cache: embed all nodes in this batch.
+        missNodes.push(...batch);
+        missTexts.push(...texts);
+        missHashes.push(...texts.map(text => computeEmbeddingTextHash(text, cacheMeta)));
+      }
+
+      let embeddedUpdates: Array<{ id: string; embedding: number[] }> = [];
+      if (missTexts.length > 0) {
+        if (!embedderReady) {
+          const loadingPercent = Math.round(20 + ((processedNodes / totalNodes) * 70));
+          await ensureEmbedderReady(loadingPercent);
+        }
+
+        let embeddings: number[][];
+        try {
+          embeddings = await embedBatchToArrays(missTexts);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error || '');
+          const looksLikeOom = /out of memory|oom|allocation|memory/i.test(message);
+          if (looksLikeOom && batchSize > 1) {
+            batchSize = Math.max(1, Math.floor(batchSize / 2));
+            totalBatches = totalBatchesForSize(batchSize);
+            onProgress({
+              phase: 'embedding',
+              percent: Math.round(20 + ((processedNodes / totalNodes) * 70)),
+              nodesProcessed: processedNodes,
+              totalNodes,
+              currentBatch,
+              totalBatches,
+            });
+            continue;
+          }
+          throw error;
+        }
+
+        embeddedUpdates = missNodes.map((node, i) => ({
+          id: node.id,
+          embedding: embeddings[i],
+        }));
+
+        if (cacheEnabled) {
+          for (let i = 0; i < embeddedUpdates.length; i += 1) {
+            const update = embeddedUpdates[i];
+            const hash = missHashes[i] || computeEmbeddingTextHash(missTexts[i] || '', cacheMeta);
+            const embeddingBase64 = encodeEmbeddingBase64(update.embedding);
+            if (embeddingBase64.length !== expectedEmbeddingBase64Length) continue;
+            const isNew = !embeddingCache.has(hash);
+            embeddingCache.set(hash, embeddingBase64);
+            if (isNew) cacheWrites += 1;
+          }
+        }
+      }
 
       // Update KuzuDB with embeddings
-      const updates = batch.map((node, i) => ({
-        id: node.id,
-        embedding: embeddings[i],
-      }));
-
+      const updates = [...cachedUpdates, ...embeddedUpdates];
       await batchInsertEmbeddings(executeWithReusedStatement, updates);
 
       processedNodes += batch.length;
+      currentBatch += 1;
+      start = end;
 
       // Report progress (20-90% for embedding phase)
       const embeddingProgress = 20 + ((processedNodes / totalNodes) * 70);
@@ -266,7 +450,7 @@ export const runEmbeddingPipeline = async (
         percent: Math.round(embeddingProgress),
         nodesProcessed: processedNodes,
         totalNodes,
-        currentBatch: batchIndex + 1,
+        currentBatch,
         totalBatches,
       });
     }
@@ -284,6 +468,10 @@ export const runEmbeddingPipeline = async (
     }
 
     await createVectorIndex(executeQuery);
+
+    if (cacheEnabled && embeddingCache.size > 0 && (cacheWrites > 0 || embeddingCacheVersion === 1)) {
+      await saveEmbeddingCache(cachePath, cacheMeta, embeddingCache);
+    }
 
     // Complete
     onProgress({
