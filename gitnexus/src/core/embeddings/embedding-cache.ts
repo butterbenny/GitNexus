@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import fs from 'fs/promises';
+import os from 'os';
 import path from 'path';
 
 export type EmbeddingCacheMeta = {
@@ -65,6 +66,12 @@ export const decodeEmbeddingBase64 = (base64: string, expectedDimensions: number
 
 export const resolveDefaultEmbeddingCachePath = (storagePath: string): string => {
   return path.join(storagePath, 'embeddings', 'cache.json');
+};
+
+export const resolveGlobalEmbeddingCachePath = (): string => {
+  const envHome = process.env.GITNEXUS_HOME?.trim();
+  const baseDir = envHome ? path.resolve(envHome) : path.join(os.homedir(), '.gitnexus');
+  return path.join(baseDir, 'embeddings', 'cache.json');
 };
 
 export const loadEmbeddingCache = async (

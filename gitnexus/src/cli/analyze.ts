@@ -7,10 +7,10 @@
 import path from 'path';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, deleteNodesForFile, deleteOutgoingRelationshipsForFile, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
+import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, deleteNodesForFiles, deleteOutgoingRelationshipsForFiles, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
 import { runEmbeddingPipeline } from '../core/embeddings/embedding-pipeline.js';
 import { disposeEmbedder } from '../core/embeddings/embedder.js';
-import { resolveDefaultEmbeddingCachePath } from '../core/embeddings/embedding-cache.js';
+import { resolveDefaultEmbeddingCachePath, resolveGlobalEmbeddingCachePath } from '../core/embeddings/embedding-cache.js';
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
 import { getCurrentCommit, isGitRepo, getGitRoot, getCommittedFileChanges, getWorkingTreeFileChanges, mergeGitFileChanges } from '../storage/git.js';
 import { KUZU_SCHEMA_VERSION } from '../core/kuzu/schema.js';
@@ -226,7 +226,43 @@ export const analyzeCommand = async (
   }
 
   const { storagePath, kuzuPath } = getStoragePaths(repoPath);
-  const embeddingCachePath = resolveDefaultEmbeddingCachePath(storagePath);
+  const repoEmbeddingCachePath = resolveDefaultEmbeddingCachePath(storagePath);
+  const globalEmbeddingCachePath = resolveGlobalEmbeddingCachePath();
+
+  const explicitEmbeddingCachePath = String(process.env.GITNEXUS_EMBEDDING_CACHE_PATH || '').trim();
+  const embeddingCacheScope = String(process.env.GITNEXUS_EMBEDDING_CACHE_SCOPE || '').trim().toLowerCase();
+
+  let embeddingCachePath = repoEmbeddingCachePath;
+  if (explicitEmbeddingCachePath) {
+    embeddingCachePath = explicitEmbeddingCachePath;
+  } else if (embeddingCacheScope === 'repo') {
+    embeddingCachePath = repoEmbeddingCachePath;
+  } else if (embeddingCacheScope === 'global') {
+    embeddingCachePath = globalEmbeddingCachePath;
+    try {
+      // Best-effort: if the user explicitly requested a global cache but it doesn't exist yet,
+      // seed it from the repo cache (worktree seeding often provides this file).
+      await fs.access(globalEmbeddingCachePath);
+    } catch {
+      try {
+        await fs.access(repoEmbeddingCachePath);
+        await fs.mkdir(path.dirname(globalEmbeddingCachePath), { recursive: true });
+        await fs.copyFile(repoEmbeddingCachePath, globalEmbeddingCachePath);
+      } catch {
+        // best-effort
+      }
+    }
+  } else if (monorepoProfile) {
+    // Default (monorepo): prefer global cache only when it already exists (avoid cold-cache full recompute).
+    try {
+      await fs.access(globalEmbeddingCachePath);
+      embeddingCachePath = globalEmbeddingCachePath;
+    } catch {
+      embeddingCachePath = repoEmbeddingCachePath;
+    }
+  } else {
+    embeddingCachePath = repoEmbeddingCachePath;
+  }
   const currentCommit = getCurrentCommit(repoPath);
   const existingMeta = await loadMeta(storagePath);
   const existingSchemaVersion = existingMeta?.kuzuSchemaVersion ?? 1;
@@ -840,28 +876,22 @@ export const analyzeCommand = async (
     // Delete nodes for removed files
     if (deletedFiles.size > 0) {
       bar.update(12, { phase: 'Incremental: removing deleted files...' });
-      for (const fp of deletedFiles) {
-        debug(`deleteNodesForFile (deleted) ${fp}`);
-        await deleteNodesForFile(fp, { includeFileNode: true });
-      }
+      debug(`deleteNodesForFiles (deleted) ${deletedFiles.size} file(s)`);
+      await deleteNodesForFiles(Array.from(deletedFiles), { includeFileNode: true });
     }
 
     // Delete code/symbol nodes for changed files, but keep File nodes (preserves CONTAINS edges)
     if (rebuildFiles.length > 0) {
       bar.update(16, { phase: 'Incremental: clearing changed symbols...' });
-      for (const fp of rebuildFiles) {
-        debug(`deleteNodesForFile (changed) ${fp}`);
-        await deleteNodesForFile(fp, { includeFileNode: false });
-      }
+      debug(`deleteNodesForFiles (changed) ${rebuildFiles.length} file(s)`);
+      await deleteNodesForFiles(rebuildFiles, { includeFileNode: false });
     }
 
     // Clear outgoing edges for processed files (we will re-emit them from fresh analysis)
     bar.update(20, { phase: 'Incremental: clearing outgoing edges...' });
     const EDGE_TYPES_TO_CLEAR = ['IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS'];
-    for (const fp of processedFiles) {
-      debug(`deleteOutgoingRelationshipsForFile ${fp}`);
-      await deleteOutgoingRelationshipsForFile(fp, EDGE_TYPES_TO_CLEAR);
-    }
+    debug(`deleteOutgoingRelationshipsForFiles ${processedFiles.length} file(s)`);
+    await deleteOutgoingRelationshipsForFiles(processedFiles, EDGE_TYPES_TO_CLEAR);
 
     // Load full symbol table from the existing index (post-delete)
     bar.update(24, { phase: 'Incremental: loading symbol table...' });

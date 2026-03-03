@@ -736,6 +736,93 @@ export const deleteNodesForFile = async (
   }
 };
 
+const chunkArray = <T>(values: T[], size: number): T[][] => {
+  if (size <= 0) return [values];
+  const chunks: T[][] = [];
+  for (let i = 0; i < values.length; i += size) {
+    chunks.push(values.slice(i, i + size));
+  }
+  return chunks;
+};
+
+export const deleteNodesForFiles = async (
+  filePaths: string[],
+  opts?: { dbPath?: string; includeFileNode?: boolean },
+): Promise<{ deletedNodes: number }> => {
+  const dbPath = opts?.dbPath;
+  const includeFileNode = opts?.includeFileNode ?? true;
+  const usePerQuery = !!dbPath;
+
+  let tempDb: kuzu.Database | null = null;
+  let tempConn: kuzu.Connection | null = null;
+  let targetConn: kuzu.Connection | null = conn;
+
+  if (usePerQuery) {
+    tempDb = new kuzu.Database(dbPath);
+    tempConn = new kuzu.Connection(tempDb);
+    targetConn = tempConn;
+  } else if (!conn) {
+    throw new Error('KuzuDB not initialized. Provide dbPath or call initKuzu first.');
+  }
+
+  try {
+    const unique = Array.from(new Set(filePaths.map(fp => fp.trim()).filter(Boolean)));
+    if (unique.length === 0) return { deletedNodes: 0 };
+
+    const filePathChunks = chunkArray(unique, 200);
+
+    for (const tableName of NODE_TABLES) {
+      // Skip tables that don't have filePath
+      if (tableName === 'Community' || tableName === 'Process' || tableName === 'FeatureSlice' || tableName === 'Gap' || tableName === 'ContractShape' || tableName === 'ContractField' || tableName === 'CacheKey' || tableName === 'DBTable' || tableName === 'DBColumn' || tableName === 'ValueNode') continue;
+      if (!includeFileNode && tableName === 'File') continue;
+
+      const t = escapeTableName(tableName);
+      for (const chunk of filePathChunks) {
+        const escapedPaths = chunk.map(fp => `'${fp.replace(/'/g, "''")}'`).join(', ');
+        if (!escapedPaths) continue;
+        try {
+          const queryResult = await targetConn!.query(
+            `MATCH (n:${t}) WHERE n.filePath IN [${escapedPaths}] DETACH DELETE n`
+          );
+          await closeQueryResults(queryResult);
+        } catch {
+          // Some tables may not support this query, skip
+        }
+      }
+    }
+
+    // Also delete any embeddings for nodes in these files
+    for (const chunk of chunkArray(unique, 50)) {
+      const conditions = chunk
+        .map(fp => {
+          const escapedPath = fp.replace(/'/g, "''");
+          return `(e.nodeId = 'File:${escapedPath}' OR e.nodeId = 'Template:${escapedPath}' OR e.nodeId CONTAINS ':${escapedPath}:')`;
+        })
+        .filter(Boolean)
+        .join(' OR ');
+      if (!conditions) continue;
+
+      try {
+        const queryResult = await targetConn!.query(
+          `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE ${conditions} DELETE e`
+        );
+        await closeQueryResults(queryResult);
+      } catch {
+        // Embedding table may not exist or nodeId format may differ
+      }
+    }
+
+    return { deletedNodes: 0 };
+  } finally {
+    if (tempConn) {
+      try { await tempConn.close(); } catch {}
+    }
+    if (tempDb) {
+      try { await tempDb.close(); } catch {}
+    }
+  }
+};
+
 export const deleteOutgoingRelationshipsForFile = async (
   filePath: string,
   relationTypes: string[],
@@ -770,6 +857,61 @@ export const deleteOutgoingRelationshipsForFile = async (
 
     const queryResult = await targetConn!.query(cypher);
     await closeQueryResults(queryResult);
+    return { deletedEdges: 0 };
+  } catch {
+    return { deletedEdges: 0 };
+  } finally {
+    if (tempConn) {
+      try { await tempConn.close(); } catch {}
+    }
+    if (tempDb) {
+      try { await tempDb.close(); } catch {}
+    }
+  }
+};
+
+export const deleteOutgoingRelationshipsForFiles = async (
+  filePaths: string[],
+  relationTypes: string[],
+  opts?: { dbPath?: string },
+): Promise<{ deletedEdges: number }> => {
+  const dbPath = opts?.dbPath;
+  const usePerQuery = !!dbPath;
+
+  let tempDb: kuzu.Database | null = null;
+  let tempConn: kuzu.Connection | null = null;
+  let targetConn: kuzu.Connection | null = conn;
+
+  if (usePerQuery) {
+    tempDb = new kuzu.Database(dbPath);
+    tempConn = new kuzu.Connection(tempDb);
+    targetConn = tempConn;
+  } else if (!conn) {
+    throw new Error('KuzuDB not initialized. Provide dbPath or call initKuzu first.');
+  }
+
+  try {
+    const unique = Array.from(new Set(filePaths.map(fp => fp.trim()).filter(Boolean)));
+    if (unique.length === 0) return { deletedEdges: 0 };
+
+    const typeList = relationTypes
+      .map(t => `'${t.replace(/'/g, "''")}'`)
+      .join(', ');
+
+    for (const chunk of chunkArray(unique, 250)) {
+      const escapedPaths = chunk.map(fp => `'${fp.replace(/'/g, "''")}'`).join(', ');
+      if (!escapedPaths) continue;
+
+      const cypher = `
+        MATCH (a)-[r:${REL_TABLE_NAME}]->()
+        WHERE a.filePath IN [${escapedPaths}]${relationTypes.length > 0 ? ` AND r.type IN [${typeList}]` : ''}
+        DELETE r
+      `;
+
+      const queryResult = await targetConn!.query(cypher);
+      await closeQueryResults(queryResult);
+    }
+
     return { deletedEdges: 0 };
   } catch {
     return { deletedEdges: 0 };

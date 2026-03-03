@@ -470,7 +470,14 @@ export const runEmbeddingPipeline = async (
     await createVectorIndex(executeQuery);
 
     if (cacheEnabled && embeddingCache.size > 0 && (cacheWrites > 0 || embeddingCacheVersion === 1)) {
-      await saveEmbeddingCache(cachePath, cacheMeta, embeddingCache);
+      try {
+        await saveEmbeddingCache(cachePath, cacheMeta, embeddingCache);
+      } catch (error) {
+        // Best effort: cache writes are optional and should not fail the embedding pipeline.
+        if (isDev) {
+          console.warn('Embedding cache save warning:', error);
+        }
+      }
     }
 
     // Complete
