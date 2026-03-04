@@ -14,6 +14,7 @@ export const EMBEDDABLE_LABELS = [
   'Method',
   'Interface',
   'File',
+  'CodeElement',
 ] as const;
 
 export type EmbeddableLabel = typeof EMBEDDABLE_LABELS[number];

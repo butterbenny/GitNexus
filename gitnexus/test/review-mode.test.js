@@ -106,6 +106,34 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   );
 
   await fs.writeFile(
+    path.join(repoPath, '.gitignore'),
+    [
+      'agents.override.md',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'agents.override.md'),
+    [
+      '# Local agent instructions (untracked)',
+      '#',
+      '# ------------------------------------------------------------',
+      '# Frontend review guardrails',
+      '# ------------------------------------------------------------',
+      '# - Finding code: prop-drilling-score',
+      '# - Finding code: import-type',
+      '# - Finding code: typescript-satisfies',
+      '# - Finding code: children-nullish-default',
+      '# - Prefer small parts APIs over prop drilling.',
+      '# - Example: `apps/dashboard/src/pages/FooPage.tsx`',
+      '#',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
     path.join(repoPath, 'apps/dashboard/src/pages/PatternTemplate.tsx'),
     [
       'export const PatternTemplate = () => <div>template</div>;',
@@ -221,16 +249,18 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
     path.join(repoPath, 'apps/dashboard/src/pages/FooPage.tsx'),
     [
       "import { useEffect } from 'react';",
+      "import type { ReactNode } from 'react';",
       "import { useMutation, useQueryClient } from '@tanstack/react-query';",
       '',
-      'export const FooPage = () => {',
+      'export const FooPage = ({ children }: { children?: ReactNode }) => {',
       '  const queryClient = useQueryClient();',
       '',
       '  const foo = 1;',
       '  const bar = 2;',
       '  const baz = 3;',
       '  const qux = 4;',
-      "  const widgetProps = { id: 'widget' };",
+      "  const widgetKind = 'widget' as const;",
+      '  const widgetProps = { id: widgetKind } satisfies { id: string };',
       '',
       '  const Inner = ({ count }: { count: number }) => <div>{count}</div>;',
       '',
@@ -248,7 +278,7 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
       '    },',
       '  });',
       '',
-      '  return (',
+      '  return children ?? (',
       '    <>',
       '      <Widget {...widgetProps} foo={foo} bar={bar} baz={baz} qux={qux} />',
       '      <Inner count={foo} />',
@@ -528,6 +558,18 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
     result.review_kernel.findings.some(f => String(f.code || '') === 'inline-param-type-object'),
     'expected inline parameter type object finding',
   );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'import-type'),
+    'expected import type finding',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'typescript-satisfies'),
+    'expected satisfies operator finding',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'children-nullish-default'),
+    'expected children ?? defaulting finding',
+  );
   assert.ok(Array.isArray(result.review_kernel.doc_guidance), 'expected review_kernel doc_guidance list');
   assert.ok(
     result.review_kernel.doc_guidance.some(item => String(item?.kind || '') === 'anti-pattern'),
@@ -536,6 +578,28 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(
     result.review_kernel.doc_guidance.some(item => String(item?.kind || '') === 'pattern-catalog'),
     'expected review_kernel doc_guidance to include pattern-catalog doc matches',
+  );
+  assert.ok(
+    result.review_kernel.doc_guidance.some(item => String(item?.kind || '') === 'agent-guideline'),
+    'expected review_kernel doc_guidance to include agent override guidance',
+  );
+
+  const propDrillingFinding = result.review_kernel.findings.find(f => String(f.code || '') === 'prop-drilling-score');
+  assert.ok(propDrillingFinding, 'expected prop-drilling-score finding payload');
+  assert.ok(Array.isArray(propDrillingFinding.guidance), 'expected prop drilling finding guidance');
+  assert.ok(
+    propDrillingFinding.guidance.some(item => String(item?.kind || '') === 'agent-guideline' && String(item?.anchor?.filePath || '') === 'agents.override.md'),
+    'expected prop drilling finding to include agent override guidance anchor',
+  );
+
+  const inlineKeyFinding = result.review_kernel.findings.find(f => String(f.code || '') === 'react-query-inline-key');
+  assert.ok(inlineKeyFinding, 'expected react-query-inline-key finding payload');
+  assert.ok(Array.isArray(inlineKeyFinding.guidance), 'expected inline key finding guidance');
+  const patternGuidance = inlineKeyFinding.guidance.find(item => String(item?.kind || '') === 'pattern-catalog');
+  assert.ok(patternGuidance, 'expected react-query-inline-key to include pattern-catalog guidance');
+  assert.ok(
+    Array.isArray(patternGuidance.examples) && patternGuidance.examples.some(ex => String(ex?.filePath || '') === 'apps/dashboard/src/pages/PatternTemplate.tsx'),
+    'expected pattern-catalog guidance to include template file',
   );
   assert.ok(result.test_intelligence, 'expected test_intelligence payload');
   assert.equal(result.test_intelligence.mode, 'changed-vs-baseline-heuristic');

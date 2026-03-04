@@ -10,7 +10,11 @@ type PatternCatalogSection = {
   alsoGoodFiles: string[];
   otherFiles: string[];
   content: string;
+  findingCodes: string[];
 };
+
+const FINDING_CODE_REGEX = /\bFinding\s+code:\s*([A-Za-z0-9][A-Za-z0-9_-]{1,120})\b/i;
+const FIXES_CODE_REGEX = /\bFixes:\s*([A-Za-z0-9][A-Za-z0-9_-]{1,120})\b/i;
 
 const normalizeRepoRelativePath = (value: string): string => {
   return String(value || '').trim().replace(/\\/g, '/');
@@ -31,6 +35,35 @@ const extractBacktickFilePaths = (line: string): string[] => {
   return out;
 };
 
+const extractFindingCodes = (content: string): string[] => {
+  const codes = new Set<string>();
+  const lines = String(content || '').split('\n');
+
+  for (const line of lines) {
+    const addCode = (raw: string) => {
+      const normalized = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+      if (/^[a-z0-9][a-z0-9-]{1,120}$/.test(normalized)) codes.add(normalized);
+    };
+
+    const findingMatch = FINDING_CODE_REGEX.exec(line);
+    if (findingMatch?.[1]) addCode(findingMatch[1]);
+
+    const fixesMatch = FIXES_CODE_REGEX.exec(line);
+    if (fixesMatch?.[1]) addCode(fixesMatch[1]);
+
+    if (/\bFixes:\b/i.test(line) || /\bFinding\s+code:\b/i.test(line)) {
+      const tail = line.split(/(?:Fixes:|Finding\s+code:)/i)[1] || '';
+      for (const part of tail.split(/[,|\s]+/g)) {
+        const candidate = String(part || '').trim();
+        if (!candidate) continue;
+        addCode(candidate.replace(/[^A-Za-z0-9_-]/g, ''));
+      }
+    }
+  }
+
+  return Array.from(codes.values());
+};
+
 const parsePatternCatalogMarkdown = (content: string): PatternCatalogSection[] => {
   const lines = String(content || '').split('\n');
   const sections: PatternCatalogSection[] = [];
@@ -46,12 +79,14 @@ const parsePatternCatalogMarkdown = (content: string): PatternCatalogSection[] =
     alsoGoodFiles: string[];
     otherFiles: string[];
     rawLines: string[];
+    findingCodes: Set<string>;
   } | null = null;
 
   const finalize = (endLine: number) => {
     if (!current) return;
     const dedupe = (items: string[]) => Array.from(new Set(items.map(normalizeRepoRelativePath).filter(Boolean)));
     current.endLine = Math.max(current.startLine, endLine);
+    const findingCodes = Array.from(current.findingCodes.values());
     sections.push({
       category: current.category,
       title: current.title,
@@ -61,6 +96,7 @@ const parsePatternCatalogMarkdown = (content: string): PatternCatalogSection[] =
       alsoGoodFiles: dedupe(current.alsoGoodFiles),
       otherFiles: dedupe(current.otherFiles),
       content: current.rawLines.join('\n').trim(),
+      findingCodes,
     });
     current = null;
   };
@@ -87,6 +123,7 @@ const parsePatternCatalogMarkdown = (content: string): PatternCatalogSection[] =
         alsoGoodFiles: [],
         otherFiles: [],
         rawLines: [],
+        findingCodes: new Set<string>(),
       };
       mode = null;
       continue;
@@ -94,6 +131,7 @@ const parsePatternCatalogMarkdown = (content: string): PatternCatalogSection[] =
 
     if (!current) continue;
     current.rawLines.push(line);
+    for (const code of extractFindingCodes(line)) current.findingCodes.add(code);
 
     const lowered = trimmed.toLowerCase();
     if (lowered === 'template:') {
@@ -141,6 +179,7 @@ export const processPatternCatalogTemplates = (
 
   let nodeCount = 0;
   let edgeCount = 0;
+  const findingValueNodesCreated = new Set<string>();
 
   const addRel = (rel: GraphRelationship) => {
     graph.addRelationship(rel);
@@ -186,6 +225,36 @@ export const processPatternCatalogTemplates = (
       });
     }
 
+    for (const code of section.findingCodes || []) {
+      const valueKey = `finding_code:${code}`;
+      const valueId = generateId('ValueNode', valueKey);
+      if (!findingValueNodesCreated.has(valueId)) {
+        findingValueNodesCreated.add(valueId);
+        graph.addNode({
+          id: valueId,
+          label: 'ValueNode',
+          properties: {
+            name: code,
+            filePath: '',
+            heuristicLabel: 'FindingCode',
+            valueType: 'finding_code',
+            valueKey,
+            valueRaw: code,
+          },
+        });
+        nodeCount += 1;
+      }
+
+      addRel({
+        id: generateId('USES', `${sectionId}->${valueId}:pattern-catalog:fixes`),
+        type: 'USES',
+        sourceId: sectionId,
+        targetId: valueId,
+        confidence: 1.0,
+        reason: 'pattern-catalog:fixes',
+      });
+    }
+
     const pushTemplateEdge = (filePathRaw: string, reason: string) => {
       const filePath = normalizeRepoRelativePath(filePathRaw);
       if (!filePath) return;
@@ -208,4 +277,3 @@ export const processPatternCatalogTemplates = (
 
   return { nodeCount, edgeCount, sectionCount: sections.length };
 };
-

@@ -950,6 +950,85 @@ export async function runReviewMode(
       };
 
       const parseMarkdownSections = (content: string, docPath: string, kind: string): AgentDocSection[] => {
+        const stripLeadingCommentHash = (line: string): string => {
+          return String(line || '').replace(/^#\s?/, '');
+        };
+
+        const parseCommentPrefixedGuidelineSections = (content: string): AgentDocSection[] => {
+          const rawLines = String(content || '').split('\n');
+          const lines = rawLines.map(stripLeadingCommentHash);
+          const sections: AgentDocSection[] = [];
+
+          let current: { id: string; title: string; startLine: number; rawLines: string[] } | null = null;
+
+          const isSeparator = (line: string): boolean => /^-{8,}$/.test(String(line || '').trim());
+
+          const finalize = (endLine: number) => {
+            if (!current) return;
+            const body = current.rawLines.join('\n').trim();
+            const referencedFiles = Array.from(new Set(current.rawLines.flatMap(line => extractBacktickFilePaths(line))));
+            const tokenSet = new Set<string>([
+              ...tokenize(current.title),
+              ...tokenize(body),
+              ...referencedFiles.flatMap(tokenize),
+            ]);
+
+            sections.push({
+              id: current.id,
+              title: current.title,
+              content: body,
+              startLine: current.startLine,
+              endLine: Math.max(current.startLine, endLine),
+              referencedFiles,
+              tokenSet,
+            });
+            current = null;
+          };
+
+          const startSection = (title: string, startLine: number) => {
+            const rawId = `CodeElement:agent-doc:${kind}:${docPath}:${startLine}`;
+            current = { id: rawId, title: String(title || '').trim(), startLine, rawLines: [] };
+          };
+
+          for (let idx = 0; idx < lines.length; idx += 1) {
+            const line = String(lines[idx] || '');
+            const lineNo = idx + 1;
+
+            if (isSeparator(line)) {
+              let titleIdx = idx + 1;
+              while (titleIdx < lines.length && String(lines[titleIdx] || '').trim() === '') titleIdx += 1;
+              if (titleIdx >= lines.length) continue;
+
+              const titleLine = String(lines[titleIdx] || '');
+              if (isSeparator(titleLine) || titleLine.trim() === '') continue;
+
+              let tailIdx = titleIdx + 1;
+              while (tailIdx < lines.length && String(lines[tailIdx] || '').trim() === '') tailIdx += 1;
+              if (tailIdx >= lines.length || !isSeparator(String(lines[tailIdx] || ''))) continue;
+
+              finalize(lineNo - 1);
+              startSection(titleLine, titleIdx + 1);
+              idx = tailIdx;
+              continue;
+            }
+
+            if (!current && line.trim()) {
+              startSection(line, lineNo);
+              continue;
+            }
+
+            if (current) current.rawLines.push(line);
+          }
+
+          finalize(lines.length);
+
+          return sections.filter(section => section.title && section.startLine > 0);
+        };
+
+        if (String(kind || '').trim() === 'override') {
+          return parseCommentPrefixedGuidelineSections(content);
+        }
+
         const lines = String(content || '').split('\n');
         const sections: AgentDocSection[] = [];
 
@@ -1191,6 +1270,92 @@ export async function runReviewMode(
             return {
               kind: 'anti-pattern',
               signature: `anti-pattern:${match.section.title}`,
+              score: match.score,
+              anchor: {
+                name: match.section.title,
+                kind: 'DocSection',
+                filePath: doc.relativePath,
+                startLine: match.section.startLine,
+                endLine: match.section.endLine,
+                doc_kind: docKind,
+                score: match.score,
+              },
+              examples: exampleFiles.map(filePath => ({
+                name: path.basename(filePath),
+                kind: 'File',
+                filePath,
+              })),
+            };
+          });
+        } catch {
+          return [];
+        }
+      };
+
+      const buildOverrideGuidance = async (): Promise<any[]> => {
+        try {
+          const docKind = 'override';
+          const candidatePaths = ['agents.override.md', 'AGENTS.override.md'];
+
+          let doc: { relativePath: string; sections: AgentDocSection[] } | null = null;
+          for (const docPath of candidatePaths) {
+            doc = await loadSectionsFromGraph({ kind: docKind, doc_path: docPath })
+              || await loadSectionsFromFile({ kind: docKind, doc_path: docPath });
+            if (doc && doc.sections.length > 0) break;
+          }
+          if (!doc || doc.sections.length === 0) return [];
+
+          const scored = doc.sections
+            .map(section => {
+              const sectionTokenSet = section.tokenSet || new Set<string>();
+              let tokenOverlap = 0;
+              for (const token of sectionTokenSet) {
+                if (reviewTokenSet.has(token)) tokenOverlap += 1;
+              }
+
+              const referencedFiles = section.referencedFiles
+                .map(filePath => normalizePath(filePath))
+                .filter(Boolean);
+              const referencedInScope = referencedFiles.filter(filePath => isInScope(filePath));
+
+              const fileHits = referencedFiles.filter(filePath => changedFileSet.has(filePath)).length;
+              let affinity = 0;
+              if (changedFileList.length > 0 && referencedFiles.length > 0) {
+                for (const ref of referencedFiles) {
+                  for (const changed of changedFileList) {
+                    affinity = Math.max(affinity, pathAffinity(ref, changed));
+                  }
+                }
+              }
+
+              const score = tokenOverlap
+                + (fileHits > 0 ? 6 : 0)
+                + Math.round(affinity * 4);
+
+              return {
+                section,
+                score,
+                fileHits,
+                referencedFiles: referencedInScope.length > 0 ? referencedInScope : referencedFiles,
+              };
+            })
+            .filter(item => item.score > 0)
+            .sort((left, right) => {
+              if (right.score !== left.score) return right.score - left.score;
+              if (right.fileHits !== left.fileHits) return right.fileHits - left.fileHits;
+              if (left.section.startLine !== right.section.startLine) return left.section.startLine - right.section.startLine;
+              return left.section.title.localeCompare(right.section.title);
+            })
+            .slice(0, 3);
+
+          return scored.map(match => {
+            const exampleFiles = Array.from(new Set(match.referencedFiles))
+              .filter(Boolean)
+              .slice(0, 5);
+
+            return {
+              kind: 'agent-guideline',
+              signature: `agent-guideline:${match.section.title}`,
               score: match.score,
               anchor: {
                 name: match.section.title,
@@ -1522,6 +1687,7 @@ export async function runReviewMode(
       const out = [
         ...await buildPatternCatalogGuidance(),
         ...await buildAntiPatternGuidance(),
+        ...await buildOverrideGuidance(),
       ]
         .sort((left, right) => {
           const leftScore = toFiniteNumber(left?.score, 0);
@@ -4996,7 +5162,13 @@ export async function runReviewMode(
         | 'react-fc'
         | 'react-usecontext'
         | 'react-context-provider'
-        | 'tailwind-space-class';
+        | 'tailwind-space-class'
+        | 'import-type'
+        | 'as-const'
+        | 'typescript-satisfies'
+        | 'children-nullish-default'
+        | 'children-undefined-default'
+        | 'component-function-declaration';
       filePath: string;
       line: number;
       summary: string;
@@ -5138,6 +5310,11 @@ export async function runReviewMode(
     const invalidateInlineQueryKeyRegex = /\binvalidateQueries\s*\(\s*\{[^}]*\bqueryKey\s*:\s*\[/;
     const getQueryDataRegex = /\bqueryClient\.getQueryData\s*\(/;
     const inlineStringMungingRegex = /\.\s*replaceAll\s*\(\s*['"`]_['"`]\s*,\s*['"`] ['"`]\s*\)|\bupperFirst\s*\(|\bcapitalize\s*\(/;
+    const importTypeRegex = /^\s*import\s+type\b/;
+    const asConstRegex = /\bas\s+const\b/;
+    const satisfiesRegex = /\bsatisfies\b/;
+    const childrenNullishDefaultRegex = /\bchildren\s*\?\?/;
+    const childrenUndefinedDefaultRegex = /\bchildren\s*===\s*undefined\b|\bundefined\s*===\s*children\b/;
     const consoleLogRegex = /\bconsole\.log\s*\(/;
     const debuggerRegex = /\bdebugger\b/;
     const xxxCommentRegex = /(?:\/\/|\/\*).*?\bXXX\b/i;
@@ -5404,20 +5581,48 @@ export async function runReviewMode(
         let useContextLine = 0;
         let providerLine = 0;
         let tailwindSpaceLine = 0;
+        let importTypeLine = 0;
+        let asConstLine = 0;
+        let satisfiesLine = 0;
+        let childrenNullishLine = 0;
+        let childrenUndefinedLine = 0;
+        let functionComponentLine = 0;
+        let functionComponentName = '';
 
+        let braceDepth = 0;
         for (let idx = 0; idx < lines.length; idx += 1) {
           const lineNo = idx + 1;
-          if (!lineNearChanged(lineNo)) continue;
-
+          const nearChanged = lineNearChanged(lineNo);
           const rawLine = String(lines[idx] || '');
           const codeLine = rawLine.replace(/\/\/.*$/g, '');
+          const trimmed = codeLine.trimEnd();
 
-          if (!defaultExportLine && defaultExportRegex.test(codeLine)) defaultExportLine = lineNo;
-          if (!todoLine && todoCommentRegex.test(rawLine)) todoLine = lineNo;
-          if (!reactFcLine && reactFcRegex.test(codeLine)) reactFcLine = lineNo;
-          if (!useContextLine && useContextRegex.test(codeLine)) useContextLine = lineNo;
-          if (!providerLine && isJsxFile && providerJsxRegex.test(codeLine)) providerLine = lineNo;
-          if (!tailwindSpaceLine && tailwindSpaceRegex.test(codeLine)) tailwindSpaceLine = lineNo;
+          if (nearChanged) {
+            if (!defaultExportLine && defaultExportRegex.test(codeLine)) defaultExportLine = lineNo;
+            if (!todoLine && todoCommentRegex.test(rawLine)) todoLine = lineNo;
+            if (!reactFcLine && reactFcRegex.test(codeLine)) reactFcLine = lineNo;
+            if (!useContextLine && useContextRegex.test(codeLine)) useContextLine = lineNo;
+            if (!providerLine && isJsxFile && providerJsxRegex.test(codeLine)) providerLine = lineNo;
+            if (!tailwindSpaceLine && tailwindSpaceRegex.test(codeLine)) tailwindSpaceLine = lineNo;
+            if (!importTypeLine && isTsFile && importTypeRegex.test(trimmed)) importTypeLine = lineNo;
+            if (!asConstLine && isTsFile && asConstRegex.test(codeLine)) asConstLine = lineNo;
+            if (!satisfiesLine && isTsFile && satisfiesRegex.test(codeLine)) satisfiesLine = lineNo;
+            if (!childrenNullishLine && isJsxFile && childrenNullishDefaultRegex.test(codeLine)) childrenNullishLine = lineNo;
+            if (!childrenUndefinedLine && isJsxFile && childrenUndefinedDefaultRegex.test(codeLine)) childrenUndefinedLine = lineNo;
+            if (!functionComponentLine && isJsxFile && braceDepth === 0) {
+              const fnMatch = nestedComponentFnRegex.exec(trimmed);
+              if (fnMatch?.[1]) {
+                functionComponentLine = lineNo;
+                functionComponentName = fnMatch[1];
+              }
+            }
+          }
+
+          for (let col = 0; col < trimmed.length; col += 1) {
+            const ch = trimmed[col];
+            if (ch === '{') braceDepth += 1;
+            else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+          }
 
           if (
             defaultExportLine
@@ -5425,6 +5630,9 @@ export async function runReviewMode(
             && reactFcLine
             && useContextLine
             && (!isJsxFile || (providerLine && tailwindSpaceLine))
+            && (!isTsFile || (importTypeLine && asConstLine && satisfiesLine))
+            && (!isJsxFile || (childrenNullishLine && childrenUndefinedLine))
+            && (!isJsxFile || functionComponentLine)
           ) {
             break;
           }
@@ -5499,6 +5707,78 @@ export async function runReviewMode(
             confidence: 0.86,
             reason: 'frontend-tailwind-space-class',
             summary: `Tailwind space-* class detected near line ${tailwindSpaceLine}. Prefer explicit gap/margin (monorepo convention).`,
+          });
+        }
+
+        if (importTypeLine) {
+          frontendHygieneSignals.push({
+            code: 'import-type',
+            filePath,
+            line: importTypeLine,
+            severity: 'low',
+            confidence: 0.9,
+            reason: 'typescript-import-type',
+            summary: `import type detected near line ${importTypeLine}. Prefer normal imports for types (monorepo convention).`,
+          });
+        }
+
+        if (asConstLine) {
+          frontendHygieneSignals.push({
+            code: 'as-const',
+            filePath,
+            line: asConstLine,
+            severity: 'low',
+            confidence: 0.82,
+            reason: 'typescript-as-const',
+            summary: `as const detected near line ${asConstLine}. Prefer explicit types/helpers over as const (monorepo convention).`,
+          });
+        }
+
+        if (satisfiesLine) {
+          frontendHygieneSignals.push({
+            code: 'typescript-satisfies',
+            filePath,
+            line: satisfiesLine,
+            severity: 'low',
+            confidence: 0.82,
+            reason: 'typescript-satisfies-operator',
+            summary: `satisfies operator detected near line ${satisfiesLine}. Prefer explicit types/helpers over satisfies (monorepo convention).`,
+          });
+        }
+
+        if (childrenNullishLine) {
+          frontendHygieneSignals.push({
+            code: 'children-nullish-default',
+            filePath,
+            line: childrenNullishLine,
+            severity: 'low',
+            confidence: 0.86,
+            reason: 'jsx-children-nullish-default',
+            summary: `children ?? default detected near line ${childrenNullishLine}. Prefer children || <Default /> (monorepo convention).`,
+          });
+        }
+
+        if (childrenUndefinedLine) {
+          frontendHygieneSignals.push({
+            code: 'children-undefined-default',
+            filePath,
+            line: childrenUndefinedLine,
+            severity: 'low',
+            confidence: 0.86,
+            reason: 'jsx-children-undefined-default',
+            summary: `children === undefined defaulting detected near line ${childrenUndefinedLine}. Prefer children || <Default /> (monorepo convention).`,
+          });
+        }
+
+        if (functionComponentLine) {
+          frontendHygieneSignals.push({
+            code: 'component-function-declaration',
+            filePath,
+            line: functionComponentLine,
+            severity: 'low',
+            confidence: 0.74,
+            reason: 'react-function-component-declaration',
+            summary: `Function component declaration detected at line ${functionComponentLine} (${functionComponentName}). Prefer a named const component assignment (monorepo convention).`,
           });
         }
       }
@@ -6020,6 +6300,218 @@ export async function runReviewMode(
         }, findingDedupe);
       }
     }
+
+    const attachGuidanceToFindingsByCode = async (): Promise<void> => {
+      const codes = Array.from(new Set(
+        reviewFindings
+          .map(finding => String(finding?.code || '').trim())
+          .filter(Boolean),
+      ));
+      if (codes.length === 0) return;
+
+      const toCypherStringList = (values: string[]): string => {
+        const escaped = values
+          .map(value => String(value || '').trim())
+          .filter(Boolean)
+          .map(value => `'${value.replace(/'/g, "''")}'`);
+        return escaped.length > 0 ? `[${escaped.join(', ')}]` : '[]';
+      };
+
+      type SectionMatchRow = {
+        code: string;
+        sectionId: string;
+        title: string;
+        docPath: string;
+        startLine: number;
+        endLine: number;
+        reason: string;
+      };
+
+      const sectionMatches: SectionMatchRow[] = [];
+      try {
+        const codeList = toCypherStringList(codes.slice(0, 250));
+        const rows = await executeQuery(repo.id, `
+          MATCH (s:CodeElement)-[r:CodeRelation {type: 'USES'}]->(v:ValueNode)
+          WHERE v.valueType = 'finding_code'
+            AND v.valueRaw IN ${codeList}
+            AND (s.id STARTS WITH 'CodeElement:agent-doc:' OR s.id STARTS WITH 'CodeElement:pattern-catalog:')
+          RETURN v.valueRaw AS code,
+                 s.id AS sectionId,
+                 s.name AS title,
+                 s.filePath AS docPath,
+                 s.startLine AS startLine,
+                 s.endLine AS endLine,
+                 r.reason AS reason
+        `);
+
+        for (const row of rows) {
+          const code = String((row as any).code ?? (row as any)[0] ?? '').trim();
+          const sectionId = String((row as any).sectionId ?? (row as any)[1] ?? '').trim();
+          const title = String((row as any).title ?? (row as any)[2] ?? '').trim();
+          const docPath = normalizePath(String((row as any).docPath ?? (row as any)[3] ?? '').trim());
+          const startLine = toOptionalLineNumber((row as any).startLine ?? (row as any)[4]) ?? 0;
+          const endLine = toOptionalLineNumber((row as any).endLine ?? (row as any)[5]) ?? startLine;
+          const reason = String((row as any).reason ?? (row as any)[6] ?? '').trim();
+          if (!code || !sectionId || !title || !docPath || startLine <= 0) continue;
+          sectionMatches.push({
+            code,
+            sectionId,
+            title,
+            docPath,
+            startLine,
+            endLine: endLine > 0 ? endLine : startLine,
+            reason,
+          });
+        }
+      } catch {
+        return;
+      }
+
+      if (sectionMatches.length === 0) return;
+
+      const referencedFilesBySectionId = new Map<string, Array<{ filePath: string; reason: string }>>();
+      try {
+        const sectionIdList = toCypherStringList(Array.from(new Set(sectionMatches.map(match => match.sectionId))).slice(0, 400));
+        const rows = await executeQuery(repo.id, `
+          MATCH (s:CodeElement)-[r:CodeRelation {type: 'USES'}]->(f:File)
+          WHERE s.id IN ${sectionIdList}
+          RETURN s.id AS sectionId,
+                 f.filePath AS filePath,
+                 r.reason AS reason
+        `);
+
+        for (const row of rows) {
+          const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+          const filePath = normalizePath(String((row as any).filePath ?? (row as any)[1] ?? '').trim());
+          const reason = String((row as any).reason ?? (row as any)[2] ?? '').trim();
+          if (!sectionId || !filePath) continue;
+          const list = referencedFilesBySectionId.get(sectionId) || [];
+          if (!referencedFilesBySectionId.has(sectionId)) referencedFilesBySectionId.set(sectionId, list);
+          list.push({ filePath, reason });
+        }
+      } catch {
+        // Ignore: example files are optional
+      }
+
+      const changedFileSet = new Set(
+        changedFileObjs
+          .map(file => normalizePath(String(file?.filePath || '')))
+          .filter(Boolean),
+      );
+      const changedFileList = Array.from(changedFileSet.values());
+
+      const baseKindWeight = (kind: string): number => {
+        if (kind === 'pattern-catalog') return 10;
+        if (kind === 'agent-guideline') return 9;
+        if (kind === 'anti-pattern') return 8;
+        return 7;
+      };
+
+      const detectKind = (sectionId: string): { kind: string; docKind: string } => {
+        if (sectionId.startsWith('CodeElement:pattern-catalog:')) return { kind: 'pattern-catalog', docKind: 'pattern-catalog' };
+        const parts = sectionId.split(':');
+        // agent-doc sections encode: CodeElement:agent-doc:<docKind>:<filePath>:<title>:<startLine>
+        // Keep this stable and avoid parsing later segments (title may contain colons).
+        const docKind = String(parts[2] || '').trim();
+        if (docKind === 'anti-patterns') return { kind: 'anti-pattern', docKind };
+        if (docKind === 'override') return { kind: 'agent-guideline', docKind };
+        return { kind: 'agent-doc', docKind: docKind || 'agent-doc' };
+      };
+
+      const guidanceByCode = new Map<string, any[]>();
+      for (const match of sectionMatches) {
+        const { kind, docKind } = detectKind(match.sectionId);
+        const refRows = referencedFilesBySectionId.get(match.sectionId) || [];
+
+        const byReasonBuckets = (() => {
+          const buckets = new Map<string, string[]>();
+          for (const entry of refRows) {
+            const bucket = String(entry.reason || '').trim();
+            const list = buckets.get(bucket) || [];
+            if (!buckets.has(bucket)) buckets.set(bucket, list);
+            list.push(entry.filePath);
+          }
+          return buckets;
+        })();
+
+        const getBucket = (key: string) => Array.from(new Set((byReasonBuckets.get(key) || []).map(filePath => normalizePath(filePath)).filter(Boolean)));
+
+        const templateFiles = getBucket('pattern-catalog:template');
+        const alsoGoodFiles = getBucket('pattern-catalog:also-good');
+        const otherFiles = getBucket('pattern-catalog:other');
+        const agentRefFiles = refRows
+          .filter(row => String(row.reason || '').includes('agent-doc:ref:'))
+          .map(row => normalizePath(row.filePath))
+          .filter(Boolean);
+
+        const exampleFiles = kind === 'pattern-catalog'
+          ? [
+              ...templateFiles,
+              ...alsoGoodFiles,
+              ...otherFiles,
+            ]
+          : agentRefFiles;
+
+        let affinity = 0;
+        if (changedFileList.length > 0 && exampleFiles.length > 0) {
+          for (const ref of exampleFiles) {
+            for (const changed of changedFileList) {
+              affinity = Math.max(affinity, pathAffinity(ref, changed));
+            }
+          }
+        }
+        const fileHits = exampleFiles.filter(filePath => changedFileSet.has(filePath)).length;
+        const score = baseKindWeight(kind)
+          + (fileHits > 0 ? 4 : 0)
+          + Math.round(affinity * 4);
+
+        const item = {
+          kind,
+          signature: `${kind}:${match.title}`,
+          score,
+          anchor: {
+            name: match.title,
+            kind: 'DocSection',
+            filePath: match.docPath,
+            startLine: match.startLine,
+            endLine: match.endLine,
+            doc_kind: docKind,
+            score,
+          },
+          examples: Array.from(new Set(exampleFiles))
+            .filter(Boolean)
+            .slice(0, 6)
+            .map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+        };
+
+        const existing = guidanceByCode.get(match.code) || [];
+        if (!guidanceByCode.has(match.code)) guidanceByCode.set(match.code, existing);
+        existing.push(item);
+      }
+
+      for (const list of guidanceByCode.values()) {
+        list.sort((left, right) => {
+          const leftScore = toFiniteNumber(left?.score, 0);
+          const rightScore = toFiniteNumber(right?.score, 0);
+          if (rightScore !== leftScore) return rightScore - leftScore;
+          return String(left?.signature || '').localeCompare(String(right?.signature || ''));
+        });
+      }
+
+      for (const finding of reviewFindings) {
+        const code = String(finding?.code || '').trim();
+        if (!code) continue;
+        const guidance = guidanceByCode.get(code) || [];
+        if (guidance.length === 0) continue;
+        (finding as any).guidance = guidance.slice(0, 3);
+      }
+    };
+
+    await attachGuidanceToFindingsByCode();
 
     const review_kernel: any = buildReviewKernel({
       changed_files: changedFileObjs.length,

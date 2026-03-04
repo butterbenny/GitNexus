@@ -113,6 +113,30 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
   );
 
   await fs.writeFile(
+    path.join(repoPath, '.gitignore'),
+    [
+      'agents.override.md',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'agents.override.md'),
+    [
+      '# Local agent instructions (untracked)',
+      '#',
+      '# ------------------------------------------------------------',
+      '# Implement-mode guidance',
+      '# ------------------------------------------------------------',
+      '# - Prefer precedent anatomy near `apps/dashboard/src/api/notifications.ts` (fetchAccountNotifications).',
+      '# - Avoid inventing new query wiring when a close callsite exists.',
+      '#',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
     path.join(repoPath, 'apps/backend/app/Providers/RouteServiceProvider.php'),
     [
       '<?php',
@@ -260,6 +284,10 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
   assert.ok(
     result.implement_mode.doc_guidance.some(item => String(item?.kind || '') === 'anti-pattern'),
     'expected implement_mode.doc_guidance to include anti-pattern doc matches',
+  );
+  assert.ok(
+    result.implement_mode.doc_guidance.some(item => String(item?.kind || '') === 'agent-guideline'),
+    'expected implement_mode.doc_guidance to include agent override guidance',
   );
   assert.ok(Array.isArray(result.implement_mode?.next_actions));
   assert.ok(result.implement_mode.next_actions.some(step => String(step).includes('review_mode')));

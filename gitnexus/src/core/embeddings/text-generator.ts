@@ -164,6 +164,33 @@ const generateInterfaceText = (
 };
 
 /**
+ * Generate embedding text for a CodeElement node
+ * Used for doc/template nodes (agent docs, pattern catalog) and other small semantic anchors.
+ */
+const generateCodeElementText = (
+  node: EmbeddableNode,
+  maxSnippetLength: number,
+): string => {
+  const parts: string[] = [
+    `CodeElement: ${node.name}`,
+    `File: ${getFileName(node.filePath)}`,
+  ];
+
+  const dir = getDirectory(node.filePath);
+  if (dir) {
+    parts.push(`Directory: ${dir}`);
+  }
+
+  if (node.content) {
+    const cleanedContent = cleanContent(node.content);
+    const snippet = truncateContent(cleanedContent, maxSnippetLength);
+    parts.push('', snippet);
+  }
+
+  return parts.join('\n');
+};
+
+/**
  * Generate embedding text for a File node
  * Uses file name and first N characters of content
  */
@@ -209,6 +236,8 @@ export const generateEmbeddingText = (
       return generateMethodText(node, maxSnippetLength);
     case 'Interface':
       return generateInterfaceText(node, maxSnippetLength);
+    case 'CodeElement':
+      return generateCodeElementText(node, maxSnippetLength);
     case 'File':
       return generateFileText(node, maxSnippetLength);
     default:

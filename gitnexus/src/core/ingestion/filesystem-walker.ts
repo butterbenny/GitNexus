@@ -18,6 +18,13 @@ const ALLOWED_DOT_PATH_SEGMENTS = new Set([
   '.claude',
 ]);
 
+// Special-case allowlist for monorepo-local agent override guidance.
+// These files are commonly gitignored (or excluded via .git/info/exclude) but should still be indexable.
+const ALLOWED_REPO_RELATIVE_FILES = [
+  'agents.override.md',
+  'AGENTS.override.md',
+] as const;
+
 const hasDisallowedDotPathSegment = (relativePath: string): boolean => {
   return relativePath
     .split('/')
@@ -88,7 +95,27 @@ export const listRepositoryFiles = async (repoPath: string): Promise<string[]> =
     )
   )).flat();
 
-  const files = Array.from(new Set([...baseFiles, ...allowlistedDotFiles].map(normalizeRelativePath)));
+  const allowlistedRepoFiles = (await Promise.all(
+    ALLOWED_REPO_RELATIVE_FILES.map(async filePath => {
+      try {
+        const stat = await fs.stat(path.join(repoPath, filePath));
+        return stat.isFile() ? filePath : null;
+      } catch {
+        return null;
+      }
+    }),
+  ))
+    .filter(Boolean) as string[];
+
+  const files = Array.from(
+    new Set(
+      [
+        ...baseFiles,
+        ...allowlistedDotFiles,
+        ...allowlistedRepoFiles,
+      ].map(normalizeRelativePath),
+    ),
+  );
 
   return files
     .filter(Boolean)

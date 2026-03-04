@@ -513,6 +513,89 @@ type AgentDocSection = {
 const agentDocCache = new Map<string, { mtimeMs: number; sections: AgentDocSection[] }>();
 
 function parseAgentDocMarkdownSections(content: string, kind: string, docPath: string): AgentDocSection[] {
+  if (String(kind || '').trim() === 'override') {
+    const rawLines = String(content || '').split('\n');
+    const lines = rawLines.map(line => String(line || '').replace(/^#\s?/, ''));
+    const sections: AgentDocSection[] = [];
+
+    let current: { title: string; startLine: number; rawLines: string[] } | null = null;
+
+    const isSeparator = (line: string): boolean => /^-{8,}$/.test(String(line || '').trim());
+
+    const trunc = (value: string, maxChars: number): string => {
+      const raw = String(value || '');
+      if (raw.length <= maxChars) return raw;
+      return `${raw.slice(0, maxChars).trimEnd()}\n…`;
+    };
+
+    const finalize = (endLine: number) => {
+      if (!current) return;
+      const contentText = current.rawLines.join('\n').trim();
+      const referencedFiles = Array.from(new Set(current.rawLines.flatMap(line => extractBacktickFilePaths(line))));
+
+      const tokenSet = new Set<string>([
+        ...tokenizePatternCatalogText(current.title),
+        ...tokenizePatternCatalogText(contentText),
+        ...referencedFiles.flatMap(tokenizePatternCatalogText),
+      ]);
+
+      sections.push({
+        kind,
+        doc_path: docPath,
+        title: current.title,
+        level: 2,
+        startLine: current.startLine,
+        endLine: Math.max(current.startLine, endLine),
+        content: trunc(contentText, 12_000),
+        referencedFiles,
+        tokenSet,
+      });
+      current = null;
+    };
+
+    const startSection = (title: string, startLine: number) => {
+      current = {
+        title: String(title || '').trim(),
+        startLine,
+        rawLines: [],
+      };
+    };
+
+    for (let idx = 0; idx < lines.length; idx += 1) {
+      const line = String(lines[idx] || '');
+      const lineNo = idx + 1;
+
+      if (isSeparator(line)) {
+        let titleIdx = idx + 1;
+        while (titleIdx < lines.length && String(lines[titleIdx] || '').trim() === '') titleIdx += 1;
+        if (titleIdx >= lines.length) continue;
+
+        const titleLine = String(lines[titleIdx] || '');
+        if (isSeparator(titleLine) || titleLine.trim() === '') continue;
+
+        let tailIdx = titleIdx + 1;
+        while (tailIdx < lines.length && String(lines[tailIdx] || '').trim() === '') tailIdx += 1;
+        if (tailIdx >= lines.length || !isSeparator(String(lines[tailIdx] || ''))) continue;
+
+        finalize(lineNo - 1);
+        startSection(titleLine, titleIdx + 1);
+        idx = tailIdx;
+        continue;
+      }
+
+      if (!current && line.trim()) {
+        startSection(line, lineNo);
+        continue;
+      }
+
+      if (current) current.rawLines.push(line);
+    }
+
+    finalize(lines.length);
+
+    return sections.filter(section => section.title);
+  }
+
   const lines = String(content || '').split('\n');
   const sections: AgentDocSection[] = [];
 
@@ -3127,6 +3210,93 @@ export class LocalBackend {
       }
     }
 
+    let overrideGuidancePrecedents: any[] = [];
+    let overrideGuidanceDiagnostics: any | null = null;
+    if (queryTokens.length > 0) {
+      const queryTokenSet = new Set<string>([
+        ...queryTokens,
+        ...tokenizePatternCatalogText(queryText),
+      ]);
+
+      const overrideDocs = await loadAgentDocSectionsFromGraph(repo.id, {
+        kind: 'override',
+        doc_path: 'agents.override.md',
+      })
+        || await loadAgentDocSectionsFromGraph(repo.id, {
+          kind: 'override',
+          doc_path: 'AGENTS.override.md',
+        })
+        || await loadAgentDocSections(repo.repoPath, {
+          kind: 'override',
+          doc_path: 'agents.override.md',
+        })
+        || await loadAgentDocSections(repo.repoPath, {
+          kind: 'override',
+          doc_path: 'AGENTS.override.md',
+        });
+
+      if (overrideDocs && overrideDocs.sections.length > 0) {
+        const maxDocs = Math.min(2, Math.max(1, limit));
+        const scored = overrideDocs.sections
+          .map(section => {
+            let score = 0;
+            for (const token of queryTokenSet) {
+              if (section.tokenSet.has(token)) score += 1;
+            }
+            return { section, score };
+          })
+          .filter(item => item.score > 0)
+          .sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            if (left.section.startLine !== right.section.startLine) return left.section.startLine - right.section.startLine;
+            return left.section.title.localeCompare(right.section.title);
+          })
+          .slice(0, maxDocs);
+
+        const resolveDocFile = (filePathRaw: string): string | null => {
+          const resolved = resolvePathInsideRepo(repo.repoPath, filePathRaw);
+          if (!resolved) return null;
+          const relative = normalizeRepoRelativePath(resolved.relativePath);
+          if (!relative) return null;
+          if (!filePathTouchesPrefixes(relative, pathPrefixes)) return null;
+          return relative;
+        };
+
+        for (const match of scored) {
+          const referenced = match.section.referencedFiles
+            .map(resolveDocFile)
+            .filter(Boolean) as string[];
+          const exampleFiles = Array.from(new Set(referenced)).slice(0, examplesPer);
+
+          overrideGuidancePrecedents.push({
+            kind: 'agent-guideline',
+            signature: `agent-guideline:${match.section.title}`,
+            score: match.score,
+            anchor: {
+              name: match.section.title,
+              kind: 'DocSection',
+              filePath: overrideDocs.relativePath,
+              startLine: match.section.startLine,
+              endLine: match.section.endLine,
+              doc_kind: 'override',
+              score: match.score,
+            },
+            examples: exampleFiles.map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+          });
+        }
+
+        overrideGuidanceDiagnostics = {
+          filePath: overrideDocs.relativePath,
+          candidates: overrideDocs.sections.length,
+          matched: overrideGuidancePrecedents.length,
+        };
+      }
+    }
+
     const slicePrecedents = buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById, cochangeMap);
     const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
@@ -3137,6 +3307,7 @@ export class LocalBackend {
     const precedents = [
       ...patternCatalogPrecedents,
       ...antiPatternPrecedents,
+      ...overrideGuidancePrecedents,
       ...slicePrecedents,
       ...hopPrecedents,
       ...processPrecedents,
@@ -3159,6 +3330,7 @@ export class LocalBackend {
       slice_precedents: slicePrecedents.length,
       ...(patternCatalogDiagnostics ? { pattern_catalog: patternCatalogDiagnostics } : {}),
       ...(antiPatternDiagnostics ? { anti_patterns: antiPatternDiagnostics } : {}),
+      ...(overrideGuidanceDiagnostics ? { override_guidance: overrideGuidanceDiagnostics } : {}),
       path_prefixes: pathPrefixes,
     };
     if (precedents.length === 0) {

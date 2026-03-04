@@ -993,8 +993,9 @@ export async function runActionPlan(
     }
 
     const precedentItems: any[] = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
-    const docGuidanceItems = precedentItems.filter(item => String(item?.kind || '').trim() === 'anti-pattern');
-    const precedentCandidates = precedentItems.filter(item => String(item?.kind || '').trim() !== 'anti-pattern');
+    const docGuidanceKinds = new Set(['anti-pattern', 'agent-guideline']);
+    const docGuidanceItems = precedentItems.filter(item => docGuidanceKinds.has(String(item?.kind || '').trim()));
+    const precedentCandidates = precedentItems.filter(item => !docGuidanceKinds.has(String(item?.kind || '').trim()));
     const implementPrecedents = precedentCandidates.slice(0, 3).map((item: any) => ({
       kind: item?.kind,
       signature: item?.signature,

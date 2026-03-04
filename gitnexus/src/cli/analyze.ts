@@ -85,8 +85,6 @@ export interface AnalyzeOptions {
   force?: boolean;
   skipEmbeddings?: boolean;
   profile?: string;
-  withCochange?: boolean;
-  withBrain?: boolean;
   registry?: boolean;
   hooks?: boolean;
   writeContext?: boolean;
@@ -239,15 +237,7 @@ export const analyzeCommand = async (
 
   const skipEmbeddingsRequested = Boolean(options?.skipEmbeddings);
   const skipEmbeddings = !monorepoProfile && skipEmbeddingsRequested;
-  const skipCochange = monorepoProfile && options?.withCochange !== true;
-  const runBrainTick = !monorepoProfile || options?.withBrain === true;
-
-  if (monorepoProfile && options?.withCochange !== true) {
-    profileWarnings.push('Monorepo profile: skipping git-history cochange graph (pass --with-cochange to enable).');
-  }
-  if (monorepoProfile && options?.withBrain !== true) {
-    profileWarnings.push('Monorepo profile: skipping BrainKernel tick (pass --with-brain to enable).');
-  }
+  const skipCochange = false;
 
   const { storagePath, kuzuPath } = getStoragePaths(repoPath);
   const repoEmbeddingCachePath = resolveDefaultEmbeddingCachePath(storagePath);
@@ -524,6 +514,19 @@ export const analyzeCommand = async (
         // Non-fatal
       }
     }
+
+    const upToDateWarnings: string[] = [...profileWarnings];
+    const brainManifestPath = await runBrainKernelTick(existingMeta, upToDateWarnings, []);
+    if (brainManifestPath) {
+      console.log(`  Brain manifest: ${brainManifestPath}`);
+    }
+    if (upToDateWarnings.length > 0) {
+      console.log(`\n  Warnings (${upToDateWarnings.length}):`);
+      for (const warning of upToDateWarnings) {
+        console.log(`    ${warning}`);
+      }
+    }
+    console.log('');
     return;
   }
 
@@ -3295,6 +3298,63 @@ export const analyzeCommand = async (
         `);
         await executeQuery(`MATCH (n:ValueNode) DETACH DELETE n`);
 
+        const normalizeFindingCode = (raw: string): string | null => {
+          const normalized = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+          if (!/^[a-z0-9][a-z0-9-]{1,120}$/.test(normalized)) return null;
+          return normalized;
+        };
+
+        const extractFindingCodesFromText = (content: string): string[] => {
+          const codes = new Set<string>();
+          const lines = String(content || '').split('\n');
+
+          for (const line of lines) {
+            const match = /\b(?:Finding\s+code|Fixes):\s*([A-Za-z0-9][A-Za-z0-9_-]{1,120})\b/i.exec(line);
+            if (match?.[1]) {
+              const normalized = normalizeFindingCode(match[1]);
+              if (normalized) codes.add(normalized);
+            }
+
+            if (/\b(?:Finding\s+code|Fixes):\b/i.test(line)) {
+              const tail = line.split(/(?:Finding\s+code|Fixes):/i)[1] || '';
+              for (const part of tail.split(/[,|\s]+/g)) {
+                const candidate = String(part || '').trim();
+                if (!candidate) continue;
+                const normalized = normalizeFindingCode(candidate.replace(/[^A-Za-z0-9_-]/g, ''));
+                if (normalized) codes.add(normalized);
+              }
+            }
+          }
+
+          return Array.from(codes.values());
+        };
+
+        const findingCodeReasonForSection = (filePathRaw: string): string => {
+          const fp = String(filePathRaw || '').replace(/\\/g, '/').trim();
+          if (fp === '.agents/review/pattern-catalog.md') return 'pattern-catalog:fixes';
+          if (fp === '.agents/architecture/anti-patterns.md') return 'agent-doc:finding-code:anti-patterns';
+          if (fp.startsWith('.agents/review/sweep-')) return 'agent-doc:finding-code:review-sweep';
+          if (fp === 'AGENTS.md') return 'agent-doc:finding-code:agents';
+          if (fp === 'CLAUDE.md') return 'agent-doc:finding-code:claude';
+          if (fp.toLowerCase() === 'agents.override.md') return 'agent-doc:finding-code:override';
+          return 'agent-doc:finding-code';
+        };
+
+        // Keep these in the ValueNode table so review findings can attach deterministic doc/template guidance by code.
+        const guidelineSectionRows = await executeQuery(`
+          MATCH (c:CodeElement)
+          WHERE c.filePath IN [
+            'AGENTS.md',
+            'CLAUDE.md',
+            'agents.override.md',
+            'AGENTS.override.md',
+            '.agents/architecture/anti-patterns.md',
+            '.agents/review/pattern-catalog.md'
+          ]
+          OR c.filePath STARTS WITH '.agents/review/sweep-'
+          RETURN c.id AS id, c.filePath AS filePath, c.content AS content
+        `);
+
         const valueGraphInput = createKnowledgeGraph();
         const valueGraphNodeIds = new Set<string>();
         const valueGraphNodeLabels = Array.from(new Set([
@@ -3388,27 +3448,67 @@ export const analyzeCommand = async (
           skippedMalformed: valueGraphResult.stats.skippedMalformed,
         };
 
-        if (valueGraphResult.values.length > 0 || valueGraphResult.edges.length > 0) {
-          const valueGraphInsert = createKnowledgeGraph();
-          for (const value of valueGraphResult.values) {
-            valueGraphInsert.addNode({
-              id: value.id,
-              label: 'ValueNode',
-              properties: {
-                name: value.label,
-                filePath: '',
-                heuristicLabel: value.heuristicLabel,
-                valueType: value.valueType,
-                valueKey: value.valueKey,
-                valueRaw: value.valueRaw,
-              },
+        const valueGraphInsert = createKnowledgeGraph();
+        for (const value of valueGraphResult.values) {
+          valueGraphInsert.addNode({
+            id: value.id,
+            label: 'ValueNode',
+            properties: {
+              name: value.label,
+              filePath: '',
+              heuristicLabel: value.heuristicLabel,
+              valueType: value.valueType,
+              valueKey: value.valueKey,
+              valueRaw: value.valueRaw,
+            },
+          });
+        }
+
+        for (const edge of valueGraphResult.edges) {
+          valueGraphInsert.addRelationship(edge);
+        }
+
+        const findingCodeValueNodesCreated = new Set<string>();
+        for (const row of guidelineSectionRows) {
+          const sectionId = String((row as any)?.id ?? row[0] ?? '').trim();
+          const filePath = String((row as any)?.filePath ?? row[1] ?? '').trim();
+          const content = String((row as any)?.content ?? row[2] ?? '');
+          if (!sectionId || !filePath) continue;
+
+          const reason = findingCodeReasonForSection(filePath);
+          const codes = extractFindingCodesFromText(content);
+
+          for (const code of codes) {
+            const valueKey = `finding_code:${code}`;
+            const valueId = `ValueNode:${valueKey}`;
+            if (!findingCodeValueNodesCreated.has(valueId)) {
+              findingCodeValueNodesCreated.add(valueId);
+              valueGraphInsert.addNode({
+                id: valueId,
+                label: 'ValueNode',
+                properties: {
+                  name: code,
+                  filePath: '',
+                  heuristicLabel: 'FindingCode',
+                  valueType: 'finding_code',
+                  valueKey,
+                  valueRaw: code,
+                },
+              });
+            }
+
+            valueGraphInsert.addRelationship({
+              id: `USES:${sectionId}->${valueId}:${reason}`,
+              type: 'USES',
+              sourceId: sectionId,
+              targetId: valueId,
+              confidence: 1.0,
+              reason,
             });
           }
+        }
 
-          for (const edge of valueGraphResult.edges) {
-            valueGraphInsert.addRelationship(edge);
-          }
-
+        if (valueGraphInsert.nodeCount > 0 || valueGraphInsert.relationshipCount > 0) {
           await loadGraphToKuzu(valueGraphInsert, new Map(), storagePath, (msg) => {
             bar.update(89, { phase: msg });
           });
@@ -3515,7 +3615,10 @@ export const analyzeCommand = async (
     }
     markPassTiming('provenance', provenancePassStartedAt);
 
-    const shouldRecomputeCochange = !skipCochange && (incrementalDerivedMode === 'full' || fileChangesTotal >= 200);
+    const shouldRecomputeCochange = !skipCochange && (
+      incrementalDerivedMode === 'full'
+      || (existingMeta?.lastCommit && existingMeta.lastCommit !== currentCommit)
+    );
     if (skipCochange) {
       skipDerivedPass('cochange');
       const cochangePassStartedAt = Date.now();
@@ -3927,13 +4030,8 @@ export const analyzeCommand = async (
     }
 
     const fastWarnings: string[] = [...profileWarnings];
-    let brainManifestPath: string | null = null;
-    if (runBrainTick) {
-      bar.update(99, { phase: 'Running BrainKernel tick...' });
-      brainManifestPath = await runBrainKernelTick(meta, fastWarnings, []);
-    } else {
-      bar.update(99, { phase: 'Skipping BrainKernel tick (profile)...' });
-    }
+    bar.update(99, { phase: 'Running BrainKernel tick...' });
+    const brainManifestPath = await runBrainKernelTick(meta, fastWarnings, []);
 
     bar.update(100, { phase: 'Done' });
     bar.stop();
@@ -3999,16 +4097,12 @@ export const analyzeCommand = async (
         : { files: [] as string[] };
 
       let brainManifestPath: string | null = null;
-      if (runBrainTick) {
-        bar.update(99, { phase: 'Running BrainKernel tick...' });
-        brainManifestPath = await runBrainKernelTick(
-          meta,
-          inc.kuzuWarnings,
-          [...fileChanges.changed, ...fileChanges.deleted],
-        );
-      } else {
-        bar.update(99, { phase: 'Skipping BrainKernel tick (profile)...' });
-      }
+      bar.update(99, { phase: 'Running BrainKernel tick...' });
+      brainManifestPath = await runBrainKernelTick(
+        meta,
+        inc.kuzuWarnings,
+        [...fileChanges.changed, ...fileChanges.deleted],
+      );
 
       await closeKuzu();
       await disposeEmbedder();
@@ -4366,16 +4460,12 @@ export const analyzeCommand = async (
     : { files: [] as string[] };
 
   let brainManifestPath: string | null = null;
-  if (runBrainTick) {
-    bar.update(99, { phase: 'Running BrainKernel tick...' });
-    brainManifestPath = await runBrainKernelTick(
-      meta,
-      kuzuWarnings,
-      [...fileChanges.changed, ...fileChanges.deleted],
-    );
-  } else {
-    bar.update(99, { phase: 'Skipping BrainKernel tick (profile)...' });
-  }
+  bar.update(99, { phase: 'Running BrainKernel tick...' });
+  brainManifestPath = await runBrainKernelTick(
+    meta,
+    kuzuWarnings,
+    [...fileChanges.changed, ...fileChanges.deleted],
+  );
 
   await closeKuzu();
   await disposeEmbedder();

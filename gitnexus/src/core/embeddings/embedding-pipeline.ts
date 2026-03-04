@@ -100,6 +100,18 @@ const queryEmbeddableNodes = async (
           RETURN n.id AS id, n.name AS name, 'File' AS label, 
                  n.filePath AS filePath, n.content AS content
         `;
+      } else if (label === 'CodeElement') {
+        // CodeElement is a wide bucket; embed only doc/template nodes to avoid noise and cost.
+        query = `
+          MATCH (n:CodeElement)
+          WHERE n.id STARTS WITH 'CodeElement:agent-doc:' OR n.id STARTS WITH 'CodeElement:pattern-catalog:'
+          OPTIONAL MATCH (e:CodeEmbedding {nodeId: n.id})
+          WITH n, e
+          WHERE e IS NULL
+          RETURN n.id AS id, n.name AS name, 'CodeElement' AS label,
+                 n.filePath AS filePath, n.content AS content,
+                 n.startLine AS startLine, n.endLine AS endLine
+        `;
       } else {
         // Code elements have startLine/endLine
         query = `
@@ -136,6 +148,14 @@ const queryEmbeddableNodes = async (
             MATCH (n:File)
             RETURN n.id AS id, n.name AS name, 'File' AS label, 
                    n.filePath AS filePath, n.content AS content
+          `;
+        } else if (label === 'CodeElement') {
+          fallbackQuery = `
+            MATCH (n:CodeElement)
+            WHERE n.id STARTS WITH 'CodeElement:agent-doc:' OR n.id STARTS WITH 'CodeElement:pattern-catalog:'
+            RETURN n.id AS id, n.name AS name, 'CodeElement' AS label,
+                   n.filePath AS filePath, n.content AS content,
+                   n.startLine AS startLine, n.endLine AS endLine
           `;
         } else {
           fallbackQuery = `
