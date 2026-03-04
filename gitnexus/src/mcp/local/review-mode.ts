@@ -910,6 +910,635 @@ export async function runReviewMode(
       };
     };
 
+    const buildReviewDocGuidance = async (input: {
+      changedFiles: DiffFile[];
+      findings: ReviewFinding[];
+      analysisSymbols: any[];
+    }): Promise<any[]> => {
+      type AgentDocSection = {
+        id: string;
+        title: string;
+        content: string;
+        startLine: number;
+        endLine: number;
+        referencedFiles: string[];
+        tokenSet: Set<string>;
+      };
+
+      const tokenize = (value: unknown): string[] => {
+        return String(value || '')
+          .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+          .toLowerCase()
+          .split(/[^a-z0-9]+/g)
+          .map(token => token.trim())
+          .filter(token => token.length >= 3);
+      };
+
+      const extractBacktickFilePaths = (line: string): string[] => {
+        const out: string[] = [];
+        const re = /`([^`]+)`/g;
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(line)) !== null) {
+          const raw = String(match[1] || '').trim();
+          if (!raw) continue;
+          if (raw.includes(' ')) continue;
+          if (!raw.includes('/')) continue;
+          if (!/\.[a-z0-9]{1,8}$/i.test(raw)) continue;
+          out.push(normalizePath(raw));
+        }
+        return out;
+      };
+
+      const parseMarkdownSections = (content: string, docPath: string, kind: string): AgentDocSection[] => {
+        const lines = String(content || '').split('\n');
+        const sections: AgentDocSection[] = [];
+
+        let current: { id: string; title: string; startLine: number; rawLines: string[] } | null = null;
+
+        const finalize = (endLine: number) => {
+          if (!current) return;
+          const body = current.rawLines.join('\n').trim();
+          const referencedFiles = Array.from(new Set(current.rawLines.flatMap(line => extractBacktickFilePaths(line))));
+          const tokenSet = new Set<string>([
+            ...tokenize(current.title),
+            ...tokenize(body),
+            ...referencedFiles.flatMap(tokenize),
+          ]);
+
+          sections.push({
+            id: current.id,
+            title: current.title,
+            content: body,
+            startLine: current.startLine,
+            endLine: Math.max(current.startLine, endLine),
+            referencedFiles,
+            tokenSet,
+          });
+          current = null;
+        };
+
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const line = String(lines[idx] || '');
+          const trimmed = line.trimEnd();
+          const lineNo = idx + 1;
+
+          const heading = /^(#{2,4})\s+(.*)$/.exec(trimmed);
+          if (heading) {
+            finalize(lineNo - 1);
+            const title = String(heading[2] || '').trim();
+            const startLine = lineNo;
+            const rawId = `CodeElement:agent-doc:${kind}:${docPath}:${startLine}`;
+            current = { id: rawId, title, startLine, rawLines: [] };
+            continue;
+          }
+
+          if (current) current.rawLines.push(line);
+        }
+
+        finalize(lines.length);
+
+        return sections.filter(section => section.title && section.startLine > 0);
+      };
+
+      const loadSectionsFromGraph = async (options: { kind: string; doc_path: string }): Promise<{ relativePath: string; sections: AgentDocSection[] } | null> => {
+        const kind = String(options.kind || '').trim();
+        const docPath = normalizePath(String(options.doc_path || '').trim());
+        if (!kind || !docPath) return null;
+
+        const idPrefix = `CodeElement:agent-doc:${kind}:`;
+        const escapedDocPath = docPath.replace(/'/g, "''");
+        const escapedIdPrefix = idPrefix.replace(/'/g, "''");
+        const escapedKind = kind.replace(/'/g, "''");
+
+        try {
+          const sectionRows = await executeQuery(repo.id, `
+            MATCH (s:CodeElement)
+            WHERE s.filePath = '${escapedDocPath}'
+              AND s.id STARTS WITH '${escapedIdPrefix}'
+            RETURN s.id AS sectionId, s.name AS title, s.content AS content, s.startLine AS startLine, s.endLine AS endLine
+          `);
+
+          const sectionsById = new Map<string, AgentDocSection>();
+          for (const row of sectionRows) {
+            const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+            const title = String((row as any).title ?? (row as any)[1] ?? '').trim();
+            const content = String((row as any).content ?? (row as any)[2] ?? '').trim();
+            const startLine = toOptionalLineNumber((row as any).startLine ?? (row as any)[3]) ?? 0;
+            const endLine = toOptionalLineNumber((row as any).endLine ?? (row as any)[4]) ?? startLine;
+            if (!sectionId || !title || startLine <= 0) continue;
+            sectionsById.set(sectionId, {
+              id: sectionId,
+              title,
+              content,
+              startLine,
+              endLine: endLine > 0 ? endLine : startLine,
+              referencedFiles: [],
+              tokenSet: new Set<string>(),
+            });
+          }
+          if (sectionsById.size === 0) return null;
+
+          const edgeRows = await executeQuery(repo.id, `
+            MATCH (s:CodeElement)-[r:CodeRelation {type: 'USES'}]->(f:File)
+            WHERE s.filePath = '${escapedDocPath}'
+              AND s.id STARTS WITH '${escapedIdPrefix}'
+              AND r.reason = 'agent-doc:ref:${escapedKind}'
+            RETURN s.id AS sectionId, f.filePath AS filePath
+          `);
+
+          for (const row of edgeRows) {
+            const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+            const filePath = normalizePath(String((row as any).filePath ?? (row as any)[1] ?? '').trim());
+            if (!sectionId || !filePath) continue;
+            const section = sectionsById.get(sectionId);
+            if (!section) continue;
+            section.referencedFiles.push(filePath);
+          }
+
+          for (const section of sectionsById.values()) {
+            const referencedFiles = Array.from(new Set(section.referencedFiles.map(filePath => normalizePath(filePath)).filter(Boolean)));
+            section.referencedFiles = referencedFiles;
+            section.tokenSet = new Set<string>([
+              ...tokenize(section.title),
+              ...tokenize(section.content),
+              ...referencedFiles.flatMap(tokenize),
+            ]);
+          }
+
+          return {
+            relativePath: docPath,
+            sections: Array.from(sectionsById.values()).sort((a, b) => a.startLine - b.startLine || a.title.localeCompare(b.title)),
+          };
+        } catch {
+          return null;
+        }
+      };
+
+      const loadSectionsFromFile = async (options: { kind: string; doc_path: string }): Promise<{ relativePath: string; sections: AgentDocSection[] } | null> => {
+        const kind = String(options.kind || '').trim();
+        const docPath = normalizePath(String(options.doc_path || '').trim());
+        if (!kind || !docPath) return null;
+
+        const resolved = resolvePathInsideRepo(repo.repoPath, docPath);
+        if (!resolved) return null;
+
+        try {
+          const content = await fs.readFile(resolved.absolutePath, 'utf-8');
+          const sections = parseMarkdownSections(content, resolved.relativePath, kind);
+          if (sections.length === 0) return null;
+          return { relativePath: resolved.relativePath, sections };
+        } catch {
+          return null;
+        }
+      };
+
+      const buildReviewTokenSet = (): Set<string> => {
+        const tokenSet = new Set<string>();
+
+        const addTokens = (value: unknown) => {
+          for (const token of tokenize(value)) tokenSet.add(token);
+        };
+
+        for (const file of input.changedFiles) {
+          addTokens(file.filePath);
+          addTokens(path.basename(String(file.filePath || '')));
+        }
+
+        for (const finding of input.findings) {
+          addTokens(finding.code);
+          addTokens(finding.summary);
+          addTokens(finding.reason);
+          addTokens(finding.evidence?.filePath);
+          addTokens(finding.evidence?.symbol?.name);
+        }
+
+        for (const symbol of input.analysisSymbols) {
+          addTokens(symbol?.filePath);
+          addTokens(symbol?.name);
+          addTokens(symbol?.kind);
+        }
+
+        return tokenSet;
+      };
+
+      const reviewTokenSet = buildReviewTokenSet();
+      if (reviewTokenSet.size === 0) return [];
+
+      const changedFileSet = new Set<string>(
+        input.changedFiles
+          .map(file => normalizePath(String(file?.filePath || '')))
+          .filter(Boolean),
+      );
+      const changedFileList = Array.from(changedFileSet.values());
+
+      const buildAntiPatternGuidance = async (): Promise<any[]> => {
+        try {
+          const docPath = '.agents/architecture/anti-patterns.md';
+          const docKind = 'anti-patterns';
+
+          const doc = await loadSectionsFromGraph({ kind: docKind, doc_path: docPath })
+            || await loadSectionsFromFile({ kind: docKind, doc_path: docPath });
+          if (!doc || doc.sections.length === 0) return [];
+
+          const scored = doc.sections
+            .map(section => {
+              const sectionTokenSet = section.tokenSet || new Set<string>();
+              let tokenOverlap = 0;
+              for (const token of sectionTokenSet) {
+                if (reviewTokenSet.has(token)) tokenOverlap += 1;
+              }
+
+              const referencedFiles = section.referencedFiles
+                .map(filePath => normalizePath(filePath))
+                .filter(Boolean);
+              const referencedInScope = referencedFiles.filter(filePath => isInScope(filePath));
+
+              const fileHits = referencedFiles.filter(filePath => changedFileSet.has(filePath)).length;
+              let affinity = 0;
+              if (changedFileList.length > 0 && referencedFiles.length > 0) {
+                for (const ref of referencedFiles) {
+                  for (const changed of changedFileList) {
+                    affinity = Math.max(affinity, pathAffinity(ref, changed));
+                  }
+                }
+              }
+
+              const score = tokenOverlap
+                + (fileHits > 0 ? 6 : 0)
+                + Math.round(affinity * 4);
+
+              return {
+                section,
+                score,
+                fileHits,
+                referencedFiles: referencedInScope.length > 0 ? referencedInScope : referencedFiles,
+              };
+            })
+            .filter(item => item.score > 0)
+            .sort((left, right) => {
+              if (right.score !== left.score) return right.score - left.score;
+              if (right.fileHits !== left.fileHits) return right.fileHits - left.fileHits;
+              if (left.section.startLine !== right.section.startLine) return left.section.startLine - right.section.startLine;
+              return left.section.title.localeCompare(right.section.title);
+            })
+            .slice(0, 3);
+
+          return scored.map(match => {
+            const exampleFiles = Array.from(new Set(match.referencedFiles))
+              .filter(Boolean)
+              .slice(0, 5);
+
+            return {
+              kind: 'anti-pattern',
+              signature: `anti-pattern:${match.section.title}`,
+              score: match.score,
+              anchor: {
+                name: match.section.title,
+                kind: 'DocSection',
+                filePath: doc.relativePath,
+                startLine: match.section.startLine,
+                endLine: match.section.endLine,
+                doc_kind: docKind,
+                score: match.score,
+              },
+              examples: exampleFiles.map(filePath => ({
+                name: path.basename(filePath),
+                kind: 'File',
+                filePath,
+              })),
+            };
+          });
+        } catch {
+          return [];
+        }
+      };
+
+      const buildPatternCatalogGuidance = async (): Promise<any[]> => {
+        type PatternCatalogSection = {
+          id: string;
+          category: string;
+          title: string;
+          content: string;
+          startLine: number;
+          endLine: number;
+          templateFiles: string[];
+          alsoGoodFiles: string[];
+          otherFiles: string[];
+          tokenSet: Set<string>;
+        };
+
+        const extractCategory = (content: string): string => {
+          const lines = String(content || '').split('\n');
+          for (const line of lines.slice(0, 6)) {
+            const trimmed = String(line || '').trim();
+            if (!trimmed) continue;
+            const match = /^category:\s*(.+)$/i.exec(trimmed);
+            if (match) return String(match[1] || '').trim();
+            break;
+          }
+          return '';
+        };
+
+        const parsePatternCatalog = (content: string, docPath: string): PatternCatalogSection[] => {
+          const lines = String(content || '').split('\n');
+          const sections: PatternCatalogSection[] = [];
+
+          let category = '';
+          let mode: 'template' | 'also-good' | 'other' | null = null;
+          let current: {
+            category: string;
+            title: string;
+            startLine: number;
+            rawLines: string[];
+            templateFiles: string[];
+            alsoGoodFiles: string[];
+            otherFiles: string[];
+          } | null = null;
+
+          const finalize = (endLine: number) => {
+            if (!current) return;
+            const contentText = current.rawLines.join('\n').trim();
+            const templateFiles = Array.from(new Set(current.templateFiles.map(filePath => normalizePath(filePath)).filter(Boolean)));
+            const alsoGoodFiles = Array.from(new Set(current.alsoGoodFiles.map(filePath => normalizePath(filePath)).filter(Boolean)));
+            const otherFiles = Array.from(new Set(current.otherFiles.map(filePath => normalizePath(filePath)).filter(Boolean)));
+            const tokenSet = new Set<string>([
+              ...tokenize(current.category),
+              ...tokenize(current.title),
+              ...tokenize(contentText),
+              ...templateFiles.flatMap(tokenize),
+              ...alsoGoodFiles.flatMap(tokenize),
+            ]);
+
+            sections.push({
+              id: `CodeElement:pattern-catalog:${current.category}:${current.title}:${current.startLine}`,
+              category: current.category,
+              title: current.title,
+              content: contentText,
+              startLine: current.startLine,
+              endLine: Math.max(current.startLine, endLine),
+              templateFiles,
+              alsoGoodFiles,
+              otherFiles,
+              tokenSet,
+            });
+            current = null;
+          };
+
+          for (let idx = 0; idx < lines.length; idx += 1) {
+            const line = String(lines[idx] || '');
+            const trimmed = line.trim();
+            const lineNo = idx + 1;
+
+            if (trimmed.startsWith('## ')) {
+              category = trimmed.slice(3).trim();
+              mode = null;
+              continue;
+            }
+
+            if (trimmed.startsWith('### ')) {
+              finalize(lineNo - 1);
+              current = {
+                category,
+                title: trimmed.slice(4).trim(),
+                startLine: lineNo,
+                rawLines: [],
+                templateFiles: [],
+                alsoGoodFiles: [],
+                otherFiles: [],
+              };
+              mode = null;
+              continue;
+            }
+
+            if (!current) continue;
+            current.rawLines.push(line);
+
+            const lowered = trimmed.toLowerCase();
+            if (lowered === 'template:') {
+              mode = 'template';
+              continue;
+            }
+            if (lowered === 'also good:') {
+              mode = 'also-good';
+              continue;
+            }
+            if (lowered === 'notes:' || lowered === 'note:') {
+              mode = 'other';
+              continue;
+            }
+
+            const filePaths = extractBacktickFilePaths(line);
+            if (filePaths.length === 0) continue;
+            const target = mode === 'template'
+              ? current.templateFiles
+              : mode === 'also-good'
+                ? current.alsoGoodFiles
+                : current.otherFiles;
+            target.push(...filePaths);
+          }
+
+          finalize(lines.length);
+          return sections.filter(section => section.title && section.startLine > 0);
+        };
+
+        const loadCatalogFromGraph = async (): Promise<{ relativePath: string; sections: PatternCatalogSection[] } | null> => {
+          const catalogPath = '.agents/review/pattern-catalog.md';
+          try {
+            const sectionRows = await executeQuery(repo.id, `
+              MATCH (s:CodeElement)
+              WHERE s.filePath = '${catalogPath}'
+                AND s.id STARTS WITH 'CodeElement:pattern-catalog:'
+              RETURN s.id AS sectionId, s.name AS title, s.content AS content, s.startLine AS startLine, s.endLine AS endLine
+            `);
+
+            const sectionsById = new Map<string, PatternCatalogSection>();
+            for (const row of sectionRows) {
+              const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+              const title = String((row as any).title ?? (row as any)[1] ?? '').trim();
+              const content = String((row as any).content ?? (row as any)[2] ?? '').trim();
+              const startLine = toOptionalLineNumber((row as any).startLine ?? (row as any)[3]) ?? 0;
+              const endLine = toOptionalLineNumber((row as any).endLine ?? (row as any)[4]) ?? startLine;
+              if (!sectionId || !title || startLine <= 0) continue;
+
+              sectionsById.set(sectionId, {
+                id: sectionId,
+                category: extractCategory(content),
+                title,
+                content,
+                startLine,
+                endLine: endLine > 0 ? endLine : startLine,
+                templateFiles: [],
+                alsoGoodFiles: [],
+                otherFiles: [],
+                tokenSet: new Set<string>(),
+              });
+            }
+            if (sectionsById.size === 0) return null;
+
+            const edgeRows = await executeQuery(repo.id, `
+              MATCH (s:CodeElement)-[r:CodeRelation {type: 'USES'}]->(f:File)
+              WHERE s.filePath = '${catalogPath}'
+                AND s.id STARTS WITH 'CodeElement:pattern-catalog:'
+              RETURN s.id AS sectionId, f.filePath AS filePath, r.reason AS reason
+            `);
+
+            for (const row of edgeRows) {
+              const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+              if (!sectionId) continue;
+              const section = sectionsById.get(sectionId);
+              if (!section) continue;
+
+              const filePath = normalizePath(String((row as any).filePath ?? (row as any)[1] ?? '').trim());
+              if (!filePath) continue;
+
+              const reason = String((row as any).reason ?? (row as any)[2] ?? '').trim().toLowerCase();
+              if (reason === 'pattern-catalog:template') section.templateFiles.push(filePath);
+              else if (reason === 'pattern-catalog:also-good') section.alsoGoodFiles.push(filePath);
+              else if (reason === 'pattern-catalog:other') section.otherFiles.push(filePath);
+            }
+
+            const dedupe = (items: string[]) => Array.from(new Set(items.map(filePath => normalizePath(filePath)).filter(Boolean)));
+            for (const section of sectionsById.values()) {
+              section.templateFiles = dedupe(section.templateFiles);
+              section.alsoGoodFiles = dedupe(section.alsoGoodFiles);
+              section.otherFiles = dedupe(section.otherFiles);
+              section.tokenSet = new Set<string>([
+                ...tokenize(section.category),
+                ...tokenize(section.title),
+                ...tokenize(section.content),
+                ...section.templateFiles.flatMap(tokenize),
+                ...section.alsoGoodFiles.flatMap(tokenize),
+              ]);
+            }
+
+            return { relativePath: catalogPath, sections: Array.from(sectionsById.values()) };
+          } catch {
+            return null;
+          }
+        };
+
+        const loadCatalogFromFile = async (): Promise<{ relativePath: string; sections: PatternCatalogSection[] } | null> => {
+          const catalogPath = '.agents/review/pattern-catalog.md';
+          const resolved = resolvePathInsideRepo(repo.repoPath, catalogPath);
+          if (!resolved) return null;
+          try {
+            const content = await fs.readFile(resolved.absolutePath, 'utf-8');
+            const sections = parsePatternCatalog(content, resolved.relativePath);
+            if (sections.length === 0) return null;
+            return { relativePath: resolved.relativePath, sections };
+          } catch {
+            return null;
+          }
+        };
+
+        try {
+          const catalog = await loadCatalogFromGraph() || await loadCatalogFromFile();
+          if (!catalog || catalog.sections.length === 0) return [];
+
+          const scored = catalog.sections
+            .map(section => {
+              const sectionTokenSet = section.tokenSet || new Set<string>();
+              let tokenOverlap = 0;
+              for (const token of sectionTokenSet) {
+                if (reviewTokenSet.has(token)) tokenOverlap += 1;
+              }
+
+              const referencedFiles = Array.from(new Set([
+                ...section.templateFiles,
+                ...section.alsoGoodFiles,
+                ...section.otherFiles,
+              ]))
+                .map(filePath => normalizePath(filePath))
+                .filter(Boolean);
+              const referencedInScope = referencedFiles.filter(filePath => isInScope(filePath));
+              const templateFilesInScope = section.templateFiles.filter(filePath => isInScope(filePath));
+
+              const fileHits = referencedFiles.filter(filePath => changedFileSet.has(filePath)).length;
+              let affinity = 0;
+              if (changedFileList.length > 0 && referencedFiles.length > 0) {
+                for (const ref of referencedFiles) {
+                  for (const changed of changedFileList) {
+                    affinity = Math.max(affinity, pathAffinity(ref, changed));
+                  }
+                }
+              }
+
+              const score = tokenOverlap
+                + (fileHits > 0 ? 6 : 0)
+                + Math.round(affinity * 4);
+
+              return {
+                section,
+                score,
+                fileHits,
+                referencedFiles: referencedInScope.length > 0 ? referencedInScope : referencedFiles,
+                templateFiles: templateFilesInScope.length > 0 ? templateFilesInScope : section.templateFiles,
+                catalogPath: catalog.relativePath,
+              };
+            })
+            .filter(item => item.score > 0)
+            .sort((left, right) => {
+              if (right.score !== left.score) return right.score - left.score;
+              if (right.fileHits !== left.fileHits) return right.fileHits - left.fileHits;
+              if (left.section.startLine !== right.section.startLine) return left.section.startLine - right.section.startLine;
+              return left.section.title.localeCompare(right.section.title);
+            })
+            .slice(0, 2);
+
+          return scored.map(match => {
+            const exampleFiles = Array.from(new Set([
+              ...match.templateFiles,
+              ...match.referencedFiles,
+            ]))
+              .filter(Boolean)
+              .slice(0, 6);
+
+            return {
+              kind: 'pattern-catalog',
+              signature: `pattern-catalog:${match.section.title}`,
+              score: match.score,
+              anchor: {
+                name: match.section.title,
+                kind: 'DocSection',
+                filePath: match.catalogPath,
+                startLine: match.section.startLine,
+                endLine: match.section.endLine,
+                category: match.section.category || undefined,
+                catalog_path: match.catalogPath,
+                score: match.score,
+              },
+              examples: exampleFiles.map((filePath: string) => ({
+                name: path.basename(filePath),
+                kind: 'File',
+                filePath,
+              })),
+            };
+          });
+        } catch {
+          return [];
+        }
+      };
+
+      const out = [
+        ...await buildPatternCatalogGuidance(),
+        ...await buildAntiPatternGuidance(),
+      ]
+        .sort((left, right) => {
+          const leftScore = toFiniteNumber(left?.score, 0);
+          const rightScore = toFiniteNumber(right?.score, 0);
+          if (rightScore !== leftScore) return rightScore - leftScore;
+          const leftKind = String(left?.kind || '').trim();
+          const rightKind = String(right?.kind || '').trim();
+          if (leftKind !== rightKind) return leftKind.localeCompare(rightKind);
+          const leftSig = String(left?.signature || '').trim();
+          const rightSig = String(right?.signature || '').trim();
+          return leftSig.localeCompare(rightSig);
+        })
+        .slice(0, 4);
+
+      return out;
+    };
+
     let changedFilesRaw: string[] = [];
     let effectiveScope: 'unstaged' | 'staged' | 'all' | 'compare' = scope;
     let diffSource = 'requested';
@@ -4354,6 +4983,14 @@ export async function runReviewMode(
         | 'nested-component-declaration'
         | 'signature-too-many-args'
         | 'inline-param-type-object'
+        | 'useeffect-state-sync'
+        | 'shared-dashboard-surface-change'
+        | 'react-query-inline-key'
+        | 'react-query-getquerydata'
+        | 'inline-string-munging'
+        | 'console-log'
+        | 'debugger-statement'
+        | 'xxx-comment'
         | 'default-export'
         | 'todo-comment'
         | 'react-fc'
@@ -4492,6 +5129,18 @@ export async function runReviewMode(
     const useContextRegex = /\buseContext\s*\(/;
     const providerJsxRegex = /<\s*[A-Za-z_$][\w$]*\.Provider\b/;
     const tailwindSpaceRegex = /\bspace-(?:x|y)-/;
+    const useEffectRegex = /\buseEffect\s*\(/;
+    const rhfEffectSyncRegex = /\b(?:setValue|resetField|reset|setError|clearErrors)\s*\(/;
+    const dispatchEffectSyncRegex = /\bdispatch\s*\(/;
+    const setStateCallRegex = /\bset[A-Z][A-Za-z0-9_]*\s*\(/g;
+    const inlineQueryKeyArrayRegex = /\bqueryKey\s*:\s*\[/;
+    const nestedQueryKeyFactoryRegex = /\bqueryKey\s*:\s*\[\s*[A-Za-z_$][\w$]*QueryKeys\.[A-Za-z_$][\w$]*\s*\(/;
+    const invalidateInlineQueryKeyRegex = /\binvalidateQueries\s*\(\s*\{[^}]*\bqueryKey\s*:\s*\[/;
+    const getQueryDataRegex = /\bqueryClient\.getQueryData\s*\(/;
+    const inlineStringMungingRegex = /\.\s*replaceAll\s*\(\s*['"`]_['"`]\s*,\s*['"`] ['"`]\s*\)|\bupperFirst\s*\(|\bcapitalize\s*\(/;
+    const consoleLogRegex = /\bconsole\.log\s*\(/;
+    const debuggerRegex = /\bdebugger\b/;
+    const xxxCommentRegex = /(?:\/\/|\/\*).*?\bXXX\b/i;
 
     for (const filePath of frontendScanTargets) {
       const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
@@ -4512,6 +5161,29 @@ export async function runReviewMode(
       const lines = content.split('\n');
       const isJsxFile = filePath.endsWith('.tsx') || filePath.endsWith('.jsx');
       const isTsFile = filePath.endsWith('.ts') || filePath.endsWith('.tsx');
+      const firstChangedLine = ranges.length > 0 ? Math.max(1, toNonNegativeInteger(ranges[0]?.start, 1)) : 1;
+
+      // Monorepo anti-pattern: shared/generic surfaces have high blast radius; ensure edits are intentional.
+      if (
+        filePath.startsWith('apps/dashboard/src/customHooks/')
+        || filePath.startsWith('apps/dashboard/src/components/')
+        || filePath === 'apps/dashboard/src/queries/queryClient.ts'
+      ) {
+        const label = filePath.startsWith('apps/dashboard/src/customHooks/')
+          ? 'Shared dashboard hook changed'
+          : filePath.startsWith('apps/dashboard/src/components/')
+            ? 'Shared dashboard component changed'
+            : 'Shared dashboard queryClient changed';
+        frontendHygieneSignals.push({
+          code: 'shared-dashboard-surface-change',
+          filePath,
+          line: firstChangedLine,
+          severity: 'medium',
+          confidence: 0.9,
+          reason: 'dashboard-anti-pattern-shared-surface',
+          summary: `${label} near line ${firstChangedLine} (${filePath}). Prefer feature-scoped logic unless this blast radius is intentional.`,
+        });
+      }
 
       // Prop drilling score (heuristic): identity props + spread props in a single JSX tag.
       if (isJsxFile) {
@@ -4827,6 +5499,163 @@ export async function runReviewMode(
             confidence: 0.86,
             reason: 'frontend-tailwind-space-class',
             summary: `Tailwind space-* class detected near line ${tailwindSpaceLine}. Prefer explicit gap/margin (monorepo convention).`,
+          });
+        }
+      }
+
+      // Review sweeps / drift triggers (heuristic): do-not-ship artifacts, useEffect state sync, ad-hoc query keys, cache reads, and inline string munging.
+      {
+        let consoleLogLine = 0;
+        let debuggerLine = 0;
+        let xxxLine = 0;
+        let useEffectSyncLine = 0;
+        let useEffectSyncKind = '';
+        let nestedQueryKeyLine = 0;
+        let inlineQueryKeyLine = 0;
+        let inlineInvalidateLine = 0;
+        let getQueryDataLine = 0;
+        let stringMungingLine = 0;
+
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const lineNo = idx + 1;
+          if (!lineNearChanged(lineNo)) continue;
+
+          const rawLine = String(lines[idx] || '');
+          const codeLine = rawLine.replace(/\/\/.*$/g, '');
+
+          if (!consoleLogLine && consoleLogRegex.test(codeLine)) consoleLogLine = lineNo;
+          if (!debuggerLine && debuggerRegex.test(codeLine)) debuggerLine = lineNo;
+          if (!xxxLine && xxxCommentRegex.test(rawLine)) xxxLine = lineNo;
+          if (!nestedQueryKeyLine && nestedQueryKeyFactoryRegex.test(codeLine)) nestedQueryKeyLine = lineNo;
+          if (!inlineQueryKeyLine && inlineQueryKeyArrayRegex.test(codeLine)) inlineQueryKeyLine = lineNo;
+          if (!inlineInvalidateLine && invalidateInlineQueryKeyRegex.test(codeLine)) inlineInvalidateLine = lineNo;
+          if (!getQueryDataLine && getQueryDataRegex.test(codeLine)) getQueryDataLine = lineNo;
+          if (!stringMungingLine && inlineStringMungingRegex.test(codeLine)) stringMungingLine = lineNo;
+
+          if (!useEffectSyncLine && useEffectRegex.test(codeLine)) {
+            const useEffectIdx = codeLine.indexOf('useEffect');
+            const startIdx = useEffectIdx >= 0 ? codeLine.indexOf('(', useEffectIdx) : -1;
+            if (startIdx >= 0) {
+              const group = extractParenGroup(lines, idx, startIdx, 24);
+              const windowText = group?.text || lines.slice(idx, Math.min(lines.length, idx + 24)).join('\n');
+              const hasRhfSync = rhfEffectSyncRegex.test(windowText);
+              const hasDispatchSync = dispatchEffectSyncRegex.test(windowText);
+              const setCalls = windowText.match(setStateCallRegex) || [];
+              const hasSetStateSync = setCalls.some(call => !/\bset(?:Timeout|Interval|Immediate)\s*\(/.test(call));
+
+              if (hasRhfSync || hasDispatchSync || hasSetStateSync) {
+                useEffectSyncLine = lineNo;
+                useEffectSyncKind = hasRhfSync
+                  ? 'useeffect-rhf-state-sync'
+                  : hasDispatchSync
+                    ? 'useeffect-dispatch-state-sync'
+                    : 'useeffect-setstate-sync';
+              }
+            }
+          }
+
+          if (
+            consoleLogLine
+            && debuggerLine
+            && xxxLine
+            && useEffectSyncLine
+            && nestedQueryKeyLine
+            && inlineQueryKeyLine
+            && inlineInvalidateLine
+            && getQueryDataLine
+            && stringMungingLine
+          ) {
+            break;
+          }
+        }
+
+        if (consoleLogLine) {
+          frontendHygieneSignals.push({
+            code: 'console-log',
+            filePath,
+            line: consoleLogLine,
+            severity: 'medium',
+            confidence: 0.96,
+            reason: 'review-sweep-do-not-ship',
+            summary: `console.log(...) detected near line ${consoleLogLine}. Remove before merge (do-not-ship).`,
+          });
+        }
+
+        if (debuggerLine) {
+          frontendHygieneSignals.push({
+            code: 'debugger-statement',
+            filePath,
+            line: debuggerLine,
+            severity: 'high',
+            confidence: 0.98,
+            reason: 'review-sweep-do-not-ship',
+            summary: `debugger statement detected near line ${debuggerLine}. Remove before merge (do-not-ship).`,
+          });
+        }
+
+        if (xxxLine) {
+          frontendHygieneSignals.push({
+            code: 'xxx-comment',
+            filePath,
+            line: xxxLine,
+            severity: 'medium',
+            confidence: 0.9,
+            reason: 'review-sweep-do-not-ship',
+            summary: `XXX comment detected near line ${xxxLine}. Prefer resolving before merge or filing a ticket.`,
+          });
+        }
+
+        if (useEffectSyncLine) {
+          frontendHygieneSignals.push({
+            code: 'useeffect-state-sync',
+            filePath,
+            line: useEffectSyncLine,
+            severity: 'medium',
+            confidence: 0.8,
+            reason: useEffectSyncKind || 'useeffect-state-sync',
+            summary: `useEffect state sync/hydration detected near line ${useEffectSyncLine}. Prefer deriving values inline or event-driven updates over sync effects (anti-pattern).`,
+          });
+        }
+
+        const reactQueryInlineLine = inlineInvalidateLine || nestedQueryKeyLine || inlineQueryKeyLine;
+        if (reactQueryInlineLine) {
+          const kind = inlineInvalidateLine
+            ? 'invalidateQueries'
+            : nestedQueryKeyLine
+              ? 'nested-query-key'
+              : 'inline-query-key';
+          frontendHygieneSignals.push({
+            code: 'react-query-inline-key',
+            filePath,
+            line: reactQueryInlineLine,
+            severity: 'low',
+            confidence: inlineInvalidateLine ? 0.78 : nestedQueryKeyLine ? 0.86 : 0.74,
+            reason: `react-query-ad-hoc-key:${kind}`,
+            summary: `React Query queryKey drift trigger near line ${reactQueryInlineLine} (${kind}). Prefer query-key factories + narrow invalidations (monorepo convention).`,
+          });
+        }
+
+        if (getQueryDataLine) {
+          frontendHygieneSignals.push({
+            code: 'react-query-getquerydata',
+            filePath,
+            line: getQueryDataLine,
+            severity: 'low',
+            confidence: 0.82,
+            reason: 'react-query-cache-read',
+            summary: `queryClient.getQueryData(...) detected near line ${getQueryDataLine}. Prefer high-level hooks; if kept, explain why this cache read is safe.`,
+          });
+        }
+
+        if (stringMungingLine) {
+          frontendHygieneSignals.push({
+            code: 'inline-string-munging',
+            filePath,
+            line: stringMungingLine,
+            severity: 'low',
+            confidence: 0.76,
+            reason: 'inline-string-munging',
+            summary: `Inline string munging detected near line ${stringMungingLine}. Prefer a local transform helper (utils.ts) to avoid render-path contract drift.`,
           });
         }
       }
@@ -5317,6 +6146,20 @@ export async function runReviewMode(
       medium: reviewFindings.filter(finding => finding.severity === 'medium').length,
       low: reviewFindings.filter(finding => finding.severity === 'low').length,
     };
+    const doc_guidance = await buildReviewDocGuidance({
+      changedFiles: changedFileObjs,
+      findings: reviewFindings,
+      analysisSymbols,
+    });
+    if (doc_guidance.length > 0) {
+      review_kernel.doc_guidance = doc_guidance;
+      if (Array.isArray(review_kernel.next_actions)) {
+        review_kernel.next_actions = [
+          'Consult doc_guidance sections for monorepo conventions before resolving review findings.',
+          ...review_kernel.next_actions,
+        ].slice(0, 8);
+      }
+    }
     if (findingsBoosted > 0 && Array.isArray(review_kernel.next_actions)) {
       review_kernel.next_actions = [
         'Start with convergence-prioritized findings and tests to mirror strongest in-repo implementation patterns.',

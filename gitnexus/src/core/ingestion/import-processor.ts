@@ -1116,16 +1116,21 @@ export const processImports = async (
 
 export const processImportsFromExtracted = async (
   graph: KnowledgeGraph,
-  files: { path: string; content: string }[],
+  files: Array<{ path: string; content?: string }> | string[],
   extractedImports: ExtractedImport[],
   importMap: ImportMap,
   phpUseAliases: PhpUseAliasMap,
   onProgress?: (current: number, total: number) => void,
   repoRoot?: string,
 ) => {
-  const allFilePaths = new Set(files.map(f => f.path));
+  const resolveFilePaths = (): string[] => {
+    if (files.length === 0) return [];
+    if (typeof (files as any)[0] === 'string') return files as string[];
+    return (files as Array<{ path: string }>).map(f => f.path);
+  };
+  const allFileList = resolveFilePaths();
+  const allFilePaths = new Set(allFileList);
   const resolveCache = new Map<string, string | null>();
-  const allFileList = files.map(f => f.path);
   const normalizedFileList = allFileList.map(p => p.replace(/\\/g, '/'));
   // Build suffix index for O(1) lookups
   const index = buildSuffixIndex(normalizedFileList, allFileList);

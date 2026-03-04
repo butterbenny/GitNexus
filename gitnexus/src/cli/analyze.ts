@@ -8,7 +8,7 @@ import path from 'path';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
 import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, deleteNodesForFiles, deleteOutgoingRelationshipsForFiles, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
-import { runEmbeddingPipeline } from '../core/embeddings/embedding-pipeline.js';
+import { runEmbeddingPipeline, type EmbeddingPipelineSummary } from '../core/embeddings/embedding-pipeline.js';
 import { disposeEmbedder } from '../core/embeddings/embedder.js';
 import { resolveDefaultEmbeddingCachePath, resolveGlobalEmbeddingCachePath } from '../core/embeddings/embedding-cache.js';
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
@@ -57,7 +57,14 @@ import { processLaravelEloquentRelationships } from '../core/ingestion/laravel-e
 import { processLaravelEloquentLoadEdges } from '../core/ingestion/laravel-eloquent-load-processor.js';
 import { processLaravelResourceContracts } from '../core/ingestion/laravel-resource-contract-processor.js';
 import { processReactQueryKeyWiring } from '../core/ingestion/react-query-processor.js';
-import { processContractShapes } from '../core/ingestion/contract-shape-processor.js';
+import {
+  extractInvalidateQueryKeyExpressions,
+  extractKeyFactoryName,
+  extractLiteralKey,
+  processContractShapes,
+  processStaticTestClosures,
+  ShapeTestReference,
+} from '../core/ingestion/contract-shape-processor.js';
 import { processLaravelViewsAndMail } from '../core/ingestion/laravel-view-mail-processor.js';
 import { processLaravelEvents } from '../core/ingestion/laravel-event-processor.js';
 import { processLaravelEventDispatch } from '../core/ingestion/laravel-event-dispatch-processor.js';
@@ -557,6 +564,7 @@ export const analyzeCommand = async (
       totalCoveredSlots: number;
       totalRoleExpectations: number;
     };
+    embeddingSummary?: EmbeddingPipelineSummary;
     derived: {
       mode: IncrementalDerivedMode;
       skippedPasses: string[];
@@ -571,6 +579,7 @@ export const analyzeCommand = async (
     };
   }> => {
     const debugEnabled = process.env.GITNEXUS_DEBUG_INCREMENTAL === '1';
+    const profileEmbeddings = process.env.GITNEXUS_PROFILE_EMBEDDINGS === '1';
     const debug = (msg: string) => {
       if (!debugEnabled) return;
       // stderr so it shows up even when stdout progress bars are suppressed
@@ -599,8 +608,10 @@ export const analyzeCommand = async (
     }
 
     debug('listing repository files');
+    const repoFilesStartedAt = Date.now();
     const allRepoFiles = await listRepositoryFiles(repoPath);
     const allRepoFileSet = new Set(allRepoFiles);
+    markPassTiming('repo-files', repoFilesStartedAt);
 
     // Normalize + partition file changes based on current filesystem state
     const rebuildFiles: string[] = [];
@@ -1032,10 +1043,9 @@ export const analyzeCommand = async (
 
     // Imports (fast path: uses worker-extracted imports)
     bar.update(58, { phase: 'Incremental: resolving imports...' });
-    const allFileStubs = allRepoFiles.map(p => ({ path: p, content: '' }));
     await processImportsFromExtracted(
       workGraph,
-      allFileStubs,
+      allRepoFiles,
       workerData.imports,
       importMap,
       phpUseAliases,
@@ -2277,211 +2287,857 @@ export const analyzeCommand = async (
       skipDerivedPass('shape-graph');
     } else {
       bar.update(89, { phase: 'Incremental: recomputing shape graph...' });
+      const shapeGraphPassStartedAt = Date.now();
       try {
-        const shapeFilePaths = allRepoFiles.filter(filePath => {
-          const normalized = filePath.replace(/\\/g, '/');
-          if (normalized.includes('/Http/Requests/')) return true;
-          if (normalized.includes('/Http/Resources/')) return true;
-          if (normalized.includes('/Http/Controllers/')) return true;
-          if (TEST_FILE_RE.test(normalized)) return true;
-          if (/(^|\/)database\/migrations\/.+\.php$/i.test(normalized)) return true;
-          if (JS_TS_FILE_RE.test(normalized) && !normalized.endsWith('.d.ts')) return true;
-          return false;
-        });
+        const migrationsTouched = rebuildFiles.some(fp => /(^|\/)database\/migrations\/.+\.php$/i.test(fp))
+          || Array.from(deletedFiles).some(fp => /(^|\/)database\/migrations\/.+\.php$/i.test(fp));
+        const existingShapeCount = await getCount('ContractShape');
+        const shouldForceFullShapeGraph = migrationsTouched || existingShapeCount === 0;
 
-        const shapeInputGraph = createKnowledgeGraph();
-        for (const filePath of shapeFilePaths) {
-          shapeInputGraph.addNode({
-            id: `File:${filePath}`,
-            label: 'File',
-            properties: {
-              name: path.posix.basename(filePath),
-              filePath,
-            },
+        const escapeCypherString = (value: string): string => value.replace(/'/g, "''");
+        const chunk = <T>(items: T[], size: number): T[][] => {
+          if (size <= 0) return [items];
+          const chunks: T[][] = [];
+          for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+          return chunks;
+        };
+        const toCypherStringList = (values: string[]): string => values
+          .map(value => `'${escapeCypherString(value)}'`)
+          .join(', ');
+
+        if (shouldForceFullShapeGraph) {
+          const shapeFilePaths = allRepoFiles.filter(filePath => {
+            const normalized = filePath.replace(/\\/g, '/');
+            if (normalized.includes('/Http/Requests/')) return true;
+            if (normalized.includes('/Http/Resources/')) return true;
+            if (normalized.includes('/Http/Controllers/')) return true;
+            if (TEST_FILE_RE.test(normalized)) return true;
+            if (/(^|\/)database\/migrations\/.+\.php$/i.test(normalized)) return true;
+            if (JS_TS_FILE_RE.test(normalized) && !normalized.endsWith('.d.ts')) return true;
+            return false;
           });
-        }
 
-        const classRows = await executeQuery(`
-          MATCH (c:Class)
-          WHERE c.filePath CONTAINS '/Http/Requests/' OR c.filePath CONTAINS '/Http/Resources/'
-          RETURN c.id AS id, c.name AS name, c.filePath AS filePath
-        `);
-        for (const row of classRows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-          shapeInputGraph.addNode({
-            id,
-            label: 'Class',
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-            },
+          const shapeInputGraph = createKnowledgeGraph();
+          for (const filePath of shapeFilePaths) {
+            shapeInputGraph.addNode({
+              id: `File:${filePath}`,
+              label: 'File',
+              properties: {
+                name: path.posix.basename(filePath),
+                filePath,
+              },
+            });
+          }
+
+          const classRows = await executeQuery(`
+            MATCH (c:Class)
+            WHERE c.filePath CONTAINS '/Http/Requests/' OR c.filePath CONTAINS '/Http/Resources/'
+            RETURN c.id AS id, c.name AS name, c.filePath AS filePath
+          `);
+          for (const row of classRows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            shapeInputGraph.addNode({
+              id,
+              label: 'Class',
+              properties: {
+                name: String(row.name ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              },
+            });
+          }
+
+          const functionRows = await executeQuery(`
+            MATCH (f:Function)
+            WHERE LOWER(f.name) CONTAINS 'querykeys.'
+            RETURN f.id AS id, f.name AS name, f.filePath AS filePath
+          `);
+          for (const row of functionRows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            shapeInputGraph.addNode({
+              id,
+              label: 'Function',
+              properties: {
+                name: String(row.name ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[2] ?? '').trim(),
+              },
+            });
+          }
+
+          const methodRows = await executeQuery(`
+            MATCH (m:Method)
+            WHERE m.filePath CONTAINS '/Http/Controllers/'
+            RETURN m.id AS id, m.name AS name, m.filePath AS filePath, m.startLine AS startLine, m.endLine AS endLine
+          `);
+          for (const row of methodRows) {
+            const id = String(row.id ?? row[0] ?? '').trim();
+            if (!id) continue;
+            shapeInputGraph.addNode({
+              id,
+              label: 'Method',
+              properties: {
+                name: String(row.name ?? row[1] ?? '').trim(),
+                filePath: String(row.filePath ?? row[2] ?? '').trim(),
+                startLine: Math.max(0, Math.floor(Number(row.startLine ?? row[3] ?? 0) || 0)),
+                endLine: Math.max(0, Math.floor(Number(row.endLine ?? row[4] ?? 0) || 0)),
+              },
+            });
+          }
+
+          const shapeFiles = await readRepositoryFiles(repoPath, shapeFilePaths);
+          const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
+            if (progress % 20 !== 0 && progress !== 100) return;
+            bar.update(89, { phase: `Shapes: ${message}` });
           });
-        }
 
-        const functionRows = await executeQuery(`
-          MATCH (f:Function)
-          WHERE LOWER(f.name) CONTAINS 'querykeys.'
-          RETURN f.id AS id, f.name AS name, f.filePath AS filePath
-        `);
-        for (const row of functionRows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-          shapeInputGraph.addNode({
-            id,
-            label: 'Function',
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-            },
+          await executeQuery(`MATCH (f:ContractField) DETACH DELETE f`);
+          await executeQuery(`MATCH (s:ContractShape) DETACH DELETE s`);
+          await executeQuery(`MATCH (k:CacheKey) DETACH DELETE k`);
+          await executeQuery(`MATCH (c:DBColumn) DETACH DELETE c`);
+          await executeQuery(`MATCH (t:DBTable) DETACH DELETE t`);
+          await executeQuery(`MATCH (t:TestCase) DETACH DELETE t`);
+          await executeQuery(`MATCH (e:CodeElement) WHERE e.id STARTS WITH 'CodeElement:laravel-validation-boundary:' DETACH DELETE e`);
+
+          const shapeInsertGraph = createKnowledgeGraph();
+          for (const shape of shapeResult.shapes) {
+            shapeInsertGraph.addNode({
+              id: shape.id,
+              label: 'ContractShape',
+              properties: {
+                name: shape.label,
+                filePath: '',
+                heuristicLabel: shape.heuristicLabel,
+                shapeType: shape.shapeType,
+                sourceNodeId: shape.sourceNodeId,
+                sourceFilePath: shape.sourceFilePath,
+              },
+            });
+          }
+
+          for (const field of shapeResult.fields) {
+            shapeInsertGraph.addNode({
+              id: field.id,
+              label: 'ContractField',
+              properties: {
+                name: field.label,
+                filePath: '',
+                heuristicLabel: field.heuristicLabel,
+                fieldName: field.fieldName,
+                shapeId: field.shapeId,
+                shapeType: field.shapeType,
+              },
+            });
+          }
+
+          for (const cacheKey of shapeResult.cacheKeys) {
+            shapeInsertGraph.addNode({
+              id: cacheKey.id,
+              label: 'CacheKey',
+              properties: {
+                name: cacheKey.label,
+                filePath: '',
+                heuristicLabel: cacheKey.heuristicLabel,
+                keyName: cacheKey.keyName,
+                keyType: cacheKey.keyType,
+                sourceNodeId: cacheKey.sourceNodeId,
+              },
+            });
+          }
+
+          for (const dbTable of shapeResult.dbTables) {
+            shapeInsertGraph.addNode({
+              id: dbTable.id,
+              label: 'DBTable',
+              properties: {
+                name: dbTable.label,
+                filePath: dbTable.sourceFilePath,
+                heuristicLabel: dbTable.heuristicLabel,
+                tableName: dbTable.tableName,
+                sourceFilePath: dbTable.sourceFilePath,
+              },
+            });
+          }
+
+          for (const dbColumn of shapeResult.dbColumns) {
+            shapeInsertGraph.addNode({
+              id: dbColumn.id,
+              label: 'DBColumn',
+              properties: {
+                name: dbColumn.label,
+                filePath: dbColumn.sourceFilePath,
+                heuristicLabel: dbColumn.heuristicLabel,
+                columnName: dbColumn.columnName,
+                tableId: dbColumn.tableId,
+                tableName: dbColumn.tableName,
+                sourceFilePath: dbColumn.sourceFilePath,
+              },
+            });
+          }
+
+          for (const testCase of shapeResult.testCases) {
+            shapeInsertGraph.addNode({
+              id: testCase.id,
+              label: 'TestCase',
+              properties: {
+                name: testCase.name,
+                filePath: testCase.filePath,
+                startLine: testCase.startLine,
+                endLine: testCase.endLine,
+              },
+            });
+          }
+
+          for (const node of shapeResult.codeElements) {
+            shapeInsertGraph.addNode(node);
+          }
+
+          for (const edge of shapeResult.edges) {
+            shapeInsertGraph.addRelationship({
+              id: edge.id,
+              type: edge.type,
+              sourceId: edge.sourceId,
+              targetId: edge.targetId,
+              confidence: edge.confidence,
+              reason: edge.reason,
+            });
+          }
+
+          await loadGraphToKuzu(shapeInsertGraph, new Map(), storagePath, (msg) => {
+            bar.update(89, { phase: msg });
           });
+        } else {
+          const normalizeDbName = (value: string): string => {
+            return String(value || '')
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9_]+/g, '_')
+              .replace(/^_+|_+$/g, '');
+          };
+
+          const toSnakeCase = (value: string): string => {
+            return String(value || '')
+              .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+              .replace(/([A-Z])([A-Z][a-z])/g, '$1_$2')
+              .replace(/[^A-Za-z0-9]+/g, '_')
+              .replace(/^_+|_+$/g, '')
+              .toLowerCase();
+          };
+
+          const pluralizeSimple = (value: string): string => {
+            const normalized = String(value || '').trim();
+            if (!normalized) return '';
+            if (normalized.endsWith('s')) return normalized;
+            if (normalized.endsWith('y')) return `${normalized.slice(0, -1)}ies`;
+            return `${normalized}s`;
+          };
+
+          const normalizeFieldKeyForColumn = (fieldName: string): string => {
+            const normalized = String(fieldName || '').trim();
+            if (!normalized) return '';
+
+            const dotExpanded = normalized
+              .replace(/\[/g, '.')
+              .replace(/\]/g, '.')
+              .replace(/\.+/g, '.')
+              .replace(/^\.|\.$/g, '');
+
+            const segments = dotExpanded
+              .split('.')
+              .map(segment => segment.trim())
+              .filter(segment => Boolean(segment) && segment !== '*' && !/^\d+$/.test(segment));
+
+            if (segments.length === 0) return normalizeDbName(normalized);
+            return normalizeDbName(segments[segments.length - 1]);
+          };
+
+          const extractShapeTableHints = (className: string, sourceFilePath: string): string[] => {
+            const candidates = new Set<string>();
+            const normalizedClass = String(className || '').trim();
+            const classCore = normalizedClass.replace(/(Request|Resource|Controller|Model|Policy)$/i, '').trim();
+            const classSnake = normalizeDbName(toSnakeCase(classCore));
+            if (classSnake) {
+              candidates.add(classSnake);
+              candidates.add(pluralizeSimple(classSnake));
+            }
+
+            const fileBase = String(sourceFilePath || '')
+              .replace(/\\/g, '/')
+              .split('/')
+              .pop()
+              ?.replace(/\.[^.]+$/, '')
+              ?.replace(/(_request|_resource|request|resource)$/i, '') || '';
+            const fileSnake = normalizeDbName(toSnakeCase(fileBase));
+            if (fileSnake) {
+              candidates.add(fileSnake);
+              candidates.add(pluralizeSimple(fileSnake));
+            }
+
+            return Array.from(candidates).filter(Boolean);
+          };
+
+          const sanitizeIdSegment = (value: string): string => {
+            return String(value || '')
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '_')
+              .replace(/^_+|_+$/g, '')
+              .slice(0, 120);
+          };
+
+          const isPhp = (filePath: string): boolean => filePath.toLowerCase().endsWith('.php');
+          const changedControllerFiles = rebuildFiles.filter(fp => isPhp(fp) && fp.includes('/Http/Controllers/'));
+          const changedRequestFiles = rebuildFiles.filter(fp => isPhp(fp) && fp.includes('/Http/Requests/'));
+          const changedResourceFiles = rebuildFiles.filter(fp => isPhp(fp) && fp.includes('/Http/Resources/'));
+          const phpShapeFiles = Array.from(new Set([
+            ...changedControllerFiles,
+            ...changedRequestFiles,
+            ...changedResourceFiles,
+          ]));
+
+          const changedJsTsFiles = rebuildFiles.filter(fp => JS_TS_FILE_RE.test(fp) && !fp.toLowerCase().endsWith('.d.ts'));
+          const changedTestFiles = rebuildFiles.filter(fp => TEST_FILE_RE.test(fp));
+
+          const insertGraph = createKnowledgeGraph();
+
+          if (phpShapeFiles.length > 0) {
+            const shapeInputGraph = createKnowledgeGraph();
+            const classNameById = new Map<string, string>();
+
+            const classFilePaths = Array.from(new Set([...changedRequestFiles, ...changedResourceFiles]));
+            for (const classChunk of chunk(classFilePaths, 200)) {
+              const list = toCypherStringList(classChunk);
+              if (!list) continue;
+              const classRows = await executeQuery(`
+                MATCH (c:Class)
+                WHERE c.filePath IN [${list}]
+                RETURN c.id AS id, c.name AS name, c.filePath AS filePath
+              `);
+              for (const row of classRows) {
+                const id = String(row.id ?? row[0] ?? '').trim();
+                if (!id) continue;
+                const name = String(row.name ?? row[1] ?? '').trim();
+                const filePath = String(row.filePath ?? row[2] ?? '').trim();
+                classNameById.set(id, name);
+                shapeInputGraph.addNode({
+                  id,
+                  label: 'Class',
+                  properties: { name, filePath },
+                });
+              }
+            }
+
+            for (const methodChunk of chunk(changedControllerFiles, 200)) {
+              const list = toCypherStringList(methodChunk);
+              if (!list) continue;
+              const methodRows = await executeQuery(`
+                MATCH (m:Method)
+                WHERE m.filePath IN [${list}]
+                RETURN m.id AS id, m.name AS name, m.filePath AS filePath, m.startLine AS startLine, m.endLine AS endLine
+              `);
+              for (const row of methodRows) {
+                const id = String(row.id ?? row[0] ?? '').trim();
+                if (!id) continue;
+                shapeInputGraph.addNode({
+                  id,
+                  label: 'Method',
+                  properties: {
+                    name: String(row.name ?? row[1] ?? '').trim(),
+                    filePath: String(row.filePath ?? row[2] ?? '').trim(),
+                    startLine: Math.max(0, Math.floor(Number(row.startLine ?? row[3] ?? 0) || 0)),
+                    endLine: Math.max(0, Math.floor(Number(row.endLine ?? row[4] ?? 0) || 0)),
+                  },
+                });
+              }
+            }
+
+            const shapeFiles: Array<{ path: string; content: string }> = [];
+            for (const fp of phpShapeFiles) {
+              let content = contentByPath.get(fp);
+              if (content === undefined) {
+                try {
+                  content = await fs.readFile(path.join(repoPath, fp), 'utf-8');
+                } catch {
+                  content = '';
+                }
+              }
+              shapeFiles.push({ path: fp, content });
+            }
+
+            const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
+              if (progress % 25 !== 0 && progress !== 100) return;
+              bar.update(89, { phase: `Shapes: ${message}` });
+            });
+
+            // Remove derived nodes/edges for the changed Laravel shape sources.
+            // Keep ContractShape nodes when possible to preserve TESTS_SHAPE links from unchanged tests.
+            const changedShapeSourceFiles = phpShapeFiles;
+            const existingShapeRows = await executeQuery(`
+              MATCH (s:ContractShape)
+              WHERE s.sourceFilePath IN [${toCypherStringList(changedShapeSourceFiles)}]
+              RETURN s.id AS id, s.sourceFilePath AS sourceFilePath
+            `);
+
+            const existingShapeIdsByFile = new Map<string, Set<string>>();
+            const existingShapeIds = new Set<string>();
+            for (const row of existingShapeRows) {
+              const id = String((row as any)?.id ?? row[0] ?? '').trim();
+              const fp = String((row as any)?.sourceFilePath ?? row[1] ?? '').trim();
+              if (!id || !fp) continue;
+              const set = existingShapeIdsByFile.get(fp) || new Set<string>();
+              set.add(id);
+              existingShapeIdsByFile.set(fp, set);
+              existingShapeIds.add(id);
+            }
+
+            const newShapeIdsByFile = new Map<string, Set<string>>();
+            for (const shape of shapeResult.shapes) {
+              const fp = String(shape.sourceFilePath || '').trim();
+              if (!fp) continue;
+              const set = newShapeIdsByFile.get(fp) || new Set<string>();
+              set.add(shape.id);
+              newShapeIdsByFile.set(fp, set);
+            }
+
+            const shapesToRemove: string[] = [];
+            for (const fp of changedShapeSourceFiles) {
+              const existingIds = existingShapeIdsByFile.get(fp) || new Set<string>();
+              const newIds = newShapeIdsByFile.get(fp) || new Set<string>();
+              for (const id of existingIds) {
+                if (!newIds.has(id)) shapesToRemove.push(id);
+              }
+            }
+
+            // Clear contract fields (and their edges) for existing shapes from these files.
+            for (const idChunk of chunk(Array.from(existingShapeIds), 250)) {
+              const list = toCypherStringList(idChunk);
+              if (!list) continue;
+              await executeQuery(`
+                MATCH (f:ContractField)
+                WHERE f.shapeId IN [${list}]
+                DETACH DELETE f
+              `);
+            }
+
+            // Clear derived Class->ContractShape DEFINES edges for the touched request/resource files to avoid duplicates.
+            if (classFilePaths.length > 0) {
+              for (const fileChunk of chunk(classFilePaths, 200)) {
+                const list = toCypherStringList(fileChunk);
+                if (!list) continue;
+                await executeQuery(`
+                  MATCH (c:Class)-[r:CodeRelation]->(s:ContractShape)
+                  WHERE r.type = 'DEFINES' AND c.filePath IN [${list}]
+                  DELETE r
+                `);
+              }
+            }
+
+            // Clear derived Laravel validation boundary code elements for touched controller files.
+            if (changedControllerFiles.length > 0) {
+              for (const fileChunk of chunk(changedControllerFiles, 200)) {
+                const list = toCypherStringList(fileChunk);
+                if (!list) continue;
+                await executeQuery(`
+                  MATCH (e:CodeElement)
+                  WHERE e.id STARTS WITH 'CodeElement:laravel-validation-boundary:'
+                    AND e.filePath IN [${list}]
+                  DETACH DELETE e
+                `);
+              }
+            }
+
+            // Remove shapes that no longer exist in these source files.
+            for (const idChunk of chunk(shapesToRemove, 250)) {
+              const list = toCypherStringList(idChunk);
+              if (!list) continue;
+              await executeQuery(`
+                MATCH (s:ContractShape)
+                WHERE s.id IN [${list}]
+                DETACH DELETE s
+              `);
+            }
+
+            // Insert updated shapes/fields/boundaries for changed files.
+            for (const shape of shapeResult.shapes) {
+              insertGraph.addNode({
+                id: shape.id,
+                label: 'ContractShape',
+                properties: {
+                  name: shape.label,
+                  filePath: '',
+                  heuristicLabel: shape.heuristicLabel,
+                  shapeType: shape.shapeType,
+                  sourceNodeId: shape.sourceNodeId,
+                  sourceFilePath: shape.sourceFilePath,
+                },
+              });
+            }
+
+            for (const field of shapeResult.fields) {
+              insertGraph.addNode({
+                id: field.id,
+                label: 'ContractField',
+                properties: {
+                  name: field.label,
+                  filePath: '',
+                  heuristicLabel: field.heuristicLabel,
+                  fieldName: field.fieldName,
+                  shapeId: field.shapeId,
+                  shapeType: field.shapeType,
+                },
+              });
+            }
+
+            for (const node of shapeResult.codeElements) {
+              insertGraph.addNode(node);
+            }
+
+            // Derive field->column wiring using existing DBColumn nodes (avoid full migration rescans).
+            const fieldColumnKeys = new Set<string>();
+            for (const field of shapeResult.fields) {
+              const key = normalizeFieldKeyForColumn(field.fieldName);
+              if (key) fieldColumnKeys.add(key);
+            }
+
+            const dbColumnsByName = new Map<string, Array<{ id: string; tableName: string }>>();
+            if (fieldColumnKeys.size > 0) {
+              for (const keyChunk of chunk(Array.from(fieldColumnKeys), 250)) {
+                const list = toCypherStringList(keyChunk);
+                if (!list) continue;
+                const columnRows = await executeQuery(`
+                  MATCH (c:DBColumn)
+                  WHERE c.columnName IN [${list}]
+                  RETURN c.id AS id, c.columnName AS columnName, c.tableName AS tableName
+                `);
+                for (const row of columnRows) {
+                  const id = String((row as any)?.id ?? row[0] ?? '').trim();
+                  const columnName = String((row as any)?.columnName ?? row[1] ?? '').trim();
+                  const tableName = String((row as any)?.tableName ?? row[2] ?? '').trim();
+                  if (!id || !columnName || !tableName) continue;
+                  const listForName = dbColumnsByName.get(columnName) || [];
+                  listForName.push({ id, tableName });
+                  dbColumnsByName.set(columnName, listForName);
+                }
+              }
+            }
+
+            const shapeById = new Map<string, typeof shapeResult.shapes[number]>();
+            for (const shape of shapeResult.shapes) shapeById.set(shape.id, shape);
+
+            for (const edge of shapeResult.edges) {
+              insertGraph.addRelationship({
+                id: edge.id,
+                type: edge.type,
+                sourceId: edge.sourceId,
+                targetId: edge.targetId,
+                confidence: edge.confidence,
+                reason: edge.reason,
+              });
+            }
+
+            for (const field of shapeResult.fields) {
+              const shape = shapeById.get(field.shapeId);
+              if (!shape) continue;
+
+              const columnKey = normalizeFieldKeyForColumn(field.fieldName);
+              if (!columnKey) continue;
+
+              const candidates = dbColumnsByName.get(columnKey) || [];
+              if (candidates.length === 0) continue;
+
+              let selected: { id: string; tableName: string } | null = null;
+              let reason = 'db-schema:field-name-exact';
+              let confidence = 0.86;
+
+              if (candidates.length === 1) {
+                selected = candidates[0];
+              } else {
+                const className = classNameById.get(shape.sourceNodeId) || '';
+                const tableHints = extractShapeTableHints(className, shape.sourceFilePath);
+                const narrowed = candidates.filter(candidate => tableHints.includes(candidate.tableName));
+                if (narrowed.length === 1) {
+                  selected = narrowed[0];
+                  reason = 'db-schema:field-name-shape-table';
+                  confidence = 0.82;
+                }
+              }
+
+              if (!selected) continue;
+              insertGraph.addRelationship({
+                id: `DERIVES_FROM_COLUMN:${field.id}->${selected.id}`,
+                type: 'DERIVES_FROM_COLUMN',
+                sourceId: field.id,
+                targetId: selected.id,
+                confidence,
+                reason,
+              });
+            }
+          }
+
+          // Incremental CacheKey + invalidateQueries wiring (only for changed JS/TS files)
+          if (changedJsTsFiles.length > 0) {
+            const functionRows = await executeQuery(`
+              MATCH (f:Function)
+              WHERE f.filePath IN [${toCypherStringList(changedJsTsFiles)}]
+                AND LOWER(f.name) CONTAINS 'querykeys.'
+              RETURN f.id AS id, f.name AS name, f.filePath AS filePath
+            `);
+
+            // Clear prior function->cacheKey edges for these files (avoid duplicates).
+            for (const fileChunk of chunk(changedJsTsFiles, 200)) {
+              const list = toCypherStringList(fileChunk);
+              if (!list) continue;
+              await executeQuery(`
+                MATCH (f:Function)-[r:CodeRelation]->(k:CacheKey)
+                WHERE r.type = 'DEFINES' AND f.filePath IN [${list}]
+                DELETE r
+              `);
+            }
+
+            const cacheKeyIdByFactoryName = new Map<string, string>();
+            for (const row of functionRows) {
+              const id = String((row as any)?.id ?? row[0] ?? '').trim();
+              const name = String((row as any)?.name ?? row[1] ?? '').trim();
+              if (!id || !name) continue;
+
+              const sourcePart = sanitizeIdSegment(id) || 'unknown';
+              const keyPart = sanitizeIdSegment(name) || 'cache_key';
+              const cacheKeyId = `CacheKey:query_key_factory:${sourcePart}:${keyPart}`;
+              cacheKeyIdByFactoryName.set(name, cacheKeyId);
+
+              const label = `Cache Key: ${name}`;
+              insertGraph.addNode({
+                id: cacheKeyId,
+                label: 'CacheKey',
+                properties: {
+                  name: label,
+                  filePath: '',
+                  heuristicLabel: label,
+                  keyName: name,
+                  keyType: 'query_key_factory',
+                  sourceNodeId: id,
+                },
+              });
+
+              insertGraph.addRelationship({
+                id: `DEFINES:${id}->${cacheKeyId}`,
+                type: 'DEFINES',
+                sourceId: id,
+                targetId: cacheKeyId,
+                confidence: 0.95,
+                reason: 'react-query:key-factory',
+              });
+            }
+
+            const invalidateFiles = changedJsTsFiles
+              .filter(fp => String(contentByPath.get(fp) || '').includes('invalidateQueries('));
+
+            if (invalidateFiles.length > 0) {
+              // Clear prior invalidation edges from these file nodes.
+              for (const fileChunk of chunk(invalidateFiles, 200)) {
+                const list = toCypherStringList(fileChunk);
+                if (!list) continue;
+                await executeQuery(`
+                  MATCH (f:File)-[r:CodeRelation]->(k:CacheKey)
+                  WHERE r.type = 'INVALIDATES_KEY' AND f.filePath IN [${list}]
+                  DELETE r
+                `);
+              }
+
+              // Clear prior literal cache keys derived from these files.
+              const fileNodeIds = invalidateFiles.map(fp => `File:${fp}`);
+              for (const nodeChunk of chunk(fileNodeIds, 200)) {
+                const list = toCypherStringList(nodeChunk);
+                if (!list) continue;
+                await executeQuery(`
+                  MATCH (k:CacheKey)
+                  WHERE k.keyType = 'literal' AND k.sourceNodeId IN [${list}]
+                  DETACH DELETE k
+                `);
+              }
+
+              const exprsByFile = new Map<string, string[]>();
+              const factoryNames = new Set<string>();
+
+              for (const fp of invalidateFiles) {
+                const content = String(contentByPath.get(fp) || '');
+                const exprs = extractInvalidateQueryKeyExpressions(content);
+                if (exprs.length === 0) continue;
+                exprsByFile.set(fp, exprs);
+                for (const expr of exprs) {
+                  const factoryName = extractKeyFactoryName(expr);
+                  if (factoryName) factoryNames.add(factoryName);
+                }
+              }
+
+              const existingFactoryKeyIdByName = new Map<string, string>();
+              const missingFactories = Array.from(factoryNames).filter(name => !cacheKeyIdByFactoryName.has(name));
+              for (const nameChunk of chunk(missingFactories, 200)) {
+                const list = toCypherStringList(nameChunk);
+                if (!list) continue;
+                const keyRows = await executeQuery(`
+                  MATCH (k:CacheKey)
+                  WHERE k.keyType = 'query_key_factory' AND k.keyName IN [${list}]
+                  RETURN k.id AS id, k.keyName AS keyName
+                `);
+                for (const row of keyRows) {
+                  const id = String((row as any)?.id ?? row[0] ?? '').trim();
+                  const keyName = String((row as any)?.keyName ?? row[1] ?? '').trim();
+                  if (!id || !keyName) continue;
+                  existingFactoryKeyIdByName.set(keyName, id);
+                }
+              }
+
+              for (const [fp, exprs] of exprsByFile) {
+                const fileNodeId = `File:${fp}`;
+                for (const expr of exprs) {
+                  const factoryName = extractKeyFactoryName(expr);
+                  if (factoryName) {
+                    const cacheKeyId = cacheKeyIdByFactoryName.get(factoryName) || existingFactoryKeyIdByName.get(factoryName) || null;
+                    if (cacheKeyId) {
+                      insertGraph.addRelationship({
+                        id: `INVALIDATES_KEY:${fileNodeId}:${cacheKeyId}`,
+                        type: 'INVALIDATES_KEY',
+                        sourceId: fileNodeId,
+                        targetId: cacheKeyId,
+                        confidence: 0.9,
+                        reason: 'react-query:invalidateQueries',
+                      });
+                      continue;
+                    }
+                  }
+
+                  const literalKey = extractLiteralKey(expr);
+                  if (!literalKey) continue;
+
+                  const sourcePart = sanitizeIdSegment(fileNodeId) || 'unknown';
+                  const keyPart = sanitizeIdSegment(literalKey) || 'cache_key';
+                  const cacheKeyId = `CacheKey:literal:${sourcePart}:${keyPart}`;
+                  const label = `Cache Key: ${literalKey}`;
+
+                  insertGraph.addNode({
+                    id: cacheKeyId,
+                    label: 'CacheKey',
+                    properties: {
+                      name: label,
+                      filePath: '',
+                      heuristicLabel: label,
+                      keyName: literalKey,
+                      keyType: 'literal',
+                      sourceNodeId: fileNodeId,
+                    },
+                  });
+
+                  insertGraph.addRelationship({
+                    id: `INVALIDATES_KEY:${fileNodeId}:${cacheKeyId}`,
+                    type: 'INVALIDATES_KEY',
+                    sourceId: fileNodeId,
+                    targetId: cacheKeyId,
+                    confidence: 0.9,
+                    reason: 'react-query:invalidateQueries:literal',
+                  });
+                }
+              }
+            }
+          }
+
+          if (insertGraph.nodeCount > 0 || insertGraph.relationshipCount > 0) {
+            await loadGraphToKuzu(insertGraph, new Map(), storagePath, (msg) => {
+              bar.update(89, { phase: msg });
+            });
+          }
+
+          if (changedTestFiles.length > 0) {
+            // Remove prior test-case nodes for these files, then re-link to current shapes.
+            for (const fileChunk of chunk(changedTestFiles, 200)) {
+              const list = toCypherStringList(fileChunk);
+              if (!list) continue;
+              await executeQuery(`
+                MATCH (t:TestCase)
+                WHERE t.filePath IN [${list}]
+                DETACH DELETE t
+              `);
+            }
+
+            const shapeReferenceRows = await executeQuery(`
+              MATCH (s:ContractShape)
+              OPTIONAL MATCH (c:Class {id: s.sourceNodeId})
+              RETURN s.id AS shapeId,
+                     COALESCE(c.name, '') AS className,
+                     s.sourceFilePath AS sourceFilePath
+            `);
+
+            const shapeReferences: ShapeTestReference[] = [];
+            for (const row of shapeReferenceRows) {
+              const shapeId = String((row as any)?.shapeId ?? row[0] ?? '').trim();
+              const className = String((row as any)?.className ?? row[1] ?? '').trim();
+              const sourceFilePath = String((row as any)?.sourceFilePath ?? row[2] ?? '').trim();
+              if (!shapeId) continue;
+              const sourceFileBase = sourceFilePath
+                .replace(/\\/g, '/')
+                .split('/')
+                .pop()
+                ?.replace(/\.[^.]+$/, '') || '';
+
+              shapeReferences.push({
+                shapeId,
+                className,
+                sourceFileBase,
+              });
+            }
+
+            const testFiles: Array<{ path: string; content: string }> = [];
+            for (const fp of changedTestFiles) {
+              let content = contentByPath.get(fp);
+              if (content === undefined) {
+                try {
+                  content = await fs.readFile(path.join(repoPath, fp), 'utf-8');
+                } catch {
+                  content = '';
+                }
+              }
+              testFiles.push({ path: fp, content: String(content || '') });
+            }
+
+            const testClosureResult = processStaticTestClosures(testFiles, shapeReferences);
+
+            const testInsertGraph = createKnowledgeGraph();
+            for (const testCase of testClosureResult.testCases) {
+              testInsertGraph.addNode({
+                id: testCase.id,
+                label: 'TestCase',
+                properties: {
+                  name: testCase.name,
+                  filePath: testCase.filePath,
+                  startLine: testCase.startLine,
+                  endLine: testCase.endLine,
+                },
+              });
+            }
+
+            for (const edge of testClosureResult.edges) {
+              testInsertGraph.addRelationship({
+                id: edge.id,
+                type: edge.type,
+                sourceId: edge.sourceId,
+                targetId: edge.targetId,
+                confidence: edge.confidence,
+                reason: edge.reason,
+              });
+            }
+
+            if (testInsertGraph.nodeCount > 0 || testInsertGraph.relationshipCount > 0) {
+              await loadGraphToKuzu(testInsertGraph, new Map(), storagePath, (msg) => {
+                bar.update(89, { phase: msg });
+              });
+            }
+          }
         }
-
-        const methodRows = await executeQuery(`
-          MATCH (m:Method)
-          WHERE m.filePath CONTAINS '/Http/Controllers/'
-          RETURN m.id AS id, m.name AS name, m.filePath AS filePath, m.startLine AS startLine, m.endLine AS endLine
-        `);
-        for (const row of methodRows) {
-          const id = String(row.id ?? row[0] ?? '').trim();
-          if (!id) continue;
-          shapeInputGraph.addNode({
-            id,
-            label: 'Method',
-            properties: {
-              name: String(row.name ?? row[1] ?? '').trim(),
-              filePath: String(row.filePath ?? row[2] ?? '').trim(),
-              startLine: Math.max(0, Math.floor(Number(row.startLine ?? row[3] ?? 0) || 0)),
-              endLine: Math.max(0, Math.floor(Number(row.endLine ?? row[4] ?? 0) || 0)),
-            },
-          });
-        }
-
-        const shapeFiles = await readRepositoryFiles(repoPath, shapeFilePaths);
-        const shapeResult = await processContractShapes(shapeInputGraph, shapeFiles, (message, progress) => {
-          if (progress % 20 !== 0 && progress !== 100) return;
-          bar.update(89, { phase: `Shapes: ${message}` });
-        });
-
-        await executeQuery(`MATCH (f:ContractField) DETACH DELETE f`);
-        await executeQuery(`MATCH (s:ContractShape) DETACH DELETE s`);
-        await executeQuery(`MATCH (k:CacheKey) DETACH DELETE k`);
-        await executeQuery(`MATCH (c:DBColumn) DETACH DELETE c`);
-        await executeQuery(`MATCH (t:DBTable) DETACH DELETE t`);
-        await executeQuery(`MATCH (t:TestCase) DETACH DELETE t`);
-        await executeQuery(`MATCH (e:CodeElement) WHERE e.id STARTS WITH 'CodeElement:laravel-validation-boundary:' DETACH DELETE e`);
-
-        const shapeInsertGraph = createKnowledgeGraph();
-        for (const shape of shapeResult.shapes) {
-          shapeInsertGraph.addNode({
-            id: shape.id,
-            label: 'ContractShape',
-            properties: {
-              name: shape.label,
-              filePath: '',
-              heuristicLabel: shape.heuristicLabel,
-              shapeType: shape.shapeType,
-              sourceNodeId: shape.sourceNodeId,
-              sourceFilePath: shape.sourceFilePath,
-            },
-          });
-        }
-
-        for (const field of shapeResult.fields) {
-          shapeInsertGraph.addNode({
-            id: field.id,
-            label: 'ContractField',
-            properties: {
-              name: field.label,
-              filePath: '',
-              heuristicLabel: field.heuristicLabel,
-              fieldName: field.fieldName,
-              shapeId: field.shapeId,
-              shapeType: field.shapeType,
-            },
-          });
-        }
-
-        for (const cacheKey of shapeResult.cacheKeys) {
-          shapeInsertGraph.addNode({
-            id: cacheKey.id,
-            label: 'CacheKey',
-            properties: {
-              name: cacheKey.label,
-              filePath: '',
-              heuristicLabel: cacheKey.heuristicLabel,
-              keyName: cacheKey.keyName,
-              keyType: cacheKey.keyType,
-              sourceNodeId: cacheKey.sourceNodeId,
-            },
-          });
-        }
-
-        for (const dbTable of shapeResult.dbTables) {
-          shapeInsertGraph.addNode({
-            id: dbTable.id,
-            label: 'DBTable',
-            properties: {
-              name: dbTable.label,
-              filePath: dbTable.sourceFilePath,
-              heuristicLabel: dbTable.heuristicLabel,
-              tableName: dbTable.tableName,
-              sourceFilePath: dbTable.sourceFilePath,
-            },
-          });
-        }
-
-        for (const dbColumn of shapeResult.dbColumns) {
-          shapeInsertGraph.addNode({
-            id: dbColumn.id,
-            label: 'DBColumn',
-            properties: {
-              name: dbColumn.label,
-              filePath: dbColumn.sourceFilePath,
-              heuristicLabel: dbColumn.heuristicLabel,
-              columnName: dbColumn.columnName,
-              tableId: dbColumn.tableId,
-              tableName: dbColumn.tableName,
-              sourceFilePath: dbColumn.sourceFilePath,
-            },
-          });
-        }
-
-        for (const testCase of shapeResult.testCases) {
-          shapeInsertGraph.addNode({
-            id: testCase.id,
-            label: 'TestCase',
-            properties: {
-              name: testCase.name,
-              filePath: testCase.filePath,
-              startLine: testCase.startLine,
-              endLine: testCase.endLine,
-            },
-          });
-        }
-
-        for (const node of shapeResult.codeElements) {
-          shapeInsertGraph.addNode(node);
-        }
-
-        for (const edge of shapeResult.edges) {
-          shapeInsertGraph.addRelationship({
-            id: edge.id,
-            type: edge.type,
-            sourceId: edge.sourceId,
-            targetId: edge.targetId,
-            confidence: edge.confidence,
-            reason: edge.reason,
-          });
-        }
-
-        await loadGraphToKuzu(shapeInsertGraph, new Map(), storagePath, (msg) => {
-          bar.update(89, { phase: msg });
-        });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         kuzuWarnings.push(`Incremental: unable to recompute shape graph (${msg.slice(0, 120)})`);
       }
+      markPassTiming('shape-graph', shapeGraphPassStartedAt);
     }
 
     const valueGraphPassStartedAt = Date.now();
@@ -3036,6 +3692,7 @@ export const analyzeCommand = async (
     let embeddingTime = '0.0';
     let embeddingSkipped = false;
     let embeddingSkipReason = '';
+    let embeddingSummary: EmbeddingPipelineSummary | null = null;
 
     if (skipEmbeddings) {
       embeddingSkipped = true;
@@ -3046,7 +3703,7 @@ export const analyzeCommand = async (
       bar.update(90, { phase: 'Embedding new/changed nodes...' });
       const t0Emb = Date.now();
       try {
-        await runEmbeddingPipeline(
+        embeddingSummary = await runEmbeddingPipeline(
           executeQuery,
           (cypher, paramsList) => executeWithReusedStatement(cypher, paramsList, { throwOnError: true }),
           (progress) => {
@@ -3088,6 +3745,7 @@ export const analyzeCommand = async (
       evidenceSpans: evidenceSpanSummary,
       summaries: summaryOverlaySummary,
       closureTemplates: closureTemplateSummary,
+      ...(profileEmbeddings && embeddingSummary ? { embeddingSummary } : {}),
       derived: {
         mode: incrementalDerivedMode,
         skippedPasses: skippedDerivedPasses,
@@ -3221,6 +3879,12 @@ export const analyzeCommand = async (
       console.log(`\n  Repository updated incrementally (${totalTime}s)\n`);
       console.log(`  ${inc.stats.nodes.toLocaleString()} nodes | ${inc.stats.edges.toLocaleString()} edges | ${inc.communityCount} clusters | ${inc.processCount} flows`);
       console.log(`  KuzuDB ${inc.kuzuTime}s | FTS ${inc.ftsTime}s | Embeddings ${inc.embeddingSkipped ? inc.embeddingSkipReason : inc.embeddingTime + 's'}`);
+      if (inc.embeddingSummary) {
+        const sum = inc.embeddingSummary;
+        console.log(
+          `  Embedding profiling: cache=${sum.cache.readMode} hits=${sum.cache.cacheHits} misses=${sum.cache.cacheMisses} writes=${sum.cache.cacheWrites} overlay_appends=${sum.cache.overlayAppends} model_loaded=${sum.model.loaded ? 'yes' : 'no'} timings_ms(query=${sum.timingsMs.queryNodes} cache=${sum.timingsMs.cacheLoad} embed=${sum.timingsMs.embedCompute} insert=${sum.timingsMs.insert} index=${sum.timingsMs.vectorIndex} save=${sum.timingsMs.cacheSave} overlay=${sum.timingsMs.overlayAppend})`,
+        );
+      }
       if (inc.precision) {
         const producerBits: string[] = [];
         if (inc.precision.producer) producerBits.push(inc.precision.producer);
@@ -3466,6 +4130,8 @@ export const analyzeCommand = async (
   let embeddingTime = '0.0';
   let embeddingSkipped = false;
   let embeddingSkipReason = '';
+  const profileEmbeddings = process.env.GITNEXUS_PROFILE_EMBEDDINGS === '1';
+  let embeddingSummary: EmbeddingPipelineSummary | null = null;
 
   if (skipEmbeddings) {
     embeddingSkipped = true;
@@ -3476,7 +4142,7 @@ export const analyzeCommand = async (
     bar.update(90, { phase: 'Loading embedding model...' });
     const t0Emb = Date.now();
     try {
-      await runEmbeddingPipeline(
+      embeddingSummary = await runEmbeddingPipeline(
         executeQuery,
         (cypher, paramsList) => executeWithReusedStatement(cypher, paramsList, { throwOnError: true }),
         (progress) => {
@@ -3581,6 +4247,12 @@ export const analyzeCommand = async (
   console.log(`\n  Repository indexed successfully (${totalTime}s)\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
   console.log(`  KuzuDB ${kuzuTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
+  if (profileEmbeddings && embeddingSummary) {
+    const sum = embeddingSummary;
+    console.log(
+      `  Embedding profiling: cache=${sum.cache.readMode} hits=${sum.cache.cacheHits} misses=${sum.cache.cacheMisses} writes=${sum.cache.cacheWrites} overlay_appends=${sum.cache.overlayAppends} model_loaded=${sum.model.loaded ? 'yes' : 'no'} timings_ms(query=${sum.timingsMs.queryNodes} cache=${sum.timingsMs.cacheLoad} embed=${sum.timingsMs.embedCompute} insert=${sum.timingsMs.insert} index=${sum.timingsMs.vectorIndex} save=${sum.timingsMs.cacheSave} overlay=${sum.timingsMs.overlayAppend})`,
+    );
+  }
   console.log(`  Pipeline ${pipelineTime}s | Evidence ${evidenceTime}s | Summaries ${summariesTime}s`);
   if (pipelineResult.precisionOverlayResult) {
     const precision = pipelineResult.precisionOverlayResult.stats;

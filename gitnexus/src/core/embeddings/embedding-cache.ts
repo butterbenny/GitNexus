@@ -77,6 +77,63 @@ export const resolveGlobalEmbeddingCachePath = (): string => {
   return path.join(baseDir, 'embeddings', 'cache.json');
 };
 
+export const resolveEmbeddingCacheOverlayPath = (cachePath: string): string => {
+  const resolved = String(cachePath || '').trim();
+  if (!resolved) return '';
+  if (resolved.endsWith('.json')) return `${resolved.slice(0, -5)}.overlay.jsonl`;
+  return `${resolved}.overlay.jsonl`;
+};
+
+export const loadEmbeddingCacheOverlay = async (
+  overlayPath: string,
+): Promise<EmbeddingCacheByHash> => {
+  try {
+    const raw = await fs.readFile(overlayPath, 'utf-8');
+    const byHash = new Map<string, string>();
+    for (const line of String(raw || '').split('\n')) {
+      const trimmed = String(line || '').trim();
+      if (!trimmed) continue;
+      let parsed: any;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const hash = String(parsed?.hash || '').trim();
+      const embeddingBase64 = String(parsed?.embeddingBase64 || '').trim();
+      if (!hash || !embeddingBase64) continue;
+      byHash.set(hash, embeddingBase64);
+    }
+    return byHash;
+  } catch {
+    return new Map();
+  }
+};
+
+export const appendEmbeddingCacheOverlay = async (
+  overlayPath: string,
+  entries: Array<{ hash: string; embeddingBase64: string }>,
+): Promise<void> => {
+  const normalizedPath = String(overlayPath || '').trim();
+  if (!normalizedPath) return;
+  if (!Array.isArray(entries) || entries.length === 0) return;
+
+  const dir = path.dirname(normalizedPath);
+  await fs.mkdir(dir, { recursive: true });
+
+  const payload = entries
+    .map(entry => ({
+      hash: String(entry?.hash || '').trim(),
+      embeddingBase64: String(entry?.embeddingBase64 || '').trim(),
+    }))
+    .filter(entry => entry.hash && entry.embeddingBase64)
+    .map(entry => JSON.stringify(entry))
+    .join('\n');
+
+  if (!payload) return;
+  await fs.appendFile(normalizedPath, `${payload}\n`, 'utf-8');
+};
+
 export const loadEmbeddingCache = async (
   cachePath: string,
   meta: EmbeddingCacheMeta,

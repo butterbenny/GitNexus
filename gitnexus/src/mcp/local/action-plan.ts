@@ -993,11 +993,19 @@ export async function runActionPlan(
     }
 
     const precedentItems: any[] = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
-    const implementPrecedents = precedentItems.slice(0, 3).map((item: any) => ({
+    const docGuidanceItems = precedentItems.filter(item => String(item?.kind || '').trim() === 'anti-pattern');
+    const precedentCandidates = precedentItems.filter(item => String(item?.kind || '').trim() !== 'anti-pattern');
+    const implementPrecedents = precedentCandidates.slice(0, 3).map((item: any) => ({
       kind: item?.kind,
       signature: item?.signature,
       anchor: item?.anchor,
       examples: Array.isArray(item?.examples) ? item.examples.slice(0, 3) : [],
+    }));
+    const docGuidance = docGuidanceItems.slice(0, 3).map((item: any) => ({
+      kind: item?.kind,
+      signature: item?.signature,
+      anchor: item?.anchor,
+      examples: Array.isArray(item?.examples) ? item.examples.slice(0, 5) : [],
     }));
 
     const companionSignals = new Map<string, {
@@ -1315,6 +1323,7 @@ export async function runActionPlan(
           : null,
       },
       precedents: implementPrecedents,
+      doc_guidance: docGuidance,
       closure_template: targetTemplate,
       companion_set: {
         files: companionFiles,

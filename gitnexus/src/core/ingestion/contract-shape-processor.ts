@@ -537,7 +537,7 @@ const extractObjectPropertyExpression = (objectBody: string, propertyName: strin
   return null;
 };
 
-const extractInvalidateQueryKeyExpressions = (content: string): string[] => {
+export const extractInvalidateQueryKeyExpressions = (content: string): string[] => {
   const expressions: string[] = [];
   const token = 'invalidateQueries';
 
@@ -570,7 +570,7 @@ const extractInvalidateQueryKeyExpressions = (content: string): string[] => {
   return expressions;
 };
 
-const extractKeyFactoryName = (expression: string): string | null => {
+export const extractKeyFactoryName = (expression: string): string | null => {
   const expr = expression.trim();
 
   const memberCall = expr.match(/^([A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*)\s*\(/);
@@ -585,7 +585,7 @@ const extractKeyFactoryName = (expression: string): string | null => {
   return null;
 };
 
-const extractLiteralKey = (expression: string): string | null => {
+export const extractLiteralKey = (expression: string): string | null => {
   const expr = expression.trim();
   const match = expr.match(/^\[\s*['"]([^'"]+)['"]/);
   if (!match?.[1]) return null;
@@ -793,7 +793,7 @@ interface ExtractedTestCase {
   endLine: number;
 }
 
-interface ShapeTestReference {
+export interface ShapeTestReference {
   shapeId: string;
   className: string;
   sourceFileBase: string;
@@ -927,6 +927,78 @@ const collectShapeMatchesForTestFile = (
   return Array.from(byShapeId.values())
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 8);
+};
+
+export const processStaticTestClosures = (
+  files: { path: string; content: string }[],
+  shapeReferences: ShapeTestReference[],
+): { testCases: TestCaseNode[]; edges: ShapeEdge[]; stats: { testCaseCount: number; testsShapeEdges: number } } => {
+  const testCaseNodeMap = new Map<string, TestCaseNode>();
+  const edgeMap = new Map<string, ShapeEdge>();
+
+  const addEdge = (edge: ShapeEdge) => {
+    if (!edge.sourceId || !edge.targetId) return;
+    if (!edgeMap.has(edge.id)) edgeMap.set(edge.id, edge);
+  };
+
+  let testsShapeEdges = 0;
+  const testCandidates = files.filter(file => TEST_FILE_RE.test(normalizePath(file.path)));
+
+  for (const file of testCandidates) {
+    const normalizedPath = normalizePath(file.path);
+    const shapeMatches = collectShapeMatchesForTestFile(normalizedPath, file.content, shapeReferences);
+    if (shapeMatches.length === 0) continue;
+
+    const extractedTests = extractStaticTestCases(normalizedPath, file.content);
+    const fileNodeId = generateId('File', normalizedPath);
+
+    for (const extracted of extractedTests) {
+      const testCaseId = generateId(
+        'TestCase',
+        `${normalizedPath}:${sanitizeIdSegment(extracted.name)}:${extracted.startLine}`
+      );
+
+      if (!testCaseNodeMap.has(testCaseId)) {
+        testCaseNodeMap.set(testCaseId, {
+          id: testCaseId,
+          name: buildLabel('Test Case', extracted.name),
+          filePath: normalizedPath,
+          startLine: extracted.startLine,
+          endLine: extracted.endLine,
+        });
+      }
+
+      addEdge({
+        id: generateId('DEFINES', `${fileNodeId}->${testCaseId}`),
+        type: 'DEFINES',
+        sourceId: fileNodeId,
+        targetId: testCaseId,
+        confidence: 0.9,
+        reason: 'test-case:static-extraction',
+      });
+
+      for (const match of shapeMatches) {
+        addEdge({
+          id: generateId('TESTS_SHAPE', `${testCaseId}->${match.shapeId}`),
+          type: 'TESTS_SHAPE',
+          sourceId: testCaseId,
+          targetId: match.shapeId,
+          confidence: match.confidence,
+          reason: `test-closure:${match.reason}`,
+        });
+        testsShapeEdges++;
+      }
+    }
+  }
+
+  return {
+    testCases: Array.from(testCaseNodeMap.values()),
+    edges: Array.from(edgeMap.values()),
+    stats: {
+      testCaseCount: testCaseNodeMap.size,
+      testsShapeEdges,
+    },
+  };
 };
 
 export const processContractShapes = async (

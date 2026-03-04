@@ -498,6 +498,202 @@ async function loadPatternCatalogSections(repoPath: string): Promise<{ relativeP
   return { relativePath: resolved.relativePath, sections };
 }
 
+type AgentDocSection = {
+  kind: string;
+  doc_path: string;
+  title: string;
+  level: number;
+  startLine: number;
+  endLine: number;
+  content: string;
+  referencedFiles: string[];
+  tokenSet: Set<string>;
+};
+
+const agentDocCache = new Map<string, { mtimeMs: number; sections: AgentDocSection[] }>();
+
+function parseAgentDocMarkdownSections(content: string, kind: string, docPath: string): AgentDocSection[] {
+  const lines = String(content || '').split('\n');
+  const sections: AgentDocSection[] = [];
+
+  let current: {
+    title: string;
+    level: number;
+    startLine: number;
+    rawLines: string[];
+  } | null = null;
+
+  const trunc = (value: string, maxChars: number): string => {
+    const raw = String(value || '');
+    if (raw.length <= maxChars) return raw;
+    return `${raw.slice(0, maxChars).trimEnd()}\n…`;
+  };
+
+  const finalize = (endLine: number) => {
+    if (!current) return;
+    const contentText = current.rawLines.join('\n').trim();
+    const referencedFiles = Array.from(new Set(current.rawLines.flatMap(line => extractBacktickFilePaths(line))));
+
+    const tokenSet = new Set<string>([
+      ...tokenizePatternCatalogText(current.title),
+      ...tokenizePatternCatalogText(contentText),
+      ...referencedFiles.flatMap(tokenizePatternCatalogText),
+    ]);
+
+    sections.push({
+      kind,
+      doc_path: docPath,
+      title: current.title,
+      level: current.level,
+      startLine: current.startLine,
+      endLine: Math.max(current.startLine, endLine),
+      content: trunc(contentText, 12_000),
+      referencedFiles,
+      tokenSet,
+    });
+    current = null;
+  };
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = String(lines[idx] || '');
+    const trimmed = line.trimEnd();
+    const lineNo = idx + 1;
+
+    const heading = /^(#{2,4})\s+(.*)$/.exec(trimmed);
+    if (heading) {
+      finalize(lineNo - 1);
+      current = {
+        title: String(heading[2] || '').trim(),
+        level: heading[1].length,
+        startLine: lineNo,
+        rawLines: [],
+      };
+      continue;
+    }
+
+    if (current) current.rawLines.push(line);
+  }
+
+  finalize(lines.length);
+
+  return sections.filter(section => section.title && section.level >= 2 && section.level <= 4);
+}
+
+async function loadAgentDocSectionsFromGraph(repoId: string, options: {
+  kind: string;
+  doc_path: string;
+}): Promise<{ relativePath: string; sections: AgentDocSection[] } | null> {
+  const kind = String(options.kind || '').trim();
+  const docPath = normalizeRepoRelativePath(String(options.doc_path || '').trim());
+  if (!kind || !docPath) return null;
+
+  const idPrefix = `CodeElement:agent-doc:${kind}:`;
+  const escapedDocPath = docPath.replace(/'/g, "''");
+  const escapedIdPrefix = idPrefix.replace(/'/g, "''");
+  const escapedKind = kind.replace(/'/g, "''");
+
+  try {
+    const sectionRows = await executeQuery(repoId, `
+      MATCH (s:CodeElement)
+      WHERE s.filePath = '${escapedDocPath}'
+        AND s.id STARTS WITH '${escapedIdPrefix}'
+      RETURN s.id AS sectionId, s.name AS title, s.content AS content, s.startLine AS startLine, s.endLine AS endLine
+    `);
+
+    const sectionsById = new Map<string, AgentDocSection>();
+    for (const row of sectionRows) {
+      const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+      const title = String((row as any).title ?? (row as any)[1] ?? '').trim();
+      const content = String((row as any).content ?? (row as any)[2] ?? '').trim();
+      const startLine = toOptionalLineNumber((row as any).startLine ?? (row as any)[3]) ?? 0;
+      const endLine = toOptionalLineNumber((row as any).endLine ?? (row as any)[4]) ?? startLine;
+      if (!sectionId || !title || startLine <= 0) continue;
+
+      sectionsById.set(sectionId, {
+        kind,
+        doc_path: docPath,
+        title,
+        level: 2,
+        startLine,
+        endLine: endLine > 0 ? endLine : startLine,
+        content,
+        referencedFiles: [],
+        tokenSet: new Set<string>(),
+      });
+    }
+    if (sectionsById.size === 0) return null;
+
+    const edgeRows = await executeQuery(repoId, `
+      MATCH (s:CodeElement)-[r:CodeRelation {type: 'USES'}]->(f:File)
+      WHERE s.filePath = '${escapedDocPath}'
+        AND s.id STARTS WITH '${escapedIdPrefix}'
+        AND r.reason = 'agent-doc:ref:${escapedKind}'
+      RETURN s.id AS sectionId, f.filePath AS filePath
+    `);
+
+    for (const row of edgeRows) {
+      const sectionId = String((row as any).sectionId ?? (row as any)[0] ?? '').trim();
+      const filePath = normalizeRepoRelativePath(String((row as any).filePath ?? (row as any)[1] ?? '').trim());
+      if (!sectionId || !filePath) continue;
+      const section = sectionsById.get(sectionId);
+      if (!section) continue;
+      section.referencedFiles.push(filePath);
+    }
+
+    for (const section of sectionsById.values()) {
+      section.referencedFiles = Array.from(new Set(section.referencedFiles.map(filePath => normalizeRepoRelativePath(filePath)).filter(Boolean)));
+      section.tokenSet = new Set<string>([
+        ...tokenizePatternCatalogText(section.title),
+        ...tokenizePatternCatalogText(section.content),
+        ...section.referencedFiles.flatMap(tokenizePatternCatalogText),
+      ]);
+    }
+
+    return {
+      relativePath: docPath,
+      sections: Array.from(sectionsById.values()).sort((a, b) => a.startLine - b.startLine || a.title.localeCompare(b.title)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function loadAgentDocSections(repoPath: string, options: {
+  kind: string;
+  doc_path: string;
+}): Promise<{ relativePath: string; sections: AgentDocSection[] } | null> {
+  const kind = String(options.kind || '').trim();
+  const docPath = normalizeRepoRelativePath(String(options.doc_path || '').trim());
+  if (!kind || !docPath) return null;
+
+  const resolved = resolvePathInsideRepo(repoPath, docPath);
+  if (!resolved) return null;
+
+  let stat: { mtimeMs: number } | null = null;
+  try {
+    stat = await fs.stat(resolved.absolutePath);
+  } catch {
+    stat = null;
+  }
+  if (!stat) return null;
+
+  const cached = agentDocCache.get(resolved.absolutePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs) {
+    return { relativePath: resolved.relativePath, sections: cached.sections };
+  }
+
+  let content = '';
+  try {
+    content = await fs.readFile(resolved.absolutePath, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const sections = parseAgentDocMarkdownSections(content, kind, resolved.relativePath);
+  agentDocCache.set(resolved.absolutePath, { mtimeMs: stat.mtimeMs, sections });
+  return { relativePath: resolved.relativePath, sections };
+}
+
 function normalizeSliceStencilToken(value: unknown): string {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -2777,7 +2973,10 @@ export class LocalBackend {
     let patternCatalogPrecedents: any[] = [];
     let patternCatalogDiagnostics: any | null = null;
     if (queryTokens.length > 0) {
-      const queryTokenSet = new Set<string>(queryTokens);
+      const queryTokenSet = new Set<string>([
+        ...queryTokens,
+        ...tokenizePatternCatalogText(queryText),
+      ]);
       const catalog = await loadPatternCatalogSectionsFromGraph(repo.id) || await loadPatternCatalogSections(repo.repoPath);
       if (catalog && catalog.sections.length > 0) {
         const maxPatterns = Math.min(3, Math.max(limit, 2));
@@ -2851,6 +3050,83 @@ export class LocalBackend {
       }
     }
 
+    let antiPatternPrecedents: any[] = [];
+    let antiPatternDiagnostics: any | null = null;
+    if (queryTokens.length > 0) {
+      const queryTokenSet = new Set<string>([
+        ...queryTokens,
+        ...tokenizePatternCatalogText(queryText),
+      ]);
+      const antiPatterns = await loadAgentDocSectionsFromGraph(repo.id, {
+        kind: 'anti-patterns',
+        doc_path: '.agents/architecture/anti-patterns.md',
+      }) || await loadAgentDocSections(repo.repoPath, {
+        kind: 'anti-patterns',
+        doc_path: '.agents/architecture/anti-patterns.md',
+      });
+
+      if (antiPatterns && antiPatterns.sections.length > 0) {
+        const maxDocs = Math.min(2, Math.max(1, limit));
+        const scored = antiPatterns.sections
+          .map(section => {
+            let score = 0;
+            for (const token of queryTokenSet) {
+              if (section.tokenSet.has(token)) score += 1;
+            }
+            return { section, score };
+          })
+          .filter(item => item.score > 0)
+          .sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            if (left.section.startLine !== right.section.startLine) return left.section.startLine - right.section.startLine;
+            return left.section.title.localeCompare(right.section.title);
+          })
+          .slice(0, maxDocs);
+
+        const resolveDocFile = (filePathRaw: string): string | null => {
+          const resolved = resolvePathInsideRepo(repo.repoPath, filePathRaw);
+          if (!resolved) return null;
+          const relative = normalizeRepoRelativePath(resolved.relativePath);
+          if (!relative) return null;
+          if (!filePathTouchesPrefixes(relative, pathPrefixes)) return null;
+          return relative;
+        };
+
+        for (const match of scored) {
+          const referenced = match.section.referencedFiles
+            .map(resolveDocFile)
+            .filter(Boolean) as string[];
+          const exampleFiles = Array.from(new Set(referenced)).slice(0, examplesPer);
+
+          antiPatternPrecedents.push({
+            kind: 'anti-pattern',
+            signature: `anti-pattern:${match.section.title}`,
+            score: match.score,
+            anchor: {
+              name: match.section.title,
+              kind: 'DocSection',
+              filePath: antiPatterns.relativePath,
+              startLine: match.section.startLine,
+              endLine: match.section.endLine,
+              doc_kind: 'anti-patterns',
+              score: match.score,
+            },
+            examples: exampleFiles.map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+          });
+        }
+
+        antiPatternDiagnostics = {
+          filePath: antiPatterns.relativePath,
+          candidates: antiPatterns.sections.length,
+          matched: antiPatternPrecedents.length,
+        };
+      }
+    }
+
     const slicePrecedents = buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById, cochangeMap);
     const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
@@ -2858,8 +3134,20 @@ export class LocalBackend {
       addProcessPrecedent(pid);
     }
 
-    const precedents = [...patternCatalogPrecedents, ...slicePrecedents, ...hopPrecedents, ...processPrecedents]
-      .slice(0, Math.max(limit, patternCatalogPrecedents.length + slicePrecedents.length + hopPrecedents.length + processPrecedents.length));
+    const precedents = [
+      ...patternCatalogPrecedents,
+      ...antiPatternPrecedents,
+      ...slicePrecedents,
+      ...hopPrecedents,
+      ...processPrecedents,
+    ].slice(0, Math.max(
+      limit,
+      patternCatalogPrecedents.length
+        + antiPatternPrecedents.length
+        + slicePrecedents.length
+        + hopPrecedents.length
+        + processPrecedents.length,
+    ));
 
     const diagnostics: any = {
       anchor_uid: anchorUid || undefined,
@@ -2870,6 +3158,7 @@ export class LocalBackend {
       scoped_slices: inScopeSlices.length,
       slice_precedents: slicePrecedents.length,
       ...(patternCatalogDiagnostics ? { pattern_catalog: patternCatalogDiagnostics } : {}),
+      ...(antiPatternDiagnostics ? { anti_patterns: antiPatternDiagnostics } : {}),
       path_prefixes: pathPrefixes,
     };
     if (precedents.length === 0) {

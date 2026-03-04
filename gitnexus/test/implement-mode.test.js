@@ -65,6 +65,7 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
   await fs.mkdir(path.join(repoPath, 'apps/backend/app/Http/Controllers/Dashboard/API/Notifications'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'app/Domains/AccessControl/Permissions'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'config'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, '.agents/architecture'), { recursive: true });
 
   await fs.writeFile(
     path.join(repoPath, 'apps/dashboard/src/customHooks/useConfigureHttpClient.ts'),
@@ -88,6 +89,24 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
       'export const fetchAccountNotifications = (accountId: number) => {',
       '  return Axios.get(`/accounts/${accountId}/notifications`);',
       '};',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, '.agents/architecture/anti-patterns.md'),
+    [
+      '# Dashboard anti-patterns (apps/dashboard/src)',
+      '',
+      '## 4) Ad-hoc query keys / broad invalidations',
+      '',
+      '**Drift trigger**',
+      '- Inlining query key arrays instead of using query-key factories.',
+      '',
+      '**Examples**',
+      '- Notifications API surface: `apps/dashboard/src/api/notifications.ts` (fetchAccountNotifications)',
+      '- Preferred boot alternative: `apps/dashboard/src/customHooks/useConfigureHttpClient.ts`',
       '',
     ].join('\n'),
     'utf-8'
@@ -237,6 +256,11 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
   assert.ok(result.implement_mode?.coverage_banner, 'expected coverage banner');
   assert.ok(result.implement_mode.coverage_banner.freshness);
   assert.ok(result.implement_mode.coverage_banner.coverage);
+  assert.ok(Array.isArray(result.implement_mode?.doc_guidance));
+  assert.ok(
+    result.implement_mode.doc_guidance.some(item => String(item?.kind || '') === 'anti-pattern'),
+    'expected implement_mode.doc_guidance to include anti-pattern doc matches',
+  );
   assert.ok(Array.isArray(result.implement_mode?.next_actions));
   assert.ok(result.implement_mode.next_actions.some(step => String(step).includes('review_mode')));
   assert.equal(result.implement_mode?.post_edit_review?.tool, 'review_mode');

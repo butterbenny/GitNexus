@@ -161,6 +161,11 @@ export async function runImplementMode(
   const precedents = (precedentsFromPlan.length > 0 ? precedentsFromPlan : precedentsFromQuery)
     .slice(0, limitPrecedents);
 
+  const docGuidanceFromPlan = Array.isArray(implementPlan?.doc_guidance)
+    ? implementPlan.doc_guidance
+    : [];
+  const doc_guidance = docGuidanceFromPlan.slice(0, 4);
+
   const patternCatalogTemplateCompanions: any[] = (() => {
     const out: any[] = [];
     const seen = new Set<string>();
@@ -983,6 +988,7 @@ export async function runImplementMode(
       companion_files: companionFilesWithPrecedents,
       write_plan: writePlan,
       precedents,
+      doc_guidance,
       action_hints: {
         files: actionHintFiles,
         checks,

@@ -62,6 +62,57 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   await fs.mkdir(path.join(repoPath, 'tests'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'app'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'apps/dashboard/src/pages'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, '.agents/architecture'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, '.agents/review'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoPath, '.agents/architecture/anti-patterns.md'),
+    [
+      '# Dashboard anti-patterns (apps/dashboard/src)',
+      '',
+      '## Avoid effect-driven state sync',
+      '',
+      '- Prefer event-driven wiring over `useEffect` state sync when populating RHF fields.',
+      '- Finding code: useeffect-state-sync',
+      '- Example: `apps/dashboard/src/pages/FooPage.tsx`',
+      '',
+      '## Prefer query-key factories',
+      '',
+      '- Avoid inline queryKey arrays inside callsites.',
+      '- Finding code: react-query-inline-key',
+      '- Example: `apps/dashboard/src/pages/FooPage.tsx`',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, '.agents/review/pattern-catalog.md'),
+    [
+      '# Pattern catalog',
+      '',
+      '## React Query',
+      '### Query key factories',
+      'Template:',
+      '- `apps/dashboard/src/pages/PatternTemplate.tsx`',
+      'Also good:',
+      '- `apps/dashboard/src/pages/FooPage.tsx`',
+      'Notes:',
+      '- Fixes: react-query-inline-key',
+      '- Prefer query key factories over inline arrays.',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'apps/dashboard/src/pages/PatternTemplate.tsx'),
+    [
+      'export const PatternTemplate = () => <div>template</div>;',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
 
   await fs.writeFile(
     path.join(repoPath, 'src/doThing.ts'),
@@ -169,20 +220,41 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   await fs.writeFile(
     path.join(repoPath, 'apps/dashboard/src/pages/FooPage.tsx'),
     [
+      "import { useEffect } from 'react';",
       "import { useMutation, useQueryClient } from '@tanstack/react-query';",
       '',
       'export const FooPage = () => {',
       '  const queryClient = useQueryClient();',
       '',
+      '  const foo = 1;',
+      '  const bar = 2;',
+      '  const baz = 3;',
+      '  const qux = 4;',
+      "  const widgetProps = { id: 'widget' };",
+      '',
+      '  const Inner = ({ count }: { count: number }) => <div>{count}</div>;',
+      '',
+      '  const sum = (a: number, b: number, c: number, d: number) => a + b + c + d;',
+      '',
+      '  useEffect(() => {',
+      "    setValue('name', 'example');",
+      '  }, []);',
+      '',
       '  const { mutate } = useMutation({',
-      '    mutationFn: async () => 1,',
+      '    mutationFn: async () => sum(foo, bar, baz, qux),',
       '    onSuccess: () => {',
       "      queryClient.invalidateQueries({ queryKey: ['foo'] });",
       "      queryClient.invalidateQueries({ queryKey: ['bar'] });",
       '    },',
       '  });',
       '',
-      '  return <button onClick={() => mutate()}>Save</button>;',
+      '  return (',
+      '    <>',
+      '      <Widget {...widgetProps} foo={foo} bar={bar} baz={baz} qux={qux} />',
+      '      <Inner count={foo} />',
+      '      <button onClick={() => mutate()}>Save</button>',
+      '    </>',
+      '  );',
       '};',
       '',
     ].join('\n'),
@@ -431,6 +503,39 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(
     result.review_kernel.findings.some(f => String(f.code || '').startsWith('perf-')),
     'expected perf_backend_findings to feed review findings'
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'useeffect-state-sync'),
+    'expected useEffect state sync finding (monorepo anti-pattern)',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'react-query-inline-key'),
+    'expected React Query inline queryKey finding (monorepo convention)',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'prop-drilling-score'),
+    'expected prop drilling score finding',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'nested-component-declaration'),
+    'expected nested component declaration finding',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'signature-too-many-args'),
+    'expected too-many-args function signature finding',
+  );
+  assert.ok(
+    result.review_kernel.findings.some(f => String(f.code || '') === 'inline-param-type-object'),
+    'expected inline parameter type object finding',
+  );
+  assert.ok(Array.isArray(result.review_kernel.doc_guidance), 'expected review_kernel doc_guidance list');
+  assert.ok(
+    result.review_kernel.doc_guidance.some(item => String(item?.kind || '') === 'anti-pattern'),
+    'expected review_kernel doc_guidance to include anti-pattern doc matches',
+  );
+  assert.ok(
+    result.review_kernel.doc_guidance.some(item => String(item?.kind || '') === 'pattern-catalog'),
+    'expected review_kernel doc_guidance to include pattern-catalog doc matches',
   );
   assert.ok(result.test_intelligence, 'expected test_intelligence payload');
   assert.equal(result.test_intelligence.mode, 'changed-vs-baseline-heuristic');

@@ -11,7 +11,17 @@
 
 import { initEmbedder, embedBatchToArrays, embedText, embeddingToArray, isEmbedderReady } from './embedder.js';
 import { generateBatchEmbeddingTexts } from './text-generator.js';
-import { computeEmbeddingTextHash, decodeEmbeddingBase64, encodeEmbeddingBase64, loadEmbeddingCache, saveEmbeddingCache } from './embedding-cache.js';
+import fs from 'fs/promises';
+import {
+  computeEmbeddingTextHash,
+  decodeEmbeddingBase64,
+  encodeEmbeddingBase64,
+  loadEmbeddingCache,
+  saveEmbeddingCache,
+  resolveEmbeddingCacheOverlayPath,
+  loadEmbeddingCacheOverlay,
+  appendEmbeddingCacheOverlay,
+} from './embedding-cache.js';
 import {
   type EmbeddingProgress,
   type EmbeddingConfig,
@@ -23,11 +33,44 @@ import {
 } from './types.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+const EMBEDDING_CACHE_OVERLAY_READ_MAX_BYTES = 25 * 1024 * 1024; // 25MB
 
 /**
  * Progress callback type
  */
 export type EmbeddingProgressCallback = (progress: EmbeddingProgress) => void;
+
+export type EmbeddingPipelineSummary = {
+  totalNodes: number;
+  cachedNodes: number;
+  embeddedNodes: number;
+  cache: {
+    enabledRequested: boolean;
+    cachePath: string | null;
+    overlayPath: string | null;
+    readMode: 'none' | 'overlay' | 'full';
+    entriesLoaded: number;
+    overlayEntriesLoaded: number;
+    cacheHits: number;
+    cacheMisses: number;
+    cacheWrites: number;
+    overlayAppends: number;
+  };
+  model: {
+    loaded: boolean;
+    loadMs: number;
+  };
+  timingsMs: {
+    total: number;
+    queryNodes: number;
+    cacheLoad: number;
+    embedCompute: number;
+    insert: number;
+    vectorIndex: number;
+    cacheSave: number;
+    overlayAppend: number;
+  };
+};
 
 /**
  * Query all embeddable nodes from KuzuDB
@@ -186,7 +229,8 @@ export const runEmbeddingPipeline = async (
   onProgress: EmbeddingProgressCallback,
   config: Partial<EmbeddingConfig> = {},
   options?: { cachePath?: string },
-): Promise<void> => {
+): Promise<EmbeddingPipelineSummary> => {
+  const startedAt = Date.now();
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
   const cacheMeta = { modelId: finalConfig.modelId, dimensions: finalConfig.dimensions };
   const cachePath = String(options?.cachePath || '').trim();
@@ -196,6 +240,20 @@ export const runEmbeddingPipeline = async (
   let embeddingCache = new Map<string, string>();
   let embeddingCacheVersion = 0;
   let cacheWrites = 0;
+  let overlayAppends = 0;
+  let cacheReadMode: 'none' | 'overlay' | 'full' = 'none';
+  const overlayPath = cacheEnabledRequested ? resolveEmbeddingCacheOverlayPath(cachePath) : '';
+  let overlayEntriesLoaded = 0;
+  let cacheLoadMs = 0;
+  let embedComputeMs = 0;
+  let insertMs = 0;
+  let vectorIndexMs = 0;
+  let cacheSaveMs = 0;
+  let overlayAppendMs = 0;
+  let modelLoaded = false;
+  let modelLoadMs = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
 
   try {
     if (isDev) {
@@ -203,7 +261,9 @@ export const runEmbeddingPipeline = async (
     }
 
     // Phase 1: Query embeddable nodes (avoid loading model/cache if there's nothing to embed)
+    const queryStartedAt = Date.now();
     let nodes = await queryEmbeddableNodes(executeQuery);
+    const queryNodesMs = Math.max(0, Date.now() - queryStartedAt);
 
     const totalNodes = nodes.length;
 
@@ -218,13 +278,44 @@ export const runEmbeddingPipeline = async (
         nodesProcessed: 0,
         totalNodes: 0,
       });
-      return;
+      return {
+        totalNodes: 0,
+        cachedNodes: 0,
+        embeddedNodes: 0,
+        cache: {
+          enabledRequested: cacheEnabledRequested,
+          cachePath: cacheEnabledRequested ? cachePath : null,
+          overlayPath: overlayPath || null,
+          readMode: 'none',
+          entriesLoaded: 0,
+          overlayEntriesLoaded: 0,
+          cacheHits: 0,
+          cacheMisses: 0,
+          cacheWrites: 0,
+          overlayAppends: 0,
+        },
+        model: {
+          loaded: false,
+          loadMs: 0,
+        },
+        timingsMs: {
+          total: Math.max(0, Date.now() - startedAt),
+          queryNodes: queryNodesMs,
+          cacheLoad: 0,
+          embedCompute: 0,
+          insert: 0,
+          vectorIndex: 0,
+          cacheSave: 0,
+          overlayAppend: 0,
+        },
+      };
     }
 
     // Only load the embedding cache when we're doing a cold embedding build (no embeddings exist yet).
     // Incremental runs almost always miss the cache (content hashes changed) and paying to parse a large cache
     // file can dominate runtime on big repos.
     if (cacheEnabledRequested) {
+      const cacheLoadStartedAt = Date.now();
       let hasAnyEmbeddings = false;
       try {
         const rows = await executeQuery(`MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId LIMIT 1`);
@@ -233,13 +324,40 @@ export const runEmbeddingPipeline = async (
         hasAnyEmbeddings = false;
       }
 
+      const tryLoadOverlay = async (): Promise<Map<string, string>> => {
+        if (!overlayPath) return new Map();
+        try {
+          const stat = await fs.stat(overlayPath);
+          if (!Number.isFinite(stat.size) || stat.size <= 0) return new Map();
+          if (stat.size > EMBEDDING_CACHE_OVERLAY_READ_MAX_BYTES) return new Map();
+        } catch {
+          return new Map();
+        }
+        return loadEmbeddingCacheOverlay(overlayPath);
+      };
+
       if (hasAnyEmbeddings) {
-        cacheEnabledForRun = false;
+        // Incremental runs: avoid parsing the large primary cache file, but keep a cheap
+        // overlay cache so we can persist new embeddings for future cold rebuilds.
+        embeddingCache = await tryLoadOverlay();
+        overlayEntriesLoaded = embeddingCache.size;
+        cacheReadMode = overlayEntriesLoaded > 0 ? 'overlay' : 'none';
       } else {
         const loaded = await loadEmbeddingCache(cachePath, cacheMeta);
         embeddingCache = loaded.byHash;
         embeddingCacheVersion = loaded.loadedVersion;
+
+        const overlay = await tryLoadOverlay();
+        overlayEntriesLoaded = overlay.size;
+        if (overlay.size > 0) {
+          for (const [hash, embeddingBase64] of overlay.entries()) {
+            embeddingCache.set(hash, embeddingBase64);
+          }
+        }
+
+        cacheReadMode = embeddingCache.size > 0 ? 'full' : (overlayEntriesLoaded > 0 ? 'overlay' : 'none');
       }
+      cacheLoadMs = Math.max(0, Date.now() - cacheLoadStartedAt);
     }
 
     // Phase 2: Load embedding model only when needed.
@@ -249,6 +367,7 @@ export const runEmbeddingPipeline = async (
     let embedderReady = false;
     const ensureEmbedderReady = async (percent: number): Promise<void> => {
       if (embedderReady) return;
+      const modelLoadStartedAt = Date.now();
       onProgress({
         phase: 'loading-model',
         percent,
@@ -270,6 +389,8 @@ export const runEmbeddingPipeline = async (
         modelDownloadPercent: 100,
       });
       embedderReady = true;
+      modelLoaded = true;
+      modelLoadMs = Math.max(0, Date.now() - modelLoadStartedAt);
     };
 
     // Phase 3: Batch embed nodes
@@ -328,6 +449,8 @@ export const runEmbeddingPipeline = async (
 
           cachedUpdates.push({ id: node.id, embedding });
         }
+        cacheHits += cachedUpdates.length;
+        cacheMisses += missNodes.length;
       } else {
         // No cache: embed all nodes in this batch.
         missNodes.push(...batch);
@@ -335,6 +458,7 @@ export const runEmbeddingPipeline = async (
         if (cacheEnabledForRun) {
           missHashes.push(...texts.map(text => computeEmbeddingTextHash(text, cacheMeta)));
         }
+        cacheMisses += missNodes.length;
       }
 
       let embeddedUpdates: Array<{ id: string; embedding: number[] }> = [];
@@ -346,7 +470,9 @@ export const runEmbeddingPipeline = async (
 
         let embeddings: number[][];
         try {
+          const embedStartedAt = Date.now();
           embeddings = await embedBatchToArrays(missTexts);
+          embedComputeMs += Math.max(0, Date.now() - embedStartedAt);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error || '');
           const looksLikeOom = /out of memory|oom|allocation|memory/i.test(message);
@@ -372,21 +498,44 @@ export const runEmbeddingPipeline = async (
         }));
 
         if (cacheEnabledForRun) {
+          const overlayAppendEntries: Array<{ hash: string; embeddingBase64: string }> = [];
+          const overlayAppendSeen = new Set<string>();
+
           for (let i = 0; i < embeddedUpdates.length; i += 1) {
             const update = embeddedUpdates[i];
             const hash = missHashes[i] || computeEmbeddingTextHash(missTexts[i] || '', cacheMeta);
             const embeddingBase64 = encodeEmbeddingBase64(update.embedding);
             if (embeddingBase64.length !== expectedEmbeddingBase64Length) continue;
+
             const isNew = !embeddingCache.has(hash);
             embeddingCache.set(hash, embeddingBase64);
-            if (isNew) cacheWrites += 1;
+            if (isNew) {
+              cacheWrites += 1;
+              if (overlayPath && !overlayAppendSeen.has(hash) && cacheReadMode !== 'full') {
+                overlayAppendSeen.add(hash);
+                overlayAppendEntries.push({ hash, embeddingBase64 });
+              }
+            }
+          }
+
+          if (overlayPath && overlayAppendEntries.length > 0 && cacheReadMode !== 'full') {
+            const appendStartedAt = Date.now();
+            try {
+              await appendEmbeddingCacheOverlay(overlayPath, overlayAppendEntries);
+              overlayAppends += overlayAppendEntries.length;
+            } catch {
+              // best-effort; cache overlay is optional
+            }
+            overlayAppendMs += Math.max(0, Date.now() - appendStartedAt);
           }
         }
       }
 
       // Update KuzuDB with embeddings
       const updates = [...cachedUpdates, ...embeddedUpdates];
+      const insertStartedAt = Date.now();
       await batchInsertEmbeddings(executeWithReusedStatement, updates);
+      insertMs += Math.max(0, Date.now() - insertStartedAt);
 
       processedNodes += batch.length;
       currentBatch += 1;
@@ -416,11 +565,20 @@ export const runEmbeddingPipeline = async (
       console.log('📇 Creating vector index...');
     }
 
+    const indexStartedAt = Date.now();
     await createVectorIndex(executeQuery);
+    vectorIndexMs += Math.max(0, Date.now() - indexStartedAt);
 
-    if (cacheEnabledForRun && embeddingCache.size > 0 && (cacheWrites > 0 || embeddingCacheVersion === 1)) {
+    if (
+      cacheEnabledForRun
+      && cacheReadMode === 'full'
+      && embeddingCache.size > 0
+      && (cacheWrites > 0 || embeddingCacheVersion === 1 || overlayEntriesLoaded > 0)
+    ) {
       try {
+        const saveStartedAt = Date.now();
         await saveEmbeddingCache(cachePath, cacheMeta, embeddingCache);
+        cacheSaveMs += Math.max(0, Date.now() - saveStartedAt);
       } catch (error) {
         // Best effort: cache writes are optional and should not fail the embedding pipeline.
         if (isDev) {
@@ -440,6 +598,41 @@ export const runEmbeddingPipeline = async (
     if (isDev) {
       console.log('✅ Embedding pipeline complete!');
     }
+
+    const cachedNodes = Math.max(0, cacheHits);
+    const embeddedNodes = Math.max(0, cacheMisses);
+
+    return {
+      totalNodes,
+      cachedNodes,
+      embeddedNodes,
+      cache: {
+        enabledRequested: cacheEnabledRequested,
+        cachePath: cacheEnabledRequested ? cachePath : null,
+        overlayPath: overlayPath || null,
+        readMode: cacheReadMode,
+        entriesLoaded: embeddingCache.size,
+        overlayEntriesLoaded,
+        cacheHits,
+        cacheMisses,
+        cacheWrites,
+        overlayAppends,
+      },
+      model: {
+        loaded: modelLoaded,
+        loadMs: modelLoadMs,
+      },
+      timingsMs: {
+        total: Math.max(0, Date.now() - startedAt),
+        queryNodes: queryNodesMs,
+        cacheLoad: cacheLoadMs,
+        embedCompute: embedComputeMs,
+        insert: insertMs,
+        vectorIndex: vectorIndexMs,
+        cacheSave: cacheSaveMs,
+        overlayAppend: overlayAppendMs,
+      },
+    };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     
