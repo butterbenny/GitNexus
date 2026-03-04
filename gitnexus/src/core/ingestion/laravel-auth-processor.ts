@@ -497,13 +497,7 @@ export const processLaravelAuthorization = async (
     const file = files[i];
     if (i % 200 === 0) await yieldToEventLoop();
 
-    if (
-      !isLaravelControllerFile(file.path)
-      && !isLaravelFormRequestFile(file.path)
-      && !isLaravelAuthorizationRelevantFile(file.path, file.content)
-    ) {
-      continue;
-    }
+    if (!isLaravelAuthorizationRelevantFile(file.path, file.content)) continue;
 
     const language = getLanguageFromFilename(file.path);
     if (language !== SupportedLanguages.PHP) continue;

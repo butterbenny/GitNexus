@@ -63,6 +63,19 @@ export const runPipelineFromRepo = async (
   onProgress: (progress: PipelineProgress) => void,
   options?: PipelineRunOptions,
 ): Promise<PipelineResult> => {
+  const profilePipelineTimings = process.env.GITNEXUS_PROFILE_PIPELINE === '1';
+  const pipelineTimingsMs: Record<string, number> = {};
+  const t0Pipeline = profilePipelineTimings ? Date.now() : 0;
+  const timeStage = async <T>(stage: string, run: () => Promise<T> | T): Promise<T> => {
+    if (!profilePipelineTimings) return await run();
+    const t0 = Date.now();
+    try {
+      return await run();
+    } finally {
+      pipelineTimingsMs[stage] = Math.max(0, Date.now() - t0);
+    }
+  };
+
   const graph = createKnowledgeGraph();
   const fileContents = new Map<string, string>();
   const symbolTable = createSymbolTable();
@@ -83,18 +96,21 @@ export const runPipelineFromRepo = async (
       message: 'Scanning repository...',
     });
 
-    const files = await walkRepository(repoPath, (current, total, filePath) => {
-      const scanProgress = Math.round((current / total) * 15);
-      onProgress({
-        phase: 'extracting',
-        percent: scanProgress,
-        message: 'Scanning repository...',
-        detail: filePath,
-        stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+    const files = await timeStage('scan', async () => {
+      const files = await walkRepository(repoPath, (current, total, filePath) => {
+        const scanProgress = Math.round((current / total) * 15);
+        onProgress({
+          phase: 'extracting',
+          percent: scanProgress,
+          message: 'Scanning repository...',
+          detail: filePath,
+          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+        });
       });
-    });
 
-    files.forEach(f => fileContents.set(f.path, f.content));
+      files.forEach(f => fileContents.set(f.path, f.content));
+      return files;
+    });
 
     // Resize AST cache to fit all files — avoids re-parsing in import/call/heritage phases
     astCache = createASTCache(files.length);
@@ -115,12 +131,14 @@ export const runPipelineFromRepo = async (
 
     const filePaths = files.map(f => f.path);
     const allFilePathSet = new Set<string>(filePaths);
-    processStructure(graph, filePaths);
+    await timeStage('structure', async () => {
+      processStructure(graph, filePaths);
 
-    processPatternCatalogTemplates(graph, files, allFilePathSet);
-    processAgentDocs(graph, files, allFilePathSet);
-    processBladeTemplates(graph, files);
-    processMjmlIncludes(graph, files, allFilePathSet);
+      processPatternCatalogTemplates(graph, files, allFilePathSet);
+      processAgentDocs(graph, files, allFilePathSet);
+      processBladeTemplates(graph, files);
+      processMjmlIncludes(graph, files, allFilePathSet);
+    });
 
     onProgress({
       phase: 'structure',
@@ -137,29 +155,31 @@ export const runPipelineFromRepo = async (
     });
 
     // Create worker pool for parallel parsing, with graceful fallback
-    let workerPool: WorkerPool | undefined;
-    try {
-      const workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
-      workerPool = createWorkerPool(workerUrl);
-    } catch (err) {
-      // Worker pool creation failed (e.g., single core) — sequential fallback
-    }
-
     let workerData: Awaited<ReturnType<typeof processParsing>> = null;
-    try {
-      workerData = await processParsing(graph, files, symbolTable, astCache, (current, total, filePath) => {
-        const parsingProgress = 30 + ((current / total) * 40);
-        onProgress({
-          phase: 'parsing',
-          percent: Math.round(parsingProgress),
-          message: 'Parsing code definitions...',
-          detail: filePath,
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
-        });
-      }, workerPool);
-    } finally {
-      await workerPool?.terminate();
-    }
+    await timeStage('parsing', async () => {
+      let workerPool: WorkerPool | undefined;
+      try {
+        const workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
+        workerPool = createWorkerPool(workerUrl);
+      } catch (err) {
+        // Worker pool creation failed (e.g., single core) — sequential fallback
+      }
+
+      try {
+        workerData = await processParsing(graph, files, symbolTable, astCache, (current, total, filePath) => {
+          const parsingProgress = 30 + ((current / total) * 40);
+          onProgress({
+            phase: 'parsing',
+            percent: Math.round(parsingProgress),
+            message: 'Parsing code definitions...',
+            detail: filePath,
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
+        }, workerPool);
+      } finally {
+        await workerPool?.terminate();
+      }
+    });
 
     onProgress({
       phase: 'imports',
@@ -168,29 +188,31 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    if (workerData) {
-      // Fast path: imports already extracted by workers, just resolve paths
-      await processImportsFromExtracted(graph, files, workerData.imports, importMap, phpUseAliases, (current, total) => {
-        const importProgress = 70 + ((current / total) * 12);
-        onProgress({
-          phase: 'imports',
-          percent: Math.round(importProgress),
-          message: 'Resolving imports...',
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
-        });
-      }, repoPath);
-    } else {
-      // Fallback: full parse + resolve (sequential path)
-      await processImports(graph, files, astCache, importMap, phpUseAliases, (current, total) => {
-        const importProgress = 70 + ((current / total) * 12);
-        onProgress({
-          phase: 'imports',
-          percent: Math.round(importProgress),
-          message: 'Resolving imports...',
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
-        });
-      }, repoPath);
-    }
+    await timeStage('imports', async () => {
+      if (workerData) {
+        // Fast path: imports already extracted by workers, just resolve paths
+        await processImportsFromExtracted(graph, files, workerData.imports, importMap, phpUseAliases, (current, total) => {
+          const importProgress = 70 + ((current / total) * 12);
+          onProgress({
+            phase: 'imports',
+            percent: Math.round(importProgress),
+            message: 'Resolving imports...',
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
+        }, repoPath);
+      } else {
+        // Fallback: full parse + resolve (sequential path)
+        await processImports(graph, files, astCache, importMap, phpUseAliases, (current, total) => {
+          const importProgress = 70 + ((current / total) * 12);
+          onProgress({
+            phase: 'imports',
+            percent: Math.round(importProgress),
+            message: 'Resolving imports...',
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
+        }, repoPath);
+      }
+    });
 
     if (isDev) {
       const importsCount = graph.relationships.filter(r => r.type === 'IMPORTS').length;
@@ -204,29 +226,31 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    if (workerData) {
-      // Fast path: calls already extracted by workers, just resolve targets
-      await processCallsFromExtracted(graph, workerData.calls, symbolTable, importMap, phpUseAliases, workerData.phpAssignments, workerData.phpTraitUses, (current, total) => {
-        const callProgress = 82 + ((current / total) * 10);
-        onProgress({
-          phase: 'calls',
-          percent: Math.round(callProgress),
-          message: 'Tracing function calls...',
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+    await timeStage('calls', async () => {
+      if (workerData) {
+        // Fast path: calls already extracted by workers, just resolve targets
+        await processCallsFromExtracted(graph, workerData.calls, symbolTable, importMap, phpUseAliases, workerData.phpAssignments, workerData.phpTraitUses, (current, total) => {
+          const callProgress = 82 + ((current / total) * 10);
+          onProgress({
+            phase: 'calls',
+            percent: Math.round(callProgress),
+            message: 'Tracing function calls...',
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
         });
-      });
-    } else {
-      // Fallback: full parse + resolve (sequential path)
-      await processCalls(graph, files, astCache, symbolTable, importMap, phpUseAliases, (current, total) => {
-        const callProgress = 82 + ((current / total) * 10);
-        onProgress({
-          phase: 'calls',
-          percent: Math.round(callProgress),
-          message: 'Tracing function calls...',
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+      } else {
+        // Fallback: full parse + resolve (sequential path)
+        await processCalls(graph, files, astCache, symbolTable, importMap, phpUseAliases, (current, total) => {
+          const callProgress = 82 + ((current / total) * 10);
+          onProgress({
+            phase: 'calls',
+            percent: Math.round(callProgress),
+            message: 'Tracing function calls...',
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
         });
-      });
-    }
+      }
+    });
 
     onProgress({
       phase: 'calls',
@@ -235,27 +259,69 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    await processLaravelViewsAndMail(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelEvents(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelSchedule(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelTacticianDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelNotifications(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    processLaravelRoutes(graph, files, symbolTable, importMap, phpUseAliases);
-    await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    processTemplateMethodCallWiring(graph, files, symbolTable);
-    await processLaravelSemanticEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelEloquentRelationships(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelEloquentLoadEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelResourceContracts(graph, files, astCache, symbolTable, importMap);
-    await processLaravelPermissionsConfig(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    processLaravelRouteMiddlewareAuthorization(graph, files, symbolTable, importMap, phpUseAliases);
-    processBladeAuthorization(graph, files, symbolTable);
-    await processPhpMatchReturnEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processLaravelAuthorization(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-    await processReactQueryKeyWiring(graph, files, astCache, symbolTable, importMap);
+    await timeStage('framework', async () => {
+      await timeStage('framework.views_mail', async () => {
+        await processLaravelViewsAndMail(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+      });
+
+      await timeStage('framework.events', async () => {
+        await processLaravelEvents(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelSchedule(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelTacticianDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelNotifications(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+      });
+
+      await timeStage('framework.routes', async () => {
+        processLaravelRoutes(graph, files, symbolTable, importMap, phpUseAliases);
+        await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+      });
+
+      await timeStage('framework.template_methods', async () => {
+        processTemplateMethodCallWiring(graph, files, symbolTable);
+      });
+
+      await timeStage('framework.semantic', async () => {
+        await processLaravelSemanticEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+      });
+
+      await timeStage('framework.eloquent', async () => {
+        await processLaravelEloquentRelationships(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelEloquentLoadEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+      });
+
+      await timeStage('framework.resource_contracts', async () => {
+        await processLaravelResourceContracts(graph, files, astCache, symbolTable, importMap);
+      });
+
+      await timeStage('framework.permissions', async () => {
+        await processLaravelPermissionsConfig(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+      });
+
+      await timeStage('framework.auth', async () => {
+        await timeStage('framework.auth.route_middleware', async () => {
+          processLaravelRouteMiddlewareAuthorization(graph, files, symbolTable, importMap, phpUseAliases);
+        });
+
+        await timeStage('framework.auth.blade', async () => {
+          processBladeAuthorization(graph, files, symbolTable);
+        });
+
+        await timeStage('framework.auth.match_return', async () => {
+          await processPhpMatchReturnEdges(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+
+        await timeStage('framework.auth.laravel', async () => {
+          await processLaravelAuthorization(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+      });
+
+      await timeStage('framework.react_query', async () => {
+        await processReactQueryKeyWiring(graph, files, astCache, symbolTable, importMap);
+      });
+    });
 
     onProgress({
       phase: 'shapes',
@@ -264,119 +330,121 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const shapeResult = await processContractShapes(
-      graph,
-      files,
-      (message) => {
-        onProgress({
-          phase: 'shapes',
-          percent: 93,
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+    await timeStage('shapes', async () => {
+      const shapeResult = await processContractShapes(
+        graph,
+        files,
+        (message) => {
+          onProgress({
+            phase: 'shapes',
+            percent: 93,
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+      );
+
+      shapeResult.shapes.forEach(shape => {
+        graph.addNode({
+          id: shape.id,
+          label: 'ContractShape',
+          properties: {
+            name: shape.label,
+            filePath: '',
+            heuristicLabel: shape.heuristicLabel,
+            shapeType: shape.shapeType,
+            sourceNodeId: shape.sourceNodeId,
+            sourceFilePath: shape.sourceFilePath,
+          },
         });
-      },
-    );
-
-    shapeResult.shapes.forEach(shape => {
-      graph.addNode({
-        id: shape.id,
-        label: 'ContractShape',
-        properties: {
-          name: shape.label,
-          filePath: '',
-          heuristicLabel: shape.heuristicLabel,
-          shapeType: shape.shapeType,
-          sourceNodeId: shape.sourceNodeId,
-          sourceFilePath: shape.sourceFilePath,
-        },
       });
-    });
 
-    shapeResult.fields.forEach(field => {
-      graph.addNode({
-        id: field.id,
-        label: 'ContractField',
-        properties: {
-          name: field.label,
-          filePath: '',
-          heuristicLabel: field.heuristicLabel,
-          fieldName: field.fieldName,
-          shapeId: field.shapeId,
-          shapeType: field.shapeType,
-        },
+      shapeResult.fields.forEach(field => {
+        graph.addNode({
+          id: field.id,
+          label: 'ContractField',
+          properties: {
+            name: field.label,
+            filePath: '',
+            heuristicLabel: field.heuristicLabel,
+            fieldName: field.fieldName,
+            shapeId: field.shapeId,
+            shapeType: field.shapeType,
+          },
+        });
       });
-    });
 
-    shapeResult.cacheKeys.forEach(cacheKey => {
-      graph.addNode({
-        id: cacheKey.id,
-        label: 'CacheKey',
-        properties: {
-          name: cacheKey.label,
-          filePath: '',
-          heuristicLabel: cacheKey.heuristicLabel,
-          keyName: cacheKey.keyName,
-          keyType: cacheKey.keyType,
-          sourceNodeId: cacheKey.sourceNodeId,
-        },
+      shapeResult.cacheKeys.forEach(cacheKey => {
+        graph.addNode({
+          id: cacheKey.id,
+          label: 'CacheKey',
+          properties: {
+            name: cacheKey.label,
+            filePath: '',
+            heuristicLabel: cacheKey.heuristicLabel,
+            keyName: cacheKey.keyName,
+            keyType: cacheKey.keyType,
+            sourceNodeId: cacheKey.sourceNodeId,
+          },
+        });
       });
-    });
 
-    shapeResult.dbTables.forEach(dbTable => {
-      graph.addNode({
-        id: dbTable.id,
-        label: 'DBTable',
-        properties: {
-          name: dbTable.label,
-          filePath: dbTable.sourceFilePath,
-          heuristicLabel: dbTable.heuristicLabel,
-          tableName: dbTable.tableName,
-          sourceFilePath: dbTable.sourceFilePath,
-        },
+      shapeResult.dbTables.forEach(dbTable => {
+        graph.addNode({
+          id: dbTable.id,
+          label: 'DBTable',
+          properties: {
+            name: dbTable.label,
+            filePath: dbTable.sourceFilePath,
+            heuristicLabel: dbTable.heuristicLabel,
+            tableName: dbTable.tableName,
+            sourceFilePath: dbTable.sourceFilePath,
+          },
+        });
       });
-    });
 
-    shapeResult.dbColumns.forEach(dbColumn => {
-      graph.addNode({
-        id: dbColumn.id,
-        label: 'DBColumn',
-        properties: {
-          name: dbColumn.label,
-          filePath: dbColumn.sourceFilePath,
-          heuristicLabel: dbColumn.heuristicLabel,
-          columnName: dbColumn.columnName,
-          tableId: dbColumn.tableId,
-          tableName: dbColumn.tableName,
-          sourceFilePath: dbColumn.sourceFilePath,
-        },
+      shapeResult.dbColumns.forEach(dbColumn => {
+        graph.addNode({
+          id: dbColumn.id,
+          label: 'DBColumn',
+          properties: {
+            name: dbColumn.label,
+            filePath: dbColumn.sourceFilePath,
+            heuristicLabel: dbColumn.heuristicLabel,
+            columnName: dbColumn.columnName,
+            tableId: dbColumn.tableId,
+            tableName: dbColumn.tableName,
+            sourceFilePath: dbColumn.sourceFilePath,
+          },
+        });
       });
-    });
 
-    shapeResult.testCases.forEach(testCase => {
-      graph.addNode({
-        id: testCase.id,
-        label: 'TestCase',
-        properties: {
-          name: testCase.name,
-          filePath: testCase.filePath,
-          startLine: testCase.startLine,
-          endLine: testCase.endLine,
-        },
+      shapeResult.testCases.forEach(testCase => {
+        graph.addNode({
+          id: testCase.id,
+          label: 'TestCase',
+          properties: {
+            name: testCase.name,
+            filePath: testCase.filePath,
+            startLine: testCase.startLine,
+            endLine: testCase.endLine,
+          },
+        });
       });
-    });
 
-    shapeResult.codeElements.forEach(node => {
-      graph.addNode(node);
-    });
+      shapeResult.codeElements.forEach(node => {
+        graph.addNode(node);
+      });
 
-    shapeResult.edges.forEach(edge => {
-      graph.addRelationship({
-        id: edge.id,
-        type: edge.type,
-        sourceId: edge.sourceId,
-        targetId: edge.targetId,
-        confidence: edge.confidence,
-        reason: edge.reason,
+      shapeResult.edges.forEach(edge => {
+        graph.addRelationship({
+          id: edge.id,
+          type: edge.type,
+          sourceId: edge.sourceId,
+          targetId: edge.targetId,
+          confidence: edge.confidence,
+          reason: edge.reason,
+        });
       });
     });
 
@@ -387,29 +455,31 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    if (workerData) {
-      // Fast path: heritage already extracted by workers, just resolve symbols
-      await processHeritageFromExtracted(graph, workerData.heritage, symbolTable, (current, total) => {
-        const heritageProgress = 94 + ((current / total) * 2);
-        onProgress({
-          phase: 'heritage',
-          percent: Math.round(heritageProgress),
-          message: 'Extracting class inheritance...',
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+    await timeStage('heritage', async () => {
+      if (workerData) {
+        // Fast path: heritage already extracted by workers, just resolve symbols
+        await processHeritageFromExtracted(graph, workerData.heritage, symbolTable, (current, total) => {
+          const heritageProgress = 94 + ((current / total) * 2);
+          onProgress({
+            phase: 'heritage',
+            percent: Math.round(heritageProgress),
+            message: 'Extracting class inheritance...',
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
         });
-      });
-    } else {
-      // Fallback: full parse + resolve (sequential path)
-      await processHeritage(graph, files, astCache, symbolTable, (current, total) => {
-        const heritageProgress = 94 + ((current / total) * 2);
-        onProgress({
-          phase: 'heritage',
-          percent: Math.round(heritageProgress),
-          message: 'Extracting class inheritance...',
-          stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+      } else {
+        // Fallback: full parse + resolve (sequential path)
+        await processHeritage(graph, files, astCache, symbolTable, (current, total) => {
+          const heritageProgress = 94 + ((current / total) * 2);
+          onProgress({
+            phase: 'heritage',
+            percent: Math.round(heritageProgress),
+            message: 'Extracting class inheritance...',
+            stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+          });
         });
-      });
-    }
+      }
+    });
 
     onProgress({
       phase: 'precision',
@@ -418,28 +488,32 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const precisionOverlayResult = await processPrecisionOverlay(
-      repoPath,
-      graph,
-      (message, progress) => {
-        const precisionProgress = 95 + (progress * 0.01);
-        onProgress({
-          phase: 'precision',
-          percent: Math.round(precisionProgress),
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-      {
-        overlayPath: options?.precisionOverlayPath,
-        producerMode: options?.precisionOverlayMode,
-        producerForceRefresh: options?.precisionOverlayForce,
-        producerScipJson: options?.precisionOverlayScipJson,
-      },
-    );
+    const precisionOverlayResult = await timeStage('precision', async () => {
+      const result = await processPrecisionOverlay(
+        repoPath,
+        graph,
+        (message, progress) => {
+          const precisionProgress = 95 + (progress * 0.01);
+          onProgress({
+            phase: 'precision',
+            percent: Math.round(precisionProgress),
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+        {
+          overlayPath: options?.precisionOverlayPath,
+          producerMode: options?.precisionOverlayMode,
+          producerForceRefresh: options?.precisionOverlayForce,
+          producerScipJson: options?.precisionOverlayScipJson,
+        },
+      );
 
-    precisionOverlayResult.edges.forEach(edge => {
-      graph.addRelationship(edge);
+      result.edges.forEach(edge => {
+        graph.addRelationship(edge);
+      });
+
+      return result;
     });
 
     onProgress({
@@ -449,21 +523,25 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const microDataflowResult = await processMicroDataflow(
-      graph,
-      (message, progress) => {
-        const microflowProgress = 96 + (progress * 0.01);
-        onProgress({
-          phase: 'microflow',
-          percent: Math.round(microflowProgress),
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-    );
+    const microDataflowResult = await timeStage('microflow', async () => {
+      const result = await processMicroDataflow(
+        graph,
+        (message, progress) => {
+          const microflowProgress = 96 + (progress * 0.01);
+          onProgress({
+            phase: 'microflow',
+            percent: Math.round(microflowProgress),
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+      );
 
-    microDataflowResult.edges.forEach(edge => {
-      graph.addRelationship(edge);
+      result.edges.forEach(edge => {
+        graph.addRelationship(edge);
+      });
+
+      return result;
     });
 
     onProgress({
@@ -473,36 +551,40 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const valueGraphResult = await processValueGraph(
-      graph,
-      (message, progress) => {
-        const valueProgress = 97 + (progress * 0.005);
-        onProgress({
-          phase: 'values',
-          percent: Math.round(valueProgress),
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-    );
-
-    valueGraphResult.values.forEach(valueNode => {
-      graph.addNode({
-        id: valueNode.id,
-        label: 'ValueNode',
-        properties: {
-          name: valueNode.label,
-          filePath: '',
-          heuristicLabel: valueNode.heuristicLabel,
-          valueType: valueNode.valueType,
-          valueKey: valueNode.valueKey,
-          valueRaw: valueNode.valueRaw,
+    const valueGraphResult = await timeStage('values', async () => {
+      const result = await processValueGraph(
+        graph,
+        (message, progress) => {
+          const valueProgress = 97 + (progress * 0.005);
+          onProgress({
+            phase: 'values',
+            percent: Math.round(valueProgress),
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
         },
-      });
-    });
+      );
 
-    valueGraphResult.edges.forEach(edge => {
-      graph.addRelationship(edge);
+      result.values.forEach(valueNode => {
+        graph.addNode({
+          id: valueNode.id,
+          label: 'ValueNode',
+          properties: {
+            name: valueNode.label,
+            filePath: '',
+            heuristicLabel: valueNode.heuristicLabel,
+            valueType: valueNode.valueType,
+            valueKey: valueNode.valueKey,
+            valueRaw: valueNode.valueRaw,
+          },
+        });
+      });
+
+      result.edges.forEach(edge => {
+        graph.addRelationship(edge);
+      });
+
+      return result;
     });
 
     onProgress({
@@ -512,21 +594,25 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const provenanceResult = await processProvenanceEdges(
-      graph,
-      (message, progress) => {
-        const provenanceProgress = 97 + (progress * 0.005);
-        onProgress({
-          phase: 'provenance',
-          percent: Math.round(provenanceProgress),
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-    );
+    const provenanceResult = await timeStage('provenance', async () => {
+      const result = await processProvenanceEdges(
+        graph,
+        (message, progress) => {
+          const provenanceProgress = 97 + (progress * 0.005);
+          onProgress({
+            phase: 'provenance',
+            percent: Math.round(provenanceProgress),
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+      );
 
-    provenanceResult.edges.forEach(edge => {
-      graph.addRelationship(edge);
+      result.edges.forEach(edge => {
+        graph.addRelationship(edge);
+      });
+
+      return result;
     });
 
     onProgress({
@@ -536,15 +622,17 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const communityResult = await processCommunities(graph, (message, progress) => {
-      const communityProgress = 97 + (progress * 0.01);
-      onProgress({
-        phase: 'communities',
-        percent: Math.round(communityProgress),
-        message,
-        stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-      });
-    });
+    const communityResult = await timeStage('communities', async () => (
+      await processCommunities(graph, (message, progress) => {
+        const communityProgress = 97 + (progress * 0.01);
+        onProgress({
+          phase: 'communities',
+          percent: Math.round(communityProgress),
+          message,
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+      })
+    ));
 
     if (isDev) {
       console.log(`🏘️ Community detection: ${communityResult.stats.totalCommunities} communities found (modularity: ${communityResult.stats.modularity.toFixed(3)})`);
@@ -586,20 +674,22 @@ export const runPipelineFromRepo = async (
     const symbolCount = graph.nodes.filter(n => n.label !== 'File').length;
     const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
 
-    const processResult = await processProcesses(
-      graph,
-      communityResult.memberships,
-      (message, progress) => {
-        const processProgress = 98 + (progress * 0.01);
-        onProgress({
-          phase: 'processes',
-          percent: Math.round(processProgress),
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-      { maxProcesses: dynamicMaxProcesses, minSteps: 3 }
-    );
+    const processResult = await timeStage('processes', async () => (
+      await processProcesses(
+        graph,
+        communityResult.memberships,
+        (message, progress) => {
+          const processProgress = 98 + (progress * 0.01);
+          onProgress({
+            phase: 'processes',
+            percent: Math.round(processProgress),
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+        { maxProcesses: dynamicMaxProcesses, minSteps: 3 }
+      )
+    ));
 
     if (isDev) {
       console.log(`🔄 Process detection: ${processResult.stats.totalProcesses} processes found (${processResult.stats.crossCommunityCount} cross-community)`);
@@ -641,17 +731,19 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const featureSliceResult = await processFeatureSlices(
-      graph,
-      (message) => {
-        onProgress({
-          phase: 'slices',
-          percent: 99,
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-    );
+    const featureSliceResult = await timeStage('slices', async () => (
+      await processFeatureSlices(
+        graph,
+        (message) => {
+          onProgress({
+            phase: 'slices',
+            percent: 99,
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+      )
+    ));
 
     featureSliceResult.slices.forEach(slice => {
       graph.addNode({
@@ -689,22 +781,24 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    const gapResult = await processGaps(
-      graph,
-      (message) => {
-        onProgress({
-          phase: 'gaps',
-          percent: 99,
-          message,
-          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-        });
-      },
-      {
-        repoPath,
-        expectationPath: options?.graphExpectationPath,
-        expectationJson: options?.graphExpectationJson,
-      },
-    );
+    const gapResult = await timeStage('gaps', async () => (
+      await processGaps(
+        graph,
+        (message) => {
+          onProgress({
+            phase: 'gaps',
+            percent: 99,
+            message,
+            stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+          });
+        },
+        {
+          repoPath,
+          expectationPath: options?.graphExpectationPath,
+          expectationJson: options?.graphExpectationJson,
+        },
+      )
+    ));
 
     gapResult.gaps.forEach(gap => {
       graph.addNode({
@@ -743,14 +837,17 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
     });
 
-    if (options?.skipCochange) {
-      onProgress({
-        phase: 'cochange',
-        percent: 99,
-        message: 'Skipping git-history cochange graph (profile)...',
-        stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
-      });
-    } else {
+    await timeStage('cochange', async () => {
+      if (options?.skipCochange) {
+        onProgress({
+          phase: 'cochange',
+          percent: 99,
+          message: 'Skipping git-history cochange graph (profile)...',
+          stats: { filesProcessed: files.length, totalFiles: files.length, nodesCreated: graph.nodeCount },
+        });
+        return;
+      }
+
       const cochangeResult = await processGitHistoryCochange(
         repoPath,
         filePaths,
@@ -767,7 +864,7 @@ export const runPipelineFromRepo = async (
       cochangeResult.edges.forEach(edge => {
         graph.addRelationship(edge);
       });
-    }
+    });
 
     onProgress({
       phase: 'complete',
@@ -785,6 +882,9 @@ export const runPipelineFromRepo = async (
     return {
       graph,
       fileContents,
+      timingsMs: profilePipelineTimings
+        ? { ...pipelineTimingsMs, total: Math.max(0, Date.now() - t0Pipeline) }
+        : undefined,
       communityResult,
       processResult,
       precisionOverlayResult,

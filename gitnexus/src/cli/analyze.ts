@@ -11,8 +11,8 @@ import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReuse
 import { runEmbeddingPipeline, type EmbeddingPipelineSummary } from '../core/embeddings/embedding-pipeline.js';
 import { disposeEmbedder } from '../core/embeddings/embedder.js';
 import { resolveDefaultEmbeddingCachePath, resolveGlobalEmbeddingCachePath } from '../core/embeddings/embedding-cache.js';
-import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
-import { getCurrentCommit, isGitRepo, getGitRoot, getCommittedFileChanges, getWorkingTreeFileChanges, mergeGitFileChanges } from '../storage/git.js';
+import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, listRegisteredRepos } from '../storage/repo-manager.js';
+import { getCurrentCommit, isGitRepo, getGitRoot, getGitCommonDir, getCommittedFileChanges, getWorkingTreeFileChanges, mergeGitFileChanges } from '../storage/git.js';
 import { KUZU_SCHEMA_VERSION } from '../core/kuzu/schema.js';
 import { generateAIContextFiles } from './ai-context.js';
 import fs from 'fs/promises';
@@ -113,6 +113,23 @@ const normalizeIncrementalDerivedMode = (value?: string): { mode: IncrementalDer
 const INCREMENTAL_MAX_CHANGES_DEFAULT = 500;
 const INCREMENTAL_MAX_CHANGES_CAP = 5_000;
 const INCREMENTAL_MAX_CHANGES_FRACTION_OF_FILES = 0.2;
+const GLOBAL_FULL_REINDEX_BASENAMES = new Set([
+  'tsconfig.json',
+  'jsconfig.json',
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'composer.json',
+  'composer.lock',
+  'go.mod',
+  'go.sum',
+  'Cargo.toml',
+  'Cargo.lock',
+  'pom.xml',
+  'build.gradle',
+  'build.gradle.kts',
+]);
 const FTS_INDEX_TARGETS: Array<{ table: string; index: string; properties: string[] }> = [
   { table: 'File', index: 'file_fts', properties: ['name', 'content'] },
   { table: 'Function', index: 'function_fts', properties: ['name', 'content'] },
@@ -278,7 +295,133 @@ export const analyzeCommand = async (
     embeddingCachePath = repoEmbeddingCachePath;
   }
   const currentCommit = getCurrentCommit(repoPath);
-  const existingMeta = await loadMeta(storagePath);
+
+  let seedNote: { sourceRepoPath: string; sourceCommit: string } | null = null;
+  let existingMeta = await loadMeta(storagePath);
+  if (!existingMeta && !options?.force && process.env.GITNEXUS_DISABLE_WORKTREE_SEED !== '1') {
+    const trySeedFromRegisteredRepo = async (): Promise<{ sourceRepoPath: string; sourceCommit: string } | null> => {
+      const commonDir = getGitCommonDir(repoPath);
+      if (!commonDir) return null;
+
+      const entries = await listRegisteredRepos({ validate: true });
+      if (!Array.isArray(entries) || entries.length === 0) return null;
+
+      const seedCandidates: Array<{
+        repoPath: string;
+        storagePath: string;
+        meta: any;
+        fileChangesTotal: number;
+        indexedAtMs: number;
+      }> = [];
+
+      const computeSeedIncrementalMaxChanges = (indexedFileCount: number): number => {
+        const explicit = options?.incrementalMaxChanges;
+        if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit >= 0) {
+          return Math.floor(explicit);
+        }
+        const files = Number(indexedFileCount || 0) || 0;
+        if (files > 0) {
+          const byFraction = Math.round(files * INCREMENTAL_MAX_CHANGES_FRACTION_OF_FILES);
+          return Math.max(
+            INCREMENTAL_MAX_CHANGES_DEFAULT,
+            Math.min(INCREMENTAL_MAX_CHANGES_CAP, byFraction),
+          );
+        }
+        return INCREMENTAL_MAX_CHANGES_DEFAULT;
+      };
+
+      for (const entry of entries) {
+        const candidateRepoPath = path.resolve(String((entry as any)?.path || '').trim());
+        const candidateStoragePath = path.resolve(String((entry as any)?.storagePath || '').trim());
+        if (!candidateRepoPath || !candidateStoragePath) continue;
+        if (candidateRepoPath === repoPath) continue;
+
+        const candidateCommonDir = getGitCommonDir(candidateRepoPath);
+        if (!candidateCommonDir || candidateCommonDir !== commonDir) continue;
+
+        const candidateMeta = await loadMeta(candidateStoragePath);
+        if (!candidateMeta) continue;
+        const candidateSchema = Number(candidateMeta?.kuzuSchemaVersion ?? 1) || 1;
+        if (candidateSchema !== KUZU_SCHEMA_VERSION) continue;
+
+        const candidateKuzuPath = path.join(candidateStoragePath, 'kuzu');
+        try {
+          await fs.access(candidateKuzuPath);
+        } catch {
+          continue;
+        }
+
+        const seedChanges = mergeGitFileChanges(
+          getCommittedFileChanges(repoPath, String(candidateMeta.lastCommit || ''), currentCommit),
+          getWorkingTreeFileChanges(repoPath),
+        );
+        const fileChangesTotal = seedChanges.changed.length + seedChanges.deleted.length;
+        const seedMaxChanges = computeSeedIncrementalMaxChanges(Number(candidateMeta?.stats?.files ?? 0));
+        if (fileChangesTotal > seedMaxChanges) continue;
+
+        const seedForcesFull = [...seedChanges.changed, ...seedChanges.deleted].some(fp => {
+          const base = path.posix.basename(fp);
+          return GLOBAL_FULL_REINDEX_BASENAMES.has(base);
+        });
+        if (seedForcesFull) continue;
+
+        const indexedAtMs = Date.parse(String(candidateMeta.indexedAt || '')) || 0;
+        seedCandidates.push({
+          repoPath: candidateRepoPath,
+          storagePath: candidateStoragePath,
+          meta: candidateMeta,
+          fileChangesTotal,
+          indexedAtMs,
+        });
+      }
+
+      if (seedCandidates.length === 0) return null;
+
+      seedCandidates.sort((a, b) => {
+        if (a.fileChangesTotal !== b.fileChangesTotal) return a.fileChangesTotal - b.fileChangesTotal;
+        if (b.indexedAtMs !== a.indexedAtMs) return b.indexedAtMs - a.indexedAtMs;
+        return a.repoPath.localeCompare(b.repoPath);
+      });
+
+      const best = seedCandidates[0];
+      if (!best) return null;
+
+      try {
+        await fs.rm(storagePath, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+
+      try {
+        await fs.cp(best.storagePath, storagePath, { recursive: true });
+      } catch {
+        return null;
+      }
+
+      try {
+        await saveMeta(storagePath, { ...best.meta, repoPath });
+      } catch {
+        // best-effort; meta rewrite failure will just fall back to full index build
+      }
+
+      // Clear stale lock artifacts that can block opening the seeded Kuzu DB.
+      const kuzuFiles = [kuzuPath, `${kuzuPath}.wal`, `${kuzuPath}.lock`];
+      for (const f of kuzuFiles.slice(1)) {
+        try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+      }
+
+      return { sourceRepoPath: best.repoPath, sourceCommit: String(best.meta.lastCommit || '') };
+    };
+
+    seedNote = await trySeedFromRegisteredRepo();
+    if (seedNote) {
+      existingMeta = await loadMeta(storagePath);
+      if (existingMeta) {
+        profileWarnings.push(`Seeded index from ${seedNote.sourceRepoPath} (commit ${seedNote.sourceCommit.slice(0, 10) || 'unknown'}).`);
+      }
+    }
+  }
+
   const existingSchemaVersion = existingMeta?.kuzuSchemaVersion ?? 1;
   const schemaMismatch = existingMeta !== null && existingSchemaVersion !== KUZU_SCHEMA_VERSION;
   const ftsSchemaVersion = Number(existingMeta?.ftsSchemaVersion || 0);
@@ -364,6 +507,23 @@ export const analyzeCommand = async (
 
   if (isUpToDate) {
     console.log('  Already up to date\n');
+    if (seedNote) {
+      console.log(`  Seeded index from ${seedNote.sourceRepoPath} (commit ${seedNote.sourceCommit.slice(0, 10) || 'unknown'})`);
+    }
+    if (options?.registry !== false) {
+      try {
+        await registerRepo(repoPath, existingMeta);
+      } catch {
+        // Non-fatal: index is still usable even if we can't write global registry
+      }
+    }
+    if (options?.hooks !== false) {
+      try {
+        await registerClaudeHook();
+      } catch {
+        // Non-fatal
+      }
+    }
     return;
   }
 
@@ -405,24 +565,6 @@ export const analyzeCommand = async (
   };
 
   const incrementalMaxChanges = computeIncrementalMaxChanges();
-
-  const GLOBAL_FULL_REINDEX_BASENAMES = new Set([
-    'tsconfig.json',
-    'jsconfig.json',
-    'package.json',
-    'package-lock.json',
-    'pnpm-lock.yaml',
-    'yarn.lock',
-    'composer.json',
-    'composer.lock',
-    'go.mod',
-    'go.sum',
-    'Cargo.toml',
-    'Cargo.lock',
-    'pom.xml',
-    'build.gradle',
-    'build.gradle.kts',
-  ]);
 
   const shouldForceFullDueToConfig = [...fileChanges.changed, ...fileChanges.deleted].some(fp => {
     const base = path.posix.basename(fp);
@@ -4254,6 +4396,17 @@ export const analyzeCommand = async (
     );
   }
   console.log(`  Pipeline ${pipelineTime}s | Evidence ${evidenceTime}s | Summaries ${summariesTime}s`);
+  const profilePipeline = process.env.GITNEXUS_PROFILE_PIPELINE === '1';
+  if (profilePipeline && pipelineResult.timingsMs && Object.keys(pipelineResult.timingsMs).length > 0) {
+    const sorted = Object.entries(pipelineResult.timingsMs)
+      .filter(([name]) => name !== 'total')
+      .sort((a, b) => b[1] - a[1])
+    const MAX_PARTS = 20;
+    const parts = sorted.slice(0, MAX_PARTS).map(([name, ms]) => `${name}=${ms}ms`);
+    const omitted = Math.max(0, sorted.length - parts.length);
+    const totalMs = pipelineResult.timingsMs.total;
+    console.log(`  Pipeline timings: ${parts.join(', ')}${omitted > 0 ? ` (+${omitted} more)` : ''}${typeof totalMs === 'number' ? ` (total=${totalMs}ms)` : ''}`);
+  }
   if (pipelineResult.precisionOverlayResult) {
     const precision = pipelineResult.precisionOverlayResult.stats;
     const producerBits: string[] = [];

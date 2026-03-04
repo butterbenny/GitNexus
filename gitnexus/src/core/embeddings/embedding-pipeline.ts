@@ -12,6 +12,9 @@
 import { initEmbedder, embedBatchToArrays, embedText, embeddingToArray, isEmbedderReady } from './embedder.js';
 import { generateBatchEmbeddingTexts } from './text-generator.js';
 import fs from 'fs/promises';
+import { createWriteStream } from 'fs';
+import os from 'os';
+import path from 'path';
 import {
   computeEmbeddingTextHash,
   decodeEmbeddingBase64,
@@ -34,6 +37,7 @@ import {
 
 const isDev = process.env.NODE_ENV === 'development';
 const EMBEDDING_CACHE_OVERLAY_READ_MAX_BYTES = 25 * 1024 * 1024; // 25MB
+const EMBEDDING_COPY_BUFFER_FLUSH_BYTES = 2 * 1024 * 1024; // 2MB
 
 /**
  * Progress callback type
@@ -184,13 +188,142 @@ const batchInsertEmbeddings = async (
   // Insert embeddings in batches with a single query per chunk (UNWIND).
   // This avoids 1 execute() call per row and is significantly faster on large repos.
   const cypher = `UNWIND $rows AS row CREATE (e:CodeEmbedding {nodeId: row.nodeId, embedding: row.embedding})`;
-  const rowsPerQuery = 200;
+  const DEFAULT_ROWS_PER_QUERY = 200;
+  const rawRowsPerQuery = Number(process.env.GITNEXUS_EMBEDDING_INSERT_ROWS_PER_QUERY ?? DEFAULT_ROWS_PER_QUERY);
+  const rowsPerQuery = (
+    Number.isFinite(rawRowsPerQuery) && rawRowsPerQuery > 0
+      ? Math.min(5_000, Math.floor(rawRowsPerQuery))
+      : DEFAULT_ROWS_PER_QUERY
+  );
   const paramsList: Array<Record<string, any>> = [];
   for (let start = 0; start < updates.length; start += rowsPerQuery) {
     const rows = updates.slice(start, start + rowsPerQuery).map(u => ({ nodeId: u.id, embedding: u.embedding }));
     paramsList.push({ rows });
   }
   await executeWithReusedStatement(cypher, paramsList);
+};
+
+const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
+
+const sanitizeCSVField = (value: string): string => {
+  return String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/"/g, '""');
+};
+
+const escapeCSVField = (value: string): string => `"${sanitizeCSVField(value)}"`;
+
+type EmbeddingCopyWriter = {
+  filePath: string;
+  writeRows: (rows: Array<{ id: string; embedding: number[] }>) => Promise<void>;
+  flushAndClose: () => Promise<void>;
+  abort: () => Promise<void>;
+};
+
+const createEmbeddingCopyWriter = async (): Promise<EmbeddingCopyWriter> => {
+  const tmpDir = path.join(os.tmpdir(), 'gitnexus');
+  await fs.mkdir(tmpDir, { recursive: true });
+  const filePath = path.join(
+    tmpDir,
+    `code-embeddings-${Date.now()}-${Math.random().toString(16).slice(2)}.csv`,
+  );
+
+  const stream = createWriteStream(filePath, { encoding: 'utf-8' });
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      stream.off('open', onOpen);
+      stream.off('error', onError);
+    };
+    const onOpen = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onError = (err: any): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    stream.once('open', onOpen);
+    stream.once('error', onError);
+  });
+
+  let buffer = 'nodeId,embedding\n';
+  const flushBuffer = async (): Promise<void> => {
+    if (!buffer) return;
+    const payload = buffer;
+    buffer = '';
+    if (!stream.write(payload)) {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const cleanup = (): void => {
+          stream.off('drain', onDrain);
+          stream.off('error', onError);
+        };
+        const onDrain = (): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        };
+        const onError = (err: any): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(err);
+        };
+        stream.once('drain', onDrain);
+        stream.once('error', onError);
+      });
+    }
+  };
+
+  const writeRows = async (rows: Array<{ id: string; embedding: number[] }>): Promise<void> => {
+    for (const row of rows) {
+      const embeddingLiteral = `[${row.embedding.join(',')}]`;
+      buffer += `${escapeCSVField(row.id)},${escapeCSVField(embeddingLiteral)}\n`;
+      if (buffer.length >= EMBEDDING_COPY_BUFFER_FLUSH_BYTES) {
+        await flushBuffer();
+      }
+    }
+  };
+
+  const flushAndClose = async (): Promise<void> => {
+    await flushBuffer();
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        stream.off('finish', onFinish);
+        stream.off('error', onError);
+      };
+      const onFinish = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onError = (err: any): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+      stream.once('finish', onFinish);
+      stream.once('error', onError);
+      stream.end();
+    });
+  };
+
+  const abort = async (): Promise<void> => {
+    buffer = '';
+    try { stream.destroy(); } catch {}
+  };
+
+  return { filePath, writeRows, flushAndClose, abort };
 };
 
 /**
@@ -254,6 +387,9 @@ export const runEmbeddingPipeline = async (
   let modelLoadMs = 0;
   let cacheHits = 0;
   let cacheMisses = 0;
+  let hasAnyEmbeddings = false;
+  let shouldUseCopyInsert = false;
+  let copyWriter: EmbeddingCopyWriter | null = null;
 
   try {
     if (isDev) {
@@ -311,19 +447,18 @@ export const runEmbeddingPipeline = async (
       };
     }
 
+    try {
+      const rows = await executeQuery(`MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId LIMIT 1`);
+      hasAnyEmbeddings = Array.isArray(rows) && rows.length > 0;
+    } catch {
+      hasAnyEmbeddings = false;
+    }
+
     // Only load the embedding cache when we're doing a cold embedding build (no embeddings exist yet).
     // Incremental runs almost always miss the cache (content hashes changed) and paying to parse a large cache
     // file can dominate runtime on big repos.
     if (cacheEnabledRequested) {
       const cacheLoadStartedAt = Date.now();
-      let hasAnyEmbeddings = false;
-      try {
-        const rows = await executeQuery(`MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId LIMIT 1`);
-        hasAnyEmbeddings = Array.isArray(rows) && rows.length > 0;
-      } catch {
-        hasAnyEmbeddings = false;
-      }
-
       const tryLoadOverlay = async (): Promise<Map<string, string>> => {
         if (!overlayPath) return new Map();
         try {
@@ -358,6 +493,24 @@ export const runEmbeddingPipeline = async (
         cacheReadMode = embeddingCache.size > 0 ? 'full' : (overlayEntriesLoaded > 0 ? 'overlay' : 'none');
       }
       cacheLoadMs = Math.max(0, Date.now() - cacheLoadStartedAt);
+    }
+
+    const DEFAULT_INSERT_MODE = 'auto';
+    const rawInsertMode = String(process.env.GITNEXUS_EMBEDDING_INSERT_MODE ?? DEFAULT_INSERT_MODE).trim().toLowerCase();
+    const insertMode: 'auto' | 'unwind' | 'copy' = rawInsertMode === 'copy' || rawInsertMode === 'unwind' ? rawInsertMode : 'auto';
+    const DEFAULT_COPY_MIN_ROWS = 5_000;
+    const rawCopyMinRows = Number(process.env.GITNEXUS_EMBEDDING_INSERT_COPY_MIN_ROWS ?? DEFAULT_COPY_MIN_ROWS);
+    const copyMinRows = (
+      Number.isFinite(rawCopyMinRows) && rawCopyMinRows > 0
+        ? Math.min(200_000, Math.floor(rawCopyMinRows))
+        : DEFAULT_COPY_MIN_ROWS
+    );
+
+    // COPY-based insertion is significantly faster on large cold builds (Kuzu optimized bulk loader).
+    // For incremental runs with small deltas, UNWIND keeps overhead low.
+    shouldUseCopyInsert = insertMode === 'copy' || (insertMode === 'auto' && !hasAnyEmbeddings && totalNodes >= copyMinRows);
+    if (shouldUseCopyInsert) {
+      copyWriter = await createEmbeddingCopyWriter();
     }
 
     // Phase 2: Load embedding model only when needed.
@@ -412,6 +565,39 @@ export const runEmbeddingPipeline = async (
       currentBatch: 0,
       totalBatches,
     });
+
+    const DEFAULT_INSERT_FLUSH_SIZE = 2048;
+    const rawInsertFlushSize = Number(process.env.GITNEXUS_EMBEDDING_INSERT_FLUSH_SIZE ?? DEFAULT_INSERT_FLUSH_SIZE);
+    const insertFlushSize = (
+      Number.isFinite(rawInsertFlushSize) && rawInsertFlushSize > 0
+        ? Math.min(20_000, Math.floor(rawInsertFlushSize))
+        : DEFAULT_INSERT_FLUSH_SIZE
+    );
+
+    const pendingInsertUpdates: Array<{ id: string; embedding: number[] }> = [];
+    const flushInsertUpdates = async (): Promise<void> => {
+      if (pendingInsertUpdates.length === 0) return;
+      const insertStartedAt = Date.now();
+      await batchInsertEmbeddings(executeWithReusedStatement, pendingInsertUpdates);
+      insertMs += Math.max(0, Date.now() - insertStartedAt);
+      pendingInsertUpdates.length = 0;
+    };
+
+    const recordInsertUpdates = async (updates: Array<{ id: string; embedding: number[] }>): Promise<void> => {
+      if (updates.length === 0) return;
+
+      if (copyWriter) {
+        const insertStartedAt = Date.now();
+        await copyWriter.writeRows(updates);
+        insertMs += Math.max(0, Date.now() - insertStartedAt);
+        return;
+      }
+
+      pendingInsertUpdates.push(...updates);
+      if (pendingInsertUpdates.length >= insertFlushSize) {
+        await flushInsertUpdates();
+      }
+    };
 
     for (let start = 0; start < totalNodes;) {
       const end = Math.min(start + batchSize, totalNodes);
@@ -533,9 +719,7 @@ export const runEmbeddingPipeline = async (
 
       // Update KuzuDB with embeddings
       const updates = [...cachedUpdates, ...embeddedUpdates];
-      const insertStartedAt = Date.now();
-      await batchInsertEmbeddings(executeWithReusedStatement, updates);
-      insertMs += Math.max(0, Date.now() - insertStartedAt);
+      await recordInsertUpdates(updates);
 
       processedNodes += batch.length;
       currentBatch += 1;
@@ -551,6 +735,21 @@ export const runEmbeddingPipeline = async (
         currentBatch,
         totalBatches,
       });
+    }
+
+    if (copyWriter) {
+      const copyStartedAt = Date.now();
+      await copyWriter.flushAndClose();
+      const normalizedPath = normalizeCopyPath(copyWriter.filePath);
+      const parallelCopyRaw = String(process.env.GITNEXUS_EMBEDDING_COPY_PARALLEL ?? '0').trim().toLowerCase();
+      const parallelCopy = parallelCopyRaw === '1' || parallelCopyRaw === 'true' || parallelCopyRaw === 'yes' || parallelCopyRaw === 'on';
+      await executeQuery(
+        `COPY CodeEmbedding(nodeId, embedding) FROM "${normalizedPath}" (HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=${parallelCopy ? 'true' : 'false'}, auto_detect=false)`,
+      );
+      insertMs += Math.max(0, Date.now() - copyStartedAt);
+      try { await fs.unlink(copyWriter.filePath); } catch {}
+    } else {
+      await flushInsertUpdates();
     }
 
     // Phase 4: Create vector index
@@ -638,6 +837,11 @@ export const runEmbeddingPipeline = async (
     
     if (isDev) {
       console.error('❌ Embedding pipeline error:', error);
+    }
+
+    if (copyWriter) {
+      try { await copyWriter.abort(); } catch {}
+      try { await fs.unlink(copyWriter.filePath); } catch {}
     }
 
     onProgress({

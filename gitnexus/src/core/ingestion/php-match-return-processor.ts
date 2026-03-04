@@ -19,6 +19,18 @@ type ParsedClassConst = {
   constant: string;
 };
 
+const MATCH_EXPRESSION_RE = /\bmatch\s*\(/i;
+const MATCH_EXPRESSION_GLOBAL_RE = /\bmatch\s*\(/ig;
+
+const hasMatchExpressionInRange = (content: string, startIndex: number, endIndex: number): boolean => {
+  if (!content) return false;
+  if (!Number.isFinite(startIndex) || !Number.isFinite(endIndex)) return false;
+  if (startIndex < 0 || endIndex <= startIndex) return false;
+  MATCH_EXPRESSION_GLOBAL_RE.lastIndex = startIndex;
+  const match = MATCH_EXPRESSION_GLOBAL_RE.exec(content);
+  return Boolean(match && match.index < endIndex);
+};
+
 const PHP_SCALAR_TYPES = new Set([
   'int',
   'float',
@@ -209,6 +221,8 @@ export const processPhpMatchReturnEdges = async (
     const file = files[i];
     if (i % 200 === 0) await yieldToEventLoop();
 
+    if (!MATCH_EXPRESSION_RE.test(file.content || '')) continue;
+
     const language = getLanguageFromFilename(file.path);
     if (language !== SupportedLanguages.PHP) continue;
 
@@ -232,7 +246,16 @@ export const processPhpMatchReturnEdges = async (
       if (node.type === 'function_definition') functions.push(node);
     });
 
+    const hasMatchCandidateInBody = (bodyNode: any): boolean => {
+      const startIndex = bodyNode?.startIndex;
+      const endIndex = bodyNode?.endIndex;
+      if (!Number.isFinite(startIndex) || !Number.isFinite(endIndex)) return true;
+      if (startIndex < 0 || endIndex <= startIndex) return true;
+      return hasMatchExpressionInRange(file.content || '', startIndex, endIndex);
+    };
+
     const processBody = async (symbolNodeId: string, currentFilePath: string, bodyNode: any) => {
+      if (!hasMatchCandidateInBody(bodyNode)) return;
       const specs = extractMatchReturnConstsFromBody(bodyNode);
       if (specs.length === 0) return;
 

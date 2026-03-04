@@ -1,4 +1,5 @@
 import { execFileSync } from 'child_process';
+import path from 'path';
 
 // Git utilities for repository detection, commit tracking, and diff analysis
 const GIT_NAME_LIST_MAX_BUFFER = 64 * 1024 * 1024; // 64MB for large change sets
@@ -28,6 +29,34 @@ export const getGitRoot = (fromPath: string): string | null => {
     return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: fromPath, encoding: 'utf-8' }).trim();
   } catch {
     return null;
+  }
+};
+
+/**
+ * Resolve the worktree "common" git dir as an absolute path.
+ *
+ * For a normal repo, this is usually `<repo>/.git`.
+ * For a linked worktree, this points at the shared `.git` directory of the main worktree.
+ */
+export const getGitCommonDir = (repoPath: string): string => {
+  try {
+    // Prefer absolute path format when supported by the installed git.
+    try {
+      const absolute = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+        cwd: repoPath,
+        encoding: 'utf-8',
+      }).trim();
+      if (absolute) return absolute;
+    } catch {
+      // fallback below
+    }
+
+    const raw = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: repoPath, encoding: 'utf-8' }).trim();
+    if (!raw) return '';
+    if (path.isAbsolute(raw)) return raw;
+    return path.resolve(repoPath, raw);
+  } catch {
+    return '';
   }
 };
 

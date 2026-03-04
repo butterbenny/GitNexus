@@ -24,6 +24,7 @@ export interface PipelineProgress {
 export interface PipelineResult {
   graph: KnowledgeGraph;
   fileContents: Map<string, string>;
+  timingsMs?: Record<string, number>;
   communityResult?: CommunityDetectionResult;
   processResult?: ProcessDetectionResult;
   precisionOverlayResult?: PrecisionOverlayResult;
