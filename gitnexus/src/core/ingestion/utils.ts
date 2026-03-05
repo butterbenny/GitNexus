@@ -86,8 +86,15 @@ export const getParseableContent = (filePath: string, content: string): string =
 };
 
 const MIN_TREE_SITTER_BUFFER_SIZE = 1024 * 256; // 256 KB
+// If a string is <= 64k chars, even worst-case UTF-8 expansion (4 bytes/char)
+// stays strictly under the 256KB buffer (4 * 65535 = 262140 < 262144).
+// This avoids an O(n) Buffer.byteLength scan for the vast majority of files.
+const TREE_SITTER_FAST_PATH_MAX_CHARS = 65535;
 
 const getAdaptiveTreeSitterBufferSize = (content: string): number => {
+  if (content.length <= TREE_SITTER_FAST_PATH_MAX_CHARS) {
+    return MIN_TREE_SITTER_BUFFER_SIZE;
+  }
   const byteLength = Buffer.byteLength(content, 'utf8');
   let bufferSize = MIN_TREE_SITTER_BUFFER_SIZE;
   while (bufferSize <= byteLength) {

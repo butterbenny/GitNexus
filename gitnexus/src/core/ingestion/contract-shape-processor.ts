@@ -1,5 +1,6 @@
 import { generateId } from '../../lib/utils.js';
 import { GraphNode, KnowledgeGraph } from '../graph/types.js';
+import { performance } from 'node:perf_hooks';
 
 type ShapeType = 'form_request' | 'resource' | 'controller_validation';
 type CacheKeyType = 'query_key_factory' | 'literal';
@@ -812,13 +813,42 @@ const normalizeTestName = (value: string): string => {
     .slice(0, 160);
 };
 
-const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+type ShapeReferenceIndex = {
+  byClassName: Map<string, ShapeTestReference[]>;
+  bySourceFileBase: Map<string, ShapeTestReference[]>;
+  byClassNameLower: Map<string, ShapeTestReference[]>;
+  bySourceFileBaseLower: Map<string, ShapeTestReference[]>;
+};
 
-const tokenExists = (content: string, token: string): boolean => {
-  const trimmed = String(token || '').trim();
-  if (!trimmed) return false;
-  const re = new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(trimmed)}(?=$|[^A-Za-z0-9_])`);
-  return re.test(content);
+const isWordToken = (value: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+
+const indexShapeReferences = (references: ShapeTestReference[]): ShapeReferenceIndex => {
+  const byClassName = new Map<string, ShapeTestReference[]>();
+  const bySourceFileBase = new Map<string, ShapeTestReference[]>();
+  const byClassNameLower = new Map<string, ShapeTestReference[]>();
+  const bySourceFileBaseLower = new Map<string, ShapeTestReference[]>();
+
+  const add = (map: Map<string, ShapeTestReference[]>, key: string, reference: ShapeTestReference) => {
+    const list = map.get(key) || [];
+    list.push(reference);
+    map.set(key, list);
+  };
+
+  for (const reference of references) {
+    const className = String(reference.className || '').trim();
+    if (className && isWordToken(className)) {
+      add(byClassName, className, reference);
+      add(byClassNameLower, className.toLowerCase(), reference);
+    }
+
+    const sourceFileBase = String(reference.sourceFileBase || '').trim();
+    if (sourceFileBase && isWordToken(sourceFileBase)) {
+      add(bySourceFileBase, sourceFileBase, reference);
+      add(bySourceFileBaseLower, sourceFileBase.toLowerCase(), reference);
+    }
+  }
+
+  return { byClassName, bySourceFileBase, byClassNameLower, bySourceFileBaseLower };
 };
 
 const buildLineStarts = (content: string): number[] => {
@@ -889,38 +919,95 @@ const extractStaticTestCases = (filePath: string, content: string): ExtractedTes
 const collectShapeMatchesForTestFile = (
   filePath: string,
   content: string,
-  references: ShapeTestReference[],
+  index: ShapeReferenceIndex,
 ): ShapeMatch[] => {
   const fileName = normalizePath(filePath).split('/').pop()?.toLowerCase() || '';
   const byShapeId = new Map<string, ShapeMatch>();
 
-  for (const reference of references) {
-    let confidence = 0;
-    let reason = '';
-
-    if (reference.className && tokenExists(content, reference.className)) {
-      confidence = 0.95;
-      reason = 'class-name-reference';
-    } else if (reference.sourceFileBase && tokenExists(content, reference.sourceFileBase)) {
-      confidence = 0.9;
-      reason = 'source-file-reference';
-    } else if (reference.className && fileName.includes(reference.className.toLowerCase())) {
-      confidence = 0.85;
-      reason = 'test-file-name-hint';
-    } else if (reference.sourceFileBase && fileName.includes(reference.sourceFileBase.toLowerCase())) {
-      confidence = 0.8;
-      reason = 'source-file-name-hint';
-    }
-
-    if (confidence === 0) continue;
-
-    const existing = byShapeId.get(reference.shapeId);
+  const consider = (shapeId: string, confidence: number, reason: string): void => {
+    if (!shapeId || confidence === 0) return;
+    const existing = byShapeId.get(shapeId);
     if (!existing || confidence > existing.confidence) {
-      byShapeId.set(reference.shapeId, {
-        shapeId: reference.shapeId,
+      byShapeId.set(shapeId, {
+        shapeId,
         confidence,
         reason,
       });
+    }
+  };
+
+  // Content token scan (single pass) — avoids O(testFiles * references) regex work.
+  const wordRe = /\b[A-Za-z_][A-Za-z0-9_]*\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = wordRe.exec(content)) !== null) {
+    const token = match[0];
+
+    const classRefs = index.byClassName.get(token);
+    if (classRefs) {
+      for (const reference of classRefs) {
+        consider(reference.shapeId, 0.95, 'class-name-reference');
+      }
+    }
+
+    const baseRefs = index.bySourceFileBase.get(token);
+    if (baseRefs) {
+      for (const reference of baseRefs) {
+        consider(reference.shapeId, 0.9, 'source-file-reference');
+      }
+    }
+  }
+
+  // File-name hints (cheap, index-backed) — helps when tests don't reference the target by name.
+  const fileBase = fileName.replace(/\.[^.]+$/, '');
+  const compressed = fileBase.replace(/[^a-z0-9]+/g, '');
+  if (compressed) {
+    const nameCandidates = new Set<string>();
+    const work: string[] = [];
+
+    const enqueue = (value: string) => {
+      const v = String(value || '').trim();
+      if (!v) return;
+      if (nameCandidates.has(v)) return;
+      nameCandidates.add(v);
+      work.push(v);
+    };
+
+    enqueue(compressed);
+
+    const suffixes = ['test', 'tests', 'spec', 'specs'];
+    const prefixes = ['test', 'spec'];
+
+    while (work.length > 0 && nameCandidates.size < 20) {
+      const current = work.pop() || '';
+      if (!current) continue;
+
+      for (const suffix of suffixes) {
+        if (current.endsWith(suffix) && current.length > suffix.length) {
+          enqueue(current.slice(0, -suffix.length));
+        }
+      }
+
+      for (const prefix of prefixes) {
+        if (current.startsWith(prefix) && current.length > prefix.length) {
+          enqueue(current.slice(prefix.length));
+        }
+      }
+    }
+
+    for (const candidate of nameCandidates) {
+      const classRefs = index.byClassNameLower.get(candidate);
+      if (classRefs) {
+        for (const reference of classRefs) {
+          consider(reference.shapeId, 0.85, 'test-file-name-hint');
+        }
+      }
+
+      const baseRefs = index.bySourceFileBaseLower.get(candidate);
+      if (baseRefs) {
+        for (const reference of baseRefs) {
+          consider(reference.shapeId, 0.8, 'source-file-name-hint');
+        }
+      }
     }
   }
 
@@ -935,6 +1022,7 @@ export const processStaticTestClosures = (
 ): { testCases: TestCaseNode[]; edges: ShapeEdge[]; stats: { testCaseCount: number; testsShapeEdges: number } } => {
   const testCaseNodeMap = new Map<string, TestCaseNode>();
   const edgeMap = new Map<string, ShapeEdge>();
+  const shapeIndex = indexShapeReferences(shapeReferences);
 
   const addEdge = (edge: ShapeEdge) => {
     if (!edge.sourceId || !edge.targetId) return;
@@ -946,7 +1034,7 @@ export const processStaticTestClosures = (
 
   for (const file of testCandidates) {
     const normalizedPath = normalizePath(file.path);
-    const shapeMatches = collectShapeMatchesForTestFile(normalizedPath, file.content, shapeReferences);
+    const shapeMatches = collectShapeMatchesForTestFile(normalizedPath, file.content, shapeIndex);
     if (shapeMatches.length === 0) continue;
 
     const extractedTests = extractStaticTestCases(normalizedPath, file.content);
@@ -1006,6 +1094,9 @@ export const processContractShapes = async (
   files: { path: string; content: string }[],
   onProgress?: (message: string, progress: number) => void,
 ): Promise<ContractShapeResult> => {
+  const shapesStartMs = performance.now();
+  const shapeTimings: Record<string, number> = {};
+
   onProgress?.('Scanning contract shape sources...', 0);
 
   const classByFile = new Map<string, GraphNode>();
@@ -1038,6 +1129,48 @@ export const processContractShapes = async (
       functionByName.set(name, list);
     }
   }
+
+  type FileEntry = { path: string; content: string };
+  const candidatesStartMs = performance.now();
+  const normalizedFiles: FileEntry[] = files.map(file => ({
+    path: normalizePath(file.path),
+    content: file.content,
+  }));
+
+  const migrationCandidates: FileEntry[] = [];
+  const requestCandidates: FileEntry[] = [];
+  const controllerCandidates: FileEntry[] = [];
+  const resourceCandidates: FileEntry[] = [];
+  const invalidateCandidates: FileEntry[] = [];
+  const testCandidates: FileEntry[] = [];
+
+  for (const file of normalizedFiles) {
+    const filePath = file.path;
+    const lowerPath = filePath.toLowerCase();
+
+    if (MIGRATION_FILE_RE.test(filePath)) migrationCandidates.push(file);
+
+    if (filePath.includes('/Http/Requests/') && /\bfunction\s+rules\s*\(/.test(file.content)) {
+      requestCandidates.push(file);
+    }
+
+    if (filePath.includes('/Http/Controllers/') && lowerPath.endsWith('.php')) {
+      controllerCandidates.push(file);
+    }
+
+    if (filePath.includes('/Http/Resources/') && /\bfunction\s+toArray\s*\(/.test(file.content)) {
+      resourceCandidates.push(file);
+    }
+
+    if (JS_TS_FILE_RE.test(filePath) && file.content.includes('invalidateQueries(')) {
+      invalidateCandidates.push(file);
+    }
+
+    if (TEST_FILE_RE.test(filePath)) {
+      testCandidates.push(file);
+    }
+  }
+  shapeTimings.candidates = Math.round(performance.now() - candidatesStartMs);
 
   const shapeNodeMap = new Map<string, ContractShapeNode>();
   const fieldNodeMap = new Map<string, ContractFieldNode>();
@@ -1226,11 +1359,10 @@ export const processContractShapes = async (
 
   onProgress?.('Extracting migration table/column contracts...', 15);
 
-  const migrationCandidates = files.filter(file => MIGRATION_FILE_RE.test(normalizePath(file.path)));
+  const migrationsStartMs = performance.now();
   for (const file of migrationCandidates) {
-    const normalizedPath = normalizePath(file.path);
-    const fileNodeId = generateId('File', normalizedPath);
-    const tableBlocks = extractMigrationTableBlocks(normalizedPath, file.content);
+    const fileNodeId = generateId('File', file.path);
+    const tableBlocks = extractMigrationTableBlocks(file.path, file.content);
     if (tableBlocks.length === 0) continue;
 
     for (const block of tableBlocks) {
@@ -1252,15 +1384,12 @@ export const processContractShapes = async (
       }
     }
   }
+  shapeTimings.migrations = Math.round(performance.now() - migrationsStartMs);
 
-  const requestCandidates = files.filter(file => {
-    const filePath = normalizePath(file.path);
-    return filePath.includes('/Http/Requests/') && /\bfunction\s+rules\s*\(/.test(file.content);
-  });
-
+  const formRequestsStartMs = performance.now();
   let validatedFieldEdges = 0;
   for (const file of requestCandidates) {
-    const classNode = classByFile.get(normalizePath(file.path));
+    const classNode = classByFile.get(file.path);
     if (!classNode) continue;
 
     const rulesBody = extractPhpMethodBody(file.content, 'rules');
@@ -1282,22 +1411,77 @@ export const processContractShapes = async (
       validatedFieldEdges++;
     }
   }
+  shapeTimings.form_requests = Math.round(performance.now() - formRequestsStartMs);
 
-  const controllerCandidates = files.filter(file => {
-    const filePath = normalizePath(file.path);
-    return filePath.includes('/Http/Controllers/') && filePath.toLowerCase().endsWith('.php');
-  });
+  const controllerValidationStartMs = performance.now();
   for (const file of controllerCandidates) {
-    const filePath = normalizePath(file.path);
+    // Fast prefilter: avoid per-method body extraction when the file clearly has no validation calls.
+    // (False positives are fine; false negatives are not.)
+    if (
+      !file.content.includes('validate')
+      && !file.content.includes('->safe')
+      && !file.content.includes('Validator::make')
+    ) continue;
+
+    const filePath = file.path;
     const methodNodes = methodByFile.get(filePath) || [];
     if (methodNodes.length === 0) continue;
+
+    // Build line-start offsets once per file so we can slice method spans cheaply.
+    // This avoids scanning the full file content repeatedly per method.
+    const lineStarts: number[] = [0];
+    for (let i = 0; i < file.content.length; i++) {
+      if (file.content[i] === '\n') lineStarts.push(i + 1);
+    }
 
     for (const methodNode of methodNodes) {
       const methodName = String(methodNode.properties.name || '').trim();
       if (!methodName) continue;
 
-      const methodSpan = extractPhpMethodBodySpan(file.content, methodName);
-      if (!methodSpan) continue;
+      const startLineRaw = methodNode.properties.startLine;
+      const endLineRaw = methodNode.properties.endLine;
+      const startLine = typeof startLineRaw === 'number' ? startLineRaw : Number(startLineRaw);
+      const endLine = typeof endLineRaw === 'number' ? endLineRaw : Number(endLineRaw);
+      const hasLineSpan = Number.isFinite(startLine) && Number.isFinite(endLine) && startLine >= 0 && endLine >= startLine;
+
+      let methodText: string | null = null;
+      if (hasLineSpan) {
+        const startIdx = lineStarts[Math.min(startLine, lineStarts.length - 1)] ?? 0;
+        const endIdx = (endLine + 1 < lineStarts.length)
+          ? lineStarts[endLine + 1]
+          : file.content.length;
+        methodText = file.content.slice(startIdx, endIdx);
+      }
+
+      if (
+        methodText
+        && !methodText.includes('validate')
+        && !methodText.includes('->safe')
+        && !methodText.includes('Validator::make')
+      ) {
+        continue;
+      }
+
+      let methodSpan: { body: string; openBraceIdx: number; closeBraceIdx: number } | null = null;
+      let methodBodyStartLine: number | null = null;
+
+      if (methodText && hasLineSpan) {
+        // Use the method-local slice to avoid scanning the full file per method,
+        // but still locate the real body brace (docblocks can contain `{...}`).
+        const localSpan = extractPhpMethodBodySpan(methodText, methodName);
+        if (localSpan) {
+          methodSpan = localSpan;
+          methodBodyStartLine = (startLine + 1) + countNewlinesUpTo(methodText, localSpan.openBraceIdx + 1);
+        }
+      }
+
+      if (!methodSpan) {
+        const fullSpan = extractPhpMethodBodySpan(file.content, methodName);
+        if (!fullSpan) continue;
+        methodSpan = fullSpan;
+        methodBodyStartLine = 1 + countNewlinesUpTo(file.content, fullSpan.openBraceIdx + 1);
+      }
+
       const methodBody = methodSpan.body;
 
       const boundaries = extractLaravelValidationBoundariesFromMethodBody(methodBody);
@@ -1305,7 +1489,7 @@ export const processContractShapes = async (
       if (boundaries.length === 0 && inlineValidation.keys.length === 0) continue;
 
       const fileNodeId = generateId('File', filePath);
-      const methodBodyStartLine = 1 + countNewlinesUpTo(file.content, methodSpan.openBraceIdx + 1);
+      if (methodBodyStartLine === null) continue;
 
       for (const boundary of boundaries) {
         const boundaryLine = methodBodyStartLine + countNewlinesUpTo(methodBody, boundary.index);
@@ -1383,17 +1567,14 @@ export const processContractShapes = async (
       }
     }
   }
+  shapeTimings.controller_validation = Math.round(performance.now() - controllerValidationStartMs);
 
   onProgress?.('Extracting resource serialization shapes...', 40);
 
+  const resourcesStartMs = performance.now();
   let serializedFieldEdges = 0;
-  const resourceCandidates = files.filter(file => {
-    const filePath = normalizePath(file.path);
-    return filePath.includes('/Http/Resources/') && /\bfunction\s+toArray\s*\(/.test(file.content);
-  });
-
   for (const file of resourceCandidates) {
-    const classNode = classByFile.get(normalizePath(file.path));
+    const classNode = classByFile.get(file.path);
     if (!classNode) continue;
 
     const toArrayBody = extractPhpMethodBody(file.content, 'toArray');
@@ -1415,9 +1596,12 @@ export const processContractShapes = async (
       serializedFieldEdges++;
     }
   }
+  shapeTimings.resources = Math.round(performance.now() - resourcesStartMs);
 
+  const deriveColumnsStartMs = performance.now();
   let derivesFromColumnEdges = 0;
   if (dbColumnNodeMap.size > 0 && fieldNodeMap.size > 0) {
+    const tableHintsByShapeId = new Map<string, string[]>();
     for (const field of fieldNodeMap.values()) {
       const columnKey = normalizeFieldKeyForColumn(field.fieldName);
       if (!columnKey) continue;
@@ -1433,11 +1617,15 @@ export const processContractShapes = async (
         selected = candidates[0];
       } else {
         const shape = shapeNodeMap.get(field.shapeId);
-        const sourceClass = shape ? classById.get(shape.sourceNodeId) : null;
-        const tableHints = extractShapeTableHints(
-          String(sourceClass?.properties?.name || ''),
-          String(shape?.sourceFilePath || ''),
-        );
+        let tableHints = tableHintsByShapeId.get(field.shapeId);
+        if (!tableHints) {
+          const sourceClass = shape ? classById.get(shape.sourceNodeId) : null;
+          tableHints = extractShapeTableHints(
+            String(sourceClass?.properties?.name || ''),
+            String(shape?.sourceFilePath || ''),
+          );
+          tableHintsByShapeId.set(field.shapeId, tableHints);
+        }
         const narrowed = candidates.filter(candidate => tableHints.includes(candidate.tableName));
         if (narrowed.length === 1) {
           selected = narrowed[0];
@@ -1458,9 +1646,11 @@ export const processContractShapes = async (
       derivesFromColumnEdges++;
     }
   }
+  shapeTimings.derive_columns = Math.round(performance.now() - deriveColumnsStartMs);
 
   onProgress?.('Extracting React Query cache keys...', 70);
 
+  const cacheKeysStartMs = performance.now();
   for (const node of knowledgeGraph.nodes) {
     if (node.label !== 'Function') continue;
     const functionName = String(node.properties.name || '').trim();
@@ -1477,15 +1667,15 @@ export const processContractShapes = async (
       reason: 'react-query:key-factory',
     });
   }
+  shapeTimings.cache_keys = Math.round(performance.now() - cacheKeysStartMs);
 
+  const invalidationsStartMs = performance.now();
   let invalidationEdges = 0;
-  const invalidateCandidates = files.filter(file => JS_TS_FILE_RE.test(file.path) && file.content.includes('invalidateQueries('));
-
   for (const file of invalidateCandidates) {
     const expressions = extractInvalidateQueryKeyExpressions(file.content);
     if (expressions.length === 0) continue;
 
-    const fileNodeId = generateId('File', normalizePath(file.path));
+    const fileNodeId = generateId('File', file.path);
     for (const expression of expressions) {
       const factoryName = extractKeyFactoryName(expression);
       if (factoryName) {
@@ -1526,9 +1716,11 @@ export const processContractShapes = async (
       invalidationEdges++;
     }
   }
+  shapeTimings.invalidations = Math.round(performance.now() - invalidationsStartMs);
 
   onProgress?.('Materializing static test closure...', 85);
 
+  const testClosureStartMs = performance.now();
   const shapeReferences: ShapeTestReference[] = Array.from(shapeNodeMap.values())
     .map(shape => {
       const sourceClass = classById.get(shape.sourceNodeId);
@@ -1542,29 +1734,27 @@ export const processContractShapes = async (
       };
     })
     .filter(reference => reference.className || reference.sourceFileBase);
+  const shapeIndex = indexShapeReferences(shapeReferences);
 
   let testsShapeEdges = 0;
-  const testCandidates = files.filter(file => TEST_FILE_RE.test(normalizePath(file.path)));
-
   for (const file of testCandidates) {
-    const normalizedPath = normalizePath(file.path);
-    const shapeMatches = collectShapeMatchesForTestFile(normalizedPath, file.content, shapeReferences);
+    const shapeMatches = collectShapeMatchesForTestFile(file.path, file.content, shapeIndex);
     if (shapeMatches.length === 0) continue;
 
-    const extractedTests = extractStaticTestCases(normalizedPath, file.content);
-    const fileNodeId = generateId('File', normalizedPath);
+    const extractedTests = extractStaticTestCases(file.path, file.content);
+    const fileNodeId = generateId('File', file.path);
 
     for (const extracted of extractedTests) {
       const testCaseId = generateId(
         'TestCase',
-        `${normalizedPath}:${sanitizeIdSegment(extracted.name)}:${extracted.startLine}`
+        `${file.path}:${sanitizeIdSegment(extracted.name)}:${extracted.startLine}`
       );
 
       if (!testCaseNodeMap.has(testCaseId)) {
         testCaseNodeMap.set(testCaseId, {
           id: testCaseId,
           name: buildLabel('Test Case', extracted.name),
-          filePath: normalizedPath,
+          filePath: file.path,
           startLine: extracted.startLine,
           endLine: extracted.endLine,
         });
@@ -1591,6 +1781,14 @@ export const processContractShapes = async (
         testsShapeEdges++;
       }
     }
+  }
+  shapeTimings.test_closure = Math.round(performance.now() - testClosureStartMs);
+
+  const shapesTotalMs = performance.now() - shapesStartMs;
+  if (shapesTotalMs >= 1500) {
+    console.log(
+      `  Shape timings: candidates=${shapeTimings.candidates}ms, migrations=${shapeTimings.migrations}ms, form_requests=${shapeTimings.form_requests}ms, controller_validation=${shapeTimings.controller_validation}ms, resources=${shapeTimings.resources}ms, derive_columns=${shapeTimings.derive_columns}ms, cache_keys=${shapeTimings.cache_keys}ms, invalidations=${shapeTimings.invalidations}ms, test_closure=${shapeTimings.test_closure}ms (total=${Math.round(shapesTotalMs)}ms)`
+    );
   }
 
   onProgress?.('Contract shape extraction complete.', 100);

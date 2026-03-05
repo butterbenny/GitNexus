@@ -13,6 +13,10 @@ type ResolvedFunction = {
   reason: string;
 };
 
+const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const QUERY_KEYS_HINT_RE = /queryKeys/i;
+const REACT_QUERY_HOOK_RE = /\buse(Query|InfiniteQuery|SuspenseQuery|SuspenseInfiniteQuery)\b/;
+
 const REACT_QUERY_HOOK_NAMES = new Set([
   'useQuery',
   'useInfiniteQuery',
@@ -20,23 +24,60 @@ const REACT_QUERY_HOOK_NAMES = new Set([
   'useSuspenseInfiniteQuery',
 ]);
 
-const looksLikeIdentifier = (value: string): boolean => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value);
+const looksLikeIdentifier = (value: string): boolean => IDENTIFIER_RE.test(value);
 
 const isReactQueryRelevantFile = (filePath: string, content: string): boolean => {
   const lang = getLanguageFromFilename(filePath);
   if (lang !== SupportedLanguages.TypeScript && lang !== SupportedLanguages.JavaScript) return false;
-  return /\buse(Query|InfiniteQuery|SuspenseQuery|SuspenseInfiniteQuery)\b/.test(content);
+  return REACT_QUERY_HOOK_RE.test(content);
 };
 
 const isQueryKeysDefinitionFile = (filePath: string, content: string): boolean => {
   const lang = getLanguageFromFilename(filePath);
   if (lang !== SupportedLanguages.TypeScript && lang !== SupportedLanguages.JavaScript) return false;
-  return /queryKeys/i.test(content);
+  return QUERY_KEYS_HINT_RE.test(content);
 };
 
 const walkNodes = (node: any, fn: (n: any) => void) => {
-  fn(node);
-  for (let i = 0; i < node.namedChildCount; i++) walkNodes(node.namedChild(i), fn);
+  const stack = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    fn(current);
+    for (let i = current.namedChildCount - 1; i >= 0; i--) {
+      stack.push(current.namedChild(i));
+    }
+  }
+};
+
+const getDescendantsOfType = (node: any, type: string): any[] => {
+  if (!node) return [];
+
+  const descendantsOfType = node.descendantsOfType;
+  if (typeof descendantsOfType === 'function') {
+    try {
+      return descendantsOfType.call(node, type) ?? [];
+    } catch {
+      // fall through to manual walk
+    }
+  }
+
+  const nodes: any[] = [];
+  walkNodes(node, (n: any) => {
+    if (n?.type === type) nodes.push(n);
+  });
+  return nodes;
+};
+
+const getDescendantsOfTypeIncludingSelf = (node: any, type: string): any[] => {
+  const nodes = getDescendantsOfType(node, type);
+  if (!node || node.type !== type) return nodes;
+
+  const first = nodes[0];
+  if (!first || first.startIndex !== node.startIndex || first.endIndex !== node.endIndex) {
+    nodes.unshift(node);
+  }
+  return nodes;
 };
 
 const getCallCalleeName = (callNode: any): string | null => {
@@ -184,16 +225,15 @@ const indexReactQueryKeyFactories = async (
       }
     }
 
-    walkNodes(tree.rootNode, (node: any) => {
-      if (node.type !== 'variable_declarator') return;
-
+    const declarators = getDescendantsOfType(tree.rootNode, 'variable_declarator');
+    for (const node of declarators) {
       const nameNode = node.childForFieldName?.('name');
       const objectName = nameNode?.type === 'identifier' ? String(nameNode.text || '') : '';
-      if (!objectName || !looksLikeIdentifier(objectName) || !/queryKeys/i.test(objectName)) return;
+      if (!objectName || !looksLikeIdentifier(objectName) || !QUERY_KEYS_HINT_RE.test(objectName)) continue;
 
       const valueNodeRaw = node.childForFieldName?.('value');
       const valueNode = peelExpression(valueNodeRaw);
-      if (!valueNode || valueNode.type !== 'object') return;
+      if (!valueNode || valueNode.type !== 'object') continue;
 
       for (const child of valueNode.namedChildren || []) {
         if (child.type !== 'pair') continue;
@@ -234,7 +274,7 @@ const indexReactQueryKeyFactories = async (
 
         symbolTable.add(file.path, symbolName, nodeId, 'Function');
       }
-    });
+    }
   }
 };
 
@@ -243,15 +283,15 @@ const extractQueryKeyFactoryCallNames = (node: any): string[] => {
   const root = peelExpression(node);
   if (!root) return [];
 
-  walkNodes(root, (n: any) => {
-    if (n.type !== 'call_expression') return;
+  const callNodes = getDescendantsOfTypeIncludingSelf(root, 'call_expression');
+  for (const n of callNodes) {
     const fnNode = n.childForFieldName?.('function');
-    if (!fnNode) return;
+    if (!fnNode) continue;
 
     if (fnNode.type === 'identifier') {
       const text = fnNode.text ?? '';
       if (text) names.add(text);
-      return;
+      continue;
     }
 
     if (fnNode.type === 'member_expression') {
@@ -259,10 +299,10 @@ const extractQueryKeyFactoryCallNames = (node: any): string[] => {
       const propNode = fnNode.childForFieldName?.('property');
       const objName = objNode?.type === 'identifier' ? String(objNode.text || '') : '';
       const propName = propNode?.type === 'property_identifier' ? String(propNode.text || '') : '';
-      if (!objName || !propName) return;
+      if (!objName || !propName) continue;
       names.add(`${objName}.${propName}`);
     }
-  });
+  }
 
   return Array.from(names);
 };
@@ -314,11 +354,7 @@ export const processReactQueryKeyWiring = async (
       }
     }
 
-    const callNodes: any[] = [];
-    walkNodes(tree.rootNode, (node: any) => {
-      if (node.type === 'call_expression') callNodes.push(node);
-    });
-
+    const callNodes = getDescendantsOfType(tree.rootNode, 'call_expression');
     for (const callNode of callNodes) {
       const callee = getCallCalleeName(callNode);
       if (!callee || !REACT_QUERY_HOOK_NAMES.has(callee)) continue;

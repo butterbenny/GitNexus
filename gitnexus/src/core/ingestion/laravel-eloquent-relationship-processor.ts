@@ -134,8 +134,34 @@ const isLaravelModelFile = (filePath: string, content: string): boolean => {
 };
 
 const walkNodes = (node: any, fn: (n: any) => void) => {
-  fn(node);
-  for (let i = 0; i < node.namedChildCount; i++) walkNodes(node.namedChild(i), fn);
+  const stack = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    fn(current);
+    for (let i = current.namedChildCount - 1; i >= 0; i--) {
+      stack.push(current.namedChild(i));
+    }
+  }
+};
+
+const getDescendantsOfType = (node: any, type: string): any[] => {
+  if (!node) return [];
+
+  const descendantsOfType = node.descendantsOfType;
+  if (typeof descendantsOfType === 'function') {
+    try {
+      return descendantsOfType.call(node, type) ?? [];
+    } catch {
+      // fall through to manual walk
+    }
+  }
+
+  const nodes: any[] = [];
+  walkNodes(node, (n: any) => {
+    if (n?.type === type) nodes.push(n);
+  });
+  return nodes;
 };
 
 const peelExpression = (node: any): any | null => {
@@ -277,11 +303,7 @@ export const processLaravelEloquentRelationships = async (
 
     const namespaceParts = parsePhpNamespaceParts(file.content);
 
-    const methods: any[] = [];
-    walkNodes(tree.rootNode, (node: any) => {
-      if (node.type === 'method_declaration') methods.push(node);
-    });
-
+    const methods = getDescendantsOfType(tree.rootNode, 'method_declaration');
     for (const method of methods) {
       const methodName = getMethodName(method);
       if (!methodName) continue;
@@ -292,15 +314,14 @@ export const processLaravelEloquentRelationships = async (
       const bodyNode = getMethodBodyNode(method);
       if (!bodyNode) continue;
 
-      walkNodes(bodyNode, (node: any) => {
-        if (node.type !== 'return_statement') return;
-
+      const returnStatements = getDescendantsOfType(bodyNode, 'return_statement');
+      for (const node of returnStatements) {
         const exprNode = node.namedChildren?.at(0);
         const relationship = findRelationshipCallInChain(exprNode);
-        if (!relationship) return;
+        if (!relationship) continue;
 
         const roles = ELOQUENT_RELATIONSHIPS.get(relationship.methodKey);
-        if (!roles || roles.length === 0) return;
+        if (!roles || roles.length === 0) continue;
 
         const argsNode = relationship.call.childForFieldName?.('arguments');
         const args = getCallArgumentExpressions(argsNode);
@@ -330,7 +351,7 @@ export const processLaravelEloquentRelationships = async (
           });
           edgesAdded++;
         }
-      });
+      }
     }
   }
 

@@ -11,7 +11,6 @@
  */
 
 import { KnowledgeGraph, GraphNode } from '../graph/types.js';
-import { enrichRelationshipMetadata, serializeWitnessPathIds } from '../graph/edge-metadata.js';
 import { NODE_TABLES, NodeTableName } from './schema.js';
 
 // ============================================================================
@@ -22,13 +21,18 @@ import { NODE_TABLES, NodeTableName } from './schema.js';
  * Sanitize string to ensure valid UTF-8 and safe CSV content for KuzuDB
  * Removes or replaces invalid characters that would break CSV parsing.
  * 
- * Critical: KuzuDB's native CSV parser on Windows can misinterpret \r\n
- * inside quoted fields. We normalize all line endings to \n only.
+ * Critical:
+ * - Normalize Windows line endings (\r\n) and legacy Mac (\r) to \n.
+ * - Then replace raw newlines with a Unicode line separator (U+2028) so every
+ *   CSV record remains single-line. This unlocks PARALLEL=true COPY for node
+ *   tables while preserving "visual line breaks" for downstream display/search.
  */
 const sanitizeUTF8 = (str: string): string => {
+  const LINE_SEPARATOR = '\u2028';
   return str
     .replace(/\r\n/g, '\n')          // Normalize Windows line endings first
     .replace(/\r/g, '\n')            // Normalize remaining \r to \n
+    .replace(/\n/g, LINE_SEPARATOR)  // Remove raw newlines (parallel COPY cannot handle quoted newlines)
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // Remove control chars except \t \n
     .replace(/[\uD800-\uDFFF]/g, '') // Remove surrogate pairs (invalid standalone)
     .replace(/[\uFFFE\uFFFF]/g, ''); // Remove BOM and special chars
@@ -137,7 +141,6 @@ const extractContent = (
 
 export interface CSVData {
   nodes: Map<NodeTableName, string>;
-  relCSV: string;  // Single relation CSV with relation metadata columns
 }
 
 // ============================================================================
@@ -531,47 +534,6 @@ const generateValueNodeCSV = (nodes: GraphNode[]): string => {
   return rows.join('\n');
 };
 
-/**
- * Generate CSV for the single CodeRelation table
- * Headers: from,to,type,confidence,reason,step,certaintyTier,provenanceFamily,absenceSemantics,witnessPathIds
- * 
- * confidence: 0-1 score for CALLS edges (how sure are we about the target?)
- * reason: 'import-resolved' | 'same-file' | 'fuzzy-global' (or empty for non-CALLS)
- */
-const generateRelationCSV = (graph: KnowledgeGraph): string => {
-  const headers = [
-    'from',
-    'to',
-    'type',
-    'confidence',
-    'reason',
-    'step',
-    'certaintyTier',
-    'provenanceFamily',
-    'absenceSemantics',
-    'witnessPathIds',
-  ];
-  const rows: string[] = [headers.join(',')];
-  
-  for (const rel of graph.relationships) {
-    const metadata = enrichRelationshipMetadata(rel);
-    rows.push([
-      escapeCSVField(metadata.sourceId),
-      escapeCSVField(metadata.targetId),
-      escapeCSVField(metadata.type),
-      escapeCSVNumber(metadata.confidence, 1.0),
-      escapeCSVField(metadata.reason),
-      escapeCSVNumber(metadata.step, 0),
-      escapeCSVField(metadata.certaintyTier || ''),
-      escapeCSVField(metadata.provenanceFamily || ''),
-      escapeCSVField(metadata.absenceSemantics || ''),
-      escapeCSVField(serializeWitnessPathIds(metadata.witnessPathIds)),
-    ].join(','));
-  }
-  
-  return rows.join('\n');
-};
-
 // ============================================================================
 // MAIN CSV GENERATION FUNCTION
 // ============================================================================
@@ -647,8 +609,5 @@ export const generateAllCSVs = (
     nodeCSVs.set(tableName, generateCodeElementBaseCSV(nodes, tableName, fileContents, fileLinesCache));
   }
   
-  // Generate single relation CSV
-  const relCSV = generateRelationCSV(graph);
-  
-  return { nodes: nodeCSVs, relCSV };
+  return { nodes: nodeCSVs };
 };

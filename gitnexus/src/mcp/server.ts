@@ -27,6 +27,7 @@ import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { safeStringify } from '../lib/safe-json.js';
 import { checkStaleness } from './staleness.js';
+import { installMcpStdioGuard } from './core/stdio-guard.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -103,6 +104,10 @@ function getStalenessBanner(backend: LocalBackend, toolName: string, args: Recor
 }
 
 export async function startMCPServer(backend: LocalBackend): Promise<void> {
+  // Protect stdio transport even when server is started outside the CLI `mcp` command.
+  // Any non-protocol stdout output can corrupt framing and surface as "Transport closed".
+  installMcpStdioGuard();
+
   const server = new Server(
     {
       name: 'gitnexus',
@@ -116,6 +121,56 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
       },
     }
   );
+
+  let shuttingDown = false;
+  const safeShutdown = async (exitCode: number): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      await backend.disconnect();
+    } catch {}
+    try {
+      await server.close();
+    } catch {}
+    try {
+      process.exit(exitCode);
+    } catch {}
+  };
+
+  const logFatal = (kind: string, error: unknown): void => {
+    const lastTool = (globalThis as any).__gitnexus_last_tool;
+    const err = error instanceof Error ? error : new Error(String(error || 'Unknown error'));
+
+    try {
+      process.stderr.write(`\nGitNexus MCP fatal: ${kind}\n`);
+      if (lastTool) {
+        process.stderr.write(`Last tool: ${safeStringify(lastTool, 2)}\n`);
+      }
+      process.stderr.write(`Error: ${err.message}\n`);
+      if (err.stack) process.stderr.write(`${err.stack}\n`);
+    } catch {}
+  };
+
+  process.on('uncaughtException', (error) => {
+    logFatal('uncaughtException', error);
+    void safeShutdown(1);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    logFatal('unhandledRejection', reason);
+    void safeShutdown(1);
+  });
+
+  // Avoid hard crashes when the client closes the stdio pipe while we're writing.
+  // This often surfaces as EPIPE and can show up to clients as "Transport closed".
+  process.stdout.on('error', (error: any) => {
+    if (error?.code === 'EPIPE') {
+      void safeShutdown(0);
+      return;
+    }
+    logFatal('stdout error', error);
+    void safeShutdown(1);
+  });
 
   // Handle list resources request
   server.setRequestHandler(ListResourcesRequestSchema, async () => {
@@ -184,6 +239,12 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   // Handle tool calls — append next-step hints to guide agent workflow
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
+
+    (globalThis as any).__gitnexus_last_tool = {
+      name,
+      repo: typeof (args as any)?.repo === 'string' ? (args as any).repo : undefined,
+      startedAt: new Date().toISOString(),
+    };
 
     try {
       const result = await backend.callTool(name, args);
@@ -294,14 +355,10 @@ Follow these steps:
 
   // Handle graceful shutdown
   process.on('SIGINT', async () => {
-    await backend.disconnect();
-    await server.close();
-    process.exit(0);
+    await safeShutdown(0);
   });
 
   process.on('SIGTERM', async () => {
-    await backend.disconnect();
-    await server.close();
-    process.exit(0);
+    await safeShutdown(0);
   });
 }

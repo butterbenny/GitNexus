@@ -29,6 +29,18 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
   const maxSize = poolSize ?? Math.max(1, os.cpus().length - 1);
   const workers: Worker[] = [];
 
+  const getItemWeight = (item: unknown): number => {
+    // Heuristic: many workloads (like parse-worker) send `{ path, content }` objects.
+    // Weight by content length to reduce chunk skew from a few very large files.
+    if (item && typeof item === 'object') {
+      const maybeContent = (item as { content?: unknown }).content;
+      if (typeof maybeContent === 'string' && maybeContent.length > 0) {
+        return maybeContent.length;
+      }
+    }
+    return 1;
+  };
+
   const ensureWorkers = (count: number): void => {
     while (workers.length < count) {
       workers.push(new Worker(workerUrl));
@@ -43,12 +55,40 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
     const size = Math.min(maxSize, items.length);
     ensureWorkers(size);
 
-    // Split items into one chunk per worker
-    const chunkSize = Math.ceil(items.length / size);
-    const chunks: TInput[][] = [];
-    for (let i = 0; i < items.length; i += chunkSize) {
-      chunks.push(items.slice(i, i + chunkSize));
+    // Split into one chunk per worker, but weight-balance by item size when possible.
+    // This keeps us at one postMessage() per worker (minimize clone overhead),
+    // while reducing the common skew from a handful of huge source files.
+    const entries = items.map((item, index) => ({
+      index,
+      item,
+      weight: getItemWeight(item),
+    }));
+    entries.sort((left, right) => {
+      if (right.weight !== left.weight) return right.weight - left.weight;
+      return left.index - right.index;
+    });
+
+    const buckets: Array<{ totalWeight: number; items: Array<{ index: number; item: TInput }> }> = Array.from(
+      { length: size },
+      () => ({ totalWeight: 0, items: [] }),
+    );
+
+    for (const entry of entries) {
+      let best = 0;
+      for (let i = 1; i < buckets.length; i++) {
+        if (buckets[i].totalWeight < buckets[best].totalWeight) best = i;
+      }
+      buckets[best].items.push({ index: entry.index, item: entry.item });
+      buckets[best].totalWeight += entry.weight;
     }
+
+    const chunks: TInput[][] = buckets
+      .map(bucket =>
+        bucket.items
+          .sort((a, b) => a.index - b.index) // preserve original order within each chunk
+          .map(entry => entry.item)
+      )
+      .filter(chunk => chunk.length > 0);
 
     // Track per-worker progress for cumulative reporting
     const workerProgress = new Array(chunks.length).fill(0);

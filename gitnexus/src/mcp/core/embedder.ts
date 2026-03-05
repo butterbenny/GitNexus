@@ -6,6 +6,9 @@
  */
 
 import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/transformers';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 // Model config
 const MODEL_ID = 'Snowflake/snowflake-arctic-embed-xs';
@@ -33,6 +36,23 @@ export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
   initPromise = (async () => {
     try {
       env.allowLocalModels = false;
+      const preferredCacheDir =
+        process.env.GITNEXUS_EMBEDDING_CACHE_DIR
+        || process.env.GITNEXUS_CACHE_DIR
+        || path.join(os.homedir(), '.cache', 'gitnexus');
+      const fallbackCacheDir = path.join(os.tmpdir(), 'gitnexus');
+
+      try {
+        await fs.mkdir(preferredCacheDir, { recursive: true });
+        env.cacheDir = preferredCacheDir;
+      } catch {
+        try {
+          await fs.mkdir(fallbackCacheDir, { recursive: true });
+          env.cacheDir = fallbackCacheDir;
+        } catch {
+          // Best effort: cache dir creation failure should not block embedding.
+        }
+      }
       
       console.error('GitNexus: Loading embedding model (first search may take a moment)...');
 
@@ -91,12 +111,20 @@ export const isEmbedderReady = (): boolean => embedderInstance !== null;
 export const embedQuery = async (query: string): Promise<number[]> => {
   const embedder = await initEmbedder();
   
-  const result = await embedder(query, {
-    pooling: 'mean',
-    normalize: true,
-  });
+  // Silence stdout during embedding — some native stacks may emit init logs on
+  // first inference, which can corrupt MCP stdio protocol.
+  const origWrite = process.stdout.write;
+  process.stdout.write = (() => true) as any;
+  try {
+    const result = await embedder(query, {
+      pooling: 'mean',
+      normalize: true,
+    });
   
-  return Array.from(result.data as ArrayLike<number>);
+    return Array.from(result.data as ArrayLike<number>);
+  } finally {
+    process.stdout.write = origWrite;
+  }
 };
 
 /**

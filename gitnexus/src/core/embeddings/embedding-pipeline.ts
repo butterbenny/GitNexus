@@ -762,7 +762,12 @@ export const runEmbeddingPipeline = async (
       await copyWriter.flushAndClose();
       const normalizedPath = normalizeCopyPath(copyWriter.filePath);
       const parallelCopyRaw = String(process.env.GITNEXUS_EMBEDDING_COPY_PARALLEL ?? '0').trim().toLowerCase();
-      const parallelCopy = parallelCopyRaw === '1' || parallelCopyRaw === 'true' || parallelCopyRaw === 'yes' || parallelCopyRaw === 'on';
+      const parallelCopy = !(
+        parallelCopyRaw === '0'
+        || parallelCopyRaw === 'false'
+        || parallelCopyRaw === 'no'
+        || parallelCopyRaw === 'off'
+      );
       await executeQuery(
         `COPY CodeEmbedding(nodeId, embedding) FROM "${normalizedPath}" (HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=${parallelCopy ? 'true' : 'false'}, auto_detect=false)`,
       );

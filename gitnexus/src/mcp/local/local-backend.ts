@@ -2247,7 +2247,15 @@ export class LocalBackend {
       byMemberNodeId: Map<string, Set<string>>;
       byAnchorNodeId: Map<string, Set<string>>;
       inScope: SliceSummary[];
+      stats: {
+        slices_loaded: number;
+        members_loaded: number;
+        slices_truncated: boolean;
+        members_truncated: boolean;
+      };
     }> => {
+      const SLICE_ROW_LIMIT = 4000;
+      const SLICE_MEMBER_ROW_LIMIT = 20000;
       let sliceRows: any[] = [];
       let memberRows: any[] = [];
       try {
@@ -2262,7 +2270,7 @@ export class LocalBackend {
                  s.closureSlots AS closureSlots,
                  s.closedSlots AS closedSlots,
                  s.closureScore AS closureScore
-          LIMIT 4000
+          LIMIT ${SLICE_ROW_LIMIT}
         `);
       } catch {
         return {
@@ -2270,6 +2278,12 @@ export class LocalBackend {
           byMemberNodeId: new Map(),
           byAnchorNodeId: new Map(),
           inScope: [],
+          stats: {
+            slices_loaded: 0,
+            members_loaded: 0,
+            slices_truncated: false,
+            members_truncated: false,
+          },
         };
       }
 
@@ -2282,11 +2296,18 @@ export class LocalBackend {
                  n.name AS nodeName,
                  n.filePath AS filePath,
                  r.reason AS reason
-          LIMIT 20000
+          LIMIT ${SLICE_MEMBER_ROW_LIMIT}
         `);
       } catch {
         memberRows = [];
       }
+
+      const stats = {
+        slices_loaded: sliceRows.length,
+        members_loaded: memberRows.length,
+        slices_truncated: sliceRows.length >= SLICE_ROW_LIMIT,
+        members_truncated: memberRows.length >= SLICE_MEMBER_ROW_LIMIT,
+      };
 
       const byId = new Map<string, SliceSummary>();
       for (const row of sliceRows) {
@@ -2371,18 +2392,29 @@ export class LocalBackend {
         return slice.memberFiles.some(filePath => filePathTouchesPrefixes(filePath, pathPrefixes));
       });
 
-      return { byId, byMemberNodeId, byAnchorNodeId, inScope };
+      return { byId, byMemberNodeId, byAnchorNodeId, inScope, stats };
     };
 
-    const loadCochangeMap = async (): Promise<Map<string, Map<string, number>>> => {
+    const loadCochangeMapForSourceFiles = async (sourceFilePaths: string[]): Promise<Map<string, Map<string, number>>> => {
+      const escapeCypherValue = (value: string): string => String(value || '').replace(/'/g, "''");
+      const sourceFiles = Array.from(new Set(
+        sourceFilePaths
+          .map(filePath => normalizeRepoRelativePath(String(filePath || '')))
+          .filter(Boolean),
+      ));
+      if (sourceFiles.length === 0) return new Map();
+
+      const sourceFilesCypher = `[${sourceFiles.map(filePath => `'${escapeCypherValue(filePath)}'`).join(', ')}]`;
+
       let rows: any[] = [];
       try {
         rows = await executeQuery(repo.id, `
           MATCH (a:File)-[r:CodeRelation {type: 'CO_CHANGES_WITH'}]->(b:File)
+          WHERE a.filePath IN ${sourceFilesCypher}
           RETURN a.filePath AS sourceFilePath,
                  b.filePath AS targetFilePath,
                  r.confidence AS confidence
-          LIMIT 30000
+          ORDER BY a.filePath ASC, r.confidence DESC, b.filePath ASC
         `);
       } catch {
         return new Map();
@@ -2646,12 +2678,11 @@ export class LocalBackend {
       return `Slice:${slice.sliceType} → Slots:${slotPart} → Roles:${rolePart}`;
     };
 
-    const buildSlicePrecedents = (
+    const buildSlicePrecedents = async (
       anchorSliceScores: Map<string, number>,
       scopedSlices: SliceSummary[],
       byId: Map<string, SliceSummary>,
-      cochangeMap: Map<string, Map<string, number>>,
-    ): any[] => {
+    ): Promise<any[]> => {
       if (anchorSliceScores.size === 0) return [];
 
       const queryTokenSet = toTokenSet(queryText);
@@ -2678,6 +2709,8 @@ export class LocalBackend {
 
         const anchorTypePeers = (scopedByType.get(anchor.sliceType) || []).filter(candidate => candidate.id !== anchor.id);
         if (anchorTypePeers.length === 0) continue;
+
+        const cochangeMap = await loadCochangeMapForSourceFiles(anchor.memberFiles);
 
         const anchorSlotSet = new Set(anchor.closedSlots);
         const anchorRoleSet = new Set(anchor.roles);
@@ -2938,9 +2971,14 @@ export class LocalBackend {
 
     const anchorProcessIds: string[] = [];
     const anchorHops: any[] = [];
-    const { byId: slicesById, byMemberNodeId: slicesByMemberNodeId, byAnchorNodeId: slicesByAnchorNodeId, inScope: inScopeSlices } = await loadSliceSummaries();
+    const {
+      byId: slicesById,
+      byMemberNodeId: slicesByMemberNodeId,
+      byAnchorNodeId: slicesByAnchorNodeId,
+      inScope: inScopeSlices,
+      stats: sliceSummaryStats,
+    } = await loadSliceSummaries();
     const inScopeSliceIds = new Set(inScopeSlices.map(slice => slice.id));
-    const cochangeMap = await loadCochangeMap();
 
     const anchorSliceScores = new Map<string, number>();
     const addAnchorSlice = (sliceId: string, score: number): void => {
@@ -3297,7 +3335,7 @@ export class LocalBackend {
       }
     }
 
-    const slicePrecedents = buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById, cochangeMap);
+    const slicePrecedents = await buildSlicePrecedents(anchorSliceScores, inScopeSlices, slicesById);
     const hopPrecedents = await buildHopPrecedents(inScopeHops);
 
     for (const pid of uniqueAnchorProcessIds.slice(0, limit)) {
@@ -3328,11 +3366,18 @@ export class LocalBackend {
       anchor_slices: anchorSliceScores.size,
       scoped_slices: inScopeSlices.length,
       slice_precedents: slicePrecedents.length,
+      slice_summary_stats: sliceSummaryStats,
       ...(patternCatalogDiagnostics ? { pattern_catalog: patternCatalogDiagnostics } : {}),
       ...(antiPatternDiagnostics ? { anti_patterns: antiPatternDiagnostics } : {}),
       ...(overrideGuidanceDiagnostics ? { override_guidance: overrideGuidanceDiagnostics } : {}),
       path_prefixes: pathPrefixes,
     };
+    if (sliceSummaryStats.slices_truncated || sliceSummaryStats.members_truncated) {
+      diagnostics.warnings = [
+        'FeatureSlice summary queries hit row limits; slice/precedent ranking may be incomplete.',
+        `slices_loaded=${sliceSummaryStats.slices_loaded} (limit), members_loaded=${sliceSummaryStats.members_loaded} (limit)`,
+      ];
+    }
     if (precedents.length === 0) {
       diagnostics.note = 'No precedents found (no anchor slices, deterministic HTTP hops, or process matches found for this query).';
       diagnostics.suggestions = [
@@ -5297,7 +5342,27 @@ export class LocalBackend {
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
       const safeLimit = clampInteger(limit, 50, 1, 500);
-      const queryVec = await embedQuery(query);
+      const queryVec = await new Promise<number[] | null>((resolve, reject) => {
+        const timeoutMs = 2_000;
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        if (timer && typeof timer === 'object' && 'unref' in timer) {
+          (timer as NodeJS.Timeout).unref();
+        }
+
+        embedQuery(query)
+          .then(vec => {
+            clearTimeout(timer);
+            resolve(vec);
+          })
+          .catch(err => {
+            clearTimeout(timer);
+            reject(err);
+          });
+      });
+
+      // If the embedder is cold (first-time download/load), don't block the tool call.
+      // We fall back to lexical retrieval; subsequent calls will pick up semantic.
+      if (!queryVec) return [];
       const dims = getEmbeddingDims();
       const queryVecStr = `[${queryVec.join(',')}]`;
       
@@ -6546,6 +6611,7 @@ export class LocalBackend {
       MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
       WHERE c.label = '${escaped}' OR c.heuristicLabel = '${escaped}'
       RETURN DISTINCT n.name AS name, labels(n) AS type, n.filePath AS filePath
+      ORDER BY n.filePath ASC, n.name ASC
       LIMIT 30
     `);
 

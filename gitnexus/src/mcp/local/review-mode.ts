@@ -2294,7 +2294,13 @@ export async function runReviewMode(
       return computeConvergenceSignal(convergenceMatrix, reviewTokenSet, itemTokenSet, [normalizedFilePath]);
     };
 
-    const suggestedTestsAgg = new Map<string, { score: number; reasons: string[] }>();
+    type SuggestedTestAgg = {
+      score: number;
+      reasons: string[];
+      signal_kinds: string[];
+      max_edge_confidence: number;
+    };
+    const suggestedTestsAgg = new Map<string, SuggestedTestAgg>();
     const isRunnableSuggestedTestFile = (filePath: string): boolean => {
       const fp = normalizePath(String(filePath || '')).toLowerCase();
       if (!fp) return false;
@@ -2310,7 +2316,7 @@ export async function runReviewMode(
       filePath: string,
       scoreDelta: number,
       reason: string,
-      options: { allowOutOfScope?: boolean } = {},
+      options: { allowOutOfScope?: boolean; signal_kind?: string; edge_confidence?: number } = {},
     ): void => {
       const fp = normalizePath(filePath);
       if (!fp) return;
@@ -2318,13 +2324,24 @@ export async function runReviewMode(
       if (!isRunnableSuggestedTestFile(fp)) return;
       if (!options.allowOutOfScope && pathPrefixes.length > 0 && !isInScope(fp)) return;
 
-      const current = suggestedTestsAgg.get(fp) || { score: 0, reasons: [] as string[] };
+      const current = suggestedTestsAgg.get(fp) || { score: 0, reasons: [] as string[], signal_kinds: [] as string[], max_edge_confidence: 0 };
       const safeScore = Number.isFinite(scoreDelta) ? Math.max(0.05, scoreDelta) : 0.05;
       const reasonText = String(reason || '').trim();
       const reasons = reasonText && !current.reasons.includes(reasonText)
         ? [...current.reasons, reasonText].slice(0, 5)
         : current.reasons;
-      suggestedTestsAgg.set(fp, { score: current.score + safeScore, reasons });
+
+      const signalKind = String(options.signal_kind || '').trim();
+      const signal_kinds = signalKind && !current.signal_kinds.includes(signalKind)
+        ? [...current.signal_kinds, signalKind].slice(0, 6)
+        : current.signal_kinds;
+      const edgeConfidence = toFiniteNumber(options.edge_confidence, 0);
+      suggestedTestsAgg.set(fp, {
+        score: current.score + safeScore,
+        reasons,
+        signal_kinds,
+        max_edge_confidence: Math.max(current.max_edge_confidence || 0, edgeConfidence),
+      });
     };
 
     const callersByTargetId = new Map<string, any[]>();
@@ -2435,21 +2452,25 @@ export async function runReviewMode(
         return String(left?.filePath || '').localeCompare(String(right?.filePath || ''));
       });
 
+      const testCallers = callersRaw
+        .filter((c: any) => isTestFilePath(String(c?.filePath || '')))
+        .slice(0, limitTests);
+
       const callers = (pathPrefixes.length > 0
         ? callersRaw.filter((c: any) => isInScope(String(c?.filePath || '')))
         : callersRaw)
         .slice(0, callerFetchLimit);
-
-      const testCallers = callers
-        .filter((c: any) => isTestFilePath(String(c?.filePath || '')))
-        .slice(0, limitTests);
 
       for (const t of testCallers) {
         const fp = String(t?.filePath || '').trim();
         if (!fp) continue;
         const confidence = normalizeConfidence(t?.edge?.confidence, 1.0);
         const reason = sym?.name ? `${sym.name} direct caller` : 'direct caller of changed symbol';
-        addSuggestedTest(fp, 3 + Math.max(0, confidence), reason);
+        addSuggestedTest(fp, 3 + Math.max(0, confidence), reason, {
+          allowOutOfScope: true,
+          signal_kind: 'direct_caller',
+          edge_confidence: confidence,
+        });
       }
 
       symbolReviews.push({
@@ -2459,6 +2480,9 @@ export async function runReviewMode(
       });
     }
     const symbols: any[] = symbolReviews.slice(0, limitSymbols);
+
+    const SUGGESTED_TEST_MIN_FALLBACK_EDGE_CONFIDENCE = 0.75;
+    let suggestedTestsSuppressedLowEdgeConfidence = 0;
 
     // Fallback tier 1: include lower-confidence test callers if no direct high-confidence hits were found.
     if (suggestedTestsAgg.size === 0 && changedSymbolIds.length > 0) {
@@ -2478,10 +2502,17 @@ export async function runReviewMode(
           if (!isTestFilePath(callerFilePath)) continue;
           const targetName = String(row.targetName || row[1] || '').trim();
           const confidence = normalizeConfidence(row.confidence ?? row[2], 0);
+          if (confidence < SUGGESTED_TEST_MIN_FALLBACK_EDGE_CONFIDENCE) {
+            suggestedTestsSuppressedLowEdgeConfidence += 1;
+            continue;
+          }
           const reason = targetName
             ? `${targetName} low-confidence caller (confidence ${confidence.toFixed(2)})`
             : `low-confidence caller (confidence ${confidence.toFixed(2)})`;
-          addSuggestedTest(callerFilePath, 1 + Math.max(0, confidence), reason);
+          addSuggestedTest(callerFilePath, 1 + Math.max(0, confidence), reason, {
+            signal_kind: 'low_confidence_caller',
+            edge_confidence: confidence,
+          });
         }
       } catch {
         // best-effort fallback
@@ -2502,14 +2533,21 @@ export async function runReviewMode(
         for (const row of importRows) {
           const callerFilePath = String(row.callerFilePath || row[0] || '').trim();
           if (!callerFilePath) continue;
-          if (pathPrefixes.length > 0 && !isInScope(callerFilePath)) continue;
           if (!isTestFilePath(callerFilePath)) continue;
           const targetFilePath = normalizePath(String(row.targetFilePath || row[1] || ''));
           const confidence = normalizeConfidence(row.confidence ?? row[2], 0);
+          if (confidence < SUGGESTED_TEST_MIN_FALLBACK_EDGE_CONFIDENCE) {
+            suggestedTestsSuppressedLowEdgeConfidence += 1;
+            continue;
+          }
           const reason = targetFilePath
             ? `imports changed file ${targetFilePath}`
             : 'imports changed file';
-          addSuggestedTest(callerFilePath, 0.8 + Math.max(0, confidence), reason);
+          addSuggestedTest(callerFilePath, 0.8 + Math.max(0, confidence), reason, {
+            allowOutOfScope: true,
+            signal_kind: 'imports_changed_file',
+            edge_confidence: confidence,
+          });
         }
       } catch {
         // best-effort fallback
@@ -2601,7 +2639,10 @@ export async function runReviewMode(
             .slice(0, limitTests);
 
           for (const hit of ranked) {
-            addSuggestedTest(hit.filePath, hit.score, hit.reason, { allowOutOfScope: true });
+            addSuggestedTest(hit.filePath, hit.score, hit.reason, {
+              allowOutOfScope: true,
+              signal_kind: 'filename_token_proximity',
+            });
           }
         } catch {
           // best-effort fallback
@@ -2693,7 +2734,10 @@ export async function runReviewMode(
             .slice(0, limitTests);
 
           for (const hit of ranked) {
-            addSuggestedTest(hit.filePath, hit.score, hit.reason, { allowOutOfScope: true });
+            addSuggestedTest(hit.filePath, hit.score, hit.reason, {
+              allowOutOfScope: true,
+              signal_kind: 'scope_token_proximity',
+            });
           }
         } catch {
           // best-effort fallback
@@ -2764,7 +2808,7 @@ export async function runReviewMode(
         .filter(filePath => !changedFileObjs.find(item => normalizePath(String(item?.filePath || '')) === filePath && item.status === 'Deleted')),
     );
     for (const changedTestFilePath of Array.from(changedTestFileSet)) {
-      addSuggestedTest(changedTestFilePath, 1.05, 'changed test file in diff');
+      addSuggestedTest(changedTestFilePath, 1.05, 'changed test file in diff', { signal_kind: 'changed_test_file' });
     }
 
     const suggestedTestsEntries = Array.from(suggestedTestsAgg.entries())
@@ -2868,12 +2912,8 @@ export async function runReviewMode(
       const filePath = normalizePath(String(entry?.filePath || ''));
       if (!filePath) return false;
       if (changedTestFileSet.has(filePath)) return true;
-      const reasons = Array.isArray(entry?.meta?.reasons) ? entry.meta.reasons : [];
-      return reasons.some((reason: string) => {
-        const text = String(reason || '').toLowerCase();
-        return text.includes('direct caller')
-          || text.includes('imports changed file');
-      });
+      const signalKinds = Array.isArray(entry?.meta?.signal_kinds) ? entry.meta.signal_kinds : [];
+      return signalKinds.includes('direct_caller') || signalKinds.includes('imports_changed_file');
     };
 
     let suggestedTestsSuppressedLowRank = 0;
@@ -2903,7 +2943,12 @@ export async function runReviewMode(
       return true;
     });
 
-    const suggested_tests = suggestedTestsFiltered
+    let suggestedTestsSuppressedNoConfident = false;
+    if (suggestedTestsFiltered.length > 0 && !suggestedTestsFiltered.some(entry => isHighSignalSuggestedTest(entry))) {
+      suggestedTestsSuppressedNoConfident = true;
+    }
+
+    const suggested_tests = (suggestedTestsSuppressedNoConfident ? [] : suggestedTestsFiltered)
       .slice(0, limitTests)
       .map(entry => {
         const filePath = entry.filePath;
@@ -2965,6 +3010,9 @@ export async function runReviewMode(
       regression_failure_candidates: regressionCandidateTests,
       preexisting_failure_candidates: baselineWatchlistTests,
       notes: [
+        ...(suggestedTestsSuppressedNoConfident
+          ? ['No high-signal suggested tests found; low-signal fallbacks were suppressed (returning 0 suggested_tests).']
+          : []),
         'Candidates are ranked from diff-coupling (changed test files and change-adjacent caller/import signals).',
         'Treat failures in regression_failure_candidates as likely regressions first; baseline candidates are likely pre-existing unless proven otherwise.',
       ],
@@ -3636,7 +3684,6 @@ export async function runReviewMode(
               g.anchorId AS anchorId,
               g.missingSlots AS missingSlots,
               g.evidence AS evidence
-            LIMIT 100
           `);
         } else {
           gapRows = await executeQuery(repo.id, `
@@ -3653,7 +3700,6 @@ export async function runReviewMode(
               g.anchorId AS anchorId,
               g.missingSlots AS missingSlots,
               g.evidence AS evidence
-            LIMIT 100
           `);
         }
 
@@ -3667,6 +3713,40 @@ export async function runReviewMode(
           missingSlots: Array.isArray(row.missingSlots) ? row.missingSlots.map((item: any) => String(item || '')).filter(Boolean) : [],
           evidence: Array.isArray(row.evidence) ? row.evidence.map((item: any) => String(item || '')).filter(Boolean) : [],
         })).filter(gap => gap.id && gap.gapType);
+
+        const gapSeverityRank = (severity: string): number => {
+          const value = String(severity || '').toLowerCase();
+          if (value === 'high') return 3;
+          if (value === 'medium') return 2;
+          if (value === 'low') return 1;
+          return 0;
+        };
+        const gapTierRank = (tier: string): number => {
+          const value = String(tier || '').toLowerCase();
+          if (value === 'deterministic_missing') return 3;
+          if (value === 'pattern_missing') return 2;
+          if (value === 'heuristic_suspicion') return 1;
+          return 0;
+        };
+
+        gaps.sort((left, right) => {
+          const severityDelta = gapSeverityRank(right.severity) - gapSeverityRank(left.severity);
+          if (severityDelta !== 0) return severityDelta;
+
+          const tierDelta = gapTierRank(right.absenceTier) - gapTierRank(left.absenceTier);
+          if (tierDelta !== 0) return tierDelta;
+
+          const gapTypeDelta = left.gapType.localeCompare(right.gapType);
+          if (gapTypeDelta !== 0) return gapTypeDelta;
+
+          const sliceDelta = left.sliceId.localeCompare(right.sliceId);
+          if (sliceDelta !== 0) return sliceDelta;
+
+          const anchorDelta = left.anchorId.localeCompare(right.anchorId);
+          if (anchorDelta !== 0) return anchorDelta;
+
+          return left.id.localeCompare(right.id);
+        });
 
         semantic_diffs.summary.touched_edges = families.reduce((sum, family) => sum + family.edge_count, 0);
         semantic_diffs.summary.family_count = families.length;
@@ -3822,36 +3902,202 @@ export async function runReviewMode(
       ui_contracts.push(...uiResults);
     }
 
-    const ROUTE_FILE_PATH_RE = /(^|\/)routes\/[^/]+\.php$/i;
-    const route_targets: any[] = [];
-    const routeFilesWithEndpointSurfaces = new Set<string>();
-    const routeFiles = changedFileObjs
-      .map(file => normalizePath(file.filePath))
+	    const ROUTE_FILE_PATH_RE = /(^|\/)routes\/[^/]+\.php$/i;
+	    const route_targets: any[] = [];
+	    const routeFilesWithEndpointSurfaces = new Set<string>();
+	    const routeFiles = changedFileObjs
+	      .map(file => normalizePath(file.filePath))
       .filter(filePath => !!filePath)
       .filter(filePath => isInScope(filePath))
       .filter((filePath, index, arr) => arr.indexOf(filePath) === index)
-      .filter(filePath => !changedFileObjs.find(file => normalizePath(file.filePath) === filePath && file.status === 'Deleted'))
-      .filter(filePath => ROUTE_FILE_PATH_RE.test(filePath));
+	      .filter(filePath => !changedFileObjs.find(file => normalizePath(file.filePath) === filePath && file.status === 'Deleted'))
+	      .filter(filePath => ROUTE_FILE_PATH_RE.test(filePath));
 
-    if (routeFiles.length > 0) {
-      const routeFilesCypher = `[${routeFiles.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
-      let routeRows: any[] = [];
-      try {
-        routeRows = await executeQuery(repo.id, `
-          MATCH (f)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
-          WHERE f.filePath IN ${routeFilesCypher}
-            AND r.reason CONTAINS 'laravel-route'
-          OPTIONAL MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
-          RETURN f.filePath AS routeFilePath,
-                 m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
-                 c.name AS className,
-                 r.confidence AS confidence, r.reason AS reason
-          ORDER BY f.filePath ASC, r.confidence DESC
-          LIMIT ${Math.max(100, Math.min(10000, routeFiles.length * 120))}
-        `);
-      } catch {
-        routeRows = [];
-      }
+	    type RouteDiffHints = {
+	      controllers: Set<string>;
+	      methods: Set<string>;
+	      pairs: Set<string>;
+	      raw_lines: string[];
+	    };
+
+	    const normalizePhpClassBase = (raw: string): string => {
+	      const trimmed = String(raw || '').trim().replace(/^\\+/, '');
+	      if (!trimmed) return '';
+	      const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+	      return String(parts.at(-1) || trimmed).trim();
+	    };
+
+	    const extractRouteDiffHintsFromPatch = (patchText: string, routeFileSet: Set<string>): Map<string, RouteDiffHints> => {
+	      const result = new Map<string, RouteDiffHints>();
+	      let currentFile = '';
+
+	      const ensureEntry = (filePath: string): RouteDiffHints => {
+	        const existing = result.get(filePath);
+	        if (existing) return existing;
+	        const entry: RouteDiffHints = {
+	          controllers: new Set<string>(),
+	          methods: new Set<string>(),
+	          pairs: new Set<string>(),
+	          raw_lines: [],
+	        };
+	        result.set(filePath, entry);
+	        return entry;
+	      };
+
+	      const addHint = (filePath: string, controllerRaw: string, methodRaw?: string, rawLine?: string) => {
+	        const controller = normalizePhpClassBase(controllerRaw);
+	        const method = methodRaw ? String(methodRaw).trim() : '';
+	        if (!controller) return;
+	        const entry = ensureEntry(filePath);
+	        entry.controllers.add(controller);
+	        if (method) {
+	          entry.methods.add(method);
+	          entry.pairs.add(`${controller}::${method}`);
+	        }
+	        if (rawLine) entry.raw_lines.push(rawLine);
+	      };
+
+	      const ARRAY_ACTION_RE = /\[\s*([A-Za-z0-9_\\]+)::class\s*,\s*['"]([^'"]+)['"]\s*\]/g;
+	      const STRING_ACTION_RE = /['"]([A-Za-z0-9_\\]+Controller)@([^'"]+)['"]/g;
+	      const CLASS_CONST_RE = /\b(\\?[A-Za-z0-9_\\]+Controller)::class\b/g;
+
+	      for (const line of String(patchText || '').split('\n')) {
+	        const newFileLine = /^\+\+\+\s+(.+)$/.exec(line);
+	        if (newFileLine) {
+	          const newPath = String(newFileLine[1] || '').trim();
+	          if (newPath === '/dev/null') {
+	            currentFile = '';
+	          } else if (newPath.startsWith('b/')) {
+	            currentFile = normalizePath(newPath.slice(2));
+	          } else {
+	            currentFile = '';
+	          }
+	          continue;
+	        }
+
+	        if (!currentFile || !routeFileSet.has(currentFile)) continue;
+	        if (!line.startsWith('+') || line.startsWith('+++')) continue;
+	        const rawLine = line.slice(1);
+	        const content = rawLine.trim();
+	        if (!content) continue;
+
+	        for (const match of content.matchAll(ARRAY_ACTION_RE)) {
+	          addHint(currentFile, match[1] || '', match[2] || '', rawLine);
+	        }
+
+	        for (const match of content.matchAll(STRING_ACTION_RE)) {
+	          addHint(currentFile, match[1] || '', match[2] || '', rawLine);
+	        }
+
+	        // Best-effort class hints (invokable or controller-group wiring). Do not assume a method.
+	        const classMatches = Array.from(content.matchAll(CLASS_CONST_RE));
+	        for (const match of classMatches) {
+	          addHint(currentFile, match[1] || '', undefined, rawLine);
+	        }
+	      }
+
+	      // Cleanup: if we only captured raw_lines but no tokens, drop the entry.
+	      for (const [filePath, entry] of Array.from(result.entries())) {
+	        if (entry.controllers.size === 0 && entry.methods.size === 0 && entry.pairs.size === 0) {
+	          result.delete(filePath);
+	        }
+	      }
+
+	      return result;
+	    };
+
+	    const routeDiffHints = routeFiles.length > 0
+	      ? extractRouteDiffHintsFromPatch(patch, new Set(routeFiles))
+	      : new Map<string, RouteDiffHints>();
+
+		    if (routeFiles.length > 0) {
+		      const routeFilesCypher = `[${routeFiles.map(filePath => `'${filePath.replace(/'/g, "''")}'`).join(', ')}]`;
+		      const escapeCypherString = (value: string): string => String(value || '').replace(/'/g, "''");
+
+		      const routeFilesWithoutHints = routeFiles.filter(filePath => !routeDiffHints.has(filePath));
+		      const routeFilesWithoutHintsCypher = routeFilesWithoutHints.length > 0
+		        ? `[${routeFilesWithoutHints.map(filePath => `'${escapeCypherString(filePath)}'`).join(', ')}]`
+		        : '';
+
+		      const toCypherStringList = (values: string[]): string => {
+		        const items = values
+		          .map(v => String(v || '').trim())
+		          .filter(Boolean)
+		          .map(v => `'${escapeCypherString(v)}'`);
+		        return `[${items.join(', ')}]`;
+		      };
+
+		      const loadHintedRouteRows = async (routeFilePath: string, diffHints: RouteDiffHints): Promise<any[]> => {
+		        const pairs = Array.from(diffHints.pairs)
+		          .map(pair => String(pair || '').trim())
+		          .filter(Boolean)
+		          .map(pair => {
+		            const idx = pair.indexOf('::');
+		            if (idx < 0) return null;
+		            return {
+		              controller: pair.slice(0, idx).trim(),
+		              method: pair.slice(idx + 2).trim(),
+		            };
+		          })
+		          .filter((item: any): item is { controller: string; method: string } => !!item?.controller && !!item?.method);
+
+		        const controllers = Array.from(diffHints.controllers).map(v => String(v || '').trim()).filter(Boolean);
+		        const methods = Array.from(diffHints.methods).map(v => String(v || '').trim()).filter(Boolean);
+
+		        let predicate = '';
+		        if (pairs.length > 0) {
+		          predicate = pairs
+		            .map(pair => `(c.name = '${escapeCypherString(pair.controller)}' AND m.name = '${escapeCypherString(pair.method)}')`)
+		            .join(' OR ');
+		        } else if (controllers.length > 0 && methods.length > 0) {
+		          predicate = `c.name IN ${toCypherStringList(controllers)} AND m.name IN ${toCypherStringList(methods)}`;
+		        } else if (controllers.length > 0) {
+		          predicate = `c.name IN ${toCypherStringList(controllers)}`;
+		        } else if (methods.length > 0) {
+		          predicate = `m.name IN ${toCypherStringList(methods)}`;
+		        }
+
+		        if (!predicate) return [];
+
+		        const escapedFilePath = escapeCypherString(routeFilePath);
+		        try {
+		          return await executeQuery(repo.id, `
+		            MATCH (f)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
+		            WHERE f.filePath = '${escapedFilePath}'
+		              AND r.reason CONTAINS 'laravel-route'
+		            MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
+		            WHERE ${predicate}
+		            RETURN f.filePath AS routeFilePath,
+		                   m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
+		                   c.name AS className,
+		                   r.confidence AS confidence, r.reason AS reason
+		            ORDER BY r.confidence DESC
+		            LIMIT ${Math.max(80, Math.min(2000, Math.max(controllers.length, 1) * Math.max(methods.length, 1) * 20))}
+		          `);
+		        } catch {
+		          return [];
+		        }
+		      };
+
+		      let routeRows: any[] = [];
+		      if (routeFilesWithoutHints.length > 0 && routeFilesWithoutHintsCypher) {
+		        try {
+		          routeRows = await executeQuery(repo.id, `
+		            MATCH (f)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
+		            WHERE f.filePath IN ${routeFilesWithoutHintsCypher}
+		              AND r.reason CONTAINS 'laravel-route'
+		            OPTIONAL MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
+		            RETURN f.filePath AS routeFilePath,
+		                   m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
+		                   c.name AS className,
+		                   r.confidence AS confidence, r.reason AS reason
+		            ORDER BY f.filePath ASC, r.confidence DESC
+		            LIMIT ${Math.max(100, Math.min(10000, routeFilesWithoutHints.length * 120))}
+		          `);
+		        } catch {
+		          routeRows = [];
+		        }
+		      }
 
       try {
         const routeEndpointRows = await executeQuery(repo.id, `
@@ -3878,15 +4124,65 @@ export async function runReviewMode(
         rowsByRouteFile.set(routeFilePath, list);
       }
 
-      for (const routeFilePath of routeFiles) {
-        const rows = rowsByRouteFile.get(routeFilePath) || [];
-        const targetByKey = new Map<string, any>();
-        for (const row of rows) {
-          const uid = String(row.uid || row[1] || '').trim();
-          const reason = String(row.reason ?? row[7] ?? '').trim();
-          if (!uid || !reason) continue;
-          const key = `${uid}|${reason}`;
-          const currentConfidence = normalizeConfidence(row.confidence ?? row[6], 1.0);
+		      for (const routeFilePath of routeFiles) {
+		        const diffHints = routeDiffHints.get(routeFilePath) || null;
+		        let rows = rowsByRouteFile.get(routeFilePath) || [];
+		        if (diffHints) {
+		          rows = await loadHintedRouteRows(routeFilePath, diffHints);
+		          if (rows.length === 0 && diffHints.methods.size > 0) {
+		            // Fallback: method-name-only match (diff method names are often specific enough).
+		            const methods = Array.from(diffHints.methods).map(v => String(v || '').trim()).filter(Boolean);
+		            const escapedFilePath = escapeCypherString(routeFilePath);
+		            try {
+		              rows = await executeQuery(repo.id, `
+		                MATCH (f)-[r:CodeRelation {type: 'CALLS'}]->(m:Method)
+		                WHERE f.filePath = '${escapedFilePath}'
+		                  AND r.reason CONTAINS 'laravel-route'
+		                  AND m.name IN ${toCypherStringList(methods)}
+		                OPTIONAL MATCH (m)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Class)
+		                RETURN f.filePath AS routeFilePath,
+		                       m.id AS uid, m.name AS name, m.filePath AS filePath, m.startLine AS startLine,
+		                       c.name AS className,
+		                       r.confidence AS confidence, r.reason AS reason
+		                ORDER BY r.confidence DESC
+		                LIMIT ${Math.max(80, Math.min(2000, methods.length * 80))}
+		              `);
+		            } catch {
+		              rows = [];
+		            }
+		          }
+		        }
+
+		        const hintPairs = diffHints ? new Set(Array.from(diffHints.pairs)) : new Set<string>();
+		        const hintControllers = diffHints ? new Set(Array.from(diffHints.controllers)) : new Set<string>();
+		        const hintMethods = diffHints ? new Set(Array.from(diffHints.methods)) : new Set<string>();
+	        const hasHints = hintPairs.size > 0 || hintControllers.size > 0 || hintMethods.size > 0;
+
+	        const scopedRows = hasHints
+	          ? rows.filter((row: any) => {
+	            const base = String(row.name || row[2] || '').trim();
+	            const cls = String(row.className || row[5] || '').trim();
+	            if (!base && !cls) return false;
+
+	            if (cls && base && hintPairs.has(`${cls}::${base}`)) return true;
+	            if (cls && hintControllers.has(cls)) {
+	              if (hintMethods.size === 0) return true;
+	              if (base && hintMethods.has(base)) return true;
+	              return false;
+	            }
+	            if (!cls && base && hintMethods.has(base) && hintControllers.size === 0) return true;
+	            if (cls && base && hintMethods.has(base) && hintControllers.size === 0) return true;
+	            return false;
+	          })
+	          : rows;
+
+	        const targetByKey = new Map<string, any>();
+	        for (const row of scopedRows) {
+	          const uid = String(row.uid || row[1] || '').trim();
+	          const reason = String(row.reason ?? row[7] ?? '').trim();
+	          if (!uid || !reason) continue;
+	          const key = `${uid}|${reason}`;
+	          const currentConfidence = normalizeConfidence(row.confidence ?? row[6], 1.0);
           const existing = targetByKey.get(key);
           if (existing && toFiniteNumber(existing?.edge?.confidence, 0) >= currentConfidence) continue;
           targetByKey.set(key, {
@@ -3907,14 +4203,23 @@ export async function runReviewMode(
             },
           });
         }
-        const targets = Array.from(targetByKey.values());
+	        const targets = Array.from(targetByKey.values());
 
-        route_targets.push({
-          route_file: routeFilePath,
-          targets,
-        });
-      }
-    }
+	        route_targets.push({
+	          route_file: routeFilePath,
+	          targets,
+	          ...(diffHints
+	            ? {
+	              diff_hints: {
+	                controllers: Array.from(diffHints.controllers),
+	                methods: Array.from(diffHints.methods),
+	                pairs: Array.from(diffHints.pairs),
+	              },
+	            }
+	            : {}),
+	        });
+	      }
+	    }
 
     const normalizeObservedRoute = (value: string): string => {
       let raw = String(value || '').trim();
@@ -6209,44 +6514,105 @@ export async function runReviewMode(
       }
     }
 
-    for (const route of route_targets) {
-      const routeFile = String(route?.route_file || '').trim();
-      if (!routeFile) continue;
-      const firstTarget = Array.isArray(route?.targets) ? route.targets[0] : null;
-      if (!firstTarget) {
-        const hasEndpointSurface = routeFilesWithEndpointSurfaces.has(routeFile);
-        addReviewFinding(reviewFindings, {
-          code: hasEndpointSurface ? 'route-target-unresolved' : 'route-target-missing',
-          severity: hasEndpointSurface ? 'medium' : 'high',
-          summary: hasEndpointSurface
-            ? `Route file changed with endpoint surfaces but without resolved controller target: ${routeFile}.`
-            : `Route file changed without resolved controller target: ${routeFile}.`,
-          reason: hasEndpointSurface
-            ? 'route-file-endpoint-surface-without-controller-wiring'
-            : 'route-file-without-controller-wiring',
-          confidence: hasEndpointSurface ? 0.82 : 0.92,
-          evidence: { filePath: routeFile },
-        }, findingDedupe);
-        continue;
-      }
+	    for (const route of route_targets) {
+	      const routeFile = String(route?.route_file || '').trim();
+	      if (!routeFile) continue;
+	      const targets = Array.isArray(route?.targets) ? route.targets : [];
+	      const diffHints = route?.diff_hints && typeof route.diff_hints === 'object' ? route.diff_hints : null;
+	      const diffHintPairs = Array.isArray(diffHints?.pairs) ? diffHints.pairs.map((p: any) => String(p || '').trim()).filter(Boolean) : [];
+	      const diffHintControllers = Array.isArray(diffHints?.controllers)
+	        ? diffHints.controllers.map((c: any) => String(c || '').trim()).filter(Boolean)
+	        : [];
 
-      addReviewFinding(reviewFindings, {
-        code: 'route-target-changed',
-        severity: 'low',
-        summary: `Route change maps to ${String(firstTarget?.controller?.name || '<unknown>')}.`,
-        reason: String(firstTarget?.edge?.reason || 'laravel-route-edge'),
-        confidence: normalizeConfidence(firstTarget?.edge?.confidence, 0.9),
-        evidence: {
-          filePath: routeFile,
-          symbol: {
-            uid: String(firstTarget?.controller?.uid || '').trim() || undefined,
-            name: String(firstTarget?.controller?.name || '').trim() || undefined,
-            kind: String(firstTarget?.controller?.kind || '').trim() || undefined,
-            startLine: toOptionalLineNumber(firstTarget?.controller?.startLine),
-          },
-        },
-      }, findingDedupe);
-    }
+	      if (diffHints && (diffHintPairs.length > 0 || diffHintControllers.length > 0)) {
+	        if (targets.length === 0) {
+	          addReviewFinding(reviewFindings, {
+	            code: 'route-target-diff-unresolved',
+	            severity: 'medium',
+	            summary: `Route file changed but diff targets could not be resolved: ${routeFile}.`,
+	            reason: 'route-diff-targets-unresolved',
+	            confidence: 0.85,
+	            evidence: { filePath: routeFile },
+	          }, findingDedupe);
+	          continue;
+	        }
+
+	        const uniqueNames: string[] = [];
+	        for (const target of targets) {
+	          const name = String(target?.controller?.name || '').trim();
+	          if (!name) continue;
+	          if (uniqueNames.includes(name)) continue;
+	          uniqueNames.push(name);
+	          if (uniqueNames.length >= 6) break;
+	        }
+
+	        const best = targets[0] || null;
+	        const bestReason = String(best?.edge?.reason || 'laravel-route-edge').trim() || 'laravel-route-edge';
+	        const confidence = Math.max(
+	          ...targets.map((t: any) => normalizeConfidence(t?.edge?.confidence, 0)),
+	          normalizeConfidence(best?.edge?.confidence, 0.9),
+	        );
+	        const summaryTarget = uniqueNames.length > 0 ? uniqueNames.join(', ') : String(best?.controller?.name || '<unknown>');
+
+	        addReviewFinding(reviewFindings, {
+	          code: 'route-target-changed',
+	          severity: 'low',
+	          summary: uniqueNames.length > 1
+	            ? `Route changes map to ${summaryTarget}.`
+	            : `Route change maps to ${summaryTarget}.`,
+	          reason: bestReason,
+	          confidence,
+	          evidence: {
+	            filePath: routeFile,
+	            symbol: best?.controller
+	              ? {
+	                uid: String(best.controller.uid || '').trim() || undefined,
+	                name: String(best.controller.name || '').trim() || undefined,
+	                kind: String(best.controller.kind || '').trim() || undefined,
+	                startLine: toOptionalLineNumber(best.controller.startLine),
+	              }
+	              : undefined,
+	          },
+	        }, findingDedupe);
+	        continue;
+	      }
+
+	      if (targets.length === 0) {
+	        const hasEndpointSurface = routeFilesWithEndpointSurfaces.has(routeFile);
+	        addReviewFinding(reviewFindings, {
+	          code: hasEndpointSurface ? 'route-target-unresolved' : 'route-target-missing',
+	          severity: hasEndpointSurface ? 'medium' : 'high',
+	          summary: hasEndpointSurface
+	            ? `Route file changed with endpoint surfaces but without resolved controller target: ${routeFile}.`
+	            : `Route file changed without resolved controller target: ${routeFile}.`,
+	          reason: hasEndpointSurface
+	            ? 'route-file-endpoint-surface-without-controller-wiring'
+	            : 'route-file-without-controller-wiring',
+	          confidence: hasEndpointSurface ? 0.82 : 0.92,
+	          evidence: { filePath: routeFile },
+	        }, findingDedupe);
+	        continue;
+	      }
+
+	      const inferredNames: string[] = [];
+	      for (const target of targets) {
+	        const name = String(target?.controller?.name || '').trim();
+	        if (!name) continue;
+	        if (inferredNames.includes(name)) continue;
+	        inferredNames.push(name);
+	        if (inferredNames.length >= 3) break;
+	      }
+	      const inferredSummary = inferredNames.length > 0 ? inferredNames.join(', ') : '<unknown>';
+
+	      addReviewFinding(reviewFindings, {
+	        code: 'route-file-changed',
+	        severity: 'low',
+	        summary: `Route file changed: ${routeFile}. Possible targets include ${inferredSummary}.`,
+	        reason: 'route-file-changed',
+	        confidence: 0.72,
+	        evidence: { filePath: routeFile },
+	      }, findingDedupe);
+	    }
 
     const authFamily = (Array.isArray(semantic_diffs?.families) ? semantic_diffs.families : [])
       .find((family: any) => String(family?.family || '') === 'auth');
@@ -6687,11 +7053,16 @@ export async function runReviewMode(
     if (
       analysisSymbols.length > 0
       && suggested_tests.length === 0
-      && (suggestedTestsSuppressedLowRank > 0 || suggestedTestsSuppressedLowAffinity > 0)
+      && (
+        suggestedTestsSuppressedNoConfident
+        || suggestedTestsSuppressedLowRank > 0
+        || suggestedTestsSuppressedLowAffinity > 0
+        || suggestedTestsSuppressedLowEdgeConfidence > 0
+      )
       && Array.isArray((coverage_banner as any)?.warnings)
     ) {
       coverage_banner.warnings.push(
-        `Suggested tests suppressed due to low confidence/affinity (min_rank=${SUGGESTED_TEST_MIN_RANK}, min_affinity=${SUGGESTED_TEST_MIN_AFFINITY}); treat as "no confident suggested tests".`,
+        `Suggested tests suppressed; no confident candidates met (min_rank=${SUGGESTED_TEST_MIN_RANK}, min_affinity=${SUGGESTED_TEST_MIN_AFFINITY}, min_fallback_edge_confidence=${SUGGESTED_TEST_MIN_FALLBACK_EDGE_CONFIDENCE}); treat as "no confident suggested tests".`,
       );
     }
     if (
@@ -6712,10 +7083,13 @@ export async function runReviewMode(
       suggested_tests_scope_fallback: scopeFallbackSuggestedTests,
       suggested_tests_candidates: suggestedTestsRanked.length,
       suggested_tests_candidates_post_filter: suggestedTestsFiltered.length,
+      suggested_tests_suppressed_no_confident: suggestedTestsSuppressedNoConfident,
       suggested_tests_suppressed_low_rank: suggestedTestsSuppressedLowRank,
       suggested_tests_suppressed_low_affinity: suggestedTestsSuppressedLowAffinity,
+      suggested_tests_suppressed_low_edge_confidence: suggestedTestsSuppressedLowEdgeConfidence,
       suggested_tests_min_rank: SUGGESTED_TEST_MIN_RANK,
       suggested_tests_min_affinity: SUGGESTED_TEST_MIN_AFFINITY,
+      suggested_tests_min_fallback_edge_confidence: SUGGESTED_TEST_MIN_FALLBACK_EDGE_CONFIDENCE,
       findings_boosted: findingsBoosted,
       findings_reordered: findingsReordered,
       low_signal_fallback_findings: lowSignalFallbackFindingCount,

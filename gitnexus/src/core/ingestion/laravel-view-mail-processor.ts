@@ -309,6 +309,26 @@ export const processLaravelViewsAndMail = async (
     const lang = getLanguageFromFilename(file.path);
     if (lang !== SupportedLanguages.PHP) continue;
 
+    // Fast prefilter: avoid running expensive tree-sitter queries on PHP files that
+    // clearly cannot contain view/mail patterns (false positives are fine; false negatives are not).
+    const content = file.content;
+    const maybeHasViewCall = (
+      content.includes('view')
+      || content.includes('View::')
+      || content.includes('Mail::send')
+      || content.includes('->view')
+      || content.includes('->markdown')
+      || content.includes('->text')
+    );
+    const maybeHasMailableSend = (
+      content.includes('Mail::')
+      || content.includes('->send(')
+      || content.includes('->queue(')
+      || content.includes('->later(')
+      || content.includes('->sendNow(')
+    );
+    if (!maybeHasViewCall && !maybeHasMailableSend) continue;
+
     let tree = astCache.get(file.path);
     if (!tree) {
       try {
@@ -322,8 +342,12 @@ export const processLaravelViewsAndMail = async (
     let viewMatches: any[] = [];
     let mailMatches: any[] = [];
     try {
-      viewMatches = viewQuery.matches(tree.rootNode);
-      mailMatches = mailQuery.matches(tree.rootNode);
+      if (maybeHasViewCall) {
+        viewMatches = viewQuery.matches(tree.rootNode);
+      }
+      if (maybeHasMailableSend) {
+        mailMatches = mailQuery.matches(tree.rootNode);
+      }
     } catch {
       continue;
     }

@@ -418,6 +418,8 @@ export const processLaravelJobDispatch = async (
   await loadLanguage(SupportedLanguages.PHP);
 
   let edgesAdded = 0;
+  const resolvedClassCache = new Map<string, ResolvedClass | null>();
+  const handlerMethodCache = new Map<string, string | null>();
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -454,14 +456,24 @@ export const processLaravelJobDispatch = async (
     } | null> = [];
 
     for (const call of dispatchCalls) {
-      const resolved = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap, phpUseAliases);
+      const resolvedCacheKey = `${file.path}::${call.classRef}`;
+      let resolved = resolvedClassCache.get(resolvedCacheKey);
+      if (resolved === undefined) {
+        resolved = resolvePhpClassToFile(call.classRef, file.path, symbolTable, importMap, phpUseAliases) || null;
+        resolvedClassCache.set(resolvedCacheKey, resolved);
+      }
       if (!resolved) {
         callResults.push(null);
         continue;
       }
 
-      const handlerMethodId = symbolTable.lookupExact(resolved.filePath, 'handle')
-        || symbolTable.lookupExact(resolved.filePath, '__invoke');
+      let handlerMethodId = handlerMethodCache.get(resolved.filePath);
+      if (handlerMethodId === undefined) {
+        handlerMethodId = symbolTable.lookupExact(resolved.filePath, 'handle')
+          || symbolTable.lookupExact(resolved.filePath, '__invoke')
+          || null;
+        handlerMethodCache.set(resolved.filePath, handlerMethodId);
+      }
       if (!handlerMethodId) {
         callResults.push(null);
         continue;

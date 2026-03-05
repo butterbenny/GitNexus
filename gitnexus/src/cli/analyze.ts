@@ -7,7 +7,7 @@
 import path from 'path';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, deleteNodesForFiles, deleteOutgoingRelationshipsForFiles, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu } from '../core/kuzu/kuzu-adapter.js';
+import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, deleteNodesForFiles, deleteOutgoingRelationshipsForFiles, getUpstreamFilePathsForFiles, loadSymbolDefinitionsFromKuzu, resetKuzuSchemaForReload } from '../core/kuzu/kuzu-adapter.js';
 import { runEmbeddingPipeline, type EmbeddingPipelineSummary } from '../core/embeddings/embedding-pipeline.js';
 import { disposeEmbedder } from '../core/embeddings/embedder.js';
 import { resolveDefaultEmbeddingCachePath, resolveGlobalEmbeddingCachePath } from '../core/embeddings/embedding-cache.js';
@@ -423,16 +423,38 @@ export const analyzeCommand = async (
   const incrementalDerivedMode = incrementalDerivedNormalized.mode;
   const incrementalDerivedFastDeprecated = incrementalDerivedNormalized.usedFast;
 
-  const ensureFtsIndexes = async (): Promise<string> => {
+  const ensureFtsIndexes = async (): Promise<{
+    totalSeconds: string;
+    perIndexMs: Array<{ table: string; index: string; ms: number }>;
+  }> => {
     const t0Fts = Date.now();
+    const perIndexMs: Array<{ table: string; index: string; ms: number }> = [];
     try {
       for (const target of FTS_INDEX_TARGETS) {
+        const t0Index = Date.now();
         await createFTSIndex(target.table, target.index, target.properties);
+        perIndexMs.push({
+          table: target.table,
+          index: target.index,
+          ms: Date.now() - t0Index,
+        });
       }
     } catch {
       // Best effort: FTS is optional for successful indexing.
     }
-    return ((Date.now() - t0Fts) / 1000).toFixed(1);
+    const totalMs = Date.now() - t0Fts;
+    const totalSeconds = (totalMs / 1000).toFixed(1);
+
+    if (totalMs >= 2000 && perIndexMs.length > 0) {
+      const parts = perIndexMs
+        .slice()
+        .sort((a, b) => b.ms - a.ms)
+        .map((t) => `${t.table}.${t.index}=${(t.ms / 1000).toFixed(1)}s`)
+        .join(', ');
+      console.log(`  FTS index timings: ${parts}`);
+    }
+
+    return { totalSeconds, perIndexMs };
   };
 
   const runBrainKernelTick = async (
@@ -459,7 +481,7 @@ export const analyzeCommand = async (
     }
   };
 
-  const rawChanges = existingMeta && !options?.force
+  const rawChanges = existingMeta
     ? mergeGitFileChanges(
       getCommittedFileChanges(repoPath, existingMeta.lastCommit, currentCommit),
       getWorkingTreeFileChanges(repoPath),
@@ -796,6 +818,53 @@ export const analyzeCommand = async (
     await initKuzu(kuzuPath);
     debug('kuzu initialized');
 
+    // Kuzu FTS stemmer 'none' can crash (SIGBUS) on DETACH DELETE in some builds.
+    // If we detect legacy FTS indexes created with stemmer 'none', drop them before any
+    // delete workload and recreate with the stable default ('porter').
+    let forceEnsureFtsIndexesInIncremental = false;
+    try {
+      const rows = await executeQuery('CALL SHOW_INDEXES() RETURN *');
+      const ftsIndexes = rows
+        .map((row: any) => ({
+          tableName: String(row?.table_name ?? row?.tableName ?? row?.[0] ?? '').trim(),
+          indexName: String(row?.index_name ?? row?.indexName ?? row?.[1] ?? '').trim(),
+          indexType: String(row?.index_type ?? row?.indexType ?? row?.[2] ?? '').trim().toUpperCase(),
+          indexDefinition: String(row?.index_definition ?? row?.indexDefinition ?? row?.[6] ?? '').trim(),
+        }))
+        .filter(idx => idx.tableName && idx.indexName && idx.indexType === 'FTS');
+
+      const hasLegacyNoneStemmer = ftsIndexes.some(idx => {
+        const def = idx.indexDefinition.toLowerCase();
+        return def.includes("stemmer := 'none'") || def.includes('stemmer := "none"');
+      });
+
+      if (hasLegacyNoneStemmer) {
+        bar.update(6, { phase: 'Incremental: migrating FTS indexes...' });
+        debug('migrating FTS stemmer none -> porter');
+
+        try {
+          await executeQuery('LOAD EXTENSION fts');
+        } catch {
+          // best-effort
+        }
+
+        for (const idx of ftsIndexes) {
+          try {
+            const escapedTable = idx.tableName.replace(/'/g, "''");
+            const escapedIndex = idx.indexName.replace(/'/g, "''");
+            await executeQuery(`CALL DROP_FTS_INDEX('${escapedTable}', '${escapedIndex}')`);
+          } catch {
+            // best-effort
+          }
+        }
+
+        profileWarnings.push('Migrated legacy FTS indexes (stemmer none -> porter) to avoid Kuzu DELETE crashes.');
+        forceEnsureFtsIndexesInIncremental = true;
+      }
+    } catch {
+      // best-effort
+    }
+
     const impactedFiles = Array.from(new Set([...rebuildFiles, ...Array.from(deletedFiles)]));
 
     bar.update(8, { phase: 'Incremental: finding affected callers...' });
@@ -997,6 +1066,33 @@ export const analyzeCommand = async (
     const nodeInsertFiles = new Set<string>(rebuildFiles);
     if (shouldRefreshPatternCatalog && patternCatalogExists) {
       nodeInsertFiles.add(PATTERN_CATALOG_PATH);
+    }
+
+    // Embeddings must be re-generated for changed/deleted files; otherwise semantic search
+    // will drift on incremental runs (CodeEmbedding rows are keyed only by nodeId).
+    const embeddingInvalidationFiles = new Set<string>([...rebuildFiles, ...Array.from(deletedFiles)]);
+    if (shouldRefreshPatternCatalog && patternCatalogExists) {
+      embeddingInvalidationFiles.add(PATTERN_CATALOG_PATH);
+    }
+
+    if (embeddingInvalidationFiles.size > 0) {
+      bar.update(10, { phase: 'Incremental: invalidating embeddings...' });
+      const escapedPaths = Array.from(embeddingInvalidationFiles)
+        .map(fp => `'${fp.replace(/'/g, "''")}'`);
+      const CHUNK_SIZE = 60;
+      for (let start = 0; start < escapedPaths.length; start += CHUNK_SIZE) {
+        const chunk = escapedPaths.slice(start, start + CHUNK_SIZE).join(', ');
+        try {
+          await executeQuery(`
+            MATCH (n)
+            WHERE n.filePath IN [${chunk}]
+            MATCH (e:CodeEmbedding {nodeId: n.id})
+            DETACH DELETE e
+          `);
+        } catch {
+          // best-effort: if embeddings are unavailable or the table doesn't exist yet, continue
+        }
+      }
     }
 
     // If permissions config changed, we may re-emit permission slug nodes that already exist
@@ -1399,7 +1495,10 @@ export const analyzeCommand = async (
     const kuzuTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
 
     // Ensure FTS only when schema/metadata indicates it is missing.
-    const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
+    const ftsResult = (shouldEnsureFtsIndexes || forceEnsureFtsIndexesInIncremental)
+      ? await ensureFtsIndexes()
+      : null;
+    const ftsTime = ftsResult ? ftsResult.totalSeconds : '0.0';
 
     const kuzuWarnings = [...kuzuResult.warnings, ...profileWarnings];
     if (incrementalDerivedFastDeprecated) {
@@ -4270,13 +4369,80 @@ export const analyzeCommand = async (
   bar.update(60, { phase: 'Loading into KuzuDB...' });
 
   await closeKuzu();
-  const kuzuFiles = [kuzuPath, `${kuzuPath}.wal`, `${kuzuPath}.lock`];
-  for (const f of kuzuFiles) {
-    try { await fs.rm(f, { recursive: true, force: true }); } catch {}
-  }
 
   const t0Kuzu = Date.now();
-  await initKuzu(kuzuPath);
+  let preservedEmbeddings = false;
+
+  const tryPreserveEmbeddings = async (): Promise<boolean> => {
+    if (!existingMeta || schemaMismatch) return false;
+
+    try {
+      await fs.access(kuzuPath);
+    } catch {
+      return false;
+    }
+
+    bar.update(60, { phase: 'Opening existing KuzuDB (preserve embeddings)...' });
+    await initKuzu(kuzuPath);
+
+    // We only preserve embeddings when the current index already has at least one embedding row.
+    // Otherwise we don't avoid the cold embedding build cost.
+    let hasAnyEmbeddings = false;
+    try {
+      const rows = await executeQuery(`MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId LIMIT 1`);
+      hasAnyEmbeddings = Array.isArray(rows) && rows.length > 0;
+    } catch {
+      hasAnyEmbeddings = false;
+    }
+    if (!hasAnyEmbeddings) return false;
+
+    // Precision-first: invalidate embeddings for changed/deleted files so post-reload semantic search
+    // reflects current content (CodeEmbedding rows are keyed only by nodeId).
+    const embeddingInvalidationFiles = Array.from(new Set([...fileChanges.changed, ...fileChanges.deleted]));
+    if (embeddingInvalidationFiles.length > 0) {
+      bar.update(60, { phase: 'Invalidating changed embeddings (preserve)...' });
+      const escapedPaths = embeddingInvalidationFiles.map(fp => `'${fp.replace(/'/g, "''")}'`);
+      const CHUNK_SIZE = 60;
+      for (let start = 0; start < escapedPaths.length; start += CHUNK_SIZE) {
+        const chunk = escapedPaths.slice(start, start + CHUNK_SIZE).join(', ');
+        if (!chunk) continue;
+        await executeQuery(`
+          MATCH (n)
+          WHERE n.filePath IN [${chunk}]
+          MATCH (e:CodeEmbedding {nodeId: n.id})
+          DETACH DELETE e
+        `);
+      }
+    }
+
+    bar.update(60, { phase: 'Resetting Kuzu schema (preserve embeddings)...' });
+    await resetKuzuSchemaForReload({ preserveEmbeddings: true });
+    profileWarnings.push('Full rebuild preserved existing embeddings + vector index.');
+    return true;
+  };
+
+  try {
+    preservedEmbeddings = await tryPreserveEmbeddings();
+  } catch {
+    preservedEmbeddings = false;
+    try { await closeKuzu(); } catch {}
+  }
+
+  if (!preservedEmbeddings) {
+    await closeKuzu();
+    const kuzuFiles = [kuzuPath, `${kuzuPath}.wal`, `${kuzuPath}.lock`];
+    for (const f of kuzuFiles) {
+      try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+    }
+    await initKuzu(kuzuPath);
+  }
+
+  // Create FTS indexes *before* bulk loading nodes so COPY can maintain them incrementally.
+  // This avoids a large post-load FTS build pass on big repos.
+  bar.update(60, { phase: 'Creating search indexes (pre-load)...' });
+  const ftsResult = await ensureFtsIndexes();
+  const ftsTime = ftsResult.totalSeconds;
+
   let kuzuMsgCount = 0;
   const kuzuResult = await loadGraphToKuzu(pipelineResult.graph, pipelineResult.fileContents, storagePath, (msg) => {
     kuzuMsgCount++;
@@ -4287,6 +4453,52 @@ export const analyzeCommand = async (
   const kuzuWarnings = [...kuzuResult.warnings, ...profileWarnings];
   if (incrementalDerivedFastDeprecated) {
     kuzuWarnings.push('Incremental derived mode "fast" is deprecated; running as "full".');
+  }
+
+  if (preservedEmbeddings) {
+    bar.update(84, { phase: 'Pruning stale embeddings...' });
+    try {
+      // Remove embeddings for node labels that are no longer embedded (keeps semantic search tight).
+      await executeQuery(`
+        MATCH (e:CodeEmbedding)
+        WHERE NOT (
+          e.nodeId STARTS WITH 'Function:'
+          OR e.nodeId STARTS WITH 'Class:'
+          OR e.nodeId STARTS WITH 'Method:'
+          OR e.nodeId STARTS WITH 'Interface:'
+          OR e.nodeId STARTS WITH 'File:'
+          OR e.nodeId STARTS WITH 'CodeElement:'
+        )
+        DELETE e
+      `);
+
+      // CodeElement is a wide bucket; only keep embeddings for agent docs + pattern catalog.
+      await executeQuery(`
+        MATCH (e:CodeEmbedding)
+        WHERE e.nodeId STARTS WITH 'CodeElement:'
+          AND NOT (
+            e.nodeId STARTS WITH 'CodeElement:agent-doc:'
+            OR e.nodeId STARTS WITH 'CodeElement:pattern-catalog:'
+          )
+        DELETE e
+      `);
+
+      // Prune orphan embeddings (node removed/renamed between index versions).
+      const labels = ['File', 'Function', 'Class', 'Method', 'Interface', 'CodeElement'] as const;
+      for (const label of labels) {
+        await executeQuery(`
+          MATCH (e:CodeEmbedding)
+          WHERE e.nodeId STARTS WITH '${label}:'
+          OPTIONAL MATCH (n:${label} {id: e.nodeId})
+          WITH e, n
+          WHERE n IS NULL
+          DELETE e
+        `);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      kuzuWarnings.push(`Unable to prune stale embeddings (${msg.slice(0, 120)})`);
+    }
   }
 
   let evidenceTime = '0.0';
@@ -4356,12 +4568,7 @@ export const analyzeCommand = async (
     kuzuWarnings.push(`Unable to refresh structured summaries (${msg.slice(0, 120)})`);
   }
 
-  // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
-  bar.update(85, { phase: 'Creating search indexes...' });
-
-  const ftsTime = shouldEnsureFtsIndexes ? await ensureFtsIndexes() : '0.0';
-
-  // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
+  // ── Phase 3: Embeddings (90–98%) ──────────────────────────────────
   const stats = await getKuzuStats();
   let embeddingTime = '0.0';
   let embeddingSkipped = false;
@@ -4479,6 +4686,25 @@ export const analyzeCommand = async (
   console.log(`\n  Repository indexed successfully (${totalTime}s)\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
   console.log(`  KuzuDB ${kuzuTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
+  if (kuzuResult.timings && kuzuResult.timings.totalMs >= 2_000) {
+    const formatSec = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+    const t = kuzuResult.timings;
+    console.log(
+      `  Kuzu timings: csvGen=${formatSec(t.csvGenMs)}, writeNodes=${formatSec(t.writeNodesMs)}, ` +
+      `groupRels=${formatSec(t.groupRelsMs)}, writeEdges=${formatSec(t.writeEdgesMs)}, copyNodes=${formatSec(t.copyNodesMs)}, ` +
+      `copyEdges=${formatSec(t.copyEdgesMs)}, cleanup=${formatSec(t.cleanupMs)}`,
+    );
+    const slowNodes = (t.slowNodes || [])
+      .slice(0, 3)
+      .map(node => `${node.table}=${formatSec(node.ms)}`)
+      .join(', ');
+    if (slowNodes) console.log(`  Kuzu slow nodes: ${slowNodes}`);
+    const slowEdges = (t.slowEdges || [])
+      .slice(0, 3)
+      .map(edge => `${edge.fromLabel}->${edge.toLabel}=${formatSec(edge.ms)}`)
+      .join(', ');
+    if (slowEdges) console.log(`  Kuzu slow edges: ${slowEdges}`);
+  }
   if (profileEmbeddings && embeddingSummary) {
     const sum = embeddingSummary;
     console.log(
@@ -4487,7 +4713,9 @@ export const analyzeCommand = async (
   }
   console.log(`  Pipeline ${pipelineTime}s | Evidence ${evidenceTime}s | Summaries ${summariesTime}s`);
   const profilePipeline = process.env.GITNEXUS_PROFILE_PIPELINE === '1';
-  if (profilePipeline && pipelineResult.timingsMs && Object.keys(pipelineResult.timingsMs).length > 0) {
+  const pipelineSeconds = Number(pipelineTime) || 0;
+  const shouldPrintPipelineTimings = profilePipeline || pipelineSeconds >= 10;
+  if (shouldPrintPipelineTimings && pipelineResult.timingsMs && Object.keys(pipelineResult.timingsMs).length > 0) {
     const sorted = Object.entries(pipelineResult.timingsMs)
       .filter(([name]) => name !== 'total')
       .sort((a, b) => b[1] - a[1])

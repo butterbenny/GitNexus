@@ -145,6 +145,7 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
     WHERE a.filePath IN [${fileList}] AND NOT b.filePath IN [${fileList}]
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
+    ORDER BY a.filePath ASC, b.filePath ASC
     LIMIT 30
   `);
 
@@ -153,6 +154,7 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
     WHERE NOT a.filePath IN [${fileList}] AND b.filePath IN [${fileList}]
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
+    ORDER BY a.filePath ASC, b.filePath ASC
     LIMIT 30
   `);
 

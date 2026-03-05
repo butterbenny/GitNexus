@@ -61,6 +61,8 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   await fs.mkdir(path.join(repoPath, 'src'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'tests'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'app'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'routes'), { recursive: true });
+  await fs.mkdir(path.join(repoPath, 'app/Http/Controllers'), { recursive: true });
   await fs.mkdir(path.join(repoPath, 'apps/dashboard/src/pages'), { recursive: true });
   await fs.mkdir(path.join(repoPath, '.agents/architecture'), { recursive: true });
   await fs.mkdir(path.join(repoPath, '.agents/review'), { recursive: true });
@@ -148,6 +150,54 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
       'export function doThing(): number {',
       '  return 1;',
       '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'app/Http/Controllers/FooController.php'),
+    [
+      '<?php',
+      '',
+      'namespace App\\Http\\Controllers;',
+      '',
+      'class FooController {',
+      '  public function index(): string {',
+      "    return 'ok';",
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'app/Http/Controllers/BarController.php'),
+    [
+      '<?php',
+      '',
+      'namespace App\\Http\\Controllers;',
+      '',
+      'class BarController {',
+      '  public function store(): string {',
+      "    return 'ok';",
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'routes/web.php'),
+    [
+      '<?php',
+      '',
+      'use Illuminate\\Support\\Facades\\Route;',
+      'use App\\Http\\Controllers\\FooController;',
+      '',
+      "Route::get('/foo', [FooController::class, 'index']);",
       '',
     ].join('\n'),
     'utf-8'
@@ -303,6 +353,21 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
       '        $model->update([]);',
       '    }',
       '}',
+      '',
+    ].join('\n'),
+    'utf-8'
+  );
+
+  await fs.writeFile(
+    path.join(repoPath, 'routes/web.php'),
+    [
+      '<?php',
+      '',
+      'use Illuminate\\Support\\Facades\\Route;',
+      'use App\\Http\\Controllers\\FooController;',
+      '',
+      "Route::get('/foo', [FooController::class, 'index']);",
+      "Route::post('/bar', [BarController::class, 'store']);",
       '',
     ].join('\n'),
     'utf-8'
@@ -481,6 +546,12 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
     result.review_kernel.findings.every(f => typeof f.reason === 'string' && Number.isFinite(Number(f.confidence))),
     'expected review findings to include reason + confidence'
   );
+  const routeFinding = result.review_kernel.findings.find(f => f?.code === 'route-target-changed');
+  assert.ok(routeFinding, 'expected route-target-changed finding');
+  assert.ok(
+    String(routeFinding.summary || '').includes('BarController::store'),
+    'expected route-target-changed to map to BarController::store'
+  );
   assert.ok(Array.isArray(result.runtime_hotspots), 'expected runtime_hotspots payload');
   assert.ok(result.runtime_hotspots.length > 0, 'expected runtime hotspot overlap for changed files');
   assert.ok(Number(result.summary?.runtime_hotspots || 0) >= 1, 'expected summary.runtime_hotspots >= 1');
@@ -642,12 +713,15 @@ test('MCP review_mode: emits changed symbols, suggested tests, and UI contract d
   assert.ok(scoped.changed_files.every(f => String(f.filePath || '').startsWith('src/')));
   assert.ok(!scoped.changed_files.some(f => f.filePath === 'apps/dashboard/src/pages/FooPage.tsx'));
   assert.ok(scoped.semantic_diffs, 'expected scoped semantic_diffs payload');
-  assert.ok(Array.isArray(scoped.suggested_tests) && scoped.suggested_tests.length > 0, 'expected scope fallback suggested tests');
+  assert.ok(Array.isArray(scoped.suggested_tests) && scoped.suggested_tests.length > 0, 'expected suggested tests in scoped review');
   assert.ok(
-    scoped.suggested_tests.some(test => (Array.isArray(test?.reasons) ? test.reasons : []).some(reason => String(reason).includes('scope fallback token proximity'))),
-    'expected scope fallback reason on scoped suggested tests',
+    scoped.suggested_tests.some(test => test.filePath === 'tests/doThing.test.ts'),
+    'expected scoped suggested tests to include tests/doThing.test.ts',
   );
-  assert.ok(Number(scoped._review_mode?.convergence?.suggested_tests_scope_fallback || 0) > 0);
+  assert.ok(
+    scoped.suggested_tests.some(test => (Array.isArray(test?.reasons) ? test.reasons : []).some(reason => String(reason).includes('direct caller') || String(reason).includes('imports changed file'))),
+    'expected scoped suggested tests to be backed by caller/import signals',
+  );
 });
 
 test('MCP review_mode: falls back when direct test callers are missing', async () => {

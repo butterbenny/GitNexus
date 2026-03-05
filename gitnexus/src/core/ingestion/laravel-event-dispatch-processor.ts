@@ -114,10 +114,54 @@ const resolvePhpClassToFile = (
 };
 
 const walkNodes = (node: any, fn: (n: any) => void) => {
-  fn(node);
-  for (let i = 0; i < node.namedChildCount; i++) {
-    walkNodes(node.namedChild(i), fn);
+  const stack = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    fn(current);
+    for (let i = current.namedChildCount - 1; i >= 0; i--) {
+      stack.push(current.namedChild(i));
+    }
   }
+};
+
+const getDescendantsOfType = (node: any, type: string): any[] => {
+  if (!node) return [];
+
+  const descendantsOfType = node.descendantsOfType;
+  if (typeof descendantsOfType === 'function') {
+    try {
+      return descendantsOfType.call(node, type) ?? [];
+    } catch {
+      // fall through to manual walk
+    }
+  }
+
+  const nodes: any[] = [];
+  walkNodes(node, (n: any) => {
+    if (n?.type === type) nodes.push(n);
+  });
+  return nodes;
+};
+
+const getDescendantsOfTypes = (node: any, types: string[]): any[] => {
+  if (!node || types.length === 0) return [];
+
+  const descendantsOfType = node.descendantsOfType;
+  if (typeof descendantsOfType === 'function') {
+    try {
+      return descendantsOfType.call(node, types) ?? [];
+    } catch {
+      // fall through to manual walk
+    }
+  }
+
+  const typeSet = new Set(types);
+  const nodes: any[] = [];
+  walkNodes(node, (n: any) => {
+    if (n?.type && typeSet.has(n.type)) nodes.push(n);
+  });
+  return nodes;
 };
 
 const extractStringContent = (node: any): string | null => {
@@ -125,12 +169,12 @@ const extractStringContent = (node: any): string | null => {
   if (node.type === 'string_content') return node.text ?? null;
 
   const queue = [node];
-  while (queue.length > 0) {
-    const current = queue.shift();
+  for (let i = 0; i < queue.length; i++) {
+    const current = queue[i];
     if (!current) continue;
     if (current.type === 'string_content') return current.text ?? null;
-    for (let i = 0; i < current.namedChildCount; i++) {
-      queue.push(current.namedChild(i));
+    for (let j = 0; j < current.namedChildCount; j++) {
+      queue.push(current.namedChild(j));
     }
   }
 
@@ -185,10 +229,7 @@ const parseListenerTargetFromExpression = (node: any): LaravelEventHandlerTarget
 const extractEventListenMappings = (rootNode: any): Array<{ eventClassRef: string; handler: LaravelEventHandlerTarget }> => {
   const mappings: Array<{ eventClassRef: string; handler: LaravelEventHandlerTarget }> = [];
 
-  const propertyElements: any[] = [];
-  walkNodes(rootNode, (node: any) => {
-    if (node.type === 'property_element') propertyElements.push(node);
-  });
+  const propertyElements = getDescendantsOfType(rootNode, 'property_element');
 
   for (const element of propertyElements) {
     const variableNode = element.namedChildren.find((n: any) => n.type === 'variable_name');
@@ -229,10 +270,7 @@ const extractEventListenMappings = (rootNode: any): Array<{ eventClassRef: strin
 const extractEventSubscriberClassRefs = (rootNode: any): string[] => {
   const subscriberClassRefs: string[] = [];
 
-  const propertyElements: any[] = [];
-  walkNodes(rootNode, (node: any) => {
-    if (node.type === 'property_element') propertyElements.push(node);
-  });
+  const propertyElements = getDescendantsOfType(rootNode, 'property_element');
 
   for (const element of propertyElements) {
     const variableNode = element.namedChildren.find((n: any) => n.type === 'variable_name');
@@ -308,10 +346,7 @@ const extractSubscriberListenMappings = (
 ): Array<{ eventClassRef: string; handler: LaravelEventHandlerTarget }> => {
   const mappings: Array<{ eventClassRef: string; handler: LaravelEventHandlerTarget }> = [];
 
-  const methods: any[] = [];
-  walkNodes(rootNode, (node: any) => {
-    if (node.type === 'method_declaration') methods.push(node);
-  });
+  const methods = getDescendantsOfType(rootNode, 'method_declaration');
 
   for (const method of methods) {
     const name = getMethodName(method);
@@ -320,12 +355,10 @@ const extractSubscriberListenMappings = (
     const paramVars = new Set<string>();
     const paramsNode = getMethodParametersNode(method);
     if (paramsNode) {
-      walkNodes(paramsNode, (node: any) => {
-        if (node.type === 'variable_name') {
-          const text = node.text?.trim();
-          if (text) paramVars.add(text);
-        }
-      });
+      for (const node of getDescendantsOfType(paramsNode, 'variable_name')) {
+        const text = node?.text?.trim();
+        if (text) paramVars.add(text);
+      }
     }
 
     const dispatcherVars = paramVars.size > 0 ? paramVars : new Set<string>(['$events']);
@@ -333,29 +366,27 @@ const extractSubscriberListenMappings = (
     const bodyNode = getMethodBodyNode(method);
     if (!bodyNode) continue;
 
-    walkNodes(bodyNode, (node: any) => {
-      if (node.type !== 'member_call_expression') return;
-
+    for (const node of getDescendantsOfType(bodyNode, 'member_call_expression')) {
       const objectNode = node.childForFieldName?.('object');
       const nameNode = node.childForFieldName?.('name');
       const argsNode = node.childForFieldName?.('arguments');
       const objectText = objectNode?.text?.trim();
       const methodName = nameNode?.text?.trim();
-      if (!objectText || !methodName || methodName !== 'listen') return;
-      if (objectNode?.type !== 'variable_name') return;
-      if (!dispatcherVars.has(objectText)) return;
+      if (!objectText || !methodName || methodName !== 'listen') continue;
+      if (objectNode?.type !== 'variable_name') continue;
+      if (!dispatcherVars.has(objectText)) continue;
 
       const args = getCallArgumentExpressions(argsNode);
-      if (args.length < 2) return;
+      if (args.length < 2) continue;
 
       const eventClassRef = parseClassRefFromDispatchArg(args[0]);
-      if (!eventClassRef) return;
+      if (!eventClassRef) continue;
 
       const handler = parseListenerTargetFromExpression(args[1]);
-      if (!handler) return;
+      if (!handler) continue;
 
       mappings.push({ eventClassRef, handler });
-    });
+    }
   }
 
   return mappings;
@@ -394,9 +425,11 @@ const getCallArgumentExpressions = (argsNode: any): any[] => {
 const extractEventDispatchCallsFromTree = (tree: Parser.Tree): ExtractedEventDispatchCall[] => {
   const calls: ExtractedEventDispatchCall[] = [];
 
-  const visit = (node: any) => {
-    if (!node) return;
-
+  const candidates = getDescendantsOfTypes(tree.rootNode, [
+    'function_call_expression',
+    'scoped_call_expression',
+  ]);
+  for (const node of candidates) {
     if (node.type === 'function_call_expression') {
       const fnNode = node.childForFieldName?.('function');
       const fnName = fnNode?.text?.trim();
@@ -426,13 +459,7 @@ const extractEventDispatchCallsFromTree = (tree: Parser.Tree): ExtractedEventDis
         }
       }
     }
-
-    for (const child of node.namedChildren || []) {
-      visit(child);
-    }
-  };
-
-  visit(tree.rootNode);
+  }
   return calls;
 };
 

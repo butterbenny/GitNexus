@@ -31,9 +31,10 @@ const runAnalyze = (repoPath, env) => {
     const stdout = (err?.stdout || '').toString();
     const stderr = (err?.stderr || '').toString();
     const status = err?.status ?? err?.code ?? 'unknown';
+    const signal = err?.signal ?? '';
     throw new Error(
       [
-        `analyze failed (status: ${status})`,
+        `analyze failed (status: ${status}${signal ? `, signal: ${signal}` : ''})`,
         stdout && `STDOUT:\n${stdout}`,
         stderr && `STDERR:\n${stderr}`,
       ]

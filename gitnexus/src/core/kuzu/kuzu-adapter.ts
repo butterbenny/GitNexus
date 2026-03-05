@@ -1,7 +1,9 @@
 import fs from 'fs/promises';
 import path from 'path';
 import kuzu from 'kuzu';
+import { performance } from 'node:perf_hooks';
 import { KnowledgeGraph } from '../graph/types.js';
+import { enrichRelationshipMetadata, serializeWitnessPathIds } from '../graph/edge-metadata.js';
 import {
   NODE_TABLES,
   REL_TABLE_NAME,
@@ -142,52 +144,135 @@ export const loadGraphToKuzu = async (
 
   const log = onProgress || (() => {});
 
+  const totalStartMs = performance.now();
+
+  const csvGenStartMs = performance.now();
   const csvData = generateAllCSVs(graph, fileContents);
+  const csvGenMs = performance.now() - csvGenStartMs;
+
   const csvDir = path.join(storagePath, 'csv');
   await fs.mkdir(csvDir, { recursive: true });
 
   log('Generating CSVs...');
 
+  const nodeCsvWriteStartMs = performance.now();
   const nodeFiles: Array<{ table: NodeTableName; path: string; rows: number }> = [];
+  const approxRowCounts = new Map<string, number>();
+  for (const node of graph.nodes) {
+    approxRowCounts.set(node.label, (approxRowCounts.get(node.label) ?? 0) + 1);
+  }
   for (const [tableName, csv] of csvData.nodes.entries()) {
-    const rowCount = csv.split('\n').length - 1;
-    if (rowCount <= 0) continue;
+    // CSV generator returns only the header line when there are no rows.
+    // Avoid `split('\n')` — many CSVs include multi-line quoted fields (code content),
+    // and splitting would be both incorrect for row counts and very expensive.
+    if (!csv.includes('\n')) continue;
     const filePath = path.join(csvDir, `${tableName.toLowerCase()}.csv`);
     await fs.writeFile(filePath, csv, 'utf-8');
-    nodeFiles.push({ table: tableName, path: filePath, rows: rowCount });
+    nodeFiles.push({ table: tableName, path: filePath, rows: approxRowCounts.get(tableName) ?? 0 });
   }
+  const nodeCsvWriteMs = performance.now() - nodeCsvWriteStartMs;
 
-  // Write relationship CSV to disk for bulk COPY
-  const relCsvPath = path.join(csvDir, 'relations.csv');
   const validTables = new Set<string>(NODE_TABLES as readonly string[]);
   const getNodeLabel = (nodeId: string): string => {
     if (nodeId.startsWith('comm_')) return 'Community';
     if (nodeId.startsWith('proc_')) return 'Process';
     return nodeId.split(':')[0];
   };
+  const nodeLabelCache = new Map<string, string>();
+  const getCachedNodeLabel = (nodeId: string): string => {
+    const cached = nodeLabelCache.get(nodeId);
+    if (cached) return cached;
+    const label = getNodeLabel(nodeId);
+    nodeLabelCache.set(nodeId, label);
+    return label;
+  };
 
-  const relLines = csvData.relCSV.split('\n');
-  const relHeader = relLines[0];
-  const validRelLines = [relHeader];
+  // Generate relationship CSV lines grouped by FROM->TO label pair.
+  // This avoids building a single huge relation CSV string and then splitting/parsing it again.
+  const sanitizeUTF8 = (str: string): string => {
+    return str
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      // Relationship CSV is intended to be strictly one-line-per-record (safe for PARALLEL COPY).
+      // Normalize away newlines in metadata fields; code content never appears in edges.
+      .replace(/\n/g, '\\n')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+      .replace(/[\uD800-\uDFFF]/g, '')
+      .replace(/[\uFFFE\uFFFF]/g, '');
+  };
+
+  const escapeCSVField = (value: string | number | undefined | null): string => {
+    if (value === undefined || value === null) {
+      return '""';
+    }
+    let str = String(value);
+    if (str === '') {
+      return '""';
+    }
+    str = sanitizeUTF8(str);
+    return `"${str.replace(/"/g, '""')}"`;
+  };
+  const escapeCSVFieldFast = (value: string | undefined | null): string => {
+    if (!value) return '""';
+    return `"${value.replace(/"/g, '""')}"`;
+  };
+
+  const escapeCSVNumber = (value: number | undefined | null, defaultValue: number = -1): string => {
+    if (value === undefined || value === null) {
+      return String(defaultValue);
+    }
+    return String(value);
+  };
+
+  const relHeader = [
+    'from',
+    'to',
+    'type',
+    'confidence',
+    'reason',
+    'step',
+    'certaintyTier',
+    'provenanceFamily',
+    'absenceSemantics',
+    'witnessPathIds',
+  ].join(',');
+
+  const relGroupStartMs = performance.now();
+  const relsByPair = new Map<string, string[]>();
   let skippedRels = 0;
-  for (let i = 1; i < relLines.length; i++) {
-    const line = relLines[i];
-    if (!line.trim()) continue;
-    const match = line.match(/"([^"]*)","([^"]*)"/);
-    if (!match) { skippedRels++; continue; }
-    const fromLabel = getNodeLabel(match[1]);
-    const toLabel = getNodeLabel(match[2]);
+  for (const rel of graph.relationships) {
+    const metadata = enrichRelationshipMetadata(rel);
+    const fromLabel = getCachedNodeLabel(metadata.sourceId);
+    const toLabel = getCachedNodeLabel(metadata.targetId);
     if (!validTables.has(fromLabel) || !validTables.has(toLabel)) {
       skippedRels++;
       continue;
     }
-    validRelLines.push(line);
+
+    const line = [
+      escapeCSVFieldFast(metadata.sourceId),
+      escapeCSVFieldFast(metadata.targetId),
+      escapeCSVFieldFast(metadata.type),
+      escapeCSVNumber(metadata.confidence, 1.0),
+      escapeCSVField(metadata.reason),
+      escapeCSVNumber(metadata.step, 0),
+      escapeCSVField(metadata.certaintyTier || ''),
+      escapeCSVField(metadata.provenanceFamily || ''),
+      escapeCSVField(metadata.absenceSemantics || ''),
+      escapeCSVField(serializeWitnessPathIds(metadata.witnessPathIds)),
+    ].join(',');
+
+    const pairKey = `${fromLabel}|${toLabel}`;
+    let list = relsByPair.get(pairKey);
+    if (!list) { list = []; relsByPair.set(pairKey, list); }
+    list.push(line);
   }
-  await fs.writeFile(relCsvPath, validRelLines.join('\n'), 'utf-8');
+  const relGroupMs = performance.now() - relGroupStartMs;
 
   // Bulk COPY all node CSVs
   const totalSteps = nodeFiles.length + 1; // +1 for relationships
   let stepsDone = 0;
+  const nodeCopyTimings: Array<{ table: NodeTableName; ms: number; rows: number }> = [];
 
   for (const { table, path: filePath, rows } of nodeFiles) {
     stepsDone++;
@@ -196,6 +281,7 @@ export const loadGraphToKuzu = async (
     const normalizedPath = normalizeCopyPath(filePath);
     const copyQuery = getCopyQuery(table, normalizedPath);
 
+    const startMs = performance.now();
     try {
       const queryResult = await conn.query(copyQuery);
       await closeQueryResults(queryResult);
@@ -209,43 +295,39 @@ export const loadGraphToKuzu = async (
         throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
       }
     }
+    const durationMs = performance.now() - startMs;
+    nodeCopyTimings.push({ table, ms: durationMs, rows });
   }
 
   // Bulk COPY relationships — split by FROM→TO label pair (KuzuDB requires it)
-  const insertedRels = validRelLines.length - 1;
+  let insertedRels = 0;
+  for (const lines of relsByPair.values()) insertedRels += lines.length;
   const warnings: string[] = [];
+  const edgeCopyTimings: Array<{ fromLabel: string; toLabel: string; ms: number; edges: number }> = [];
+  let edgeCsvWriteMs = 0;
   if (insertedRels > 0) {
-    const relsByPair = new Map<string, string[]>();
-    for (let i = 1; i < validRelLines.length; i++) {
-      const line = validRelLines[i];
-      const match = line.match(/"([^"]*)","([^"]*)"/);
-      if (!match) continue;
-      const fromLabel = getNodeLabel(match[1]);
-      const toLabel = getNodeLabel(match[2]);
-      const pairKey = `${fromLabel}|${toLabel}`;
-      let list = relsByPair.get(pairKey);
-      if (!list) { list = []; relsByPair.set(pairKey, list); }
-      list.push(line);
-    }
-
     log(`Loading edges: ${insertedRels.toLocaleString()} across ${relsByPair.size} types`);
 
     let pairIdx = 0;
     let failedPairEdges = 0;
     const failedPairLines: string[] = [];
 
-    for (const [pairKey, lines] of relsByPair) {
+    const sortedPairs = Array.from(relsByPair.entries()).sort((left, right) => left[0].localeCompare(right[0]));
+    for (const [pairKey, lines] of sortedPairs) {
       pairIdx++;
       const [fromLabel, toLabel] = pairKey.split('|');
       const pairCsvPath = path.join(csvDir, `rel_${fromLabel}_${toLabel}.csv`);
+      const writeStartMs = performance.now();
       await fs.writeFile(pairCsvPath, relHeader + '\n' + lines.join('\n'), 'utf-8');
+      edgeCsvWriteMs += Math.max(0, performance.now() - writeStartMs);
       const normalizedPath = normalizeCopyPath(pairCsvPath);
-      const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
+      const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=true, auto_detect=false)`;
 
       if (pairIdx % 5 === 0 || lines.length > 1000) {
         log(`Loading edges: ${pairIdx}/${relsByPair.size} types (${fromLabel} -> ${toLabel})`);
       }
 
+      const startMs = performance.now();
       try {
         const queryResult = await conn.query(copyQuery);
         await closeQueryResults(queryResult);
@@ -261,6 +343,8 @@ export const loadGraphToKuzu = async (
           failedPairLines.push(...lines);
         }
       }
+      const durationMs = performance.now() - startMs;
+      edgeCopyTimings.push({ fromLabel, toLabel, ms: durationMs, edges: lines.length });
       try { await fs.unlink(pairCsvPath); } catch {}
     }
 
@@ -271,7 +355,7 @@ export const loadGraphToKuzu = async (
   }
 
   // Cleanup all CSVs
-  try { await fs.unlink(relCsvPath); } catch {}
+  const cleanupStartMs = performance.now();
   for (const { path: filePath } of nodeFiles) {
     try { await fs.unlink(filePath); } catch {}
   }
@@ -282,15 +366,49 @@ export const loadGraphToKuzu = async (
     }
   } catch {}
   try { await fs.rmdir(csvDir); } catch {}
+  const cleanupMs = performance.now() - cleanupStartMs;
 
-  return { success: true, insertedRels, skippedRels, warnings };
+  const totalMs = performance.now() - totalStartMs;
+  const nodeCopyMs = nodeCopyTimings.reduce((sum, entry) => sum + entry.ms, 0);
+  const edgeCopyMs = edgeCopyTimings.reduce((sum, entry) => sum + entry.ms, 0);
+
+  const slowNodes = nodeCopyTimings
+    .slice()
+    .sort((left, right) => right.ms - left.ms)
+    .slice(0, 5);
+
+  const slowEdges = edgeCopyTimings
+    .slice()
+    .sort((left, right) => right.ms - left.ms)
+    .slice(0, 5);
+
+  return {
+    success: true,
+    insertedRels,
+    skippedRels,
+    warnings,
+    timings: {
+      totalMs,
+      csvGenMs,
+      writeNodesMs: nodeCsvWriteMs,
+      groupRelsMs: relGroupMs,
+      copyNodesMs: nodeCopyMs,
+      copyEdgesMs: edgeCopyMs,
+      cleanupMs,
+      slowNodes,
+      slowEdges,
+      writeEdgesMs: edgeCsvWriteMs,
+    },
+  };
 };
 
 // KuzuDB default ESCAPE is '\' (backslash), but our CSV uses RFC 4180 escaping ("" for literal quotes).
 // Source code content is full of backslashes which confuse the auto-detection.
 // We MUST explicitly set ESCAPE='"' to use RFC 4180 escaping, and disable auto_detect to prevent
 // KuzuDB from overriding our settings based on sample rows.
-const COPY_CSV_OPTS = `(HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
+// Node CSVs replace raw newlines with U+2028 in `csv-generator.ts`, so every record stays single-line.
+// This makes PARALLEL=true safe and materially faster on large repos.
+const COPY_CSV_OPTS = `(HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=true, auto_detect=false)`;
 
 const EXPORTED_CODE_TABLES = new Set<NodeTableName>([
   'Function',
@@ -310,6 +428,94 @@ const BACKTICK_TABLES = new Set([
 
 const escapeTableName = (table: string): string => {
   return BACKTICK_TABLES.has(table) ? `\`${table}\`` : table;
+};
+
+export const resetKuzuSchemaForReload = async (
+  opts?: { preserveEmbeddings?: boolean },
+): Promise<void> => {
+  if (!conn) {
+    throw new Error('KuzuDB not initialized. Call initKuzu first.');
+  }
+
+  const preserveEmbeddings = opts?.preserveEmbeddings ?? false;
+
+  // Existing DBs may have FTS indexes; Kuzu refuses to drop tables that are referenced by an index.
+  // Drop all FTS indexes up-front so we can drop/recreate node tables for the reload.
+  try {
+    const rows = await queryAllRows(conn!, 'CALL SHOW_INDEXES() RETURN *');
+    const ftsIndexes = rows
+      .map((row: any) => ({
+        tableName: String(row.table_name ?? row[0] ?? '').trim(),
+        indexName: String(row.index_name ?? row[1] ?? '').trim(),
+        indexType: String(row.index_type ?? row[2] ?? '').trim().toUpperCase(),
+      }))
+      .filter(idx => idx.tableName && idx.indexName && idx.indexType === 'FTS');
+
+    if (ftsIndexes.length > 0) {
+      try {
+        const loadResult = await conn!.query('LOAD EXTENSION fts');
+        await closeQueryResults(loadResult);
+      } catch {
+        // best-effort: extension may already be loaded, or unavailable in some builds
+      }
+    }
+
+    for (const idx of ftsIndexes) {
+      try {
+        const escapedTable = idx.tableName.replace(/'/g, "''");
+        const escapedIndex = idx.indexName.replace(/'/g, "''");
+        const queryResult = await conn!.query(`CALL DROP_FTS_INDEX('${escapedTable}', '${escapedIndex}')`);
+        await closeQueryResults(queryResult);
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // best-effort
+  }
+
+  // Drop relationship table first (it references node tables).
+  const dropTable = async (tableName: string): Promise<void> => {
+    const queryResult = await conn!.query(`DROP TABLE ${tableName}`);
+    await closeQueryResults(queryResult);
+  };
+
+  const tryDrop = async (tableName: string): Promise<void> => {
+    try {
+      await dropTable(tableName);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isLockErrorMessage(msg)) throw err;
+      if (msg.toLowerCase().includes('does not exist')) return;
+      throw err;
+    }
+  };
+
+  await tryDrop(REL_TABLE_NAME);
+  for (const tableName of NODE_TABLES) {
+    await tryDrop(escapeTableName(tableName));
+  }
+  if (!preserveEmbeddings) {
+    await tryDrop(EMBEDDING_TABLE_NAME);
+  }
+
+  // Recreate schema for non-embedding tables. If we're preserving embeddings,
+  // skip the embedding schema (table + index).
+  for (const schemaQuery of SCHEMA_QUERIES) {
+    if (preserveEmbeddings && schemaQuery.includes(`CREATE NODE TABLE ${EMBEDDING_TABLE_NAME}`)) continue;
+
+    try {
+      const queryResult = await conn!.query(schemaQuery);
+      await closeQueryResults(queryResult);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('already exists')) continue;
+      if (isLockErrorMessage(msg)) throw err;
+      throw err;
+    }
+  }
+
+  preparedStatementCache.clear();
 };
 
 /** Fallback: insert relationships one-by-one if COPY fails */
@@ -1030,13 +1236,13 @@ export const loadFTSExtension = async (): Promise<void> => {
  * @param tableName - The node table name (e.g., 'File', 'CodeSymbol')
  * @param indexName - Name for the FTS index
  * @param properties - List of properties to index (e.g., ['name', 'code'])
- * @param stemmer - Stemming algorithm (default: 'porter')
+ * @param stemmer - Stemming algorithm (default: 'none' for code-friendly search)
  */
 export const createFTSIndex = async (
   tableName: string,
   indexName: string,
   properties: string[],
-  stemmer: string = 'porter'
+  stemmer: string = 'none'
 ): Promise<void> => {
   if (!conn) {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');

@@ -141,8 +141,35 @@ const normalizeRelationPath = (raw: string): { segments: string[]; display: stri
 };
 
 const walkNodes = (node: any, fn: (n: any) => void) => {
-  fn(node);
-  for (let i = 0; i < node.namedChildCount; i++) walkNodes(node.namedChild(i), fn);
+  const stack = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    fn(current);
+    for (let i = current.namedChildCount - 1; i >= 0; i--) {
+      stack.push(current.namedChild(i));
+    }
+  }
+};
+
+const getDescendantsOfTypes = (node: any, types: string[]): any[] => {
+  if (!node || types.length === 0) return [];
+
+  const descendantsOfType = node.descendantsOfType;
+  if (typeof descendantsOfType === 'function') {
+    try {
+      return descendantsOfType.call(node, types) ?? [];
+    } catch {
+      // fall through to manual walk
+    }
+  }
+
+  const typeSet = new Set(types);
+  const nodes: any[] = [];
+  walkNodes(node, (n: any) => {
+    if (n?.type && typeSet.has(n.type)) nodes.push(n);
+  });
+  return nodes;
 };
 
 const findEnclosingPhpCallableId = (node: any, filePath: string, symbolTable: SymbolTable): string => {
@@ -341,18 +368,17 @@ export const processLaravelEloquentLoadEdges = async (
       }
     }
 
+    const candidateCalls = getDescendantsOfTypes(tree.rootNode, [
+      'member_call_expression',
+      'nullsafe_member_call_expression',
+      'scoped_call_expression',
+    ]);
     const loadCalls: any[] = [];
-    walkNodes(tree.rootNode, (node: any) => {
-      if (node.type === 'member_call_expression' || node.type === 'nullsafe_member_call_expression') {
-        const name = String(node.childForFieldName?.('name')?.text || '').trim();
-        if (LOAD_METHODS.has(name.toLowerCase())) loadCalls.push(node);
-        return;
-      }
-      if (node.type === 'scoped_call_expression') {
-        const name = String(node.childForFieldName?.('name')?.text || '').trim();
-        if (LOAD_METHODS.has(name.toLowerCase())) loadCalls.push(node);
-      }
-    });
+    for (const node of candidateCalls) {
+      const name = String(node.childForFieldName?.('name')?.text || '').trim();
+      if (!name) continue;
+      if (LOAD_METHODS.has(name.toLowerCase())) loadCalls.push(node);
+    }
 
     if (loadCalls.length === 0) continue;
 

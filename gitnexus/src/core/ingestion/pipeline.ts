@@ -63,9 +63,11 @@ export const runPipelineFromRepo = async (
   onProgress: (progress: PipelineProgress) => void,
   options?: PipelineRunOptions,
 ): Promise<PipelineResult> => {
-  const profilePipelineTimings = process.env.GITNEXUS_PROFILE_PIPELINE === '1';
+  // Always collect coarse per-stage timings. This adds negligible overhead but
+  // makes full-build performance bottlenecks actionable without extra flags.
+  const profilePipelineTimings = true;
   const pipelineTimingsMs: Record<string, number> = {};
-  const t0Pipeline = profilePipelineTimings ? Date.now() : 0;
+  const t0Pipeline = Date.now();
   const timeStage = async <T>(stage: string, run: () => Promise<T> | T): Promise<T> => {
     if (!profilePipelineTimings) return await run();
     const t0 = Date.now();
@@ -265,12 +267,24 @@ export const runPipelineFromRepo = async (
       });
 
       await timeStage('framework.events', async () => {
-        await processLaravelEvents(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-        await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-        await processLaravelSchedule(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-        await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-        await processLaravelTacticianDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
-        await processLaravelNotifications(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await timeStage('framework.events.providers', async () => {
+          await processLaravelEvents(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+        await timeStage('framework.events.dispatch', async () => {
+          await processLaravelEventDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+        await timeStage('framework.events.schedule', async () => {
+          await processLaravelSchedule(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+        await timeStage('framework.events.jobs', async () => {
+          await processLaravelJobDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+        await timeStage('framework.events.tactician', async () => {
+          await processLaravelTacticianDispatch(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
+        await timeStage('framework.events.notifications', async () => {
+          await processLaravelNotifications(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        });
       });
 
       await timeStage('framework.routes', async () => {

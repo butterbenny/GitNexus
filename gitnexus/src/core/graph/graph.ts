@@ -4,10 +4,13 @@ import { enrichRelationshipMetadata } from './edge-metadata.js';
 export const createKnowledgeGraph = (): KnowledgeGraph => {
   const nodeMap = new Map<string, GraphNode>();
   const relationshipMap = new Map<string, GraphRelationship>();
+  let nodeCache: GraphNode[] | null = null;
+  let relationshipCache: GraphRelationship[] | null = null;
 
   const addNode = (node: GraphNode) => {
     if(!nodeMap.has(node.id)) {
       nodeMap.set(node.id, node);
+      nodeCache = null;
     }
   };
 
@@ -15,6 +18,7 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
     const enriched = enrichRelationshipMetadata(relationship);
     if (!relationshipMap.has(enriched.id)) {
       relationshipMap.set(enriched.id, enriched);
+      relationshipCache = null;
     }
   };
 
@@ -25,6 +29,8 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
     if (!nodeMap.has(nodeId)) return false;
     
     nodeMap.delete(nodeId);
+    nodeCache = null;
+    relationshipCache = null;
     
     // Remove all relationships involving this node
     for (const [relId, rel] of relationshipMap) {
@@ -51,11 +57,13 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
 
   return{
     get nodes(){
-      return Array.from(nodeMap.values())
+      if (!nodeCache) nodeCache = Array.from(nodeMap.values());
+      return nodeCache;
     },
   
     get relationships(){
-      return Array.from(relationshipMap.values())
+      if (!relationshipCache) relationshipCache = Array.from(relationshipMap.values());
+      return relationshipCache;
     },
 
     // O(1) count getters - avoid creating arrays just for length

@@ -9,16 +9,32 @@
 import { startMCPServer } from '../mcp/server.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { listRegisteredRepos } from '../storage/repo-manager.js';
+import { installMcpStdioGuard } from '../mcp/core/stdio-guard.js';
 
 export const mcpCommand = async () => {
+  // Protect the MCP stdio transport: any non-protocol stdout output can corrupt
+  // JSON-RPC framing and surface as "Transport closed" client errors.
+  installMcpStdioGuard();
+
   // Prevent unhandled errors from crashing the MCP server process.
   // KuzuDB lock conflicts and transient errors should degrade gracefully.
   process.on('uncaughtException', (err) => {
     console.error(`GitNexus MCP: uncaught exception — ${err.message}`);
+    if (err?.stack) console.error(err.stack);
   });
   process.on('unhandledRejection', (reason) => {
     const msg = reason instanceof Error ? reason.message : String(reason);
     console.error(`GitNexus MCP: unhandled rejection — ${msg}`);
+    if (reason instanceof Error && reason.stack) console.error(reason.stack);
+  });
+
+  // Crash breadcrumbs for postmortems (best-effort).
+  process.on('exit', (code) => {
+    if (code === 0) return;
+    const last = (globalThis as any).__gitnexus_last_tool;
+    if (last?.name) {
+      console.error(`GitNexus MCP: exiting (code=${code}) lastTool=${last.name}`);
+    }
   });
 
   // Load all registered repos

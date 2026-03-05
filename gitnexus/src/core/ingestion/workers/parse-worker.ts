@@ -371,6 +371,31 @@ const isBuiltInCall = (calledName: string, language: SupportedLanguages): boolea
   return BUILT_INS.has(calledName);
 };
 
+const DEF_CAPTURE_TO_LABEL: Record<string, string> = {
+  'definition.function': 'Function',
+  'definition.class': 'Class',
+  'definition.interface': 'Interface',
+  'definition.method': 'Method',
+  'definition.struct': 'Struct',
+  'definition.enum': 'Enum',
+  'definition.namespace': 'Namespace',
+  'definition.module': 'Module',
+  'definition.trait': 'Trait',
+  'definition.impl': 'Impl',
+  'definition.type': 'TypeAlias',
+  'definition.const': 'Const',
+  'definition.static': 'Static',
+  'definition.typedef': 'Typedef',
+  'definition.macro': 'Macro',
+  'definition.union': 'Union',
+  'definition.property': 'Property',
+  'definition.record': 'Record',
+  'definition.delegate': 'Delegate',
+  'definition.annotation': 'Annotation',
+  'definition.constructor': 'Constructor',
+  'definition.template': 'Template',
+};
+
 // ============================================================================
 // Label detection from capture map
 // ============================================================================
@@ -572,7 +597,20 @@ const PHP_SCALAR_TYPES = new Set([
   'parent',
 ]);
 
-const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssignment[] => {
+const normalizePhpClassRef = (raw: string): string | null => {
+  const cleaned = raw.trim().replace(/^\?+/, '').replace(/^\\+/, '');
+  if (!cleaned) return null;
+  if (PHP_SCALAR_TYPES.has(cleaned.toLowerCase())) return null;
+  return cleaned;
+};
+
+const extractPhpVarTypes = (
+  rootNode: any,
+  filePath: string,
+  neededReceiversBySourceId: Map<string, Set<string>>,
+): ExtractedPhpAssignment[] => {
+  if (neededReceiversBySourceId.size === 0) return [];
+
   const assignments: ExtractedPhpAssignment[] = [];
 
   const visit = (node: any) => {
@@ -583,235 +621,220 @@ const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssign
         || node.namedChildren?.find((c: any) => c.type === 'declaration_list');
       const decls = bodyNode?.namedChildren || [];
 
-      const propertyTypes = new Map<string, string>();
-
-      const normalizeType = (raw: string): string | null => {
-        const cleaned = raw.trim().replace(/^\?+/, '').replace(/^\\+/, '');
-        if (!cleaned) return null;
-        if (PHP_SCALAR_TYPES.has(cleaned.toLowerCase())) return null;
-        return cleaned;
-      };
-
-      const stripPhpClassConstant = (value: string): string => value.trim().replace(/::class$/i, '').trim();
-
-      const getCallArgumentExpressions = (argsNode: any): any[] => {
-        if (!argsNode) return [];
-        const named = argsNode.namedChildren || [];
-        const exprs: any[] = [];
-
-        for (const n of named) {
-          if (n.type === 'argument') {
-            const expr = n.namedChildren?.at(-1);
-            if (expr) exprs.push(expr);
-            continue;
-          }
-          exprs.push(n);
-        }
-
-        return exprs;
-      };
-
-      const getBaseCallableName = (value: string): string => {
-        const trimmed = value.trim().replace(/^\\+/, '');
-        const parts = trimmed.split(/[\\/]+/).filter(Boolean);
-        return parts.at(-1) ?? trimmed;
-      };
-
+      // Fast path: if no method in this class needs `$this->...` receiver type resolution,
+      // skip expensive property/constructor type inference.
+      let needsThisPropertyTypes = false;
+      const neededThisReceiversInClass = new Set<string>();
       for (const decl of decls) {
-        if (decl.type === 'property_declaration') {
-          const typeNode = decl.childForFieldName?.('type');
-          if (!typeNode) continue;
-
-          const innerType = typeNode.namedChildren?.[0];
-          const classRef = normalizeType(String((innerType?.text ?? typeNode.text) || ''));
-          if (!classRef) continue;
-
-          for (const child of decl.namedChildren || []) {
-            if (child.type !== 'property_element') continue;
-            const varNode = child.namedChildren?.find((c: any) => c.type === 'variable_name');
-            const varText = varNode?.text;
-            if (!varText) continue;
-            const propName = varText.replace(/^\$/, '');
-            if (!propName) continue;
-            propertyTypes.set(`$this->${propName}`, classRef);
+        if (decl.type !== 'method_declaration') continue;
+        const nameNode = decl.childForFieldName?.('name');
+        const methodName = nameNode?.text;
+        if (!methodName) continue;
+        const sourceId = generateId('Method', `${filePath}:${methodName}`);
+        const neededReceivers = neededReceiversBySourceId.get(sourceId);
+        if (!neededReceivers) continue;
+        for (const receiver of neededReceivers) {
+          if (receiver.startsWith('$this->')) {
+            needsThisPropertyTypes = true;
+            neededThisReceiversInClass.add(receiver);
           }
-        }
-
-        if (decl.type === 'method_declaration') {
-          const nameNode = decl.childForFieldName?.('name');
-          if (nameNode?.text !== '__construct') continue;
-
-          const constructorParamTypes = new Map<string, string>();
-
-          const paramsNode = decl.childForFieldName?.('parameters');
-          const params = paramsNode?.namedChildren || [];
-
-          for (const param of params) {
-            const varNode = param.childForFieldName?.('name');
-            const varText = varNode?.type === 'variable_name' ? varNode.text : null;
-            if (!varText) continue;
-
-            const typeNode = param.childForFieldName?.('type');
-            if (!typeNode) continue;
-
-            const innerType = typeNode.namedChildren?.[0];
-            const classRef = normalizeType(String((innerType?.text ?? typeNode.text) || ''));
-            if (!classRef) continue;
-
-            constructorParamTypes.set(varText, classRef);
-
-            if (param.type === 'property_promotion_parameter') {
-              const propName = varText.replace(/^\$/, '');
-              if (!propName) continue;
-              propertyTypes.set(`$this->${propName}`, classRef);
-            }
-          }
-
-          const inferClassRefFromExpression = (expr: any): string | null => {
-            if (!expr) return null;
-
-            if (expr.type === 'parenthesized_expression') {
-              return inferClassRefFromExpression(expr.namedChildren?.[0]);
-            }
-
-            if (expr.type === 'variable_name') {
-              return constructorParamTypes.get(expr.text) || null;
-            }
-
-            if (expr.type === 'object_creation_expression') {
-              const classNode = (expr.namedChildren || []).find((c: any) => c.type === 'name' || c.type === 'qualified_name');
-              const classRef = normalizeType(String(classNode?.text || ''));
-              return classRef;
-            }
-
-            if (expr.type === 'function_call_expression') {
-              const fnNode = expr.childForFieldName?.('function') || expr.childForFieldName?.('name');
-              const fnText = String(fnNode?.text || '').trim();
-              const fnName = getBaseCallableName(fnText).toLowerCase();
-              if (fnName !== 'app' && fnName !== 'resolve') return null;
-
-              const argsNode = expr.childForFieldName?.('arguments');
-              const args = getCallArgumentExpressions(argsNode);
-              const first = args[0];
-              if (!first) return null;
-
-              if (first.type === 'class_constant_access_expression') {
-                return normalizeType(stripPhpClassConstant(String(first.text || '')));
-              }
-              if (first.type === 'qualified_name' || first.type === 'name') {
-                return normalizeType(stripPhpClassConstant(String(first.text || '')));
-              }
-              return null;
-            }
-
-            if (expr.type === 'member_call_expression') {
-              const nameNode = expr.childForFieldName?.('name');
-              const methodName = String(nameNode?.text || '').trim().toLowerCase();
-              if (methodName !== 'make' && methodName !== 'makewith') return null;
-
-              const objectNode = expr.childForFieldName?.('object');
-              if (objectNode?.type !== 'function_call_expression') return null;
-
-              const fnNode = objectNode.childForFieldName?.('function') || objectNode.childForFieldName?.('name');
-              const fnText = String(fnNode?.text || '').trim();
-              const fnName = getBaseCallableName(fnText).toLowerCase();
-              if (fnName !== 'app') return null;
-
-              const appArgsNode = objectNode.childForFieldName?.('arguments');
-              const appArgs = getCallArgumentExpressions(appArgsNode);
-              if (appArgs.length !== 0) return null;
-
-              const argsNode = expr.childForFieldName?.('arguments');
-              const args = getCallArgumentExpressions(argsNode);
-              const first = args[0];
-              if (!first) return null;
-
-              if (first.type === 'class_constant_access_expression') {
-                return normalizeType(stripPhpClassConstant(String(first.text || '')));
-              }
-              if (first.type === 'qualified_name' || first.type === 'name') {
-                return normalizeType(stripPhpClassConstant(String(first.text || '')));
-              }
-              return null;
-            }
-
-            if (expr.type === 'scoped_call_expression') {
-              const nameNode = expr.childForFieldName?.('name');
-              const methodName = String(nameNode?.text || '').trim().toLowerCase();
-              if (methodName !== 'make' && methodName !== 'makewith') return null;
-
-              const scopeNode = expr.childForFieldName?.('scope');
-              const scopeText = String(scopeNode?.text || '').trim();
-              const scopeName = getBaseCallableName(scopeText).toLowerCase();
-              if (scopeName !== 'app') return null;
-
-              const argsNode = expr.childForFieldName?.('arguments');
-              const args = getCallArgumentExpressions(argsNode);
-              const first = args[0];
-              if (!first) return null;
-
-              if (first.type === 'class_constant_access_expression') {
-                return normalizeType(stripPhpClassConstant(String(first.text || '')));
-              }
-              if (first.type === 'qualified_name' || first.type === 'name') {
-                return normalizeType(stripPhpClassConstant(String(first.text || '')));
-              }
-              return null;
-            }
-
-            return null;
-          };
-
-          const bodyNode = decl.childForFieldName?.('body')
-            || decl.namedChildren?.find((c: any) => c.type === 'compound_statement');
-
-          const visitConstructorBody = (node: any) => {
-            if (!node) return;
-
-            if (node.type === 'assignment_expression') {
-              const left = node.childForFieldName?.('left');
-              const right = node.childForFieldName?.('right');
-
-              if (left?.type === 'member_access_expression') {
-                const baseNode = left.childForFieldName?.('object');
-                if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
-                  const variableName = left.text;
-                  const classRef = inferClassRefFromExpression(right);
-                  if (variableName && classRef) {
-                    const existing = propertyTypes.get(variableName);
-                    if (!existing) propertyTypes.set(variableName, classRef);
-                  }
-                }
-              }
-            }
-
-            for (const child of node.namedChildren || []) {
-              visitConstructorBody(child);
-            }
-          };
-
-          visitConstructorBody(bodyNode);
         }
       }
 
-      if (propertyTypes.size > 0) {
+      if (needsThisPropertyTypes) {
+        const propertyTypes = new Map<string, string>();
+
         for (const decl of decls) {
-          if (decl.type !== 'method_declaration') continue;
+          if (decl.type === 'property_declaration') {
+            const typeNode = decl.childForFieldName?.('type');
+            if (!typeNode) continue;
 
-          const nameNode = decl.childForFieldName?.('name');
-          const methodName = nameNode?.text;
-          if (!methodName) continue;
+            const innerType = typeNode.namedChildren?.[0];
+            const classRef = normalizePhpClassRef(String((innerType?.text ?? typeNode.text) || ''));
+            if (!classRef) continue;
 
-          const sourceId = generateId('Method', `${filePath}:${methodName}`);
+            for (const child of decl.namedChildren || []) {
+              if (child.type !== 'property_element') continue;
+              const varNode = child.namedChildren?.find((c: any) => c.type === 'variable_name');
+              const varText = varNode?.text;
+              if (!varText) continue;
+              const propName = varText.replace(/^\$/, '');
+              if (!propName) continue;
+              const variableName = `$this->${propName}`;
+              if (!neededThisReceiversInClass.has(variableName)) continue;
+              propertyTypes.set(variableName, classRef);
+            }
+          }
 
-          for (const [variableName, classRef] of propertyTypes) {
-            assignments.push({
-              filePath,
-              sourceId,
-              variableName,
-              classRef,
-              startLine: decl.startPosition.row,
-            });
+          if (decl.type === 'method_declaration') {
+            const nameNode = decl.childForFieldName?.('name');
+            if (nameNode?.text !== '__construct') continue;
+
+            const constructorParamTypes = new Map<string, string>();
+
+            const paramsNode = decl.childForFieldName?.('parameters');
+            const params = paramsNode?.namedChildren || [];
+
+            for (const param of params) {
+              const varNode = param.childForFieldName?.('name');
+              const varText = varNode?.type === 'variable_name' ? varNode.text : null;
+              if (!varText) continue;
+
+              const typeNode = param.childForFieldName?.('type');
+              if (!typeNode) continue;
+
+              const innerType = typeNode.namedChildren?.[0];
+              const classRef = normalizePhpClassRef(String((innerType?.text ?? typeNode.text) || ''));
+              if (!classRef) continue;
+
+              constructorParamTypes.set(varText, classRef);
+
+              if (param.type === 'property_promotion_parameter') {
+                const propName = varText.replace(/^\$/, '');
+                if (!propName) continue;
+                const variableName = `$this->${propName}`;
+                if (!neededThisReceiversInClass.has(variableName)) continue;
+                propertyTypes.set(variableName, classRef);
+              }
+            }
+
+            const inferClassRefFromExpression = (expr: any): string | null => {
+              if (!expr) return null;
+
+              if (expr.type === 'parenthesized_expression') {
+                return inferClassRefFromExpression(expr.namedChildren?.[0]);
+              }
+
+              if (expr.type === 'variable_name') {
+                return constructorParamTypes.get(expr.text) || null;
+              }
+
+              if (expr.type === 'object_creation_expression') {
+                const classNode = (expr.namedChildren || []).find((c: any) => c.type === 'name' || c.type === 'qualified_name');
+                return classNode?.text ? normalizePhpClassRef(String(classNode.text)) : null;
+              }
+
+              const inferFromTypeArg = (arg: any): string | null => {
+                if (!arg) return null;
+                if (arg.type === 'class_constant_access_expression') {
+                  return normalizePhpClassRef(stripPhpClassConstantText(String(arg.text || '')));
+                }
+                if (arg.type === 'qualified_name' || arg.type === 'name') {
+                  return normalizePhpClassRef(stripPhpClassConstantText(String(arg.text || '')));
+                }
+                return null;
+              };
+
+              if (expr.type === 'function_call_expression') {
+                const fnNode = expr.childForFieldName?.('function') || expr.childForFieldName?.('name');
+                const fnText = String(fnNode?.text || '').trim();
+                const fnName = getPhpBaseCallableName(fnText).toLowerCase();
+                if (fnName !== 'app' && fnName !== 'resolve') return null;
+
+                const argsNode = expr.childForFieldName?.('arguments');
+                const args = getPhpCallArgumentExpressions(argsNode);
+                return inferFromTypeArg(args[0]);
+              }
+
+              if (expr.type === 'member_call_expression') {
+                const nameNode = expr.childForFieldName?.('name');
+                const methodName = String(nameNode?.text || '').trim().toLowerCase();
+                if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+                const objectNode = expr.childForFieldName?.('object');
+                if (objectNode?.type !== 'function_call_expression') return null;
+
+                const fnNode = objectNode.childForFieldName?.('function') || objectNode.childForFieldName?.('name');
+                const fnText = String(fnNode?.text || '').trim();
+                const fnName = getPhpBaseCallableName(fnText).toLowerCase();
+                if (fnName !== 'app') return null;
+
+                const appArgsNode = objectNode.childForFieldName?.('arguments');
+                const appArgs = getPhpCallArgumentExpressions(appArgsNode);
+                if (appArgs.length !== 0) return null;
+
+                const argsNode = expr.childForFieldName?.('arguments');
+                const args = getPhpCallArgumentExpressions(argsNode);
+                return inferFromTypeArg(args[0]);
+              }
+
+              if (expr.type === 'scoped_call_expression') {
+                const nameNode = expr.childForFieldName?.('name');
+                const methodName = String(nameNode?.text || '').trim().toLowerCase();
+                if (methodName !== 'make' && methodName !== 'makewith') return null;
+
+                const scopeNode = expr.childForFieldName?.('scope');
+                const scopeText = String(scopeNode?.text || '').trim();
+                const scopeName = getPhpBaseCallableName(scopeText).toLowerCase();
+                if (scopeName !== 'app') return null;
+
+                const argsNode = expr.childForFieldName?.('arguments');
+                const args = getPhpCallArgumentExpressions(argsNode);
+                return inferFromTypeArg(args[0]);
+              }
+
+              return null;
+            };
+
+            const bodyNode = decl.childForFieldName?.('body')
+              || decl.namedChildren?.find((c: any) => c.type === 'compound_statement');
+
+            const visitConstructorBody = (node: any) => {
+              if (!node) return;
+
+              if (node.type === 'assignment_expression') {
+                const left = node.childForFieldName?.('left');
+                const right = node.childForFieldName?.('right');
+
+                if (left?.type === 'member_access_expression') {
+                  const baseNode = left.childForFieldName?.('object');
+                  if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
+                    const variableName = left.text;
+                    if (neededThisReceiversInClass.has(variableName)) {
+                      const classRef = inferClassRefFromExpression(right);
+                      if (variableName && classRef) {
+                        const existing = propertyTypes.get(variableName);
+                        if (!existing) propertyTypes.set(variableName, classRef);
+                      }
+                    }
+                  }
+                }
+              }
+
+              for (const child of node.namedChildren || []) {
+                visitConstructorBody(child);
+              }
+            };
+
+            visitConstructorBody(bodyNode);
+          }
+        }
+
+        if (propertyTypes.size > 0) {
+          for (const decl of decls) {
+            if (decl.type !== 'method_declaration') continue;
+
+            const nameNode = decl.childForFieldName?.('name');
+            const methodName = nameNode?.text;
+            if (!methodName) continue;
+
+            const sourceId = generateId('Method', `${filePath}:${methodName}`);
+            const neededReceivers = neededReceiversBySourceId.get(sourceId);
+            if (!neededReceivers) continue;
+
+            for (const receiver of neededReceivers) {
+              if (!receiver.startsWith('$this->')) continue;
+              const classRef = propertyTypes.get(receiver);
+              if (!classRef) continue;
+
+              assignments.push({
+                filePath,
+                sourceId,
+                variableName: receiver,
+                classRef,
+                startLine: decl.startPosition.row,
+              });
+            }
           }
         }
       }
@@ -824,6 +847,12 @@ const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssign
       const sourceId = callableName ? generateId(label, `${filePath}:${callableName}`) : null;
 
       if (sourceId) {
+        const neededReceivers = neededReceiversBySourceId.get(sourceId);
+        if (!neededReceivers) {
+          // No call sites in this scope need variable-type inference.
+          // Skip param type extraction to save time.
+          // (Receiver `$this` is handled separately without this index.)
+        } else {
         const paramsNode = node.childForFieldName?.('parameters');
         const params = paramsNode?.namedChildren || [];
 
@@ -833,16 +862,15 @@ const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssign
           const varNode = param.childForFieldName?.('name');
           const variableName = varNode?.type === 'variable_name' ? varNode.text : null;
           if (!variableName) continue;
+          if (!neededReceivers.has(variableName)) continue;
 
           const typeNode = param.childForFieldName?.('type');
           if (!typeNode) continue;
 
           // named_type wraps (name|qualified_name)
           const innerType = typeNode.namedChildren?.[0];
-          const classRefRaw = String((innerType?.text ?? typeNode.text) || '').trim();
-          const classRef = classRefRaw.replace(/^\?+/, '').replace(/^\\+/, '');
+          const classRef = normalizePhpClassRef(String((innerType?.text ?? typeNode.text) || ''));
           if (!classRef) continue;
-          if (PHP_SCALAR_TYPES.has(classRef.toLowerCase())) continue;
 
           assignments.push({
             filePath,
@@ -851,6 +879,7 @@ const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssign
             classRef,
             startLine: node.startPosition.row,
           });
+        }
         }
       }
     }
@@ -861,148 +890,16 @@ const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssign
 
       const sourceId = findEnclosingFunctionId(node, filePath);
       if (sourceId) {
-        const normalizeType = (raw: string): string | null => {
-          const cleaned = raw.trim().replace(/^\?+/, '').replace(/^\\+/, '');
-          if (!cleaned) return null;
-          if (PHP_SCALAR_TYPES.has(cleaned.toLowerCase())) return null;
-          return cleaned;
-        };
-
-        const stripPhpClassConstant = (value: string): string => value.trim().replace(/::class$/i, '').trim();
-
-        const getBaseCallableName = (value: string): string => {
-          const trimmed = value.trim().replace(/^\\+/, '');
-          const parts = trimmed.split(/[\\/]+/).filter(Boolean);
-          return parts.at(-1) ?? trimmed;
-        };
-
-        const getCallArgumentExpressions = (argsNode: any): any[] => {
-          if (!argsNode) return [];
-          const named = argsNode.namedChildren || [];
-          const exprs: any[] = [];
-
-          for (const n of named) {
-            if (n.type === 'argument') {
-              const expr = n.namedChildren?.at(-1);
-              if (expr) exprs.push(expr);
-              continue;
-            }
-            exprs.push(n);
-          }
-
-          return exprs;
-        };
-
-        const inferClassRefFromExpression = (expr: any): string | null => {
-          if (!expr) return null;
-
-          if (expr.type === 'parenthesized_expression') {
-            return inferClassRefFromExpression(expr.namedChildren?.[0]);
-          }
-
-          if (expr.type === 'object_creation_expression') {
-            const classNode = (expr.namedChildren || []).find((c: any) => c.type === 'name' || c.type === 'qualified_name');
-            return classNode?.text ? normalizeType(String(classNode.text)) : null;
-          }
-
-          if (expr.type === 'function_call_expression') {
-            const fnNode = expr.childForFieldName?.('function') || expr.childForFieldName?.('name');
-            const fnText = String(fnNode?.text || '').trim();
-            const fnName = getBaseCallableName(fnText).toLowerCase();
-            if (fnName !== 'app' && fnName !== 'resolve') return null;
-
-            const argsNode = expr.childForFieldName?.('arguments');
-            const args = getCallArgumentExpressions(argsNode);
-            const first = args[0];
-            if (!first) return null;
-
-            if (first.type === 'class_constant_access_expression') {
-              return normalizeType(stripPhpClassConstant(String(first.text || '')));
-            }
-            if (first.type === 'qualified_name' || first.type === 'name') {
-              return normalizeType(stripPhpClassConstant(String(first.text || '')));
-            }
-            return null;
-          }
-
-          if (expr.type === 'member_call_expression') {
-            const nameNode = expr.childForFieldName?.('name');
-            const methodName = String(nameNode?.text || '').trim().toLowerCase();
-            if (methodName !== 'make' && methodName !== 'makewith') return null;
-
-            const objectNode = expr.childForFieldName?.('object');
-            if (objectNode?.type !== 'function_call_expression') return null;
-
-            const fnNode = objectNode.childForFieldName?.('function') || objectNode.childForFieldName?.('name');
-            const fnText = String(fnNode?.text || '').trim();
-            const fnName = getBaseCallableName(fnText).toLowerCase();
-            if (fnName !== 'app') return null;
-
-            const appArgsNode = objectNode.childForFieldName?.('arguments');
-            const appArgs = getCallArgumentExpressions(appArgsNode);
-            if (appArgs.length !== 0) return null;
-
-            const argsNode = expr.childForFieldName?.('arguments');
-            const args = getCallArgumentExpressions(argsNode);
-            const first = args[0];
-            if (!first) return null;
-
-            if (first.type === 'class_constant_access_expression') {
-              return normalizeType(stripPhpClassConstant(String(first.text || '')));
-            }
-            if (first.type === 'qualified_name' || first.type === 'name') {
-              return normalizeType(stripPhpClassConstant(String(first.text || '')));
-            }
-            return null;
-          }
-
-          if (expr.type === 'scoped_call_expression') {
-            const nameNode = expr.childForFieldName?.('name');
-            const methodName = String(nameNode?.text || '').trim().toLowerCase();
-            if (methodName !== 'make' && methodName !== 'makewith') return null;
-
-            const scopeNode = expr.childForFieldName?.('scope');
-            const scopeText = String(scopeNode?.text || '').trim();
-            const scopeName = getBaseCallableName(scopeText).toLowerCase();
-            if (scopeName !== 'app') return null;
-
-            const argsNode = expr.childForFieldName?.('arguments');
-            const args = getCallArgumentExpressions(argsNode);
-            const first = args[0];
-            if (!first) return null;
-
-            if (first.type === 'class_constant_access_expression') {
-              return normalizeType(stripPhpClassConstant(String(first.text || '')));
-            }
-            if (first.type === 'qualified_name' || first.type === 'name') {
-              return normalizeType(stripPhpClassConstant(String(first.text || '')));
-            }
-            return null;
-          }
-
-          return null;
-        };
-
+        const neededReceivers = neededReceiversBySourceId.get(sourceId);
+        if (!neededReceivers) {
+          // No call sites in this scope need variable-type inference.
+          // Skip assignment scanning to save time.
+        } else {
         if (left?.type === 'variable_name') {
           const variableName = left.text;
-          const classRef = inferClassRefFromExpression(right);
-          if (variableName && classRef) {
-            assignments.push({
-              filePath,
-              sourceId,
-              variableName,
-              classRef,
-              startLine: node.startPosition.row,
-            });
-          }
-        }
-
-        if (left?.type === 'member_access_expression') {
-          const baseNode = left.childForFieldName?.('object');
-          if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
-            const variableName = left.text;
-            const classRef = inferClassRefFromExpression(right);
-            if (variableName && classRef) {
+          if (variableName && neededReceivers.has(variableName)) {
+            const classRef = normalizePhpClassRef(inferPhpClassRefFromExpression(right) ?? '');
+            if (classRef) {
               assignments.push({
                 filePath,
                 sourceId,
@@ -1012,6 +909,26 @@ const extractPhpVarTypes = (rootNode: any, filePath: string): ExtractedPhpAssign
               });
             }
           }
+        }
+
+        if (left?.type === 'member_access_expression') {
+          const baseNode = left.childForFieldName?.('object');
+          if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
+            const variableName = left.text;
+            if (variableName && neededReceivers.has(variableName)) {
+              const classRef = normalizePhpClassRef(inferPhpClassRefFromExpression(right) ?? '');
+              if (classRef) {
+                assignments.push({
+                  filePath,
+                  sourceId,
+                  variableName,
+                  classRef,
+                  startLine: node.startPosition.row,
+                });
+              }
+            }
+          }
+        }
         }
       }
     }
@@ -1159,6 +1076,8 @@ const processFileGroup = (
   for (const file of files) {
     let tree;
     const content = getParseableContent(file.path, file.content);
+    const neededPhpReceiversBySourceId = language === SupportedLanguages.PHP ? new Map<string, Set<string>>() : null;
+    let needsPhpTraitUses = false;
     try {
       tree = parseWithAdaptiveBuffer(parser, content);
     } catch {
@@ -1176,14 +1095,70 @@ const processFileGroup = (
     }
 
     for (const match of matches) {
-      const captureMap: Record<string, any> = {};
+      let importSourceNode: any | null = null;
+      let callNode: any | null = null;
+      let callNameNode: any | null = null;
+      let heritageClassNode: any | null = null;
+      let heritageExtendsNode: any | null = null;
+      let heritageImplementsNode: any | null = null;
+      let heritageTraitNode: any | null = null;
+      let nameNode: any | null = null;
+      let defNode: any | null = null;
+      let nodeLabel: string | null = null;
+
       for (const c of match.captures) {
-        captureMap[c.name] = c.node;
+        const captureName = c.name;
+        const captureNode = c.node;
+
+        if (captureName === 'import.source') {
+          importSourceNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'call') {
+          callNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'call.name') {
+          callNameNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'heritage.class') {
+          heritageClassNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'heritage.extends') {
+          heritageExtendsNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'heritage.implements') {
+          heritageImplementsNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'heritage.trait') {
+          heritageTraitNode = captureNode;
+          continue;
+        }
+
+        if (captureName === 'name') {
+          nameNode = captureNode;
+          continue;
+        }
+
+        const label = DEF_CAPTURE_TO_LABEL[captureName];
+        if (label) {
+          nodeLabel = label;
+          defNode = captureNode;
+        }
       }
 
-      // Extract import paths before skipping
-      if (captureMap['import'] && captureMap['import.source']) {
-        const rawImportPath = captureMap['import.source'].text.replace(/['"<>]/g, '');
+      if (importSourceNode) {
+        const rawImportPath = importSourceNode.text.replace(/['"<>]/g, '');
         result.imports.push({
           filePath: file.path,
           rawImportPath,
@@ -1192,113 +1167,93 @@ const processFileGroup = (
         continue;
       }
 
-      // Extract call sites
-      if (captureMap['call']) {
-        const callNameNode = captureMap['call.name'];
-        if (callNameNode) {
-          const calledName = callNameNode.text;
-          if (!isBuiltInCall(calledName, language)) {
-            const callNode = captureMap['call'];
-            const sourceId = findEnclosingFunctionId(callNode, file.path)
-              || generateId('File', file.path);
-            const extracted: ExtractedCall = { filePath: file.path, calledName, sourceId };
+      if (callNode) {
+        const calledName = callNameNode?.text;
+        if (!calledName) continue;
+        if (!isBuiltInCall(calledName, language)) {
+          const sourceId = findEnclosingFunctionId(callNode, file.path)
+            || generateId('File', file.path);
+          const extracted: ExtractedCall = { filePath: file.path, calledName, sourceId };
 
-            if (language === SupportedLanguages.PHP) {
-              extracted.startLine = callNode.startPosition.row;
-              if (callNode.type === 'member_call_expression') {
-                extracted.kind = 'member';
-                const objectNode = callNode.childForFieldName?.('object');
-                if (objectNode?.type === 'variable_name') {
+          if (language === SupportedLanguages.PHP) {
+            extracted.startLine = callNode.startPosition.row;
+            if (callNode.type === 'member_call_expression') {
+              extracted.kind = 'member';
+              const objectNode = callNode.childForFieldName?.('object');
+              if (objectNode?.type === 'variable_name') {
+                extracted.receiver = objectNode.text;
+              } else if (objectNode?.type === 'member_access_expression') {
+                const baseNode = objectNode.childForFieldName?.('object');
+                if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
                   extracted.receiver = objectNode.text;
-                } else if (objectNode?.type === 'member_access_expression') {
-                  const baseNode = objectNode.childForFieldName?.('object');
-                  if (baseNode?.type === 'variable_name' && baseNode.text === '$this') {
-                    extracted.receiver = objectNode.text;
-                  }
-                } else {
-                  const classRef = inferPhpClassRefFromExpression(objectNode);
-                  if (classRef) extracted.receiverClassRef = classRef;
                 }
-              } else if (callNode.type === 'scoped_call_expression') {
-                extracted.kind = 'scoped';
-                const scopeNode = callNode.childForFieldName?.('scope');
-                extracted.scope = scopeNode?.text;
-              } else if (callNode.type === 'function_call_expression') {
-                extracted.kind = 'simple';
+              } else {
+                const classRef = inferPhpClassRefFromExpression(objectNode);
+                if (classRef) extracted.receiverClassRef = classRef;
               }
+            } else if (callNode.type === 'scoped_call_expression') {
+              extracted.kind = 'scoped';
+              const scopeNode = callNode.childForFieldName?.('scope');
+              extracted.scope = scopeNode?.text;
+            } else if (callNode.type === 'function_call_expression') {
+              extracted.kind = 'simple';
             }
 
-            result.calls.push(extracted);
+            if (extracted.kind === 'member') {
+              if (extracted.receiver === '$this') {
+                needsPhpTraitUses = true;
+              } else if (extracted.receiver && neededPhpReceiversBySourceId) {
+                let set = neededPhpReceiversBySourceId.get(sourceId);
+                if (!set) {
+                  set = new Set();
+                  neededPhpReceiversBySourceId.set(sourceId, set);
+                }
+                set.add(extracted.receiver);
+              }
+            }
           }
+
+          result.calls.push(extracted);
         }
         continue;
       }
 
-      // Extract heritage (extends/implements)
-      if (captureMap['heritage.class']) {
-        if (captureMap['heritage.extends']) {
+      if (heritageClassNode) {
+        if (heritageExtendsNode) {
           result.heritage.push({
             filePath: file.path,
-            className: captureMap['heritage.class'].text,
-            parentName: captureMap['heritage.extends'].text,
+            className: heritageClassNode.text,
+            parentName: heritageExtendsNode.text,
             kind: 'extends',
           });
         }
-        if (captureMap['heritage.implements']) {
+        if (heritageImplementsNode) {
           result.heritage.push({
             filePath: file.path,
-            className: captureMap['heritage.class'].text,
-            parentName: captureMap['heritage.implements'].text,
+            className: heritageClassNode.text,
+            parentName: heritageImplementsNode.text,
             kind: 'implements',
           });
         }
-        if (captureMap['heritage.trait']) {
+        if (heritageTraitNode) {
           result.heritage.push({
             filePath: file.path,
-            className: captureMap['heritage.class'].text,
-            parentName: captureMap['heritage.trait'].text,
+            className: heritageClassNode.text,
+            parentName: heritageTraitNode.text,
             kind: 'trait-impl',
           });
         }
-        if (captureMap['heritage.extends'] || captureMap['heritage.implements'] || captureMap['heritage.trait']) {
+        if (heritageExtendsNode || heritageImplementsNode || heritageTraitNode) {
           continue;
         }
       }
 
-      const nodeLabel = getLabelFromCaptures(captureMap);
-      if (!nodeLabel) continue;
+      if (!nameNode) continue;
 
-      const nameNode = captureMap['name'];
+      const resolvedLabel = nodeLabel || 'CodeElement';
       const nodeName = nameNode.text;
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+      const nodeId = generateId(resolvedLabel, `${file.path}:${nodeName}`);
 
-      const defCaptureByLabel: Record<string, string> = {
-        Function: 'definition.function',
-        Class: 'definition.class',
-        Interface: 'definition.interface',
-        Method: 'definition.method',
-        Struct: 'definition.struct',
-        Enum: 'definition.enum',
-        Namespace: 'definition.namespace',
-        Module: 'definition.module',
-        Trait: 'definition.trait',
-        Impl: 'definition.impl',
-        TypeAlias: 'definition.type',
-        Const: 'definition.const',
-        Static: 'definition.static',
-        Typedef: 'definition.typedef',
-        Macro: 'definition.macro',
-        Union: 'definition.union',
-        Property: 'definition.property',
-        Record: 'definition.record',
-        Delegate: 'definition.delegate',
-        Annotation: 'definition.annotation',
-        Constructor: 'definition.constructor',
-        Template: 'definition.template',
-      };
-
-      const defKey = defCaptureByLabel[nodeLabel] || '';
-      const defNode = (defKey ? captureMap[defKey] : null) as any;
       const spanNode = defNode || nameNode;
       const startLineRaw = spanNode?.startPosition?.row;
       const endLineRaw = spanNode?.endPosition?.row;
@@ -1307,7 +1262,7 @@ const processFileGroup = (
 
       result.nodes.push({
         id: nodeId,
-        label: nodeLabel,
+        label: resolvedLabel,
         properties: {
           name: nodeName,
           filePath: file.path,
@@ -1322,7 +1277,7 @@ const processFileGroup = (
         filePath: file.path,
         name: nodeName,
         nodeId,
-        type: nodeLabel,
+        type: resolvedLabel,
       });
 
       const fileId = generateId('File', file.path);
@@ -1336,9 +1291,8 @@ const processFileGroup = (
         reason: '',
       });
 
-      if (language === SupportedLanguages.PHP && nodeLabel === 'Method') {
-        const methodNode = captureMap['definition.method'];
-        const enclosing = methodNode ? findEnclosingPhpType(methodNode) : null;
+      if (language === SupportedLanguages.PHP && resolvedLabel === 'Method') {
+        const enclosing = defNode ? findEnclosingPhpType(defNode) : null;
         if (enclosing) {
           const containerId = generateId(enclosing.label, `${file.path}:${enclosing.name}`);
           const memberRelId = generateId('MEMBER_OF', `${nodeId}->${containerId}`);
@@ -1355,8 +1309,12 @@ const processFileGroup = (
     }
 
     if (language === SupportedLanguages.PHP) {
-      result.phpAssignments.push(...extractPhpVarTypes(tree.rootNode, file.path));
-      result.phpTraitUses.push(...extractPhpTraitUses(tree.rootNode, file.path));
+      if (neededPhpReceiversBySourceId && neededPhpReceiversBySourceId.size > 0) {
+        result.phpAssignments.push(...extractPhpVarTypes(tree.rootNode, file.path, neededPhpReceiversBySourceId));
+      }
+      if (needsPhpTraitUses) {
+        result.phpTraitUses.push(...extractPhpTraitUses(tree.rootNode, file.path));
+      }
     }
   }
 };
