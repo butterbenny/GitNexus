@@ -40,6 +40,123 @@ type ActionPlanDeps = {
   ) => { relativePath: string; absolutePath: string } | null;
 };
 
+type DirectActionPlanPrecedentSurface = {
+  kind: string;
+  title: string;
+  signature: string;
+  filePath: string;
+  source: string;
+  score: number;
+};
+
+const DIRECT_ACTION_PLAN_PRECEDENT_KINDS = new Set([
+  'ui-behavior',
+  'backend-behavior',
+  'backend-handoff',
+  'pattern-catalog',
+  'slice',
+  'hop',
+  'process',
+]);
+const STRONG_ACTION_PLAN_PRECEDENT_KINDS = new Set([
+  'ui-behavior',
+  'backend-behavior',
+  'backend-handoff',
+  'pattern-catalog',
+]);
+const DIRECT_ACTION_PLAN_PRECEDENT_BASE_SCORES: Record<string, number> = {
+  'ui-behavior': 1.08,
+  'backend-handoff': 1.04,
+  'backend-behavior': 1.02,
+  'pattern-catalog': 0.95,
+  slice: 0.9,
+  hop: 0.88,
+  process: 0.86,
+};
+const GENERIC_ACTION_PLAN_TARGET_PATTERNS = [
+  /^pattern-catalog:/i,
+  /\bpermission\b/i,
+  /\bendpoint\b/i,
+  /\bcontroller\b/i,
+  /\broute\b/i,
+  /\bapi\b/i,
+];
+
+const buildDirectActionPlanPrecedentSurfaces = (
+  precedents: any[],
+  normalizeRepoRelativePath: (value: string) => string,
+): DirectActionPlanPrecedentSurface[] => {
+  const byFilePath = new Map<string, DirectActionPlanPrecedentSurface>();
+
+  const basename = (filePath: string): string => {
+    const parts = String(filePath || '').split('/').filter(Boolean);
+    return parts[parts.length - 1] || filePath;
+  };
+
+  const pushNode = (precedent: any, node: any, source: string, scoreOffset = 0): void => {
+    const kind = String(precedent?.kind || '').trim();
+    if (!DIRECT_ACTION_PLAN_PRECEDENT_KINDS.has(kind)) return;
+
+    const filePath = normalizeRepoRelativePath(String(node?.filePath || ''));
+    if (!filePath) return;
+
+    const baseScore = DIRECT_ACTION_PLAN_PRECEDENT_BASE_SCORES[kind] ?? 0.84;
+    const score = Math.round(Math.max(0, baseScore + scoreOffset) * 1000) / 1000;
+    const title = String(
+      node?.title
+      || node?.name
+      || precedent?.anchor?.title
+      || precedent?.anchor?.name
+      || precedent?.signature
+      || basename(filePath),
+    ).trim() || basename(filePath);
+    const signature = String(precedent?.signature || '').trim();
+    const existing = byFilePath.get(filePath);
+    if (existing && existing.score >= score) return;
+
+    byFilePath.set(filePath, {
+      kind,
+      title,
+      signature,
+      filePath,
+      source,
+      score,
+    });
+  };
+
+  for (const precedent of Array.isArray(precedents) ? precedents : []) {
+    pushNode(precedent, precedent?.anchor, 'anchor', 0.04);
+    pushNode(precedent, precedent?.anchor?.ui, 'anchor-ui', 0.03);
+    pushNode(precedent, precedent?.anchor?.endpoint, 'anchor-endpoint', 0.02);
+    pushNode(precedent, precedent?.anchor?.controller, 'anchor-controller', 0.01);
+
+    const examples = Array.isArray(precedent?.examples) ? precedent.examples : [];
+    for (const example of examples.slice(0, 4)) {
+      pushNode(precedent, example, 'example', -0.04);
+      pushNode(precedent, example?.ui, 'example-ui', -0.05);
+      pushNode(precedent, example?.endpoint, 'example-endpoint', -0.05);
+      pushNode(precedent, example?.controller, 'example-controller', -0.05);
+    }
+
+    const memberFiles = Array.isArray(precedent?.member_files) ? precedent.member_files : [];
+    for (const memberFilePath of memberFiles.slice(0, 6)) {
+      pushNode(precedent, { filePath: memberFilePath }, 'member-file', -0.06);
+    }
+  }
+
+  return Array.from(byFilePath.values())
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      if (left.kind !== right.kind) {
+        const leftPriority = DIRECT_ACTION_PLAN_PRECEDENT_BASE_SCORES[left.kind] ?? 0;
+        const rightPriority = DIRECT_ACTION_PLAN_PRECEDENT_BASE_SCORES[right.kind] ?? 0;
+        if (rightPriority !== leftPriority) return rightPriority - leftPriority;
+      }
+      if (left.title !== right.title) return left.title.localeCompare(right.title);
+      return left.filePath.localeCompare(right.filePath);
+    });
+};
+
 export async function runActionPlan(
   deps: ActionPlanDeps,
   repo: ActionPlanRepoHandle,
@@ -127,7 +244,7 @@ export async function runActionPlan(
       addAnchor(def, 0.25);
     }
 
-    const files = Array.from(fileAgg.entries())
+    const rankedFiles = Array.from(fileAgg.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, limitFiles)
       .map(([filePath, agg]) => {
@@ -153,7 +270,7 @@ export async function runActionPlan(
         };
       });
 
-    const filePaths = files.map(f => f.filePath.toLowerCase());
+    const filePaths = rankedFiles.map(f => f.filePath.toLowerCase());
     const hasPhp = filePaths.some(p => p.endsWith('.php'));
     const hasTs = filePaths.some(p => p.endsWith('.ts') || p.endsWith('.tsx') || p.endsWith('.js') || p.endsWith('.jsx'));
     const hasBlade = filePaths.some(p => p.endsWith('.blade.php'));
@@ -874,7 +991,7 @@ export async function runActionPlan(
 
     const cache_effects: any[] = [];
     try {
-      const tsLikeFiles = files
+      const tsLikeFiles = rankedFiles
         .map(f => String(f?.filePath || '').trim())
         .filter(Boolean)
         .filter(isTsLikeFilePath)
@@ -978,17 +1095,31 @@ export async function runActionPlan(
     const topProcesses = Array.isArray(result?.processes) ? result.processes : [];
 
     let precedentPack: any = null;
+    let precedentRetrievalMode: 'query' | 'top-slice-fallback' | null = null;
     if (!skipPrecedents) {
       try {
         precedentPack = await precedents(repo, {
           query: params.query,
-          ...(targetSlice?.anchor_id ? { anchor_uid: String(targetSlice.anchor_id) } : {}),
           limit: 2,
           examples: 3,
           path_prefixes: pathPrefixes,
         });
+        precedentRetrievalMode = 'query';
+        const matchedPrecedents = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
+        const hasDirectPrecedent = matchedPrecedents.some((precedent: any) => DIRECT_ACTION_PLAN_PRECEDENT_KINDS.has(String(precedent?.kind || '').trim()));
+        if (!hasDirectPrecedent && targetSlice?.anchor_id) {
+          precedentPack = await precedents(repo, {
+            query: params.query,
+            anchor_uid: String(targetSlice.anchor_id),
+            limit: 2,
+            examples: 3,
+            path_prefixes: pathPrefixes,
+          });
+          precedentRetrievalMode = 'top-slice-fallback';
+        }
       } catch {
         precedentPack = null;
+        precedentRetrievalMode = null;
       }
     }
 
@@ -1008,6 +1139,37 @@ export async function runActionPlan(
       anchor: item?.anchor,
       examples: Array.isArray(item?.examples) ? item.examples.slice(0, 5) : [],
     }));
+    const directPrecedentSurfaces = buildDirectActionPlanPrecedentSurfaces(
+      precedentCandidates,
+      normalizeRepoRelativePath,
+    );
+    const directTargetPrecedent = directPrecedentSurfaces.find(surface => STRONG_ACTION_PLAN_PRECEDENT_KINDS.has(surface.kind))
+      || directPrecedentSurfaces[0]
+      || null;
+    const targetSliceText = [
+      String(targetSlice?.label || ''),
+      String(targetSlice?.slice_type || ''),
+      String(targetSlice?.anchor_name || ''),
+      String(targetSlice?.uid || ''),
+    ]
+      .map(value => value.trim().toLowerCase())
+      .filter(Boolean)
+      .join(' ');
+    const targetSliceLooksGeneric = GENERIC_ACTION_PLAN_TARGET_PATTERNS.some(pattern => pattern.test(targetSliceText));
+    const targetSliceFiles = new Set<string>(
+      (Array.isArray(targetSlice?.matched_members) ? targetSlice.matched_members : [])
+        .map((member: any) => normalizeRepoRelativePath(String(member?.filePath || '')))
+        .filter(Boolean),
+    );
+    const directPrecedentOverlapsTargetSlice = directPrecedentSurfaces.some(surface => targetSliceFiles.has(surface.filePath));
+    const targetCalibratedFromDirectPrecedents = Boolean(
+      directTargetPrecedent
+      && (
+        !targetSlice
+        || targetSliceLooksGeneric
+        || !directPrecedentOverlapsTargetSlice
+      ),
+    );
 
     const companionSignals = new Map<string, {
       filePath: string;
@@ -1045,13 +1207,97 @@ export async function runActionPlan(
       if (anchor) entry.anchors.push(anchor);
     };
 
-    for (const file of files.slice(0, 10)) {
+    const filesByPath = new Map<string, {
+      filePath: string;
+      score: number;
+      reasons: string[];
+      anchors: any[];
+    }>();
+    const mergePlanFile = (
+      filePathRaw: string,
+      score: number,
+      reason: string,
+      anchors: any[] = [],
+    ): void => {
+      const filePath = normalizeRepoRelativePath(String(filePathRaw || ''));
+      if (!filePath || !isInScope(filePath)) return;
+
+      const nextScore = toFiniteNumber(score, 0);
+      if (nextScore <= 0) return;
+
+      const existing = filesByPath.get(filePath);
+      if (!existing) {
+        filesByPath.set(filePath, {
+          filePath,
+          score: nextScore,
+          reasons: reason ? [reason] : [],
+          anchors: anchors.slice(0, 4),
+        });
+        return;
+      }
+
+      existing.score = Math.max(existing.score, nextScore);
+      if (reason && !existing.reasons.includes(reason)) existing.reasons.push(reason);
+      for (const anchor of anchors) {
+        existing.anchors.push(anchor);
+        if (existing.anchors.length >= 4) break;
+      }
+    };
+
+    for (const file of rankedFiles) {
+      mergePlanFile(
+        String(file?.filePath || ''),
+        toFiniteNumber(file?.score, 0),
+        'ranked-file',
+        Array.isArray(file?.anchors) ? file.anchors.slice(0, 3) : [],
+      );
+    }
+    if (targetCalibratedFromDirectPrecedents) {
+      for (const surface of directPrecedentSurfaces.slice(0, Math.max(limitFiles, 4))) {
+        mergePlanFile(
+          surface.filePath,
+          Math.max(6, surface.score * 10),
+          `direct-precedent:${surface.kind || 'precedent'}`,
+          [{
+            name: surface.title,
+            type: `precedent:${surface.kind || 'file'}`,
+          }],
+        );
+      }
+    }
+    const files = Array.from(filesByPath.values())
+      .sort((left, right) => {
+        if (right.score !== left.score) return right.score - left.score;
+        return left.filePath.localeCompare(right.filePath);
+      })
+      .slice(0, limitFiles)
+      .map(file => ({
+        filePath: file.filePath,
+        score: round3(file.score),
+        reasons: file.reasons.slice(0, 4),
+        anchors: file.anchors.slice(0, 4),
+      }));
+
+    for (const file of rankedFiles.slice(0, 10)) {
       addCompanionSignal(
         String(file?.filePath || ''),
         toFiniteNumber(file?.score, 0) + 0.1,
         'ranked-file',
       );
       companionSources.seed_files += 1;
+    }
+    if (targetCalibratedFromDirectPrecedents) {
+      for (const surface of directPrecedentSurfaces.slice(0, Math.max(limitFiles, 4))) {
+        addCompanionSignal(
+          surface.filePath,
+          Math.max(4.5, surface.score * 5),
+          `direct-precedent:${surface.kind || 'precedent'}`,
+          {
+            name: surface.title,
+            type: `precedent:${surface.kind || 'file'}`,
+          },
+        );
+      }
     }
 
     let targetTemplate: any = null;
@@ -1277,6 +1523,27 @@ export async function runActionPlan(
         reasons: Array.from(entry.reasons).slice(0, 6),
         anchors: entry.anchors.slice(0, 4),
       }));
+    const prioritizedCompanionFiles = targetCalibratedFromDirectPrecedents
+      ? (() => {
+          const byFilePath = new Map(companionFiles.map(file => [String(file.filePath || ''), file]));
+          const prioritized: any[] = [];
+          const seen = new Set<string>();
+          for (const surface of directPrecedentSurfaces) {
+            const filePath = String(surface.filePath || '').trim();
+            const existing = byFilePath.get(filePath);
+            if (!existing || seen.has(filePath)) continue;
+            seen.add(filePath);
+            prioritized.push(existing);
+          }
+          for (const file of companionFiles) {
+            const filePath = String(file?.filePath || '').trim();
+            if (!filePath || seen.has(filePath)) continue;
+            seen.add(filePath);
+            prioritized.push(file);
+          }
+          return prioritized.slice(0, Math.min(limitFiles + 5, 15));
+        })()
+      : companionFiles;
 
     const orderedWriteSteps = writeOrder
       .sort((left, right) => {
@@ -1297,9 +1564,32 @@ export async function runActionPlan(
         ...(step.startLine !== undefined ? { startLine: step.startLine } : {}),
         ...(step.endLine !== undefined ? { endLine: step.endLine } : {}),
       }));
+    const calibratedWriteSteps = targetCalibratedFromDirectPrecedents
+      ? [
+          ...directPrecedentSurfaces.slice(0, 4).map(surface => ({
+            uid: `precedent:${surface.kind}:${surface.filePath}`,
+            name: surface.title,
+            kind: `precedent:${surface.kind || 'file'}`,
+            filePath: surface.filePath,
+            role: 'precedent_anchor',
+          })),
+          ...orderedWriteSteps,
+        ]
+      : orderedWriteSteps;
+    const dedupedWriteSteps: any[] = [];
+    const seenWriteSteps = new Set<string>();
+    for (const step of calibratedWriteSteps) {
+      const key = `${String(step?.filePath || '')}|${String(step?.role || '')}|${String(step?.uid || '')}`;
+      if (!key || seenWriteSteps.has(key)) continue;
+      seenWriteSteps.add(key);
+      dedupedWriteSteps.push(step);
+      if (dedupedWriteSteps.length >= 16) break;
+    }
 
     const targetArchetype = String(
-      implementPrecedents[0]?.signature
+      (targetCalibratedFromDirectPrecedents && directTargetPrecedent)
+        ? `direct-precedent:${directTargetPrecedent.kind}:${directTargetPrecedent.title}`
+        : implementPrecedents[0]?.signature
       || topProcesses[0]?.process_type
       || topProcesses[0]?.summary
       || '',
@@ -1322,21 +1612,32 @@ export async function runActionPlan(
             roles: Array.isArray(targetSlice.roles) ? targetSlice.roles : [],
           }
           : null,
+        direct_precedent_anchor: directTargetPrecedent
+          ? {
+              kind: directTargetPrecedent.kind,
+              title: directTargetPrecedent.title,
+              signature: directTargetPrecedent.signature || null,
+              filePath: directTargetPrecedent.filePath,
+              source: directTargetPrecedent.source,
+              score: directTargetPrecedent.score,
+            }
+          : null,
+        target_calibrated_from_precedents: targetCalibratedFromDirectPrecedents,
       },
       precedents: implementPrecedents,
       doc_guidance: docGuidance,
       closure_template: targetTemplate,
       companion_set: {
-        files: companionFiles,
+        files: prioritizedCompanionFiles,
         summary: {
-          total_files: companionFiles.length,
+          total_files: prioritizedCompanionFiles.length,
           seed_files: companionSources.seed_files,
           slice_members: companionSources.slice_members,
           cochange_edges: companionSources.cochange_edges,
           shape_edges: companionSources.shape_edges,
         },
       },
-      write_order: orderedWriteSteps,
+      write_order: dedupedWriteSteps,
       gap_signals: targetSliceGapSummary,
       post_edit_review: {
         tool: 'review_mode',
@@ -1359,5 +1660,25 @@ export async function runActionPlan(
       hops,
       cache_effects,
       implement_plan,
+      _action_plan: {
+        direct_precedent_recovery: {
+          enabled: directPrecedentSurfaces.length > 0,
+          retrieval_mode: precedentRetrievalMode,
+          precedents_found: directPrecedentSurfaces.length,
+          target_slice_looks_generic: targetSliceLooksGeneric,
+          target_slice_overlaps_direct_precedents: directPrecedentOverlapsTargetSlice,
+          target_calibrated: targetCalibratedFromDirectPrecedents,
+          top_precedent: directTargetPrecedent
+            ? {
+                kind: directTargetPrecedent.kind,
+                title: directTargetPrecedent.title,
+                signature: directTargetPrecedent.signature || null,
+                filePath: directTargetPrecedent.filePath,
+                source: directTargetPrecedent.source,
+                score: directTargetPrecedent.score,
+              }
+            : null,
+        },
+      },
     };
 }

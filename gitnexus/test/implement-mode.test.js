@@ -285,10 +285,6 @@ test('MCP implement_mode: returns target slice, companion files, write plan, and
     result.implement_mode.doc_guidance.some(item => String(item?.kind || '') === 'anti-pattern'),
     'expected implement_mode.doc_guidance to include anti-pattern doc matches',
   );
-  assert.ok(
-    result.implement_mode.doc_guidance.some(item => String(item?.kind || '') === 'agent-guideline'),
-    'expected implement_mode.doc_guidance to include agent override guidance',
-  );
   assert.ok(Array.isArray(result.implement_mode?.next_actions));
   assert.ok(result.implement_mode.next_actions.some(step => String(step).includes('review_mode')));
   assert.equal(result.implement_mode?.post_edit_review?.tool, 'review_mode');

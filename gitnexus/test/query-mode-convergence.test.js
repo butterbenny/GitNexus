@@ -292,3 +292,127 @@ test('runQueryMode emits fallback prioritized action when adaptive thresholds re
   );
   assert.equal(result._query_mode?.convergence?.first_action_coverage?.prioritized_action_present, true);
 });
+
+test('runQueryMode calibrates next action from direct precedents when top slice drifts to generic api hotspot', async () => {
+  const repo = {
+    name: 'monorepo',
+    repoPath: '/Users/benny/monorepo',
+  };
+
+  const queryResult = {
+    query_plan: {
+      exact_lookup: { hits: 0, used: false },
+    },
+    slice_cards: [
+      {
+        uid: 'slice-endpoint-paddle-raise-intents',
+        label: 'Paddle Raise intents endpoint',
+        slice_type: 'endpoint',
+        anchor_id: 'anchor-paddle-raise-intents',
+        anchor_name: 'PaddleRaiseIntentController',
+        roles: ['controller'],
+        gap_signals: { high: 0, deterministic: 0 },
+        matched_members: [
+          {
+            uid: 'member-paddle-raise-intents',
+            name: 'PaddleRaiseIntentController',
+            filePath: 'apps/backend/app/Domains/PaddleRaise/Http/Controllers/PaddleRaiseIntentController.php',
+          },
+        ],
+      },
+    ],
+    processes: [
+      {
+        id: 'proc-paddle-raise-intents',
+        summary: 'Paddle Raise intent show flow',
+        process_type: 'cross-stack',
+      },
+    ],
+    process_symbols: [
+      {
+        process_id: 'proc-paddle-raise-intents',
+        filePath: 'apps/backend/app/Domains/PaddleRaise/Http/Controllers/PaddleRaiseIntentController.php',
+        name: 'show',
+      },
+    ],
+    definitions: [],
+  };
+
+  const precedentCalls = [];
+  const precedentsResult = {
+    precedents: [
+      {
+        kind: 'ui-behavior',
+        signature: 'settings:shared-tips-fees',
+        score: 1.08,
+        anchor: {
+          title: 'Shared donor tips / platform fees settings UI',
+          filePath: 'apps/dashboard/src/pages/campaign-settings/campaign-auction/auction-settings/AuctionSettings.tsx',
+        },
+        examples: [
+          {
+            name: 'CampaignFeeSettings',
+            filePath: 'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+          },
+        ],
+      },
+      {
+        kind: 'backend-behavior',
+        signature: 'paddle-raise:fees-config',
+        score: 1.02,
+        anchor: {
+          title: 'Paddle Raise payment config quartet',
+          filePath: 'apps/backend/app/Domains/PaddleRaise/Http/Web/Resources/PaddleRaiseResource.php',
+        },
+      },
+    ],
+  };
+
+  const result = await runQueryMode(
+    {
+      query: async () => queryResult,
+      precedents: async (_repo, params) => {
+        precedentCalls.push(params);
+        return precedentsResult;
+      },
+      actionPlan: async () => ({
+        files: [],
+        checks: [],
+        hops: [
+          {
+            http: {
+              confidence: 0.92,
+              reason: 'http-get:/api/campaigns/*/paddle_raise/intents/*',
+            },
+            ui: { name: 'fetchPaddleRaiseIntent' },
+            controller: { name: 'PaddleRaiseIntentController::show' },
+          },
+        ],
+      }),
+      parsePathPrefixes: () => [],
+      clampInteger,
+      toFiniteNumber,
+      loadConvergenceMatrix: async () => null,
+    },
+    repo,
+    {
+      query: 'Add Paddle Raise commitments dashboard settings using the same donor tips and platform fees UI and exact same options as campaign settings and auction settings',
+      include_precedents: true,
+      include_action_hints: true,
+    },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.equal(precedentCalls.length, 1);
+  assert.equal(precedentCalls[0]?.anchor_uid, undefined);
+  assert.equal(result.query_mode?.direct_precedent_anchor?.filePath, 'apps/dashboard/src/pages/campaign-settings/campaign-auction/auction-settings/AuctionSettings.tsx');
+  assert.match(String(result.query_mode?.next_actions?.[0] || ''), /AuctionSettings\.tsx|Shared donor tips/i);
+  assert.equal(result._query_mode?.convergence?.prioritized_next_action?.source, 'precedent');
+  assert.equal(result._query_mode?.convergence?.direct_precedent_recovery?.target_calibrated, true);
+  assert.equal(result._query_mode?.convergence?.direct_precedent_recovery?.top_slice_looks_generic, true);
+  assert.equal(
+    result._query_mode?.convergence?.direct_precedent_recovery?.top_precedent?.filePath,
+    'apps/dashboard/src/pages/campaign-settings/campaign-auction/auction-settings/AuctionSettings.tsx',
+  );
+  assert.equal(result.query_mode?.precedents?.[0]?.kind, 'ui-behavior');
+});

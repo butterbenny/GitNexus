@@ -114,6 +114,7 @@ test('runImplementMode reorders write plan and companions using query-head conve
         refreshCommandSandbox: null,
         refreshCommandSandboxForce: null,
       }),
+      precedents: async () => ({ precedents: [] }),
       parsePathPrefixes: () => [],
       clampInteger,
       normalizeRepoRelativePath: value => String(value || '').replace(/^\.?\//, ''),
@@ -262,6 +263,7 @@ test('runImplementMode reorders from precedent+carbon signals when convergence i
         refreshCommandSandbox: null,
         refreshCommandSandboxForce: null,
       }),
+      precedents: async () => ({ precedents: [] }),
       parsePathPrefixes: () => [],
       clampInteger,
       normalizeRepoRelativePath: value => String(value || '').replace(/^\.?\//, ''),
@@ -301,4 +303,171 @@ test('runImplementMode reorders from precedent+carbon signals when convergence i
   assert.equal(result.implement_mode.write_plan[0].filePath, 'apps/dashboard/src/api/notifications.ts');
   assert.ok((result.implement_mode.companion_files[0]?.carbon_copy_ready?.score || 0) > 0);
   assert.ok((result.implement_mode.write_plan[0]?.carbon_copy_ready?.score || 0) > 0);
+});
+
+test('runImplementMode calibrates settings hotspot targets from direct precedents when planner anchors drift', async () => {
+  const repo = {
+    id: 'repo-3',
+    name: 'monorepo',
+    repoPath: '/Users/benny/monorepo',
+  };
+
+  const result = await runImplementMode(
+    {
+      actionPlan: async () => ({
+        implement_plan: {
+          target: {
+            query_intent: 'paddle raise settings donor tips platform fees',
+            archetype: 'pattern-catalog:Contact combobox (infinite scroll + debounced search)',
+            slice: 'FeatureSlice:slice_permission_paddle_raise_view',
+          },
+          companion_set: {
+            files: [
+              {
+                filePath: 'apps/backend/app/Domains/AccessControl/Permissions/PaddleRaisePermission.php',
+                score: 1,
+                reasons: ['base-priority'],
+                anchors: [],
+              },
+              {
+                filePath: 'apps/dashboard/src/pages/campaign-settings/campaign-event/paddle-raise/EditIntentDrawer.tsx',
+                score: 0.8,
+                reasons: ['base-priority'],
+                anchors: [],
+              },
+            ],
+          },
+          write_order: [
+            {
+              uid: 'step-permission',
+              name: 'PaddleRaisePermission',
+              kind: 'Enum',
+              filePath: 'apps/backend/app/Domains/AccessControl/Permissions/PaddleRaisePermission.php',
+              role: 'permission',
+            },
+            {
+              uid: 'step-intent-drawer',
+              name: 'EditIntentDrawer',
+              kind: 'Function',
+              filePath: 'apps/dashboard/src/pages/campaign-settings/campaign-event/paddle-raise/EditIntentDrawer.tsx',
+              role: 'ui',
+            },
+          ],
+          precedents: [],
+        },
+        checks: ['Run focused tests'],
+        hops: [],
+        cache_effects: [],
+        files: [],
+      }),
+      precedents: async () => ({
+        precedents: [
+          {
+            kind: 'ui-behavior',
+            signature: 'ui-behavior:shared-fee-settings',
+            score: 9,
+            anchor: {
+              name: 'CampaignFeeSettings',
+              title: 'Shared donor tips / platform fees settings UI',
+              kind: 'Function',
+              filePath: 'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+            },
+            examples: [
+              {
+                name: 'AuctionSettings',
+                kind: 'Function',
+                filePath: 'apps/dashboard/src/pages/campaign-settings/campaign-auction/auction-settings/AuctionSettings.tsx',
+              },
+            ],
+          },
+          {
+            kind: 'backend-behavior',
+            signature: 'backend-behavior:payment-config-quartet',
+            score: 8,
+            anchor: {
+              name: 'PaddleRaiseResource',
+              title: 'Fee or tips payment config quartet',
+              kind: 'Class',
+              filePath: 'apps/backend/app/Domains/PaddleRaise/Http/Web/Resources/PaddleRaiseResource.php',
+            },
+            examples: [],
+          },
+        ],
+      }),
+      queryMode: async () => ({
+        query_mode: {
+          query_plan: { exact_lookup: { used: false, hits: 0 } },
+          slices: [],
+          processes: [],
+          symbols: [],
+          precedents: [],
+        },
+        _query_mode: {
+          convergence: {
+            enabled: false,
+            source_path: null,
+            matrix_cells: 0,
+          },
+        },
+      }),
+      getIndexStatus: async () => ({
+        isStale: false,
+        indexedAt: null,
+        indexedCommit: null,
+        headCommit: null,
+        refreshCommandSandbox: null,
+        refreshCommandSandboxForce: null,
+      }),
+      parsePathPrefixes: () => [],
+      clampInteger,
+      normalizeRepoRelativePath: value => String(value || '').replace(/^\.?\//, ''),
+      toFiniteNumber,
+    },
+    repo,
+    {
+      query: 'Add Paddle Raise commitments dashboard settings using the same donor tips and platform fees UI and exact same options as campaign settings and auction settings',
+      include_query_head: true,
+      include_review_contract: true,
+      limit_files: 10,
+      limit_write_order: 10,
+      limit_checks: 10,
+      limit_precedents: 3,
+    },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.match(
+    String(result.implement_mode?.target?.archetype || ''),
+    /^direct-precedent:ui-behavior:Shared donor tips \/ platform fees settings UI$/,
+  );
+  assert.equal(
+    result.implement_mode?.target?.reference_surface?.filePath,
+    'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+  );
+  assert.equal(
+    result.implement_mode?.companion_files?.[0]?.filePath,
+    'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+  );
+  assert.equal(
+    result.implement_mode?.write_plan?.[0]?.filePath,
+    'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+  );
+  assert.match(
+    String(result.implement_mode?.next_actions?.[0] || ''),
+    /calibrated precedent anchor "CampaignFeeSettings"/,
+  );
+  assert.ok(
+    result.implement_mode?.companion_files?.some(file => file?.filePath === 'apps/dashboard/src/pages/campaign-settings/campaign-auction/auction-settings/AuctionSettings.tsx'),
+  );
+  assert.ok(
+    result.implement_mode?.companion_files?.some(file => file?.filePath === 'apps/backend/app/Domains/PaddleRaise/Http/Web/Resources/PaddleRaiseResource.php'),
+  );
+  assert.equal(result._implement_mode?.direct_precedent_recovery?.target_calibrated, true);
+  assert.equal(
+    result._implement_mode?.direct_precedent_recovery?.top_file,
+    'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+  );
+  assert.ok(
+    result.implement_mode?.quality?.reasons?.includes('planner target calibrated from direct precedents'),
+  );
 });

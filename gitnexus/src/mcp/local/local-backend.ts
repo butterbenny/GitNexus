@@ -7025,6 +7025,7 @@ export class LocalBackend {
     return runImplementMode(
       {
         actionPlan: this.actionPlan.bind(this),
+        precedents: this.precedents.bind(this),
         queryMode: this.queryMode.bind(this),
         getIndexStatus: this.getIndexStatus.bind(this),
         parsePathPrefixes,

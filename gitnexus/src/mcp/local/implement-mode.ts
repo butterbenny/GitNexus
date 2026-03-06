@@ -22,6 +22,7 @@ export interface ImplementModeParams {
 
 type ImplementModeDeps = {
   actionPlan: (repo: ImplementModeRepoHandle, params: any) => Promise<any>;
+  precedents: (repo: ImplementModeRepoHandle, params: any) => Promise<any>;
   queryMode: (repo: ImplementModeRepoHandle, params: any) => Promise<any>;
   getIndexStatus: (repo: ImplementModeRepoHandle) => Promise<any>;
   parsePathPrefixes: (repoPath: string, param: unknown) => string[];
@@ -69,6 +70,36 @@ const IMPLEMENT_NEXT_ACTION_RANK_WEIGHTS = {
   convergence: 0.22,
   carbon: 0.16,
 } as const;
+const IMPLEMENT_DIRECT_PRECEDENT_CALIBRATION_BONUS = {
+  companion: 18,
+  write_plan: 4.5,
+} as const;
+const DIRECT_IMPLEMENT_PRECEDENT_KINDS = new Set([
+  'ui-behavior',
+  'backend-behavior',
+  'backend-handoff',
+  'pattern-catalog',
+  'slice',
+  'hop',
+  'process',
+]);
+const DIRECT_IMPLEMENT_PRECEDENT_BASE_SCORES: Record<string, number> = {
+  'ui-behavior': 1.08,
+  'backend-handoff': 1.04,
+  'backend-behavior': 1.02,
+  'pattern-catalog': 0.96,
+  slice: 0.9,
+  hop: 0.88,
+  process: 0.86,
+};
+const GENERIC_IMPLEMENT_TARGET_PATTERNS = [
+  /^pattern-catalog:/i,
+  /\bpermission\b/i,
+  /\bendpoint\b/i,
+  /\bcontroller\b/i,
+  /\broute\b/i,
+  /\bcombobox\b/i,
+];
 
 export async function runImplementMode(
   deps: ImplementModeDeps,
@@ -77,6 +108,7 @@ export async function runImplementMode(
 ): Promise<any> {
   const {
     actionPlan,
+    precedents: loadPrecedents,
     queryMode,
     getIndexStatus,
     parsePathPrefixes,
@@ -133,6 +165,20 @@ export async function runImplementMode(
     }
   }
 
+  let directPrecedentResult: any = null;
+  if (limitPrecedents > 0) {
+    try {
+      directPrecedentResult = await loadPrecedents(repo, {
+        query: queryText,
+        path_prefixes: pathPrefixes,
+        limit: Math.max(limitPrecedents, 3),
+        examples: Math.max(2, Math.min(limitFiles, 4)),
+      });
+    } catch {
+      directPrecedentResult = null;
+    }
+  }
+
   const indexStatus = await getIndexStatus(repo);
 
   const normalizePath = (value: unknown): string => normalizeRepoRelativePath(String(value || ''));
@@ -158,8 +204,26 @@ export async function runImplementMode(
   const precedentsFromQuery = Array.isArray(queryModeResult?.query_mode?.precedents)
     ? queryModeResult.query_mode.precedents
     : [];
-  const precedents = (precedentsFromPlan.length > 0 ? precedentsFromPlan : precedentsFromQuery)
-    .slice(0, limitPrecedents);
+  const directPrecedents = (
+    Array.isArray(directPrecedentResult?.precedents)
+      ? directPrecedentResult.precedents
+      : []
+  )
+    .filter((precedent: any) => DIRECT_IMPLEMENT_PRECEDENT_KINDS.has(String(precedent?.kind || '').trim()))
+    .slice(0, Math.max(limitPrecedents, 3));
+  const precedents = Array.from(new Map(
+    [
+      ...directPrecedents,
+      ...(precedentsFromPlan.length > 0 ? precedentsFromPlan : precedentsFromQuery),
+    ].map((precedent: any) => {
+      const kind = String(precedent?.kind || '').trim();
+      const signature = String(precedent?.signature || '').trim();
+      const anchorFilePath = normalizePath(precedent?.anchor?.filePath);
+      const anchorName = String(precedent?.anchor?.title || precedent?.anchor?.name || '').trim();
+      const key = `${kind}|${signature}|${anchorFilePath}|${anchorName}`;
+      return [key, precedent];
+    }),
+  ).values()).slice(0, Math.max(limitPrecedents, directPrecedents.length || limitPrecedents));
 
   const docGuidanceFromPlan = Array.isArray(implementPlan?.doc_guidance)
     ? implementPlan.doc_guidance
@@ -355,10 +419,175 @@ export async function runImplementMode(
     return out;
   };
 
+  const buildDirectPrecedentCompanionFiles = (items: any[]): any[] => {
+    const out: any[] = [];
+    const seen = new Set<string>();
+    const pushNode = (precedent: any, node: any, source: string, scoreOffset = 0): void => {
+      const kind = String(precedent?.kind || '').trim();
+      const filePath = normalizePath(node?.filePath);
+      if (!filePath || seen.has(filePath)) return;
+      seen.add(filePath);
+      const baseScore = DIRECT_IMPLEMENT_PRECEDENT_BASE_SCORES[kind] ?? 0.84;
+      out.push({
+        filePath,
+        score: round3(baseScore + scoreOffset),
+        reasons: [
+          `direct-precedent:${kind || 'precedent'}`,
+          source,
+          ...(precedent?.signature ? [`signature:${String(precedent.signature)}`] : []),
+        ].slice(0, 4),
+        anchors: [{
+          id: String(
+            node?.id
+            || node?.uid
+            || precedent?.anchor?.id
+            || precedent?.anchor?.uid
+            || `precedent:${kind}:${filePath}`,
+          ),
+          name: String(node?.name || node?.title || precedent?.anchor?.name || path.basename(filePath)),
+          type: String(node?.kind || node?.type || precedent?.anchor?.kind || 'File'),
+          startLine: node?.startLine ?? precedent?.anchor?.startLine,
+          endLine: node?.endLine ?? precedent?.anchor?.endLine,
+        }],
+      });
+    };
+
+    for (const precedent of items) {
+      const kind = String(precedent?.kind || '').trim();
+      if (!DIRECT_IMPLEMENT_PRECEDENT_KINDS.has(kind)) continue;
+
+      pushNode(precedent, precedent?.anchor, 'anchor', 0.04);
+      pushNode(precedent, precedent?.anchor?.ui, 'anchor-ui', 0.03);
+      pushNode(precedent, precedent?.anchor?.endpoint, 'anchor-endpoint', 0.02);
+      pushNode(precedent, precedent?.anchor?.controller, 'anchor-controller', 0.01);
+
+      const examples = Array.isArray(precedent?.examples) ? precedent.examples : [];
+      for (const example of examples.slice(0, 4)) {
+        pushNode(precedent, example, 'example', -0.04);
+        pushNode(precedent, example?.ui, 'example-ui', -0.05);
+        pushNode(precedent, example?.endpoint, 'example-endpoint', -0.05);
+        pushNode(precedent, example?.controller, 'example-controller', -0.05);
+      }
+
+      const memberFiles = Array.isArray(precedent?.member_files) ? precedent.member_files : [];
+      for (const memberFilePath of memberFiles.slice(0, 6)) {
+        pushNode(precedent, { filePath: memberFilePath }, 'member-file', -0.06);
+      }
+    }
+
+    return out.slice(0, Math.max(limitFiles, limitWriteOrder, 6));
+  };
+
+  const directPrecedentCompanionFiles = buildDirectPrecedentCompanionFiles(directPrecedents);
+  const plannerTarget = implementPlan?.target || null;
+  const fallbackTarget = implementPlan?.target || {
+    query_intent: queryText,
+    archetype: String(queryHeadProcesses?.[0]?.summary || queryHeadProcesses?.[0]?.process_type || '').trim() || null,
+    slice: null,
+  };
+  const targetFieldText = (value: unknown): string => {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      return [
+        obj.uid,
+        obj.label,
+        obj.slice_type,
+        obj.anchor_name,
+        obj.anchor_id,
+        obj.name,
+        obj.title,
+      ]
+        .map(part => String(part || '').trim())
+        .filter(Boolean)
+        .join(' ');
+    }
+    return String(value || '');
+  };
+  const directTargetPrecedent = directPrecedents.find((precedent: any) => {
+    const kind = String(precedent?.kind || '').trim();
+    return kind === 'ui-behavior' || kind === 'backend-behavior' || kind === 'backend-handoff' || kind === 'pattern-catalog';
+  }) || null;
+  const directTargetTitle = String(
+    directTargetPrecedent?.anchor?.title
+    || directTargetPrecedent?.anchor?.name
+    || directTargetPrecedent?.signature
+    || '',
+  ).trim();
+  const directTargetFilePath = normalizePath(
+    directTargetPrecedent?.anchor?.filePath
+    || directPrecedentCompanionFiles[0]?.filePath,
+  );
+  const plannerSeedFiles = new Set<string>([
+    ...rawCompanionFiles.map((file: any) => normalizePath(file?.filePath)),
+    ...rawWritePlan.map((step: any) => normalizePath(step?.filePath)),
+    ...actionHintFiles.map((file: any) => normalizePath(file?.filePath)),
+  ].filter(Boolean));
+  const plannerTargetText = [
+    targetFieldText(fallbackTarget?.archetype),
+    targetFieldText(fallbackTarget?.slice),
+    targetFieldText(fallbackTarget?.query_intent),
+  ]
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+  const plannerTargetLooksGeneric = GENERIC_IMPLEMENT_TARGET_PATTERNS.some(pattern => pattern.test(plannerTargetText));
+  const directTargetOverlapsPlanner = directPrecedentCompanionFiles.some(file => plannerSeedFiles.has(file.filePath));
+  const targetCalibratedFromDirectPrecedents = Boolean(
+    directTargetPrecedent
+    && directTargetFilePath
+    && (plannerTargetLooksGeneric || !directTargetOverlapsPlanner),
+  );
+  const directReferenceSurface = directTargetPrecedent && directTargetFilePath
+    ? {
+        kind: String(directTargetPrecedent?.kind || '').trim() || 'precedent',
+        title: directTargetTitle || path.basename(directTargetFilePath),
+        filePath: directTargetFilePath,
+        signature: String(directTargetPrecedent?.signature || '').trim() || null,
+        score: round3(safeNumber(directTargetPrecedent?.score)),
+        member_files: Array.isArray(directTargetPrecedent?.member_files)
+          ? directTargetPrecedent.member_files.slice(0, 6)
+          : [],
+      }
+    : null;
+  const directPrecedentCalibrationFiles = new Set<string>(
+    targetCalibratedFromDirectPrecedents
+      ? directPrecedentCompanionFiles.map(file => normalizePath(file?.filePath)).filter(Boolean)
+      : [],
+  );
+
   let companionFiles = dedupeCompanionFiles([
+    ...directPrecedentCompanionFiles,
     ...patternCatalogTemplateCompanions,
     ...baseCompanionFiles,
   ]).slice(0, limitFiles);
+
+  const buildDirectPrecedentWritePlan = (items: any[]): any[] => {
+    const out: any[] = [];
+    const seen = new Set<string>();
+    for (const file of items) {
+      const filePath = normalizePath(file?.filePath);
+      if (!filePath || seen.has(filePath)) continue;
+      seen.add(filePath);
+      const anchor = Array.isArray(file?.anchors) && file.anchors.length > 0 ? file.anchors[0] : null;
+      const anchorStartLine = toOptionalLineNumber(anchor?.startLine);
+      const anchorEndLine = toOptionalLineNumber(anchor?.endLine);
+      out.push({
+        uid: String(anchor?.id || `precedent:${filePath}`),
+        name: String(anchor?.name || path.basename(filePath)),
+        kind: String(anchor?.type || 'File'),
+        filePath,
+        role: 'precedent-anchor',
+        ...(anchorStartLine !== undefined ? { startLine: anchorStartLine } : {}),
+        ...(anchorEndLine !== undefined ? { endLine: anchorEndLine } : {}),
+      });
+    }
+    return out.slice(0, Math.max(limitWriteOrder, 6));
+  };
+
+  const directPrecedentWritePlan = buildDirectPrecedentWritePlan(directPrecedentCompanionFiles);
 
   const buildFallbackWritePlan = (): any[] => {
     const steps: any[] = [];
@@ -404,8 +633,26 @@ export async function runImplementMode(
 
   const fallbackWritePlan = buildFallbackWritePlan();
   const usedFallbackWritePlan = rawWritePlan.length === 0 && fallbackWritePlan.length > 0;
-  const writePlanBase = (rawWritePlan.length > 0 ? rawWritePlan : fallbackWritePlan)
-    .slice(0, limitWriteOrder);
+  const dedupeWritePlan = (items: any[]): any[] => {
+    const out: any[] = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      const filePath = normalizePath(item?.filePath);
+      const uid = String(item?.uid || '').trim();
+      const key = `${uid}|${filePath}`;
+      if (!filePath || seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        ...item,
+        filePath,
+      });
+    }
+    return out;
+  };
+  const writePlanBase = dedupeWritePlan([
+    ...directPrecedentWritePlan,
+    ...(rawWritePlan.length > 0 ? rawWritePlan : fallbackWritePlan),
+  ]).slice(0, limitWriteOrder);
 
   const collectPrecedentCandidates = (items: any[]): Array<{
     signature: string;
@@ -568,10 +815,14 @@ export async function runImplementMode(
     const precedentComponent = matches.length > 0
       ? IMPLEMENT_RANK_WEIGHTS.write_plan.precedent_bonus
       : 0;
+    const directPrecedentCalibrationComponent = directPrecedentCalibrationFiles.has(filePath)
+      ? IMPLEMENT_DIRECT_PRECEDENT_CALIBRATION_BONUS.write_plan
+      : 0;
     const rankingScore = round3(
       convergenceComponent
       + carbonComponent
-      + precedentComponent,
+      + precedentComponent
+      + directPrecedentCalibrationComponent,
     );
     return {
       ...step,
@@ -595,6 +846,7 @@ export async function runImplementMode(
           convergence: round3(convergenceComponent),
           carbon: round3(carbonComponent),
           precedent_bonus: round3(precedentComponent),
+          direct_precedent_calibration: round3(directPrecedentCalibrationComponent),
         },
       },
       __rank_score: rankingScore,
@@ -644,11 +896,15 @@ export async function runImplementMode(
     const precedentComponent = matches.length > 0
       ? IMPLEMENT_RANK_WEIGHTS.companion.precedent_bonus
       : 0;
+    const directPrecedentCalibrationComponent = directPrecedentCalibrationFiles.has(filePath)
+      ? IMPLEMENT_DIRECT_PRECEDENT_CALIBRATION_BONUS.companion
+      : 0;
     const rankingScore = round3(
       baseComponent
       + convergenceComponent
       + carbonComponent
-      + precedentComponent,
+      + precedentComponent
+      + directPrecedentCalibrationComponent,
     );
     return {
       ...file,
@@ -673,6 +929,7 @@ export async function runImplementMode(
           convergence: round3(convergenceComponent),
           carbon: round3(carbonComponent),
           precedent_bonus: round3(precedentComponent),
+          direct_precedent_calibration: round3(directPrecedentCalibrationComponent),
         },
       },
       __rank_score: rankingScore,
@@ -739,11 +996,19 @@ export async function runImplementMode(
   const usedFallbackChecks = rawChecks.length === 0;
   const checks = (rawChecks.length > 0 ? rawChecks : fallbackChecks).slice(0, limitChecks);
 
-  const implementTarget = implementPlan?.target || {
-    query_intent: queryText,
-    archetype: String(queryHeadProcesses?.[0]?.summary || queryHeadProcesses?.[0]?.process_type || '').trim() || null,
-    slice: null,
-  };
+  const implementTarget = directReferenceSurface
+    ? {
+        ...fallbackTarget,
+        ...(targetCalibratedFromDirectPrecedents
+          ? {
+              archetype: `direct-precedent:${directReferenceSurface.kind}:${directReferenceSurface.title}`,
+              slice: directReferenceSurface.filePath,
+            }
+          : {}),
+        reference_surface: directReferenceSurface,
+        ...(targetCalibratedFromDirectPrecedents ? { planner_target: plannerTarget } : {}),
+      }
+    : fallbackTarget;
   const usedFallbackTarget = !implementPlan?.target;
 
   const gapSignals = implementPlan?.gap_signals || {};
@@ -764,6 +1029,9 @@ export async function runImplementMode(
   }
   if (usedFallbackWritePlan || usedFallbackChecks || usedFallbackCompanion || usedFallbackTarget) {
     hypotheses.push('Plan used fallback synthesis for one or more required fields; confirm anchors manually before editing.');
+  }
+  if (targetCalibratedFromDirectPrecedents) {
+    hypotheses.push('Direct precedents overrode a generic planner target; start from the shared hotspot owners before editing.');
   }
 
   const postEditReviewBase = implementPlan?.post_edit_review || {
@@ -798,6 +1066,7 @@ export async function runImplementMode(
   if (usedFallbackWritePlan) qualityReasons.push('write_plan synthesized from available anchors');
   if (usedFallbackChecks) qualityReasons.push('verification checklist synthesized');
   if (precedents.length === 0) qualityReasons.push('precedent set is empty');
+  if (targetCalibratedFromDirectPrecedents) qualityReasons.push('planner target calibrated from direct precedents');
 
   const qualityScore = Math.max(0, Math.min(100,
     40
@@ -819,6 +1088,9 @@ export async function runImplementMode(
   }
   if (precedents.length === 0) {
     coverageWarnings.push('No precedents were resolved for this query; anatomy checks are weaker.');
+  }
+  if (targetCalibratedFromDirectPrecedents) {
+    coverageWarnings.push('Direct precedents disagreed with the initial planner target; implement_mode recalibrated the hotspot anchors.');
   }
   const coverage_banner = {
     freshness: {
@@ -886,9 +1158,16 @@ export async function runImplementMode(
   const topWriteAnchor = writePlan
     .slice()
     .sort((left, right) => safeNumber(right?.carbon_copy_ready?.score) - safeNumber(left?.carbon_copy_ready?.score))[0] || null;
+  const calibratedDirectWriteAnchors = targetCalibratedFromDirectPrecedents
+    ? writePlan.filter(step => directPrecedentCalibrationFiles.has(normalizePath(step?.filePath)))
+    : [];
   const convergedWriteAnchors = writePlan
     .filter(step => safeNumber(step?.convergence?.boost) > 0);
-  const prioritizedWriteAnchorPool = convergedWriteAnchors.length > 0 ? convergedWriteAnchors : writePlan;
+  const prioritizedWriteAnchorPool = calibratedDirectWriteAnchors.length > 0
+    ? calibratedDirectWriteAnchors
+    : convergedWriteAnchors.length > 0
+      ? convergedWriteAnchors
+      : writePlan;
   const writeAnchorRankScale = Math.max(
     1,
     ...prioritizedWriteAnchorPool.map(step => safeNumber(step?.ranking?.score)),
@@ -914,10 +1193,16 @@ export async function runImplementMode(
       if (rightConvergence !== leftConvergence) return rightConvergence - leftConvergence;
       return safeNumber(right?.carbon_copy_ready?.score) - safeNumber(left?.carbon_copy_ready?.score);
     })[0] || null;
-  const prioritizedWriteSource: 'converged' | 'ranked' = convergedWriteAnchors.length > 0 ? 'converged' : 'ranked';
+  const prioritizedWriteSource: 'calibrated-precedent' | 'converged' | 'ranked' = calibratedDirectWriteAnchors.length > 0
+    ? 'calibrated-precedent'
+    : convergedWriteAnchors.length > 0
+      ? 'converged'
+      : 'ranked';
   const prioritizedWriteAction = prioritizedWriteAnchor
     ? (
-      prioritizedWriteSource === 'converged'
+      prioritizedWriteSource === 'calibrated-precedent'
+        ? `Start with calibrated precedent anchor "${String(prioritizedWriteAnchor?.name || prioritizedWriteAnchor?.uid || prioritizedWriteAnchor?.filePath || 'write-step')}" to mirror the shared hotspot anatomy.`
+        : prioritizedWriteSource === 'converged'
         ? `Start with converged write anchor "${String(prioritizedWriteAnchor?.name || prioritizedWriteAnchor?.uid || prioritizedWriteAnchor?.filePath || 'write-step')}" (convergence ${Math.round(clampUnit(safeNumber(prioritizedWriteAnchor?.carbon_copy_ready?.signals?.convergence)) * 100)}).`
         : `Start with top-ranked write anchor "${String(prioritizedWriteAnchor?.name || prioritizedWriteAnchor?.uid || prioritizedWriteAnchor?.filePath || 'write-step')}" (score ${Math.round(safeNumber(prioritizedWriteAnchor?.carbon_copy_ready?.score))}).`
     )
@@ -1026,6 +1311,14 @@ export async function runImplementMode(
         include_query_head: includeQueryHead,
         include_review_contract: includeReviewContract,
         path_prefixes: pathPrefixes,
+      },
+      direct_precedent_recovery: {
+        resolved: directPrecedents.length,
+        companion_seeds: directPrecedentCompanionFiles.length,
+        write_plan_seeds: directPrecedentWritePlan.length,
+        target_calibrated: targetCalibratedFromDirectPrecedents,
+        top_kind: directReferenceSurface?.kind || null,
+        top_file: directReferenceSurface?.filePath || null,
       },
       convergence: convergenceMeta,
     },

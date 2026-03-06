@@ -53,6 +53,15 @@ type ConvergenceSignal = {
   route: string;
 };
 
+type DirectQueryPrecedentSurface = {
+  kind: string;
+  title: string;
+  signature: string;
+  filePath: string;
+  source: string;
+  score: number;
+};
+
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../');
 const convergenceMatrixCache = new Map<string, { mtimeMs: number; snapshot: ConvergenceMatrixSnapshot | null }>();
 
@@ -125,6 +134,38 @@ const QUERY_NEXT_ACTION_RANK_WEIGHTS = {
   convergence: 0.28,
   confidence: 0.14,
 } as const;
+const DIRECT_QUERY_PRECEDENT_KINDS = new Set([
+  'ui-behavior',
+  'backend-behavior',
+  'backend-handoff',
+  'pattern-catalog',
+  'slice',
+  'hop',
+  'process',
+]);
+const STRONG_DIRECT_QUERY_PRECEDENT_KINDS = new Set([
+  'ui-behavior',
+  'backend-behavior',
+  'backend-handoff',
+  'pattern-catalog',
+]);
+const DIRECT_QUERY_PRECEDENT_BASE_SCORES: Record<string, number> = {
+  'ui-behavior': 1.08,
+  'backend-handoff': 1.04,
+  'backend-behavior': 1.02,
+  'pattern-catalog': 0.95,
+  slice: 0.9,
+  hop: 0.88,
+  process: 0.86,
+};
+const GENERIC_QUERY_TARGET_PATTERNS = [
+  /^pattern-catalog:/i,
+  /\bpermission\b/i,
+  /\bendpoint\b/i,
+  /\bcontroller\b/i,
+  /\broute\b/i,
+  /\bapi\b/i,
+];
 
 const computeAdaptiveGate = (base: number, floor: number, retrievalSignal: number): number =>
   floor + ((base - floor) * clampUnit(retrievalSignal));
@@ -262,6 +303,76 @@ const computeConvergenceSignal = (
   }
 
   return best;
+};
+
+const buildDirectQueryPrecedentSurfaces = (
+  precedents: any[],
+  repoPath: string,
+): DirectQueryPrecedentSurface[] => {
+  const byFilePath = new Map<string, DirectQueryPrecedentSurface>();
+
+  const pushNode = (precedent: any, node: any, source: string, scoreOffset = 0): void => {
+    const kind = String(precedent?.kind || '').trim();
+    if (!DIRECT_QUERY_PRECEDENT_KINDS.has(kind)) return;
+
+    const filePath = toRepoRelativePath(node?.filePath, repoPath);
+    if (!filePath) return;
+
+    const baseScore = DIRECT_QUERY_PRECEDENT_BASE_SCORES[kind] ?? 0.84;
+    const score = round3(Math.max(0, baseScore + scoreOffset));
+    const title = String(
+      node?.title
+      || node?.name
+      || precedent?.anchor?.title
+      || precedent?.anchor?.name
+      || precedent?.signature
+      || path.basename(filePath),
+    ).trim() || path.basename(filePath);
+    const signature = String(precedent?.signature || '').trim();
+    const existing = byFilePath.get(filePath);
+    if (existing && existing.score >= score) return;
+
+    byFilePath.set(filePath, {
+      kind,
+      title,
+      signature,
+      filePath,
+      source,
+      score,
+    });
+  };
+
+  for (const precedent of Array.isArray(precedents) ? precedents : []) {
+    pushNode(precedent, precedent?.anchor, 'anchor', 0.04);
+    pushNode(precedent, precedent?.anchor?.ui, 'anchor-ui', 0.03);
+    pushNode(precedent, precedent?.anchor?.endpoint, 'anchor-endpoint', 0.02);
+    pushNode(precedent, precedent?.anchor?.controller, 'anchor-controller', 0.01);
+
+    const examples = Array.isArray(precedent?.examples) ? precedent.examples : [];
+    for (const example of examples.slice(0, 4)) {
+      pushNode(precedent, example, 'example', -0.04);
+      pushNode(precedent, example?.ui, 'example-ui', -0.05);
+      pushNode(precedent, example?.endpoint, 'example-endpoint', -0.05);
+      pushNode(precedent, example?.controller, 'example-controller', -0.05);
+    }
+
+    const memberFiles = Array.isArray(precedent?.member_files) ? precedent.member_files : [];
+    for (const memberFilePath of memberFiles.slice(0, 6)) {
+      pushNode(precedent, { filePath: memberFilePath }, 'member-file', -0.06);
+    }
+  }
+
+  return Array.from(byFilePath.values())
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      if (left.kind !== right.kind) {
+        const leftPriority = DIRECT_QUERY_PRECEDENT_BASE_SCORES[left.kind] ?? 0;
+        const rightPriority = DIRECT_QUERY_PRECEDENT_BASE_SCORES[right.kind] ?? 0;
+        if (rightPriority !== leftPriority) return rightPriority - leftPriority;
+      }
+      if (left.title !== right.title) return left.title.localeCompare(right.title);
+      return left.filePath.localeCompare(right.filePath);
+    });
 };
 
 export async function runQueryMode(
@@ -408,19 +519,64 @@ export async function runQueryMode(
   const topSlice = rankedSlices[0] || null;
 
   let precedentPack: any = null;
+  let precedentRetrievalMode: 'query' | 'top-slice-fallback' | null = null;
   if (includePrecedents && limitPrecedents > 0) {
     try {
       precedentPack = await precedents(repo, {
         query: queryText,
-        ...(topSlice?.anchor_id ? { anchor_uid: String(topSlice.anchor_id) } : {}),
         limit: Math.max(1, Math.min(5, limitPrecedents)),
         examples: Math.max(1, Math.min(5, Math.max(2, limitPrecedents))),
         path_prefixes: pathPrefixes,
       });
+      precedentRetrievalMode = 'query';
+      const matchedPrecedents = Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [];
+      const hasDirectPrecedent = matchedPrecedents.some((precedent: any) => DIRECT_QUERY_PRECEDENT_KINDS.has(String(precedent?.kind || '').trim()));
+      if (!hasDirectPrecedent && topSlice?.anchor_id) {
+        precedentPack = await precedents(repo, {
+          query: queryText,
+          anchor_uid: String(topSlice.anchor_id),
+          limit: Math.max(1, Math.min(5, limitPrecedents)),
+          examples: Math.max(1, Math.min(5, Math.max(2, limitPrecedents))),
+          path_prefixes: pathPrefixes,
+        });
+        precedentRetrievalMode = 'top-slice-fallback';
+      }
     } catch {
       precedentPack = null;
+      precedentRetrievalMode = null;
     }
   }
+  const directPrecedentSurfaces = buildDirectQueryPrecedentSurfaces(
+    Array.isArray(precedentPack?.precedents) ? precedentPack.precedents : [],
+    repo.repoPath,
+  );
+  const directTargetPrecedent = directPrecedentSurfaces.find(surface => STRONG_DIRECT_QUERY_PRECEDENT_KINDS.has(surface.kind))
+    || directPrecedentSurfaces[0]
+    || null;
+  const topSliceText = [
+    String(topSlice?.label || ''),
+    String(topSlice?.slice_type || ''),
+    String(topSlice?.anchor_name || ''),
+    String(topSlice?.uid || ''),
+  ]
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+  const topSliceLooksGeneric = GENERIC_QUERY_TARGET_PATTERNS.some(pattern => pattern.test(topSliceText));
+  const topSliceMemberFiles = new Set<string>(
+    (Array.isArray(topSlice?.matched_members) ? topSlice.matched_members : [])
+      .map((member: any) => toRepoRelativePath(member?.filePath, repo.repoPath))
+      .filter((value): value is string => typeof value === 'string' && value.length > 0),
+  );
+  const directPrecedentOverlapsTopSlice = directPrecedentSurfaces.some(surface => topSliceMemberFiles.has(surface.filePath));
+  const directPrecedentRecoveryActive = Boolean(
+    directTargetPrecedent
+    && (
+      !topSlice
+      || topSliceLooksGeneric
+      || !directPrecedentOverlapsTopSlice
+    ),
+  );
 
   let actionPlanResult: any = null;
   if (includeActionHints) {
@@ -455,6 +611,9 @@ export async function runQueryMode(
   }
   if (exactLookupHits === 0) {
     hypotheses.push('No exact lookup hit; tighten the anchor (symbol/route/permission/query key) to reduce ambiguity.');
+  }
+  if (directPrecedentRecoveryActive && directTargetPrecedent) {
+    hypotheses.unshift('Direct precedents disagree with the current top slice; inspect the stronger shared anchor before following generic API/permission paths.');
   }
 
   const genericNextActions = [
@@ -771,8 +930,9 @@ export async function runQueryMode(
     .filter((item): item is NonNullable<typeof item> => item !== null)
     .sort((left, right) => toFiniteNumber(right.readiness?.score, 0) - toFiniteNumber(left.readiness?.score, 0))[0] || null;
   type QueryNextActionCandidate = {
-    source: 'symbol' | 'carbon_anchor' | 'process';
+    source: 'symbol' | 'carbon_anchor' | 'process' | 'precedent';
     candidate_origin:
+      | 'direct_precedent_recovery'
       | 'symbol_threshold'
       | 'carbon_threshold'
       | 'process_threshold'
@@ -833,9 +993,34 @@ export async function runQueryMode(
   const topCarbonConvergence = clampUnit(toFiniteNumber(topCarbonCopy?.readiness?.convergence?.score, 0));
   const topProcessScore = clampUnit(toFiniteNumber(topProcessSignal?.signal?.score, 0));
   const topProcessConvergence = topProcessScore;
+  const directPrecedentScoreScale = directPrecedentRecoveryActive ? 1.05 : 1.2;
+  const directPrecedentBaseFloor = directPrecedentRecoveryActive ? 0.84 : 0.78;
+  const directPrecedentScore = clampUnit(Math.max(
+    toFiniteNumber(directTargetPrecedent?.score, 0) / directPrecedentScoreScale,
+    (DIRECT_QUERY_PRECEDENT_BASE_SCORES[String(directTargetPrecedent?.kind || '').trim()] ?? 0.82) * directPrecedentBaseFloor,
+  ));
+  const directPrecedentConvergence = clampUnit(Math.max(
+    directPrecedentScore * (directPrecedentRecoveryActive ? 0.9 : 0.84),
+    retrievalSignal * (directPrecedentRecoveryActive ? 0.8 : 0.72),
+  ));
   const symbolGatePassed = Boolean(topSymbolSignal && (toFiniteNumber(topSymbolSignal?.hint?.score, 0) >= symbolGateFloor));
   const carbonGatePassed = Boolean(topCarbonCopy && (toFiniteNumber(topCarbonCopy?.readiness?.score, 0) >= carbonGateFloor));
   const processGatePassed = Boolean(topProcessSignal && (toFiniteNumber(topProcessSignal?.signal?.score, 0) >= processGateFloor));
+  if (directPrecedentRecoveryActive && directTargetPrecedent) {
+    const confidence = clampUnit(Math.max(0.76, (directPrecedentScore * 0.68) + (directPrecedentConvergence * 0.32)));
+    addNextActionCandidate({
+      source: 'precedent',
+      candidate_origin: 'direct_precedent_recovery',
+      reason_code: topSliceLooksGeneric
+        ? 'generic_top_slice_precedent_recovery'
+        : 'top_slice_disagreed_with_direct_precedent',
+      label: directTargetPrecedent.title,
+      score: round3(directPrecedentScore),
+      convergence: round3(directPrecedentConvergence),
+      confidence: round3(confidence),
+      action: `Start with direct precedent anchor "${directTargetPrecedent.title}" to inspect the shared hotspot anatomy before following generic API slices.`,
+    });
+  }
   if (symbolGatePassed && topSymbolSignal) {
     const topSymbolName = String(topSymbolSignal?.symbol?.name || topSymbolSignal?.symbol?.uid || 'top symbol');
     const confidence = clampUnit((topSymbolScore * 0.62) + (topSymbolConvergence * 0.38));
@@ -1027,6 +1212,24 @@ export async function runQueryMode(
           level: String(topCarbonCopy.readiness?.level || readinessLevel(toFiniteNumber(topCarbonCopy.readiness?.score, 0))),
         }
       : null,
+    direct_precedent_recovery: {
+      enabled: directPrecedentSurfaces.length > 0,
+      retrieval_mode: precedentRetrievalMode,
+      precedents_found: directPrecedentSurfaces.length,
+      top_slice_looks_generic: topSliceLooksGeneric,
+      top_slice_overlaps_direct_precedents: directPrecedentOverlapsTopSlice,
+      target_calibrated: prioritizedNextAction?.source === 'precedent',
+      top_precedent: directTargetPrecedent
+        ? {
+            kind: directTargetPrecedent.kind,
+            title: directTargetPrecedent.title,
+            signature: directTargetPrecedent.signature || null,
+            filePath: directTargetPrecedent.filePath,
+            source: directTargetPrecedent.source,
+            score: directTargetPrecedent.score,
+          }
+        : null,
+    },
     next_action_gates: {
       retrieval_signal: round3(retrievalSignal),
       symbol_floor: round3(symbolGateFloor),
@@ -1088,6 +1291,16 @@ export async function runQueryMode(
             anchor_label: topCarbonCopy.label,
             reasons: Array.isArray(topCarbonCopy.readiness?.reasons) ? topCarbonCopy.readiness.reasons.slice(0, 6) : [],
             convergence: topCarbonCopy.readiness?.convergence || null,
+          }
+        : null,
+      direct_precedent_anchor: directTargetPrecedent
+        ? {
+            kind: directTargetPrecedent.kind,
+            title: directTargetPrecedent.title,
+            signature: directTargetPrecedent.signature || null,
+            filePath: directTargetPrecedent.filePath,
+            source: directTargetPrecedent.source,
+            score: directTargetPrecedent.score,
           }
         : null,
     },
