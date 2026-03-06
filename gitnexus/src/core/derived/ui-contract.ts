@@ -75,6 +75,10 @@ export type UiMutationHandoff = {
 
 export type UiBehaviorTag =
   | UiMutationHandoffKind
+  | 'fee-tips-settings-shared-ui'
+  | 'fee-tips-settings-setting-codes'
+  | 'fee-tips-settings-coverage-visibility'
+  | 'fee-tips-settings-payment-config-quartet'
   | 'mutation-closes-surface'
   | 'mutation-refreshes-cache'
   | 'mutation-cache-write'
@@ -1182,6 +1186,50 @@ const deriveBehaviorTags = (
       tags.add('query-keep-previous-data');
       if (isNonSuspenseQueryHook(query.hook)) tags.add('query-interactive-refetch');
     }
+  }
+
+  return Array.from(tags);
+};
+
+const deriveFeeTipsSettingsTags = (
+  filePath: string,
+  content: string,
+): UiBehaviorTag[] => {
+  const normalizedFilePath = String(filePath || '').trim().replace(/\\/g, '/');
+  const normalizedContent = String(content || '');
+  const tags = new Set<UiBehaviorTag>();
+
+  if (!/\.(tsx?|jsx?)$/i.test(normalizedFilePath)) {
+    return [];
+  }
+
+  const hasSharedTipsAndFeesUi =
+    /TipsAndFeesRadioButtons/.test(normalizedContent)
+    && (/TipsAndFeesSettingsProvider/.test(normalizedContent) || /TipsAndFeesDescription/.test(normalizedContent));
+  const hasSettingsCodeMapper =
+    /getTipFeesSettingCodesFromValues/.test(normalizedContent)
+    || /getValuesFromTipFeesSettingCodes/.test(normalizedContent)
+    || (/disableTips/.test(normalizedContent) && /hideFees/.test(normalizedContent) && /requireFees/.test(normalizedContent));
+  const hasCoverageVisibilityContract =
+    /fee_coverage_visibility/.test(normalizedContent)
+    && /fee_coverage_type/.test(normalizedContent)
+    && /tips_enabled/.test(normalizedContent);
+  const hasPaymentConfigQuartet =
+    /show_fees/.test(normalizedContent)
+    && /show_tips/.test(normalizedContent)
+    && /edit_fees/.test(normalizedContent);
+
+  if (hasSharedTipsAndFeesUi) {
+    tags.add('fee-tips-settings-shared-ui');
+  }
+  if (hasSettingsCodeMapper) {
+    tags.add('fee-tips-settings-setting-codes');
+  }
+  if (hasCoverageVisibilityContract) {
+    tags.add('fee-tips-settings-coverage-visibility');
+  }
+  if (hasPaymentConfigQuartet) {
+    tags.add('fee-tips-settings-payment-config-quartet');
   }
 
   return Array.from(tags);
@@ -2478,6 +2526,9 @@ export const extractUiContractCard = async (filePath: string, content: string): 
     fnNodesByName,
     mutationTriggerNames,
   );
+  for (const tag of deriveFeeTipsSettingsTags(filePath, content)) {
+    behaviorTags.push(tag);
+  }
 
   return {
     filePath,

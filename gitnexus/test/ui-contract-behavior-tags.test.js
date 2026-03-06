@@ -229,3 +229,47 @@ test('ui-contract: flags useEffect-driven selection sync as a smell', async () =
   assert.ok(Array.isArray(card.smells));
   assert.ok(card.smells.some(smell => smell.kind === 'selection-sync-useeffect'));
 });
+
+test('ui-contract: derives fee or tips settings hotspot tags', async () => {
+  const sharedSettingsContent = [
+    "import { TipsAndFeesDescription } from 'pages/campaign-settings/campaign-settings/tips-and-fees/TipsAndFeesDescription';",
+    "import { TipsAndFeesRadioButtons } from 'pages/campaign-settings/campaign-settings/tips-and-fees/TipsAndFeesRadioButtons';",
+    "import { TipsAndFeesSettingsProvider } from 'pages/campaign-settings/campaign-settings/tips-and-fees/TipsAndFeesSettingsContext';",
+    "import { getTipFeesSettingCodesFromValues } from 'pages/campaign-settings/campaign-settings/tips-and-fees/util';",
+    '',
+    'export const CampaignFeeSettings = () => {',
+    '  const settings = getTipFeesSettingCodesFromValues(values);',
+    '  return (',
+    '    <TipsAndFeesSettingsProvider isAuction={false}>',
+    '      <TipsAndFeesDescription />',
+    '      <TipsAndFeesRadioButtons />',
+    '    </TipsAndFeesSettingsProvider>',
+    '  );',
+    '};',
+    '',
+  ].join('\n');
+
+  const sharedCard = await extractUiContractCard(
+    'apps/dashboard/src/pages/campaign-settings/campaign-settings/CampaignFeeSettings.tsx',
+    sharedSettingsContent,
+  );
+
+  assert.ok(sharedCard.behaviorTags.includes('fee-tips-settings-shared-ui'));
+  assert.ok(sharedCard.behaviorTags.includes('fee-tips-settings-setting-codes'));
+
+  const pledgeSettingsContent = [
+    'export const PledgeSettingsForm = () => {',
+    "  const fields = ['fee_coverage_visibility', 'fee_coverage_type', 'tips_enabled'];",
+    '  return fields.join(show_fees + show_tips + edit_fees);',
+    '};',
+    '',
+  ].join('\n');
+
+  const pledgeCard = await extractUiContractCard(
+    'apps/dashboard/src/pages/pledges/PledgeSettingsForm.tsx',
+    pledgeSettingsContent,
+  );
+
+  assert.ok(pledgeCard.behaviorTags.includes('fee-tips-settings-coverage-visibility'));
+  assert.ok(pledgeCard.behaviorTags.includes('fee-tips-settings-payment-config-quartet'));
+});

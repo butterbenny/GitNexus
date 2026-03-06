@@ -321,3 +321,55 @@ test('php-behavior: derives qr CRUD, export, and parser signals', async () => {
   assert.ok(handoffCard.behaviorTags.includes('qr-trackable-redirect-link'));
   assert.ok(handoffCard.behaviorTags.includes('qr-mail-piece-handoff'));
 });
+
+test('php-behavior: derives fee or tips settings contract signals', async () => {
+  const quartetContent = [
+    '<?php',
+    '',
+    'class PaddleRaiseResource',
+    '{',
+    '    public function toArray(): array',
+    '    {',
+    '        return [',
+    "            'show_fees' => true,",
+    "            'show_tips' => $campaign->hasTipsEnabled(),",
+    "            'edit_fees' => ! $campaign->requiresCoveringFees(),",
+    "            'fee_coverage_type' => PledgeFeeCoverageTypeEnum::ALL,",
+    '        ];',
+    '    }',
+    '}',
+    '',
+  ].join('\n');
+
+  const quartetCard = await extractPhpBehaviorCard(
+    'apps/backend/app/Domains/PaddleRaise/Http/Web/Resources/PaddleRaiseResource.php',
+    quartetContent,
+  );
+
+  assert.ok(quartetCard.behaviorTags.includes('fee-tips-settings-payment-config-quartet'));
+  assert.ok(quartetCard.behaviorTags.includes('fee-tips-settings-coverage-type-contract'));
+
+  const visibilityContent = [
+    '<?php',
+    '',
+    'class PledgeStoreRequest',
+    '{',
+    '    public function rules(): array',
+    '    {',
+    '        return [',
+    "            'fee_coverage_type' => ['required'],",
+    "            'fee_coverage_visibility' => ['required'],",
+    '        ];',
+    '    }',
+    '}',
+    '',
+  ].join('\n');
+
+  const visibilityCard = await extractPhpBehaviorCard(
+    'apps/backend/app/Http/Requests/Pledges/PledgeStoreRequest.php',
+    visibilityContent,
+  );
+
+  assert.ok(visibilityCard.behaviorTags.includes('fee-tips-settings-coverage-type-contract'));
+  assert.ok(visibilityCard.behaviorTags.includes('fee-tips-settings-coverage-visibility-contract'));
+});

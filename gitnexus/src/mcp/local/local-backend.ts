@@ -431,6 +431,12 @@ type PatternCatalogSection = {
   tokenSet: Set<string>;
 };
 
+type UiBehaviorIndexEntry = {
+  filePath: string;
+  tags: string[];
+  smells: string[];
+};
+
 type BackendBehaviorIndexEntry = {
   filePath: string;
   tags: string[];
@@ -1155,6 +1161,7 @@ export class LocalBackend {
   private semanticModeCache: Map<string, { manifestMtimeMs: number; mode: SemanticRetrievalMode; source: string }> = new Map();
   private semanticVectorIndexCache: Map<string, { checkedAtMs: number; available: boolean }> = new Map();
   private archetypeIndexCache: Map<string, { builtAtMs: number; minHttpConfidence: number; byProcessId: Map<string, { signature: string; example: ArchetypeExample }>; bySignature: Map<string, ArchetypeExample[]> }> = new Map();
+  private uiBehaviorIndexCache: Map<string, { builtAtMs: number; entries: UiBehaviorIndexEntry[] }> = new Map();
   private backendBehaviorIndexCache: Map<string, { builtAtMs: number; entries: BackendBehaviorIndexEntry[] }> = new Map();
   private backendHandoffIndexCache: Map<string, { builtAtMs: number; entries: BackendHandoffIndexEntry[] }> = new Map();
 
@@ -1273,6 +1280,7 @@ export class LocalBackend {
     this.repoMetaMtimeMs.clear();
     this.repoMetaCheckedAtMs.clear();
     this.archetypeIndexCache.clear();
+    this.uiBehaviorIndexCache.clear();
     this.backendBehaviorIndexCache.clear();
     this.backendHandoffIndexCache.clear();
 
@@ -1577,6 +1585,7 @@ export class LocalBackend {
     this.initializedRepos.clear();
     this.indexStatusCache.delete(repo.id);
     this.archetypeIndexCache.delete(repo.id);
+    this.uiBehaviorIndexCache.delete(repo.id);
     this.backendBehaviorIndexCache.delete(repo.id);
     this.backendHandoffIndexCache.delete(repo.id);
 
@@ -2310,6 +2319,73 @@ export class LocalBackend {
     return { byProcessId, bySignature };
   }
 
+  private async loadUiBehaviorIndex(
+    repo: RepoHandle,
+  ): Promise<UiBehaviorIndexEntry[]> {
+    const now = Date.now();
+    const cached = this.uiBehaviorIndexCache.get(repo.id);
+    if (cached && (now - cached.builtAtMs) < 30_000) {
+      return cached.entries;
+    }
+
+    await this.ensureInitialized(repo.id);
+
+    const rows = await executeQuery(repo.id, `
+      MATCH (f:File)
+      WHERE f.filePath ENDS WITH '.ts'
+         OR f.filePath ENDS WITH '.tsx'
+         OR f.filePath ENDS WITH '.js'
+         OR f.filePath ENDS WITH '.jsx'
+      RETURN f.filePath AS filePath
+      ORDER BY f.filePath
+      LIMIT 50000
+    `);
+
+    const filePaths = Array.from(new Set(rows
+      .map((row: any) => normalizeRepoRelativePath(String(row?.filePath ?? row?.[0] ?? '')))
+      .filter(filePath => Boolean(filePath) && !isTestFilePath(filePath))));
+
+    const entries: UiBehaviorIndexEntry[] = [];
+    const concurrency = 24;
+
+    for (let i = 0; i < filePaths.length; i += concurrency) {
+      const batch = filePaths.slice(i, i + concurrency);
+      const batchEntries = await Promise.all(batch.map(async filePath => {
+        const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
+        if (!resolved) return null;
+
+        let content = '';
+        try {
+          content = await fs.readFile(resolved.absolutePath, 'utf-8');
+        } catch {
+          return null;
+        }
+
+        const card = await extractUiContractCard(resolved.relativePath, content);
+        const tags: string[] = Array.isArray((card as any)?.behaviorTags)
+          ? (card as any).behaviorTags.map((tag: unknown) => String(tag || '').trim()).filter(Boolean)
+          : [];
+        const smells: string[] = Array.isArray((card as any)?.smells)
+          ? (card as any).smells.map((smell: any) => String(smell?.kind || '').trim()).filter(Boolean)
+          : [];
+
+        if (tags.length === 0 && smells.length === 0) return null;
+        return {
+          filePath: resolved.relativePath,
+          tags: Array.from(new Set(tags)),
+          smells: Array.from(new Set(smells)),
+        };
+      }));
+
+      for (const entry of batchEntries) {
+        if (entry) entries.push(entry);
+      }
+    }
+
+    this.uiBehaviorIndexCache.set(repo.id, { builtAtMs: now, entries });
+    return entries;
+  }
+
   private async loadBackendBehaviorIndex(
     repo: RepoHandle,
   ): Promise<BackendBehaviorIndexEntry[]> {
@@ -2861,6 +2937,30 @@ export class LocalBackend {
         tags.add('query-interactive-refetch');
       }
 
+      const hasFeeTipsSettingsLanguage =
+        /\bdonor tips?\b|\boptional donor tips?\b|\btips or fees\b|\bplatform fees?\b|\bcover fees?\b|\bfee settings\b|\bfees settings\b|\bask to cover fees\b|\brequire fees\b|\bhide fees\b|\babsorb (?:the )?cost\b/.test(lower);
+      const hasCampaignAuctionFeeTipsLanguage =
+        /\bsetting codes?\b|\bsettings codes?\b|\bmapper\b|\bmapping\b|\bdisabletips\b|\bhidefees\b|\brequirefees\b|\bgettipfeessettingcodesfromvalues\b|\bgetvaluesfromtipfeessettingcodes\b/.test(lower);
+      const hasPledgeFeeTipsLanguage =
+        (hasFeeTipsSettingsLanguage && /\bpledge\b/.test(lower))
+        || /\bfee_coverage_visibility\b|\btips_enabled\b/.test(lower);
+      const hasQuartetFeeTipsLanguage =
+        /\bshow_fees\b|\bshow_tips\b|\bedit_fees\b|\bfee_coverage_type\b/.test(lower)
+        || (hasFeeTipsSettingsLanguage && /\bpaddle raise\b|\bcheckout\b|\bpublic flow\b|\bpayment config\b/.test(lower));
+
+      if (hasFeeTipsSettingsLanguage) {
+        tags.add('fee-tips-settings-shared-ui');
+      }
+      if (hasCampaignAuctionFeeTipsLanguage) {
+        tags.add('fee-tips-settings-setting-codes');
+      }
+      if (hasPledgeFeeTipsLanguage) {
+        tags.add('fee-tips-settings-coverage-visibility');
+      }
+      if (hasQuartetFeeTipsLanguage) {
+        tags.add('fee-tips-settings-payment-config-quartet');
+      }
+
       return tags;
     };
 
@@ -3012,6 +3112,18 @@ export class LocalBackend {
         }
       }
 
+      const wantsFeeTipsSettings =
+        /\bdonor tips?\b|\boptional donor tips?\b|\btips or fees\b|\bplatform fees?\b|\bcover fees?\b|\bfee settings\b|\bfees settings\b|\bask to cover fees\b|\brequire fees\b|\bhide fees\b|\babsorb (?:the )?cost\b/.test(lower);
+      if (wantsFeeTipsSettings || /\bshow_fees\b|\bshow_tips\b|\bedit_fees\b/.test(lower)) {
+        tags.add('fee-tips-settings-payment-config-quartet');
+      }
+      if (/\bfee_coverage_type\b|\bprocessing fees only\b|\bplatform fees only\b|\bboth processing\b|\bplatform fee only\b/.test(lower)) {
+        tags.add('fee-tips-settings-coverage-type-contract');
+      }
+      if (/\bfee_coverage_visibility\b|\bask to cover fees\b|\brequire fees\b|\bhide fees\b|\boptional\b|\brequired\b|\bhidden\b|\babsorb (?:the )?cost\b/.test(lower)) {
+        tags.add('fee-tips-settings-coverage-visibility-contract');
+      }
+
       return tags;
     };
 
@@ -3120,6 +3232,33 @@ export class LocalBackend {
     const shouldPenalizeTableInlineSuccessDrift = Array.from(uiBehaviorQueryTags)
       .some(tag => tag === 'mutation-table-inline-success' || tag === 'mutation-table-inline-success-undo' || tag === 'mutation-table-inline-success-deferred-refresh')
       || hasExplicitTableInlineSuccessQuery;
+    const hasExplicitSharedFeeTipsSettingsQuery =
+      /\bsettings\b/.test(lowerQueryText)
+      && /\bdonor tips?\b|\boptional donor tips?\b|\btips or fees\b|\bplatform fees?\b|\bcover fees?\b|\bfee settings\b|\bfees settings\b/.test(lowerQueryText);
+    const hasExplicitFeeTipsDashboardSettingsQuery =
+      hasExplicitSharedFeeTipsSettingsQuery
+      && /\bcampaign\b|\bauction\b/.test(lowerQueryText);
+    const hasExplicitCampaignFeeSettingsQuery =
+      hasExplicitFeeTipsDashboardSettingsQuery
+      && /\bcampaign\b/.test(lowerQueryText)
+      && !/\bauction\b/.test(lowerQueryText);
+    const hasExplicitAuctionFeeSettingsQuery =
+      hasExplicitFeeTipsDashboardSettingsQuery
+      && /\bauction\b/.test(lowerQueryText);
+    const hasExplicitPaddleRaiseFeeSettingsQuery =
+      hasExplicitSharedFeeTipsSettingsQuery
+      && /\bpaddle raise\b|\bpaddle_raise\b/.test(lowerQueryText);
+    const hasExplicitFeeTipsQuartetContractQuery =
+      /\bshow_fees\b|\bshow_tips\b|\bedit_fees\b|\bfee_coverage_type\b|\bpayment config\b/.test(lowerQueryText);
+    const hasExplicitPledgeFeeSettingsQuery =
+      /\bpledge\b/.test(lowerQueryText)
+      && /\bfee\b|\btips\b/.test(lowerQueryText)
+      && /\bvisibility\b|\bfee_coverage_visibility\b|\bask to cover fees\b|\brequire fees\b|\bhide fees\b/.test(lowerQueryText);
+    const hasExplicitPledgeDashboardFeeSettingsQuery =
+      /\bsettings\b/.test(lowerQueryText)
+      && /\bpledge\b/.test(lowerQueryText)
+      && /\bfee\b|\btips\b|\bcover fees?\b|\bask to cover fees\b|\brequire fees\b|\bhide fees\b/.test(lowerQueryText);
+    const hasExplicitSeederContextQuery = /\bseed(?:er|ing)?\b|\bfixture\b|\bfactory\b/.test(lowerQueryText);
     const pendingUiBehaviorSmellWeights = hasExplicitPendingDriftQuery
       ? {
           'mutation-without-pending-ux': 0.22,
@@ -4684,6 +4823,12 @@ export class LocalBackend {
 
     const createBackendBehaviorTitle = (tags: string[], filePath: string): string => {
       const tagSet = new Set(tags);
+      if (tagSet.has('fee-tips-settings-payment-config-quartet') && tagSet.has('fee-tips-settings-coverage-type-contract')) {
+        return 'Fee or tips payment config quartet';
+      }
+      if (tagSet.has('fee-tips-settings-coverage-visibility-contract')) {
+        return 'Fee coverage visibility contract';
+      }
       if (tagSet.has('scheduler-schedules-job')) return 'Scheduled queued job';
       if (tagSet.has('scheduler-schedules-command')) return 'Scheduled console command';
       if (tagSet.has('webhook-dispatch-callsite')) return 'Webhook dispatch callsite';
@@ -4725,6 +4870,27 @@ export class LocalBackend {
       return path.basename(filePath);
     };
 
+    const createUiBehaviorTitle = (tags: string[], filePath: string): string => {
+      const tagSet = new Set(tags);
+      if (tagSet.has('fee-tips-settings-shared-ui')) {
+        return 'Shared donor tips / platform fees settings UI';
+      }
+      if (tagSet.has('fee-tips-settings-coverage-visibility')) {
+        return 'Pledge fee coverage settings form';
+      }
+      if (tagSet.has('fee-tips-settings-payment-config-quartet')) {
+        return 'Fee or tips payment config quartet';
+      }
+      if (tagSet.has('fee-tips-settings-setting-codes')) {
+        return 'Campaign or auction fee settings owner';
+      }
+      return path.basename(filePath);
+    };
+    const isDirectUiSettingsTag = (tag: string): boolean => String(tag || '').startsWith('fee-tips-settings-');
+
+    const uiBehaviorEntries = shouldBoostUiBehaviors
+      ? await this.loadUiBehaviorIndex(repo)
+      : [];
     const backendBehaviorEntries = shouldBoostBackendBehaviors
       ? await this.loadBackendBehaviorIndex(repo)
       : [];
@@ -4969,10 +5135,75 @@ export class LocalBackend {
         .slice(0, Math.max(limit * 2, 8))
       : [];
 
+    const uiBehaviorPrecedents = shouldBoostUiBehaviors
+      ? uiBehaviorEntries
+        .filter(entry => filePathTouchesPrefixes(entry.filePath, pathPrefixes))
+        .map(entry => {
+          const matchedTags = Array.from(uiBehaviorQueryTags).filter(tag => entry.tags.includes(tag));
+          if (!matchedTags.some(isDirectUiSettingsTag)) return null;
+          const tagSet = new Set(entry.tags);
+          const isCampaignSettingsOwner = /campaign-settings\/campaign-settings\/CampaignFeeSettings\.tsx$/i.test(entry.filePath);
+          const isAuctionSettingsOwner = /campaign-auction\/auction-settings\/AuctionSettings\.tsx$/i.test(entry.filePath);
+          const isPledgeSettingsOwner = /pages\/pledges\/PledgeSettingsForm\.tsx$/i.test(entry.filePath);
+          const textTokenSet = new Set(tokenizePatternCatalogText([
+            createUiBehaviorTitle(entry.tags, entry.filePath),
+            entry.filePath,
+          ].join(' ')));
+          const textMatchScore = Math.min(
+            queryTokens.reduce((sum, token) => sum + (textTokenSet.has(token) ? 0.16 : 0), 0),
+            0.64,
+          );
+          const score = matchedTags.length
+            + (tagSet.has('fee-tips-settings-shared-ui') ? 0.45 : 0)
+            + (tagSet.has('fee-tips-settings-setting-codes') ? 0.3 : 0)
+            + (tagSet.has('fee-tips-settings-coverage-visibility') ? 0.35 : 0)
+            + (tagSet.has('fee-tips-settings-payment-config-quartet') ? 0.4 : 0)
+            + (hasExplicitSharedFeeTipsSettingsQuery && tagSet.has('fee-tips-settings-shared-ui') ? 0.55 : 0)
+            + (hasExplicitFeeTipsDashboardSettingsQuery && tagSet.has('fee-tips-settings-shared-ui') ? 0.75 : 0)
+            + (hasExplicitFeeTipsDashboardSettingsQuery && tagSet.has('fee-tips-settings-setting-codes') ? 0.45 : 0)
+            + (hasExplicitCampaignFeeSettingsQuery && isCampaignSettingsOwner ? 1.1 : 0)
+            + (hasExplicitAuctionFeeSettingsQuery && isAuctionSettingsOwner ? 1.45 : 0)
+            + (hasExplicitPaddleRaiseFeeSettingsQuery && tagSet.has('fee-tips-settings-shared-ui') ? 0.8 : 0)
+            + (hasExplicitPaddleRaiseFeeSettingsQuery && (isCampaignSettingsOwner || isAuctionSettingsOwner) ? 0.45 : 0)
+            + (hasExplicitPledgeFeeSettingsQuery && tagSet.has('fee-tips-settings-coverage-visibility') ? 1.65 : 0)
+            + (hasExplicitPledgeFeeSettingsQuery && isPledgeSettingsOwner ? 0.65 : 0)
+            + (hasExplicitPledgeDashboardFeeSettingsQuery && tagSet.has('fee-tips-settings-coverage-visibility') ? 1.1 : 0)
+            + (hasExplicitPledgeDashboardFeeSettingsQuery && isPledgeSettingsOwner ? 0.85 : 0)
+            + textMatchScore;
+
+          return {
+            kind: 'ui-behavior',
+            score,
+            anchor: {
+              name: path.basename(entry.filePath),
+              title: createUiBehaviorTitle(entry.tags, entry.filePath),
+              kind: 'File',
+              filePath: entry.filePath,
+            },
+            examples: [
+              {
+                name: path.basename(entry.filePath),
+                kind: 'File',
+                filePath: entry.filePath,
+              },
+            ],
+            ui_behavior: {
+              tags: entry.tags,
+              smells: entry.smells,
+              matched_tags: matchedTags,
+            },
+          };
+        })
+        .filter(Boolean)
+        .sort((left: any, right: any) => toFiniteNumber(right?.score, 0) - toFiniteNumber(left?.score, 0))
+        .slice(0, Math.max(limit * 2, 8))
+      : [];
+
     const familyWeights: Record<string, number> = {
       slice: 1.6,
       hop: 1.45,
       process: 1.3,
+      'ui-behavior': 1.48,
       'backend-handoff': 1.58,
       'backend-behavior': 1.45,
       'pattern-catalog': 0.9,
@@ -4985,13 +5216,15 @@ export class LocalBackend {
       hop: 1,
       process: 2,
       'backend-handoff': 3,
-      'backend-behavior': 4,
-      'pattern-catalog': 5,
-      'anti-pattern': 6,
-      'agent-guideline': 7,
+      'ui-behavior': 4,
+      'backend-behavior': 5,
+      'pattern-catalog': 6,
+      'anti-pattern': 7,
+      'agent-guideline': 8,
     };
 
     const rawPrecedents = [
+      ...uiBehaviorPrecedents,
       ...backendHandoffPrecedents,
       ...backendBehaviorPrecedents,
       ...patternCatalogPrecedents,
@@ -5008,7 +5241,7 @@ export class LocalBackend {
     let backendHandoffCardsBoosted = 0;
     let backendBehaviorCardsBoosted = 0;
     let backendBehaviorSameDomainFallbacks = 0;
-    const precedents = (await Promise.all(rawPrecedents.map(async card => {
+    const rankedPrecedents = (await Promise.all(rawPrecedents.map(async card => {
       const filtered = filterPrecedentCard(card);
       if (!filtered) return null;
       changedFilesExcluded += filtered.changedExcluded;
@@ -5020,7 +5253,7 @@ export class LocalBackend {
       const rawScore = Math.max(0, toFiniteNumber(filtered.card.score ?? filtered.card.anchor?.score, 0));
       const signal = rawScore > 0 ? 1 - (1 / (1 + rawScore)) : 0;
       const exampleCount = Array.isArray(filtered.card.examples) ? filtered.card.examples.length : 0;
-      const codeDerivedBonus = ['slice', 'hop', 'process', 'backend-handoff', 'backend-behavior'].includes(filtered.card.kind) ? 0.12 : 0;
+      const codeDerivedBonus = ['slice', 'hop', 'process', 'ui-behavior', 'backend-handoff', 'backend-behavior'].includes(filtered.card.kind) ? 0.12 : 0;
 
       let uiBehaviorBonus = 0;
       let uiBehaviorMatches = 0;
@@ -5074,6 +5307,7 @@ export class LocalBackend {
         const matchedBackendBehaviorTags = Array.from(backendBehaviorQueryTags)
           .filter(tag => candidateTags.has(tag));
         backendBehaviorMatches = matchedBackendBehaviorTags.length;
+        const includesSeederFile = candidateFiles.some(filePath => /(?:^|\/)database\/seeders\//.test(filePath));
         const matchedSpecificBackendTokens = backendSpecificQueryTokens
           .filter(token => candidateTextTokens.has(token));
         backendSpecificityMatches = matchedSpecificBackendTokens.length;
@@ -5261,6 +5495,58 @@ export class LocalBackend {
             backendContextPenalty += 0.4;
           }
 
+          if (
+            (hasExplicitFeeTipsDashboardSettingsQuery || hasExplicitPaddleRaiseFeeSettingsQuery)
+            && filtered.card.kind === 'backend-behavior'
+            && !hasExplicitFeeTipsQuartetContractQuery
+          ) {
+            if (candidateTags.has('fee-tips-settings-payment-config-quartet')) {
+              backendContextPenalty += hasExplicitPaddleRaiseFeeSettingsQuery ? 0.9 : 1.15;
+            }
+            if (candidateTags.has('fee-tips-settings-coverage-visibility-contract')) {
+              backendContextPenalty += 1.1;
+            }
+            if (candidateTags.has('fee-tips-settings-coverage-type-contract')) {
+              backendContextPenalty += 0.75;
+            }
+          }
+
+          if (
+            hasExplicitPledgeFeeSettingsQuery
+            && filtered.card.kind === 'backend-behavior'
+            && candidateTags.has('fee-tips-settings-coverage-visibility-contract')
+          ) {
+            backendContextPenalty += 1.15;
+          }
+
+          if (
+            hasExplicitPledgeFeeSettingsQuery
+            && filtered.card.kind === 'backend-behavior'
+            && candidateTags.has('fee-tips-settings-payment-config-quartet')
+          ) {
+            backendContextPenalty += 0.85;
+          }
+
+          if (
+            hasExplicitPledgeDashboardFeeSettingsQuery
+            && filtered.card.kind === 'backend-behavior'
+            && candidateTags.has('fee-tips-settings-coverage-visibility-contract')
+          ) {
+            backendContextPenalty += 0.7;
+          }
+
+          if (
+            !hasExplicitSeederContextQuery
+            && includesSeederFile
+            && (
+              hasExplicitSharedFeeTipsSettingsQuery
+              || hasExplicitPaddleRaiseFeeSettingsQuery
+              || hasExplicitPledgeFeeSettingsQuery
+            )
+          ) {
+            backendContextPenalty += 0.85;
+          }
+
           if (hasExplicitQrCrossFileHandoffQuery && filtered.card.kind !== 'backend-handoff') {
             backendContextPenalty += 1.05;
           }
@@ -5278,7 +5564,8 @@ export class LocalBackend {
       }
 
       if (shouldBoostUiBehaviors || shouldPenalizeSelectionSyncUseEffect || shouldPenalizePendingUxDrift || shouldPenalizeSuspenseDrift || shouldPenalizeQueryFreshnessDrift || shouldPenalizeMutationFreshnessDrift || shouldPenalizeRollbackOwnershipDrift || shouldPenalizeProjectionReconcileDrift || shouldPenalizeWritebackOwnershipDrift || shouldPenalizeTableInlineSuccessDrift) {
-        const candidateFiles = collectPrecedentFilePaths(filtered.card)
+        const candidateAllFiles = collectPrecedentFilePaths(filtered.card);
+        const candidateFiles = candidateAllFiles
           .filter(isTsLikeFilePath)
           .slice(0, 3);
         const candidateTags = new Set<string>();
@@ -5302,6 +5589,22 @@ export class LocalBackend {
             }
             uiBehaviorCardsBoosted += 1;
           }
+        }
+
+        const hasDashboardFeeSettingsOwnerFile = candidateAllFiles.some(filePath => (
+          /apps\/dashboard\/src\/pages\/campaign-settings\/campaign-settings\/CampaignFeeSettings\.tsx$/i.test(filePath)
+          || /apps\/dashboard\/src\/pages\/campaign-settings\/campaign-auction\/auction-settings\/AuctionSettings\.tsx$/i.test(filePath)
+          || /apps\/dashboard\/src\/pages\/pledges\/PledgeSettingsForm\.tsx$/i.test(filePath)
+        ));
+
+        if (
+          (hasExplicitFeeTipsDashboardSettingsQuery || hasExplicitPaddleRaiseFeeSettingsQuery || hasExplicitPledgeDashboardFeeSettingsQuery)
+          && filtered.card.kind !== 'ui-behavior'
+          && !hasDashboardFeeSettingsOwnerFile
+          && !candidateTags.has('fee-tips-settings-shared-ui')
+          && !candidateTags.has('fee-tips-settings-coverage-visibility')
+        ) {
+          uiBehaviorPenalty += 0.3;
         }
 
         if (shouldPenalizeSelectionSyncUseEffect && candidateSmells.has('selection-sync-useeffect')) {
@@ -5503,6 +5806,18 @@ export class LocalBackend {
 
         return String(left?.signature || '').localeCompare(String(right?.signature || ''));
       });
+    const repeatedPrecedentLimits: Record<string, number> = {
+      'backend-behavior': 3,
+    };
+    const repeatedPrecedentCounts = new Map<string, number>();
+    const precedents = rankedPrecedents.filter((card: any) => {
+      const limit = repeatedPrecedentLimits[card?.kind] ?? 0;
+      if (limit <= 0) return true;
+      const repeatKey = `${String(card?.kind || '')}:${String(card?.anchor?.title || card?.signature || card?.anchor?.name || '')}`;
+      const nextCount = (repeatedPrecedentCounts.get(repeatKey) ?? 0) + 1;
+      repeatedPrecedentCounts.set(repeatKey, nextCount);
+      return nextCount <= limit;
+    });
 
     const diagnostics: any = {
       anchor_uid: anchorUid || undefined,

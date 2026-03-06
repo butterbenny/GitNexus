@@ -1,4 +1,7 @@
 export type PhpBehaviorTag =
+  | 'fee-tips-settings-payment-config-quartet'
+  | 'fee-tips-settings-coverage-type-contract'
+  | 'fee-tips-settings-coverage-visibility-contract'
   | 'scheduler-kernel-owner'
   | 'scheduler-schedules-job'
   | 'scheduler-schedules-command'
@@ -216,6 +219,22 @@ export const extractPhpBehaviorCard = async (
   const isController = normalizedFilePath.includes('/Http/Controllers/');
   const isWebhookController = normalizedFilePath.includes('/Http/Controllers/Webhooks/');
   const isListener = normalizedFilePath.includes('/Listeners/');
+  const hasFeeTipsPaymentConfigQuartet =
+    /\bshow_fees\b/.test(normalizedContent)
+    && /\bshow_tips\b/.test(normalizedContent)
+    && /\bedit_fees\b/.test(normalizedContent);
+  const hasFeeCoverageTypeContract = /\bfee_coverage_type\b/.test(normalizedContent);
+  const hasFeeCoverageVisibilityContract = /\bfee_coverage_visibility\b/.test(normalizedContent);
+
+  if (hasFeeTipsPaymentConfigQuartet) {
+    addTag(behaviorTags, 'fee-tips-settings-payment-config-quartet');
+  }
+  if (hasFeeCoverageTypeContract) {
+    addTag(behaviorTags, 'fee-tips-settings-coverage-type-contract');
+  }
+  if (hasFeeCoverageVisibilityContract) {
+    addTag(behaviorTags, 'fee-tips-settings-coverage-visibility-contract');
+  }
 
   if (isSchedulerKernel) addTag(behaviorTags, 'scheduler-kernel-owner');
   if (isConsoleCommand) addTag(behaviorTags, 'console-command-owner');
