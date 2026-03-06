@@ -8,17 +8,26 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'url';
 import { initKuzu, executeQuery, closeKuzu, isKuzuReady } from '../core/kuzu-adapter.js';
 import { embedQuery, getEmbeddingDims, disposeEmbedder } from '../core/embedder.js';
-import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
+import {
+  isGitRepo,
+  getCurrentCommit,
+  getGitRoot,
+  getCommittedFileChanges,
+  getWorkingTreeFileChanges,
+  mergeGitFileChanges,
+} from '../../storage/git.js';
 import {
   getGlobalRegistryPath,
   listRegisteredRepos,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 import { buildArchetypeReport, computeProcessArchetype, deriveLayerTag, type ArchetypeExample, type ArchetypeReport, type HttpEdgeInfo, type ProcessTraceInfo } from '../../core/derived/archetypes.js';
+import { extractPhpBehaviorCard } from '../../core/derived/php-behavior.js';
 import { extractUiContractCard } from '../../core/derived/ui-contract.js';
 import {
   buildEpisodeOverlay,
@@ -228,6 +237,152 @@ function filePathTouchesPrefixes(filePath: string, pathPrefixes: string[]): bool
   return false;
 }
 
+function normalizePrecedentDomainSegment(value: string): string {
+  return String(value || '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/(?:controller|drawer|dialog|modal|page|route|routes|form|service|query|mutation|hook|provider)$/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function extractPrecedentDomainKeys(filePath: string): string[] {
+  const normalizedPath = normalizeRepoRelativePath(filePath);
+  if (!normalizedPath) return [];
+
+  const parts = normalizedPath.split('/').filter(Boolean);
+  const directoryParts = parts.slice(0, -1);
+  let semanticParts = directoryParts;
+  let forceSpecificDepth = false;
+  const fileStem = normalizePrecedentDomainSegment(parts.at(-1) || '');
+
+  if (parts[0] === 'apps' && parts[1] === 'dashboard') {
+    const srcIndex = parts.indexOf('src');
+    semanticParts = srcIndex >= 0 ? parts.slice(srcIndex + 1, -1) : parts.slice(2, -1);
+    if (semanticParts[0] && ['pages', 'api', 'queries', 'hooks', 'customHooks', 'components', 'features'].includes(semanticParts[0])) {
+      semanticParts = semanticParts.slice(1);
+    }
+  } else if (parts[0] === 'apps' && parts[1] === 'backend') {
+    if (parts.includes('Domains')) {
+      semanticParts = parts.slice(parts.indexOf('Domains') + 1, -1);
+    } else if (parts.includes('API')) {
+      semanticParts = parts.slice(parts.indexOf('API') + 1, -1);
+    } else if (parts.includes('Controllers')) {
+      semanticParts = parts.slice(parts.indexOf('Controllers') + 1, -1);
+    } else if (parts.includes('app')) {
+      semanticParts = parts.slice(parts.indexOf('app') + 1, -1);
+    } else if (parts.includes('routes')) {
+      semanticParts = parts.slice(parts.indexOf('routes') + 1, -1);
+    }
+  }
+
+  const normalizedSegments = semanticParts
+    .map(normalizePrecedentDomainSegment)
+    .filter(Boolean);
+
+  let domainSegments = normalizedSegments.length > 0
+    ? normalizedSegments
+    : [fileStem].filter(Boolean);
+  const isBackendApiLike = parts[0] === 'apps'
+    && parts[1] === 'backend'
+    && (parts.includes('API') || parts.includes('Controllers'));
+  if (isBackendApiLike && normalizedSegments.length === 1 && fileStem && fileStem !== normalizedSegments[0]) {
+    domainSegments = [normalizedSegments[0], fileStem];
+    forceSpecificDepth = true;
+  }
+  if (domainSegments.length === 0) return [];
+
+  const lowSignalRoots = new Set(['dashboard', 'routes', 'app', 'providers']);
+  if (domainSegments.length === 1 && lowSignalRoots.has(domainSegments[0])) {
+    return [];
+  }
+
+  const minDepth = forceSpecificDepth || (domainSegments[0] || '').endsWith('-settings') ? 2 : 1;
+  const maxDepth = Math.min(3, domainSegments.length);
+  const keys: string[] = [];
+  for (let depth = minDepth; depth <= maxDepth; depth += 1) {
+    keys.push(domainSegments.slice(0, depth).join('/'));
+  }
+  if (keys.length === 0) keys.push(domainSegments[0]);
+  return Array.from(new Set(keys.filter(Boolean)));
+}
+
+function filePathsSharePrecedentDomain(leftFilePath: string, rightFilePath: string): boolean {
+  const leftKeys = extractPrecedentDomainKeys(leftFilePath);
+  const rightKeys = extractPrecedentDomainKeys(rightFilePath);
+  if (leftKeys.length === 0 || rightKeys.length === 0) return false;
+
+  for (const left of leftKeys) {
+    for (const right of rightKeys) {
+      if (left === right) return true;
+      if (left.startsWith(`${right}/`)) return true;
+      if (right.startsWith(`${left}/`)) return true;
+    }
+  }
+
+  return false;
+}
+
+type GitPrecedentBaseline = {
+  baseRef: string | null;
+  mergeBase: string | null;
+  changedFiles: Set<string>;
+};
+
+function readGitText(repoPath: string, args: string[]): string {
+  try {
+    return execFileSync('git', args, {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function loadGitPrecedentBaseline(repoPath: string): GitPrecedentBaseline {
+  if (!isGitRepo(repoPath)) {
+    return {
+      baseRef: null,
+      mergeBase: null,
+      changedFiles: new Set<string>(),
+    };
+  }
+
+  const headCommit = getCurrentCommit(repoPath);
+  const remoteHead = readGitText(repoPath, ['symbolic-ref', 'refs/remotes/origin/HEAD']).replace(/^refs\/remotes\//, '');
+  const baseCandidates = Array.from(new Set(
+    [remoteHead, 'origin/main', 'origin/master', 'main', 'master']
+      .map(candidate => String(candidate || '').trim())
+      .filter(Boolean),
+  ));
+
+  let baseRef: string | null = null;
+  let mergeBase: string | null = null;
+  for (const candidate of baseCandidates) {
+    const resolved = readGitText(repoPath, ['merge-base', 'HEAD', candidate]);
+    if (!resolved) continue;
+    baseRef = candidate;
+    mergeBase = resolved;
+    break;
+  }
+
+  const committedChanges = headCommit && mergeBase && headCommit !== mergeBase
+    ? getCommittedFileChanges(repoPath, mergeBase, headCommit)
+    : { changed: [], deleted: [] };
+  const workingTreeChanges = getWorkingTreeFileChanges(repoPath);
+  const mergedChanges = mergeGitFileChanges(committedChanges, workingTreeChanges);
+  const changedFiles = new Set(
+    [...mergedChanges.changed, ...mergedChanges.deleted]
+      .map(filePath => normalizeRepoRelativePath(filePath))
+      .filter(Boolean),
+  );
+
+  return { baseRef, mergeBase, changedFiles };
+}
+
 function parseStringList(value: unknown): string[] {
   const dedupe = (items: string[]): string[] => Array.from(new Set(
     items
@@ -269,6 +424,7 @@ function parseStringList(value: unknown): string[] {
 type PatternCatalogSection = {
   category: string;
   title: string;
+  content: string;
   templateFiles: string[];
   alsoGoodFiles: string[];
   otherFiles: string[];
@@ -313,29 +469,63 @@ function extractPatternCatalogCategory(content: string): string {
   return '';
 }
 
+function buildPatternCatalogTokenSet(section: {
+  category: string;
+  title: string;
+  content: string;
+  templateFiles: string[];
+  alsoGoodFiles: string[];
+  otherFiles: string[];
+}): Set<string> {
+  return new Set<string>([
+    ...tokenizePatternCatalogText(section.category),
+    ...tokenizePatternCatalogText(section.title),
+    ...tokenizePatternCatalogText(section.content),
+    ...section.templateFiles.flatMap(tokenizePatternCatalogText),
+    ...section.alsoGoodFiles.flatMap(tokenizePatternCatalogText),
+    ...section.otherFiles.flatMap(tokenizePatternCatalogText),
+  ]);
+}
+
 function parsePatternCatalogMarkdown(content: string): PatternCatalogSection[] {
   const lines = String(content || '').split('\n');
   const sections: PatternCatalogSection[] = [];
 
   let category = '';
   let mode: 'template' | 'also-good' | 'other' | null = null;
-  let current: PatternCatalogSection | null = null;
+  let current: {
+    category: string;
+    title: string;
+    rawLines: string[];
+    templateFiles: string[];
+    alsoGoodFiles: string[];
+    otherFiles: string[];
+    tokenSet: Set<string>;
+  } | null = null;
 
   const finalizeCurrent = () => {
     if (!current) return;
     const dedupe = (items: string[]) => Array.from(new Set(items.map(item => normalizeRepoRelativePath(item)).filter(Boolean)));
-    current.templateFiles = dedupe(current.templateFiles);
-    current.alsoGoodFiles = dedupe(current.alsoGoodFiles);
-    current.otherFiles = dedupe(current.otherFiles);
-
-    const tokens = new Set<string>([
-      ...tokenizePatternCatalogText(current.category),
-      ...tokenizePatternCatalogText(current.title),
-      ...current.templateFiles.flatMap(tokenizePatternCatalogText),
-      ...current.alsoGoodFiles.flatMap(tokenizePatternCatalogText),
-    ]);
-    current.tokenSet = tokens;
-    sections.push(current);
+    const templateFiles = dedupe(current.templateFiles);
+    const alsoGoodFiles = dedupe(current.alsoGoodFiles);
+    const otherFiles = dedupe(current.otherFiles);
+    const sectionContent = current.rawLines.join('\n').trim();
+    sections.push({
+      category: current.category,
+      title: current.title,
+      content: sectionContent,
+      templateFiles,
+      alsoGoodFiles,
+      otherFiles,
+      tokenSet: buildPatternCatalogTokenSet({
+        category: current.category,
+        title: current.title,
+        content: sectionContent,
+        templateFiles,
+        alsoGoodFiles,
+        otherFiles,
+      }),
+    });
     current = null;
   };
 
@@ -354,6 +544,7 @@ function parsePatternCatalogMarkdown(content: string): PatternCatalogSection[] {
       current = {
         category,
         title: trimmed.slice(4).trim(),
+        rawLines: [],
         templateFiles: [],
         alsoGoodFiles: [],
         otherFiles: [],
@@ -364,6 +555,7 @@ function parsePatternCatalogMarkdown(content: string): PatternCatalogSection[] {
     }
 
     if (!current) continue;
+    current.rawLines.push(line);
 
     if (trimmed.toLowerCase() === 'template:') {
       mode = 'template';
@@ -412,6 +604,7 @@ async function loadPatternCatalogSectionsFromGraph(repoId: string): Promise<{ re
       sectionsById.set(sectionId, {
         category: extractPatternCatalogCategory(content),
         title,
+        content,
         templateFiles: [],
         alsoGoodFiles: [],
         otherFiles: [],
@@ -455,12 +648,7 @@ async function loadPatternCatalogSectionsFromGraph(repoId: string): Promise<{ re
       section.templateFiles = dedupe(section.templateFiles);
       section.alsoGoodFiles = dedupe(section.alsoGoodFiles);
       section.otherFiles = dedupe(section.otherFiles);
-      section.tokenSet = new Set<string>([
-        ...tokenizePatternCatalogText(section.category),
-        ...tokenizePatternCatalogText(section.title),
-        ...section.templateFiles.flatMap(tokenizePatternCatalogText),
-        ...section.alsoGoodFiles.flatMap(tokenizePatternCatalogText),
-      ]);
+      section.tokenSet = buildPatternCatalogTokenSet(section);
     }
 
     return { relativePath: catalogPath, sections: Array.from(sectionsById.values()) };
@@ -952,6 +1140,7 @@ export class LocalBackend {
   private semanticModeCache: Map<string, { manifestMtimeMs: number; mode: SemanticRetrievalMode; source: string }> = new Map();
   private semanticVectorIndexCache: Map<string, { checkedAtMs: number; available: boolean }> = new Map();
   private archetypeIndexCache: Map<string, { builtAtMs: number; minHttpConfidence: number; byProcessId: Map<string, { signature: string; example: ArchetypeExample }>; bySignature: Map<string, ArchetypeExample[]> }> = new Map();
+  private backendBehaviorIndexCache: Map<string, { builtAtMs: number; entries: Array<{ filePath: string; tags: string[]; smells: string[] }> }> = new Map();
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -2101,6 +2290,70 @@ export class LocalBackend {
     return { byProcessId, bySignature };
   }
 
+  private async loadBackendBehaviorIndex(
+    repo: RepoHandle,
+  ): Promise<Array<{ filePath: string; tags: string[]; smells: string[] }>> {
+    const now = Date.now();
+    const cached = this.backendBehaviorIndexCache.get(repo.id);
+    if (cached && (now - cached.builtAtMs) < 30_000) {
+      return cached.entries;
+    }
+
+    await this.ensureInitialized(repo.id);
+
+    const rows = await executeQuery(repo.id, `
+      MATCH (f:File)
+      WHERE f.filePath ENDS WITH '.php'
+      RETURN f.filePath AS filePath
+      ORDER BY f.filePath
+      LIMIT 50000
+    `);
+
+    const filePaths = Array.from(new Set(rows
+      .map((row: any) => normalizeRepoRelativePath(String(row?.filePath ?? row?.[0] ?? '')))
+      .filter(Boolean)));
+
+    const entries: Array<{ filePath: string; tags: string[]; smells: string[] }> = [];
+    const concurrency = 24;
+
+    for (let i = 0; i < filePaths.length; i += concurrency) {
+      const batch = filePaths.slice(i, i + concurrency);
+      const batchEntries = await Promise.all(batch.map(async filePath => {
+        const resolved = resolvePathInsideRepo(repo.repoPath, filePath);
+        if (!resolved) return null;
+
+        let content = '';
+        try {
+          content = await fs.readFile(resolved.absolutePath, 'utf-8');
+        } catch {
+          return null;
+        }
+
+        const card = await extractPhpBehaviorCard(resolved.relativePath, content);
+        const tags: string[] = Array.isArray((card as any)?.behaviorTags)
+          ? (card as any).behaviorTags.map((tag: unknown) => String(tag || '').trim()).filter(Boolean)
+          : [];
+        const smells: string[] = Array.isArray((card as any)?.smells)
+          ? (card as any).smells.map((smell: any) => String(smell?.kind || '').trim()).filter(Boolean)
+          : [];
+
+        if (tags.length === 0 && smells.length === 0) return null;
+        return {
+          filePath: resolved.relativePath,
+          tags: Array.from(new Set(tags)),
+          smells: Array.from(new Set(smells)),
+        };
+      }));
+
+      for (const entry of batchEntries) {
+        if (entry) entries.push(entry);
+      }
+    }
+
+    this.backendBehaviorIndexCache.set(repo.id, { builtAtMs: now, entries });
+    return entries;
+  }
+
   private async precedents(repo: RepoHandle, params: {
     query: string;
     anchor_uid?: string;
@@ -2120,6 +2373,8 @@ export class LocalBackend {
     const examplesPer = clampInteger(params.examples, 3, 1, 5);
     const minHttpConfidence = Math.max(0, Math.min(1, toFiniteNumber(params.min_http_confidence, 0.9)));
     const pathPrefixes = parsePathPrefixes(repo.repoPath, (params as any).path_prefixes);
+    const gitPrecedentBaseline = loadGitPrecedentBaseline(repo.repoPath);
+    const changedPrecedentFiles = gitPrecedentBaseline.changedFiles;
 
     const index = await this.ensureArchetypeIndex(repo, minHttpConfidence, pathPrefixes);
 
@@ -2149,10 +2404,12 @@ export class LocalBackend {
       const examples = all
         .filter(p => p.processId !== processId)
         .slice(0, examplesPer);
+      const score = Math.max(limit - processPrecedents.length, 1);
 
       processPrecedents.push({
         kind: 'process',
         signature,
+        score,
         anchor: info.example,
         examples: examples.length > 0 ? examples : all.slice(0, examplesPer),
       });
@@ -2188,6 +2445,381 @@ export class LocalBackend {
         .map(t => t.trim())
         .filter(t => t.length >= 3)
         .slice(0, 12);
+    };
+
+    const isTsLikeFilePath = (filePath: string): boolean => {
+      return /\.(tsx?|jsx?)$/i.test(String(filePath || '').trim());
+    };
+
+    const isPhpLikeFilePath = (filePath: string): boolean => {
+      return /\.php$/i.test(String(filePath || '').trim());
+    };
+
+    const getUiBehaviorQueryTags = (text: string): Set<string> => {
+      const lower = String(text || '').toLowerCase();
+      const tags = new Set<string>();
+      if (!lower) return tags;
+
+      if (/\bhandle\s*submit\b|\bsubmit flow\b|\bthin submit\b/.test(lower)) {
+        tags.add('handle-submit-mutation');
+      }
+      if (/\bstaged\b|\bsame[- ]owner\b|\bhomogeneous\b|\bfanout\b/.test(lower)) {
+        tags.add('handle-submit-sequence');
+      }
+      if (/\bonsuccess\b|\bfollow[- ]up\b|\bsecond mutation\b|\bsecondary\b|\bpartial success\b|\bhandoff\b|\bcallback\b/.test(lower)) {
+        tags.add('callback-handoff');
+      }
+      if (/\bawait\b|\btwo writes\b|\borchestrates?\b|\bsingle mutation\b|\bcreate then update\b/.test(lower)) {
+        tags.add('mutation-fn-sequence');
+      }
+      if (/\bmulti[- ]step\b/.test(lower)) {
+        tags.add('callback-handoff');
+        tags.add('mutation-fn-sequence');
+        tags.add('handle-submit-sequence');
+      }
+      if (/\bclose\b|\bdismiss\b|\bdialog\b|\bdrawer\b|\bkeep open\b/.test(lower)) {
+        tags.add('mutation-closes-surface');
+      }
+      if (/\binvalidate\b|\brefetch\b|\brefresh\b|\bcache\b/.test(lower)) {
+        tags.add('mutation-refreshes-cache');
+      }
+      if (/\bonmutate\b|\boptimistic(?:ally)?\b|\boptimistic update\b|\boptimistic write\b/.test(lower)) {
+        tags.add('mutation-optimistic-cache-write');
+      }
+      if (/\bonerror\b|\brollback\b|\bundo optimistic\b|\brestore cache\b|\brestore on error\b/.test(lower)) {
+        tags.add('mutation-rollback-restores-cache');
+      }
+      if (/\bfiltered list\b|\blist projections?\b|\bderived views?\b|\bprojection drift\b|\brestore list\b|\bmulti[- ]cache rollback\b/.test(lower)) {
+        tags.add('mutation-rollback-restores-multi-cache');
+      }
+      const hasProjectionTerms = /\bfiltered list\b|\blist projections?\b|\bderived views?\b|\blist membership\b|\bprojection\b|\bordering\b|\bsort order\b|\breorder\b|\bposition\b|\bindex\b/.test(lower);
+      const hasProjectionMutationTerms = /\bonmutate\b|\bonerror\b|\brollback\b|\bundo optimistic\b|\brestore\b|\breconcile\b|\boptimistic(?:ally)?\b|\bremove\b|\bdelete\b|\barchive\b|\bunpin\b|\bpin\b/.test(lower);
+      if (hasProjectionTerms && hasProjectionMutationTerms) {
+        tags.add('mutation-optimistic-projection-reconcile');
+      }
+      if (hasProjectionTerms && /\bonerror\b|\brollback\b|\bundo optimistic\b|\brestore\b|\breconcile\b/.test(lower)) {
+        tags.add('mutation-rollback-restores-projection-reconcile');
+      }
+      if (
+        /\bsetquerydata\b|\bsetqueriesdata\b|\bwriteback\b|\boptimistic(?:ally)? update\b|\bpatch (?:detail|cache)\b|\blocal cache\b|\bdetail cache\b|\bowned detail\b|\bimmediate detail update\b/.test(lower)
+        && /\binvalidate\b|\brefresh\b|\blist\b|\bsummary\b|\bquery keys?\b|\btargeted\b/.test(lower)
+      ) {
+        tags.add('mutation-cache-write-plus-refresh');
+      }
+      if (/\binvalidate both\b|\bmultiple query keys?\b|\bmultiple queries\b|\bsummary and detail\b|\bparent summary\b|\bowner summary\b|\broute gating\b|\btab visibility\b|\bcross[- ]resource invalidation\b|\bcampaign summary\b/.test(lower)) {
+        tags.add('mutation-refreshes-multiple-cache-roots');
+      }
+      if (/\bparent summary\b|\bowner summary\b|\bcampaign summary\b|\broute gating\b|\btab visibility\b|\bcross[- ]resource\b/.test(lower)) {
+        tags.add('mutation-refreshes-cross-root-cache');
+      }
+      if (/\bsetquerydata\b|\bsetqueriesdata\b|\boptimistic\b|\bwriteback\b|\bcache write\b/.test(lower)) {
+        tags.add('mutation-cache-write');
+      }
+      if (/\bnavigate\b|\bredirect\b|\brouter\b|\bafter success\b/.test(lower)) {
+        tags.add('mutation-navigates');
+      }
+      if (/\btoast\b|\bsuccess message\b|\berror surface\b/.test(lower)) {
+        tags.add('mutation-shows-toast');
+      }
+      if (/\bpending\b|\bispending\b|\bloading\b|\bspinner\b|\bdisabled?\b|\bduplicate click\b|\bdouble submit\b|\brepeat click\b/.test(lower)) {
+        tags.add('mutation-pending-ux');
+      }
+      if (/\bstay open\b|\bkeep open\b|\bcontrolled\b|\bonopenchange\b|\bprevent close\b|\bdisable close\b|\buncontrolled\b|\bclose timing\b|\bclose immediately\b/.test(lower)) {
+        tags.add('mutation-pending-controlled-surface');
+      }
+      const hasTableRowPendingTerms = /\brow pending\b|\bpending row\b|\btable row pending\b|\bpaginated table\b/.test(lower);
+      const hasTableInlineSuccessTerms = /\brow replacement\b|\breplace(?:d)? row\b|\binline success\b|\bsuccess state\b|\bsuccess row\b|\btable row success\b/.test(lower);
+      if (hasTableRowPendingTerms) {
+        tags.add('mutation-table-row-pending');
+      }
+      if (hasTableInlineSuccessTerms) {
+        tags.add('mutation-table-inline-success');
+      }
+      if ((/\bundo\b|\bundoable\b|\bundo before refetch\b/.test(lower) && (hasTableRowPendingTerms || hasTableInlineSuccessTerms))
+        || /\binline success undo\b|\brow replacement undo\b/.test(lower)) {
+        tags.add('mutation-table-inline-success-undo');
+      }
+      if ((/\bdelayed invalidation\b|\bdefer(?:red)? (?:invalidation|refetch|refresh)\b|\bwait before refetch\b|\bbefore refetch\b/.test(lower) && (hasTableInlineSuccessTerms || /\bundo\b/.test(lower)))
+        || /\binline success before refetch\b|\bdelayed row refresh\b/.test(lower)) {
+        tags.add('mutation-table-inline-success-deferred-refresh');
+      }
+      if (/\bprefill\b|\bauto[- ]fill\b|\bselection\b|\bsetvalue\b/.test(lower)) {
+        tags.add('selection-prefill');
+      }
+      if (
+        /\bselection\b|\bselect(?:ed)?\b|\bselected (?:contact|campaign|supporter|thing|item)\b|\bafter select\b/.test(lower)
+        && /\basync\b|\benrich(?:ment)?\b|\bfetch details\b|\bfetch contact\b|\bfetch campaign\b|\bload details\b|\bmutation\b/.test(lower)
+      ) {
+        tags.add('selection-async-enrichment');
+      }
+      if (
+        /\bselection\b|\bselected\b|\bclear selected\b|\bchange selection\b/.test(lower)
+        && /\breset\b|\bclear\b|\bwipe\b|\bdependent\b|\bstale fields?\b/.test(lower)
+      ) {
+        tags.add('selection-resets-dependent-state');
+      }
+      if (
+        /\bselection\b|\bselected (?:contact|campaign|supporter|thing|item|id)\b|\bselected[a-z0-9_]*\b/.test(lower)
+        && /\bquery\b|\benabled\b|\bfollow[- ]up query\b|\bdependent query\b|\bfetch details\b|\bfetch after select\b/.test(lower)
+      ) {
+        tags.add('selection-enabled-follow-up-query');
+      }
+      if (/\bsuspense\b|\busesuspensequery\b|\busesuspenseinfinitequery\b|\bsuspense query\b/.test(lower)) {
+        tags.add('query-required-suspense');
+      }
+      if (/\boptional\b|\bshould not suspend\b|\bavoid suspense\b|\bnon[- ]suspense\b|\bfallback flash\b|\bdrawer fallback\b|\broute fallback\b/.test(lower)) {
+        tags.add('query-optional-gate-non-suspense');
+      }
+      if (/\benabled\b|\bgated query\b|\bfollow[- ]up query\b|\bdependent query\b/.test(lower)) {
+        tags.add('query-enabled-gate');
+      }
+      if (/\boptional\b|\bnon[- ]suspense\b|\bavoid suspense\b|\bwithout suspense\b|\bshould not suspend\b|\bflash\b|\bskeleton\b/.test(lower)) {
+        tags.add('query-enabled-non-suspense');
+      }
+      if (/\brefetchonwindowfocus\b|\bwindow focus\b|\bfocus refresh\b|\bforeground\b|\bresume\b|\bexternal flow\b|\bout[- ]of[- ]app\b|\breturn from (?:browser|setup)\b|\bpost[- ]setup\b|\bwallet\b/.test(lower)) {
+        tags.add('query-focus-refresh-always');
+      }
+      if (/\bpolling\b|\brefetch ?interval\b|\brefetchinterval\b|\bstatus refresh\b|\bprogress\b|\blong[- ]running\b|\bbackground process\b/.test(lower)) {
+        tags.add('query-polling-refresh');
+      }
+
+      const hasKeepPreviousQuery = /\bkeeppreviousdata\b|\bplaceholderdata\b|\bkeep previous\b/.test(lower);
+      if (hasKeepPreviousQuery) {
+        tags.add('query-keep-previous-data');
+      }
+      if (
+        (hasKeepPreviousQuery && /\brefetch\b|\bsort\b|\bfilter\b|\bpage\b|\bpagination\b/.test(lower))
+        || /\binteractive refetch\b|\bkeep previous while\b|\bbackground refetch\b|\bkeep current surface\b|\bavoid fallback flash\b/.test(lower)
+      ) {
+        tags.add('query-interactive-refetch');
+      }
+
+      return tags;
+    };
+
+    const getBackendBehaviorQueryTags = (text: string): Set<string> => {
+      const lower = String(text || '').toLowerCase();
+      const tags = new Set<string>();
+      if (!lower) return tags;
+
+      const wantsQueuedDelivery = /\bqueued?\b|\bshouldqueue\b|\bonqueue\b|\bjobqueue\b|\bqueue assignment\b|\bqueue owner(?:ship)?\b|\bwhich queue\b/.test(lower);
+      const wantsMail = /\bmail\b|\bemail\b|\bmailable\b|\bmail::\b/.test(lower);
+      const wantsNotification = /\bnotification\b|\bnotify\b/.test(lower);
+      const wantsJob = /\bjob\b|\bdispatch\b|\bhandle\b|\bkernel\b/.test(lower);
+      const wantsEndToEndFlow = /\bend[- ]to[- ]end\b|\bflow\b|\borchestrate\b|\binside job\b|\bowner\b/.test(lower);
+      const wantsExplicitQueue = /\bonqueue\b|\bjobqueue\b|\bqueue assignment\b|\bwhich queue\b|\bexplicit queue\b/.test(lower);
+      const wantsQr = /\bqr\b|\bqr code\b|\bqrcode\b/.test(lower);
+
+      if (wantsJob || /\bjob queue\b|\bjob owner\b/.test(lower)) {
+        tags.add('queued-job-owner');
+      }
+      if (wantsQueuedDelivery && wantsMail) {
+        tags.add('queued-mail-owner');
+      }
+      if (wantsQueuedDelivery && wantsNotification) {
+        tags.add('queued-notification-owner');
+      }
+      if (wantsExplicitQueue && (wantsQueuedDelivery || wantsMail || wantsNotification || wantsJob)) {
+        tags.add('queue-assignment-explicit');
+      }
+      if (/\binherited queue\b|\bbase mailable\b|\bbase notification\b/.test(lower)) {
+        tags.add('queue-assignment-inherited');
+      }
+      if (/\bmail queue\b|\bqueue mail\b|\bqueued email\b|\bmail::queue\b|\bmail::later\b/.test(lower)) {
+        tags.add('delivery-mail-queue');
+      }
+      if (wantsMail && /\bsend\b|\bsynchronous\b|\bimmediate\b/.test(lower)) {
+        tags.add('delivery-mail-send');
+      }
+      if (/\bnotification::send\b|\bnotification facade\b|\bnotification dispatch\b/.test(lower)) {
+        tags.add('delivery-notification-send');
+      }
+      if (/\buser->notify\b|\b->notify\b|\bnotify\b/.test(lower)) {
+        tags.add('delivery-notify');
+      }
+      if (wantsJob && wantsMail && wantsEndToEndFlow) {
+        tags.add('job-orchestrates-mail-delivery');
+      }
+      if (wantsJob && wantsNotification && wantsEndToEndFlow) {
+        tags.add('job-orchestrates-notification-delivery');
+      }
+
+      if (wantsQr) {
+        if (/\bcrud\b|\bcreate\b|\bupdate\b|\bresource\b|\baccount qr\b|\btrackable\b|\bmessage\b/.test(lower)) {
+          tags.add('qr-crud-resource');
+        }
+        if (/\bmail piece\b|\bsidecar\b|\bletter\b/.test(lower)) {
+          tags.add('qr-crud-mail-piece-sidecar');
+          tags.add('qr-html-embed');
+        }
+        if (/\bpdf\b|\bexport\b|\bdownload\b|\binline\b|\bprint\b|\bfile\b/.test(lower)) {
+          tags.add('qr-export-inline-pdf');
+        }
+        if (/\bparser\b|\bembed\b|\bhtml\b|\breplace\b|\bbody\b/.test(lower)) {
+          tags.add('qr-html-embed');
+        }
+        if (/\bremove\b|\bstrip\b/.test(lower)) {
+          tags.add('qr-html-strip');
+        }
+        if (/\bsvg\b|\bbase64\b/.test(lower)) {
+          tags.add('qr-svg-generation');
+        }
+      }
+
+      return tags;
+    };
+
+    const lowerQueryText = String(queryText || '').toLowerCase();
+    const uiBehaviorQueryTags = getUiBehaviorQueryTags(queryText);
+    const backendBehaviorQueryTags = getBackendBehaviorQueryTags(queryText);
+    const shouldBoostUiBehaviors = uiBehaviorQueryTags.size > 0;
+    const shouldBoostBackendBehaviors = backendBehaviorQueryTags.size > 0;
+    const shouldPenalizeSelectionSyncUseEffect = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag.startsWith('selection-'))
+      || /\buseeffect\b|\bavoid useeffect\b|\beffect sync\b|\bselection sync\b|\bsync drift\b/.test(lowerQueryText);
+    const hasExplicitPendingDriftQuery = /\bduplicate click\b|\bdouble submit\b|\brepeat click\b|\buncontrolled\b|\balertdialog\b|\bdialog action\b|\bclose immediately\b|\bclose timing\b/.test(lowerQueryText);
+    const shouldPenalizePendingUxDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'mutation-pending-ux' || tag === 'mutation-pending-controlled-surface')
+      || hasExplicitPendingDriftQuery;
+    const hasExplicitSuspenseDriftQuery = /\bavoid suspense\b|\bshould not suspend\b|\bfallback flash\b|\bdrawer fallback\b|\broute fallback\b|\bbackground refetch\b|\bkeep current surface\b|\binteractive refetch\b/.test(lowerQueryText);
+    const shouldPenalizeSuspenseDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'query-optional-gate-non-suspense' || tag === 'query-enabled-non-suspense' || tag === 'query-interactive-refetch' || tag === 'query-keep-previous-data')
+      || hasExplicitSuspenseDriftQuery;
+    const shouldPenalizeQueryFreshnessDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'query-focus-refresh-always' || tag === 'query-polling-refresh')
+      || /\bbackground freshness\b|\bfreshness policy\b|\brefetchonwindowfocus\b|\bwindow focus\b|\bforeground refresh\b|\bexternal flow\b|\bout[- ]of[- ]app\b|\breturn from (?:browser|setup)\b|\bpolling\b|\brefetch ?interval\b/.test(lowerQueryText);
+    const hasExplicitMutationFreshnessDriftQuery = /\bfocus refetch\b|\blean on focus\b|\bdon'?t rely on focus\b|\bstale until refresh\b|\bmanual refresh\b|\broute gating\b|\btab visibility\b/.test(lowerQueryText);
+    const shouldPenalizeMutationFreshnessDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'mutation-refreshes-multiple-cache-roots' || tag === 'mutation-refreshes-cross-root-cache')
+      || hasExplicitMutationFreshnessDriftQuery;
+    const hasExplicitRollbackOwnershipQuery = /\bonmutate\b|\bonerror\b|\brollback\b|\bundo optimistic\b|\bfiltered list\b|\blist projections?\b|\bprojection drift\b|\brestore list\b|\bpartial rollback\b/.test(lowerQueryText);
+    const shouldPenalizeRollbackOwnershipDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'mutation-rollback-restores-cache' || tag === 'mutation-rollback-restores-multi-cache')
+      || hasExplicitRollbackOwnershipQuery;
+    const hasExplicitProjectionReconcileQuery =
+      /\bfiltered list\b|\blist projections?\b|\bderived views?\b|\blist membership\b|\bprojection\b|\bordering\b|\bsort order\b|\breorder\b|\bposition\b|\bindex\b/.test(lowerQueryText)
+      && /\bonmutate\b|\bonerror\b|\brollback\b|\boptimistic\b|\brestore\b|\breconcile\b|\bremove\b|\bdelete\b|\barchive\b/.test(lowerQueryText);
+    const shouldPenalizeProjectionReconcileDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'mutation-optimistic-projection-reconcile' || tag === 'mutation-rollback-restores-projection-reconcile')
+      || hasExplicitProjectionReconcileQuery;
+    const hasExplicitWritebackOwnershipQuery = /\bsetquerydata\b|\bsetqueriesdata\b|\bwriteback\b|\boptimistic(?:ally)? update\b|\bpatch (?:detail|cache)\b|\blocal cache\b|\bdetail cache\b|\bowned detail\b|\btargeted invalidation\b|\binvalidate[- ]only\b|\bbroad invalidation\b/.test(lowerQueryText);
+    const shouldPenalizeWritebackOwnershipDrift = uiBehaviorQueryTags.has('mutation-cache-write-plus-refresh')
+      || hasExplicitWritebackOwnershipQuery;
+    const hasExplicitTableInlineSuccessQuery = /\brow replacement\b|\breplace(?:d)? row\b|\binline success\b|\bsuccess state\b|\bsuccess row\b|\btable row success\b|\bundo before refetch\b|\bdelayed invalidation\b|\bdefer(?:red)? (?:invalidation|refetch|refresh)\b/.test(lowerQueryText);
+    const shouldPenalizeTableInlineSuccessDrift = Array.from(uiBehaviorQueryTags)
+      .some(tag => tag === 'mutation-table-inline-success' || tag === 'mutation-table-inline-success-undo' || tag === 'mutation-table-inline-success-deferred-refresh')
+      || hasExplicitTableInlineSuccessQuery;
+    const pendingUiBehaviorSmellWeights = hasExplicitPendingDriftQuery
+      ? {
+          'mutation-without-pending-ux': 0.22,
+          'alertdialog-action-async-uncontrolled': 0.32,
+          'dialog-action-async-uncontrolled': 0.26,
+        }
+      : {
+          'mutation-without-pending-ux': 0.16,
+          'alertdialog-action-async-uncontrolled': 0.24,
+          'dialog-action-async-uncontrolled': 0.2,
+        };
+    const uiBehaviorCardCache = new Map<string, { tags: Set<string>; smells: Set<string> }>();
+    const backendBehaviorCardCache = new Map<string, { tags: Set<string>; smells: Set<string> }>();
+
+    const getUiBehaviorSignalsForFile = async (
+      filePathRaw: string
+    ): Promise<{ tags: Set<string>; smells: Set<string> }> => {
+      const normalized = normalizeRepoRelativePath(filePathRaw);
+      if (!normalized || !isTsLikeFilePath(normalized)) {
+        return { tags: new Set<string>(), smells: new Set<string>() };
+      }
+
+      const cached = uiBehaviorCardCache.get(normalized);
+      if (cached) return cached;
+
+      const resolved = resolvePathInsideRepo(repo.repoPath, normalized);
+      if (!resolved) {
+        const empty = { tags: new Set<string>(), smells: new Set<string>() };
+        uiBehaviorCardCache.set(normalized, empty);
+        return empty;
+      }
+
+      let content = '';
+      try {
+        content = await fs.readFile(resolved.absolutePath, 'utf-8');
+      } catch {
+        const empty = { tags: new Set<string>(), smells: new Set<string>() };
+        uiBehaviorCardCache.set(normalized, empty);
+        return empty;
+      }
+
+      const card = await extractUiContractCard(resolved.relativePath, content);
+      const result = { tags: new Set<string>(), smells: new Set<string>() };
+      const behaviorTags = Array.isArray((card as any)?.behaviorTags)
+        ? (card as any).behaviorTags
+        : Array.isArray((card as any)?.mutationHandoffs)
+          ? (card as any).mutationHandoffs.map((handoff: any) => handoff?.kind)
+          : [];
+      for (const kindValue of behaviorTags) {
+        const kind = String(kindValue || '').trim();
+        if (!kind) continue;
+        result.tags.add(kind);
+      }
+
+      const smellKinds = Array.isArray((card as any)?.smells)
+        ? (card as any).smells.map((smell: any) => smell?.kind)
+        : [];
+      for (const smellValue of smellKinds) {
+        const smell = String(smellValue || '').trim();
+        if (!smell) continue;
+        result.smells.add(smell);
+      }
+
+      uiBehaviorCardCache.set(normalized, result);
+      return result;
+    };
+
+    const getBackendBehaviorSignalsForFile = async (
+      filePathRaw: string
+    ): Promise<{ tags: Set<string>; smells: Set<string> }> => {
+      const normalized = normalizeRepoRelativePath(filePathRaw);
+      if (!normalized || !isPhpLikeFilePath(normalized)) {
+        return { tags: new Set<string>(), smells: new Set<string>() };
+      }
+
+      const cached = backendBehaviorCardCache.get(normalized);
+      if (cached) return cached;
+
+      const resolved = resolvePathInsideRepo(repo.repoPath, normalized);
+      if (!resolved) {
+        const empty = { tags: new Set<string>(), smells: new Set<string>() };
+        backendBehaviorCardCache.set(normalized, empty);
+        return empty;
+      }
+
+      let content = '';
+      try {
+        content = await fs.readFile(resolved.absolutePath, 'utf-8');
+      } catch {
+        const empty = { tags: new Set<string>(), smells: new Set<string>() };
+        backendBehaviorCardCache.set(normalized, empty);
+        return empty;
+      }
+
+      const card = await extractPhpBehaviorCard(resolved.relativePath, content);
+      const result = { tags: new Set<string>(), smells: new Set<string>() };
+
+      for (const kindValue of Array.isArray((card as any)?.behaviorTags) ? (card as any).behaviorTags : []) {
+        const kind = String(kindValue || '').trim();
+        if (!kind) continue;
+        result.tags.add(kind);
+      }
+
+      for (const smellValue of Array.isArray((card as any)?.smells) ? (card as any).smells.map((smell: any) => smell?.kind) : []) {
+        const smell = String(smellValue || '').trim();
+        if (!smell) continue;
+        result.smells.add(smell);
+      }
+
+      backendBehaviorCardCache.set(normalized, result);
+      return result;
     };
 
     type SliceMember = {
@@ -2645,13 +3277,12 @@ export class LocalBackend {
       const ranked = hops
         .map(h => ({ h, score: rankHop(h, tokens) }))
         .sort((a, b) => b.score - a.score)
-        .map(x => x.h)
-        .slice(0, limit);
+        .slice(0, Math.max(limit * 2, limit));
 
       const out: any[] = [];
       const seenSig = new Set<string>();
 
-      for (const hop of ranked) {
+      for (const { h: hop, score } of ranked) {
         const signature = buildHopSignature(hop);
         if (!signature || seenSig.has(signature)) continue;
         seenSig.add(signature);
@@ -2660,6 +3291,7 @@ export class LocalBackend {
         out.push({
           kind: 'hop',
           signature,
+          score: score + 1,
           anchor: reduceHopForOutput(hop),
           examples,
         });
@@ -2760,6 +3392,7 @@ export class LocalBackend {
         out.push({
           kind: 'slice',
           signature: buildSliceSignature(anchor),
+          score: anchorSliceScores.get(anchor.id) || 0,
           anchor: reduceSliceForOutput(anchor, { score: anchorSliceScores.get(anchor.id) || 0 }),
           examples,
         });
@@ -3091,6 +3724,42 @@ export class LocalBackend {
       }
     }
 
+    const queryAnchorFileSet = new Set<string>();
+    const addQueryAnchorFile = (filePath: string): void => {
+      const normalized = normalizeRepoRelativePath(filePath);
+      if (!normalized) return;
+      if (!filePathTouchesPrefixes(normalized, pathPrefixes)) return;
+      queryAnchorFileSet.add(normalized);
+    };
+
+    for (const hop of inScopeHops.slice(0, 1)) {
+      addQueryAnchorFile(String(hop?.ui?.filePath || ''));
+      addQueryAnchorFile(String(hop?.endpoint?.filePath || ''));
+      addQueryAnchorFile(String(hop?.controller?.filePath || ''));
+    }
+
+    const queryAnchorSliceIds = Array.from(anchorSliceScores.entries())
+      .sort((left, right) => {
+        if (right[1] !== left[1]) return right[1] - left[1];
+        return left[0].localeCompare(right[0]);
+      })
+      .slice(0, 1)
+      .map(([sliceId]) => sliceId);
+    for (const sliceId of queryAnchorSliceIds) {
+      const slice = slicesById.get(sliceId);
+      if (!slice) continue;
+      for (const filePath of slice.memberFiles) addQueryAnchorFile(filePath);
+    }
+
+    for (const pid of uniqueAnchorProcessIds.slice(0, 1)) {
+      const info = index.byProcessId.get(pid);
+      if (!info) continue;
+      addQueryAnchorFile(String(info.example.entry?.filePath || ''));
+      addQueryAnchorFile(String(info.example.terminal?.filePath || ''));
+    }
+
+    const queryAnchorFilePaths = Array.from(queryAnchorFileSet);
+
     let patternCatalogPrecedents: any[] = [];
     let patternCatalogDiagnostics: any | null = null;
     if (queryTokens.length > 0) {
@@ -3148,7 +3817,8 @@ export class LocalBackend {
             signature: `pattern-catalog:${match.section.title}`,
             score: match.score,
             anchor: {
-              name: match.section.title,
+              name: path.basename(anchorFilePath),
+              title: match.section.title,
               kind: 'File',
               filePath: anchorFilePath,
               category: match.section.category || undefined,
@@ -3342,21 +4012,550 @@ export class LocalBackend {
       addProcessPrecedent(pid);
     }
 
-    const precedents = [
+    const collectPrecedentFilePaths = (candidate: any): string[] => {
+      if (!candidate || typeof candidate !== 'object') return [];
+      const files = new Set<string>();
+      const addFile = (filePath: unknown): void => {
+        const normalized = normalizeRepoRelativePath(String(filePath || ''));
+        if (!normalized) return;
+        if (!filePathTouchesPrefixes(normalized, pathPrefixes)) return;
+        files.add(normalized);
+      };
+
+      addFile(candidate.filePath);
+      addFile(candidate.anchor?.filePath);
+      if (Array.isArray(candidate.member_files)) {
+        for (const filePath of candidate.member_files) addFile(filePath);
+      }
+      if (Array.isArray(candidate.examples)) {
+        for (const example of candidate.examples) addFile(example?.filePath);
+      }
+      addFile(candidate.ui?.filePath);
+      addFile(candidate.endpoint?.filePath);
+      addFile(candidate.controller?.filePath);
+      addFile(candidate.entry?.filePath);
+      addFile(candidate.terminal?.filePath);
+      return Array.from(files);
+    };
+
+    const isSameDomainPrecedent = (filePaths: string[]): boolean => {
+      if (queryAnchorFilePaths.length === 0) return false;
+      return filePaths.some(filePath => queryAnchorFilePaths.some(anchorFilePath => filePathsSharePrecedentDomain(filePath, anchorFilePath)));
+    };
+
+    const filterExamples = (examples: any[]): {
+      kept: any[];
+      changedExcluded: number;
+      sameDomainExcluded: number;
+    } => {
+      const kept: any[] = [];
+      let changedExcluded = 0;
+      let sameDomainExcluded = 0;
+
+      for (const example of examples) {
+        const candidateFiles = collectPrecedentFilePaths(example);
+        const isChanged = candidateFiles.some(filePath => changedPrecedentFiles.has(filePath));
+        if (isChanged) {
+          changedExcluded += 1;
+          continue;
+        }
+
+        if (isSameDomainPrecedent(candidateFiles)) {
+          sameDomainExcluded += 1;
+          continue;
+        }
+
+        kept.push(example);
+      }
+
+      return {
+        kept: kept.slice(0, examplesPer),
+        changedExcluded,
+        sameDomainExcluded,
+      };
+    };
+
+    const createPatternCatalogAnchor = (card: any, filePath: string): any => ({
+      name: path.basename(filePath),
+      title: card.anchor?.title || card.anchor?.name,
+      kind: 'File',
+      filePath,
+      category: card.anchor?.category,
+      catalog_path: card.anchor?.catalog_path,
+      score: card.score,
+    });
+
+    const filterPrecedentCard = (card: any): { card: any; changedExcluded: number; sameDomainExcluded: number } | null => {
+      if (!card || typeof card !== 'object') return null;
+
+      if (card.kind === 'pattern-catalog') {
+        const orderedFiles = Array.from(new Set(
+          [card.anchor?.filePath, ...(Array.isArray(card.examples) ? card.examples.map((example: any) => example?.filePath) : [])]
+            .map(filePath => normalizeRepoRelativePath(String(filePath || '')))
+            .filter(Boolean),
+        ));
+
+        const keptFiles: string[] = [];
+        let changedExcluded = 0;
+        let sameDomainExcluded = 0;
+
+        for (const filePath of orderedFiles) {
+          if (changedPrecedentFiles.has(filePath)) {
+            changedExcluded += 1;
+            continue;
+          }
+          if (isSameDomainPrecedent([filePath])) {
+            sameDomainExcluded += 1;
+            continue;
+          }
+          keptFiles.push(filePath);
+        }
+
+        if (keptFiles.length === 0) return null;
+
+        return {
+          card: {
+            ...card,
+            anchor: createPatternCatalogAnchor(card, keptFiles[0]),
+            examples: keptFiles.slice(1, examplesPer + 1).map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+            filtering: {
+              changed_files_excluded: changedExcluded,
+              same_domain_excluded: sameDomainExcluded,
+            },
+          },
+          changedExcluded,
+          sameDomainExcluded,
+        };
+      }
+
+      const filtered = filterExamples(Array.isArray(card.examples) ? card.examples : []);
+      if (filtered.kept.length === 0) {
+        if (
+          card.kind === 'backend-behavior'
+          && filtered.changedExcluded === 0
+          && filtered.sameDomainExcluded > 0
+          && Array.isArray(card.examples)
+          && card.examples.length > 0
+        ) {
+          return {
+            card: {
+              ...card,
+              examples: card.examples.slice(0, 1),
+              filtering: {
+                changed_files_excluded: 0,
+                same_domain_excluded: filtered.sameDomainExcluded,
+                same_domain_fallback: true,
+              },
+            },
+            changedExcluded: 0,
+            sameDomainExcluded: filtered.sameDomainExcluded,
+          };
+        }
+        return null;
+      }
+
+      return {
+        card: {
+          ...card,
+          examples: filtered.kept,
+          filtering: {
+            changed_files_excluded: filtered.changedExcluded,
+            same_domain_excluded: filtered.sameDomainExcluded,
+          },
+        },
+        changedExcluded: filtered.changedExcluded,
+        sameDomainExcluded: filtered.sameDomainExcluded,
+      };
+    };
+
+    const createBackendBehaviorTitle = (tags: string[], filePath: string): string => {
+      const tagSet = new Set(tags);
+      if (tagSet.has('qr-crud-resource')) return 'QR code CRUD resource';
+      if (tagSet.has('qr-export-inline-pdf')) return 'QR code inline PDF export';
+      if (tagSet.has('qr-html-embed')) return 'QR code HTML embed parser';
+      if (tagSet.has('job-orchestrates-mail-delivery')) return 'Queued mail delivery job';
+      if (tagSet.has('job-orchestrates-notification-delivery')) return 'Queued notification delivery job';
+      if (tagSet.has('queued-mail-owner')) return 'Queued mailable owner';
+      if (tagSet.has('queued-notification-owner')) return 'Queued notification owner';
+      if (tagSet.has('queued-job-owner')) return 'Queued job owner';
+      return path.basename(filePath);
+    };
+
+    const backendBehaviorPrecedents = shouldBoostBackendBehaviors
+      ? (await this.loadBackendBehaviorIndex(repo))
+        .filter(entry => filePathTouchesPrefixes(entry.filePath, pathPrefixes))
+        .map(entry => {
+          const matchedTags = Array.from(backendBehaviorQueryTags).filter(tag => entry.tags.includes(tag));
+          if (matchedTags.length === 0) return null;
+          const tagSet = new Set(entry.tags);
+          const score = matchedTags.length
+            + (
+              matchedTags.includes('job-orchestrates-mail-delivery')
+              || matchedTags.includes('job-orchestrates-notification-delivery')
+              || matchedTags.includes('qr-export-inline-pdf')
+              || matchedTags.includes('qr-html-embed')
+                ? 0.4
+                : 0
+            )
+            + (
+              tagSet.has('queue-assignment-explicit') || tagSet.has('qr-crud-mail-piece-sidecar')
+                ? 0.2
+                : 0
+            );
+
+          return {
+            kind: 'backend-behavior',
+            score,
+            anchor: {
+              name: path.basename(entry.filePath),
+              title: createBackendBehaviorTitle(entry.tags, entry.filePath),
+              kind: 'File',
+              filePath: entry.filePath,
+            },
+            examples: [
+              {
+                name: path.basename(entry.filePath),
+                kind: 'File',
+                filePath: entry.filePath,
+              },
+            ],
+            backend_behavior: {
+              tags: entry.tags,
+              smells: entry.smells,
+              matched_tags: matchedTags,
+            },
+          };
+        })
+        .filter(Boolean)
+        .sort((left: any, right: any) => toFiniteNumber(right?.score, 0) - toFiniteNumber(left?.score, 0))
+        .slice(0, Math.max(limit * 2, 8))
+      : [];
+
+    const familyWeights: Record<string, number> = {
+      slice: 1.6,
+      hop: 1.45,
+      process: 1.3,
+      'backend-behavior': 1.45,
+      'pattern-catalog': 0.9,
+      'anti-pattern': 0.75,
+      'agent-guideline': 0.72,
+    };
+
+    const familyPriority: Record<string, number> = {
+      slice: 0,
+      hop: 1,
+      process: 2,
+      'backend-behavior': 3,
+      'pattern-catalog': 4,
+      'anti-pattern': 5,
+      'agent-guideline': 6,
+    };
+
+    const rawPrecedents = [
+      ...backendBehaviorPrecedents,
       ...patternCatalogPrecedents,
       ...antiPatternPrecedents,
       ...overrideGuidancePrecedents,
       ...slicePrecedents,
       ...hopPrecedents,
       ...processPrecedents,
-    ].slice(0, Math.max(
-      limit,
-      patternCatalogPrecedents.length
-        + antiPatternPrecedents.length
-        + slicePrecedents.length
-        + hopPrecedents.length
-        + processPrecedents.length,
-    ));
+    ];
+
+    let changedFilesExcluded = 0;
+    let sameDomainExcluded = 0;
+    let uiBehaviorCardsBoosted = 0;
+    let backendBehaviorCardsBoosted = 0;
+    let backendBehaviorSameDomainFallbacks = 0;
+    const precedents = (await Promise.all(rawPrecedents.map(async card => {
+      const filtered = filterPrecedentCard(card);
+      if (!filtered) return null;
+      changedFilesExcluded += filtered.changedExcluded;
+      sameDomainExcluded += filtered.sameDomainExcluded;
+      if (filtered.card?.filtering?.same_domain_fallback) {
+        backendBehaviorSameDomainFallbacks += 1;
+      }
+
+      const rawScore = Math.max(0, toFiniteNumber(filtered.card.score ?? filtered.card.anchor?.score, 0));
+      const signal = rawScore > 0 ? 1 - (1 / (1 + rawScore)) : 0;
+      const exampleCount = Array.isArray(filtered.card.examples) ? filtered.card.examples.length : 0;
+      const codeDerivedBonus = ['slice', 'hop', 'process', 'backend-behavior'].includes(filtered.card.kind) ? 0.12 : 0;
+
+      let uiBehaviorBonus = 0;
+      let uiBehaviorMatches = 0;
+      let backendBehaviorBonus = 0;
+      let backendBehaviorMatches = 0;
+      let uiBehaviorPenalty = 0;
+      let uiBehaviorSmells = 0;
+      let pendingUiBehaviorPenalty = 0;
+      let pendingUiBehaviorSmells = 0;
+      let suspenseDriftPenalty = 0;
+      let suspenseDriftFlags = 0;
+      let rollbackOwnershipPenalty = 0;
+      let rollbackOwnershipSmells = 0;
+      let projectionReconcilePenalty = 0;
+      let projectionReconcileSmells = 0;
+      let writebackOwnershipPenalty = 0;
+      let writebackOwnershipFlags = 0;
+      let tableInlineSuccessPenalty = 0;
+      let tableInlineSuccessFlags = 0;
+      let mutationFreshnessPenalty = 0;
+      let mutationFreshnessSmells = 0;
+      let queryFreshnessPenalty = 0;
+      let queryFreshnessFlags = 0;
+      if (shouldBoostBackendBehaviors) {
+        const candidateFiles = collectPrecedentFilePaths(filtered.card)
+          .filter(isPhpLikeFilePath)
+          .slice(0, 3);
+        const candidateTags = new Set<string>();
+
+        for (const filePath of candidateFiles) {
+          const signals = await getBackendBehaviorSignalsForFile(filePath);
+          for (const tag of signals.tags) candidateTags.add(tag);
+        }
+
+        const matchedBackendBehaviorTags = Array.from(backendBehaviorQueryTags)
+          .filter(tag => candidateTags.has(tag));
+        backendBehaviorMatches = matchedBackendBehaviorTags.length;
+
+        if (backendBehaviorMatches > 0) {
+          backendBehaviorBonus = Math.min(backendBehaviorMatches, 3) * 0.35;
+          if (matchedBackendBehaviorTags.includes('qr-export-inline-pdf')) {
+            backendBehaviorBonus += 0.5;
+          }
+          if (
+            matchedBackendBehaviorTags.includes('job-orchestrates-mail-delivery')
+            || matchedBackendBehaviorTags.includes('job-orchestrates-notification-delivery')
+            || matchedBackendBehaviorTags.includes('qr-html-embed')
+          ) {
+            backendBehaviorBonus += 0.12;
+          }
+          backendBehaviorCardsBoosted += 1;
+        }
+      }
+
+      if (shouldBoostUiBehaviors || shouldPenalizeSelectionSyncUseEffect || shouldPenalizePendingUxDrift || shouldPenalizeSuspenseDrift || shouldPenalizeQueryFreshnessDrift || shouldPenalizeMutationFreshnessDrift || shouldPenalizeRollbackOwnershipDrift || shouldPenalizeProjectionReconcileDrift || shouldPenalizeWritebackOwnershipDrift || shouldPenalizeTableInlineSuccessDrift) {
+        const candidateFiles = collectPrecedentFilePaths(filtered.card)
+          .filter(isTsLikeFilePath)
+          .slice(0, 3);
+        const candidateTags = new Set<string>();
+        const candidateSmells = new Set<string>();
+
+        for (const filePath of candidateFiles) {
+          const signals = await getUiBehaviorSignalsForFile(filePath);
+          for (const tag of signals.tags) candidateTags.add(tag);
+          for (const smell of signals.smells) candidateSmells.add(smell);
+        }
+
+        if (shouldBoostUiBehaviors) {
+          const matchedUiBehaviorTags = Array.from(uiBehaviorQueryTags)
+            .filter(tag => candidateTags.has(tag));
+          uiBehaviorMatches = matchedUiBehaviorTags.length;
+
+          if (uiBehaviorMatches > 0) {
+            uiBehaviorBonus = Math.min(uiBehaviorMatches, 3) * 0.35;
+            if (matchedUiBehaviorTags.includes('mutation-fn-sequence')) {
+              uiBehaviorBonus += 0.12;
+            }
+            uiBehaviorCardsBoosted += 1;
+          }
+        }
+
+        if (shouldPenalizeSelectionSyncUseEffect && candidateSmells.has('selection-sync-useeffect')) {
+          uiBehaviorSmells = 1;
+          uiBehaviorPenalty = /\buseeffect\b|\bavoid useeffect\b|\beffect sync\b|\bsync drift\b/.test(lowerQueryText)
+            ? 0.45
+            : 0.3;
+        }
+
+        if (shouldPenalizePendingUxDrift) {
+          const matchedPendingSmells = Array.from(candidateSmells)
+            .filter(smell => Object.prototype.hasOwnProperty.call(pendingUiBehaviorSmellWeights, smell));
+
+          if (matchedPendingSmells.length > 0) {
+            pendingUiBehaviorSmells = matchedPendingSmells.length;
+            pendingUiBehaviorPenalty = Math.min(
+              matchedPendingSmells.reduce((sum, smell) => sum + (pendingUiBehaviorSmellWeights[smell as keyof typeof pendingUiBehaviorSmellWeights] || 0), 0),
+              hasExplicitPendingDriftQuery ? 0.65 : 0.5,
+            );
+            uiBehaviorSmells += pendingUiBehaviorSmells;
+            uiBehaviorPenalty += pendingUiBehaviorPenalty;
+          }
+        }
+
+        if (shouldPenalizeSuspenseDrift) {
+          const missingOptionalNonSuspense =
+            (uiBehaviorQueryTags.has('query-optional-gate-non-suspense') || uiBehaviorQueryTags.has('query-enabled-non-suspense') || /\boptional gate\b|\bshould not suspend\b|\bavoid suspense\b/.test(lowerQueryText))
+            && candidateTags.has('query-required-suspense')
+            && !candidateTags.has('query-optional-gate-non-suspense')
+            && !candidateTags.has('query-enabled-non-suspense');
+          const missingInteractiveRefetch =
+            (uiBehaviorQueryTags.has('query-interactive-refetch') || uiBehaviorQueryTags.has('query-keep-previous-data') || /\bbackground refetch\b|\bkeep current surface\b|\bfallback flash\b|\binteractive refetch\b/.test(lowerQueryText))
+            && candidateTags.has('query-required-suspense')
+            && !candidateTags.has('query-interactive-refetch')
+            && !candidateTags.has('query-keep-previous-data');
+
+          suspenseDriftFlags = Number(missingOptionalNonSuspense) + Number(missingInteractiveRefetch);
+          if (suspenseDriftFlags > 0) {
+            suspenseDriftPenalty = Math.min(
+              (missingOptionalNonSuspense ? (hasExplicitSuspenseDriftQuery ? 0.3 : 0.22) : 0)
+              + (missingInteractiveRefetch ? (hasExplicitSuspenseDriftQuery ? 0.35 : 0.25) : 0),
+              hasExplicitSuspenseDriftQuery ? 0.65 : 0.45,
+            );
+            uiBehaviorPenalty += suspenseDriftPenalty;
+          }
+        }
+
+        if (shouldPenalizeQueryFreshnessDrift) {
+          const wantsStableFreshnessSurface = hasExplicitSuspenseDriftQuery
+            || /\bbackground freshness\b|\bkeep current surface\b|\bavoid fallback flash\b|\binteractive refetch\b/.test(lowerQueryText);
+          const broadSuspenseFocusRefresh =
+            candidateTags.has('query-focus-refresh-always')
+            && candidateTags.has('query-required-suspense')
+            && !candidateTags.has('query-polling-refresh')
+            && !candidateTags.has('query-optional-gate-non-suspense')
+            && !candidateTags.has('query-enabled-non-suspense')
+            && !candidateTags.has('query-interactive-refetch')
+            && !candidateTags.has('query-keep-previous-data');
+
+          if (broadSuspenseFocusRefresh) {
+            queryFreshnessFlags = 1;
+            queryFreshnessPenalty = wantsStableFreshnessSurface
+              ? 0.32
+              : uiBehaviorQueryTags.has('query-polling-refresh')
+                ? 0.28
+                : 0.24;
+            uiBehaviorPenalty += queryFreshnessPenalty;
+          }
+        }
+
+        if (shouldPenalizeRollbackOwnershipDrift && candidateSmells.has('mutation-rollback-misses-optimistic-cache-roots')) {
+          rollbackOwnershipSmells = 1;
+          rollbackOwnershipPenalty = hasExplicitRollbackOwnershipQuery
+            ? 0.32
+            : 0.24;
+          uiBehaviorSmells += rollbackOwnershipSmells;
+          uiBehaviorPenalty += rollbackOwnershipPenalty;
+        }
+
+        if (shouldPenalizeProjectionReconcileDrift && candidateSmells.has('mutation-rollback-misses-optimistic-projection-reconcile')) {
+          projectionReconcileSmells = 1;
+          projectionReconcilePenalty = hasExplicitProjectionReconcileQuery
+            ? 0.36
+            : 0.26;
+          uiBehaviorSmells += projectionReconcileSmells;
+          uiBehaviorPenalty += projectionReconcilePenalty;
+        }
+
+        if (shouldPenalizeWritebackOwnershipDrift) {
+          const hasRelatedCacheBehavior = candidateTags.has('mutation-cache-write') || candidateTags.has('mutation-refreshes-cache');
+          const missingWritebackOwnership = hasRelatedCacheBehavior
+            && !candidateTags.has('mutation-cache-write-plus-refresh');
+
+          if (missingWritebackOwnership) {
+            writebackOwnershipFlags = 1;
+            writebackOwnershipPenalty = hasExplicitWritebackOwnershipQuery
+              ? 0.32
+              : 0.24;
+            uiBehaviorPenalty += writebackOwnershipPenalty;
+          }
+        }
+
+        if (shouldPenalizeTableInlineSuccessDrift) {
+          const wantsInlineSuccess = uiBehaviorQueryTags.has('mutation-table-inline-success') || hasExplicitTableInlineSuccessQuery;
+          const wantsUndo = uiBehaviorQueryTags.has('mutation-table-inline-success-undo');
+          const wantsDeferredRefresh = uiBehaviorQueryTags.has('mutation-table-inline-success-deferred-refresh');
+          const hasRowPending = candidateTags.has('mutation-table-row-pending');
+          const hasInlineSuccess = candidateTags.has('mutation-table-inline-success');
+          const hasUndoableSuccess = candidateTags.has('mutation-table-inline-success-undo');
+          const hasDeferredRefresh = candidateTags.has('mutation-table-inline-success-deferred-refresh');
+
+          const missingInlineSuccess = wantsInlineSuccess && hasRowPending && !hasInlineSuccess;
+          const missingUndoableSuccess = wantsUndo && hasInlineSuccess && !hasUndoableSuccess;
+          const missingDeferredRefresh = wantsDeferredRefresh && hasInlineSuccess && !hasDeferredRefresh;
+          tableInlineSuccessFlags = Number(missingInlineSuccess) + Number(missingUndoableSuccess) + Number(missingDeferredRefresh);
+
+          if (tableInlineSuccessFlags > 0) {
+            tableInlineSuccessPenalty = Math.min(
+              (missingInlineSuccess ? (hasExplicitTableInlineSuccessQuery ? 0.28 : 0.22) : 0)
+              + (missingUndoableSuccess ? 0.18 : 0)
+              + (missingDeferredRefresh ? 0.18 : 0),
+              hasExplicitTableInlineSuccessQuery ? 0.55 : 0.4,
+            );
+            uiBehaviorPenalty += tableInlineSuccessPenalty;
+          }
+        }
+
+        if (shouldPenalizeMutationFreshnessDrift && candidateSmells.has('mutation-relies-on-freshness-policy')) {
+          mutationFreshnessSmells = 1;
+          mutationFreshnessPenalty = hasExplicitMutationFreshnessDriftQuery || /\bfocus refetch\b|\bwindow focus\b/.test(lowerQueryText)
+            ? 0.32
+            : 0.24;
+          uiBehaviorSmells += mutationFreshnessSmells;
+          uiBehaviorPenalty += mutationFreshnessPenalty;
+        }
+      }
+
+      const rankingScore = (signal * (familyWeights[filtered.card.kind] || 1))
+        + (Math.min(exampleCount, examplesPer) * 0.08)
+        + codeDerivedBonus
+        + backendBehaviorBonus
+        + uiBehaviorBonus
+        - uiBehaviorPenalty;
+
+      return {
+        ...filtered.card,
+        ranking: {
+          score: round3(rankingScore),
+          components: {
+            weight: round3(familyWeights[filtered.card.kind] || 1),
+            signal: round3(signal),
+            examples: exampleCount,
+            code_derived_bonus: round3(codeDerivedBonus),
+            backend_behavior_bonus: round3(backendBehaviorBonus),
+            backend_behavior_matches: backendBehaviorMatches,
+            ui_behavior_bonus: round3(uiBehaviorBonus),
+            ui_behavior_penalty: round3(uiBehaviorPenalty),
+            ui_behavior_matches: uiBehaviorMatches,
+            ui_behavior_smells: uiBehaviorSmells,
+            pending_ux_penalty: round3(pendingUiBehaviorPenalty),
+            pending_ux_smells: pendingUiBehaviorSmells,
+            suspense_drift_penalty: round3(suspenseDriftPenalty),
+            suspense_drift_flags: suspenseDriftFlags,
+            rollback_ownership_penalty: round3(rollbackOwnershipPenalty),
+            rollback_ownership_smells: rollbackOwnershipSmells,
+            projection_reconcile_penalty: round3(projectionReconcilePenalty),
+            projection_reconcile_smells: projectionReconcileSmells,
+            writeback_ownership_penalty: round3(writebackOwnershipPenalty),
+            writeback_ownership_flags: writebackOwnershipFlags,
+            table_inline_success_penalty: round3(tableInlineSuccessPenalty),
+            table_inline_success_flags: tableInlineSuccessFlags,
+            mutation_freshness_penalty: round3(mutationFreshnessPenalty),
+            mutation_freshness_smells: mutationFreshnessSmells,
+            query_freshness_penalty: round3(queryFreshnessPenalty),
+            query_freshness_flags: queryFreshnessFlags,
+            mutation_handoff_bonus: round3(uiBehaviorBonus),
+            mutation_handoff_matches: uiBehaviorMatches,
+          },
+        },
+      };
+    })))
+      .filter(Boolean)
+      .sort((left: any, right: any) => {
+        const scoreDiff = toFiniteNumber(right?.ranking?.score, 0) - toFiniteNumber(left?.ranking?.score, 0);
+        if (scoreDiff !== 0) return scoreDiff;
+
+        const familyDiff = (familyPriority[left?.kind] ?? 99) - (familyPriority[right?.kind] ?? 99);
+        if (familyDiff !== 0) return familyDiff;
+
+        const rawDiff = toFiniteNumber(right?.score ?? right?.anchor?.score, 0) - toFiniteNumber(left?.score ?? left?.anchor?.score, 0);
+        if (rawDiff !== 0) return rawDiff;
+
+        return String(left?.signature || '').localeCompare(String(right?.signature || ''));
+      });
 
     const diagnostics: any = {
       anchor_uid: anchorUid || undefined,
@@ -3370,6 +4569,21 @@ export class LocalBackend {
       ...(patternCatalogDiagnostics ? { pattern_catalog: patternCatalogDiagnostics } : {}),
       ...(antiPatternDiagnostics ? { anti_patterns: antiPatternDiagnostics } : {}),
       ...(overrideGuidanceDiagnostics ? { override_guidance: overrideGuidanceDiagnostics } : {}),
+      precedent_filters: {
+        base_ref: gitPrecedentBaseline.baseRef || undefined,
+        merge_base: gitPrecedentBaseline.mergeBase || undefined,
+        changed_file_count: changedPrecedentFiles.size,
+        query_anchor_file_count: queryAnchorFilePaths.length,
+        changed_files_excluded: changedFilesExcluded,
+        same_domain_excluded: sameDomainExcluded,
+      },
+      backend_behavior_query_tags: Array.from(backendBehaviorQueryTags),
+      backend_behavior_cards_boosted: backendBehaviorCardsBoosted,
+      backend_behavior_same_domain_fallbacks: backendBehaviorSameDomainFallbacks,
+      ui_behavior_query_tags: Array.from(uiBehaviorQueryTags),
+      ui_behavior_cards_boosted: uiBehaviorCardsBoosted,
+      mutation_handoff_query_tags: Array.from(uiBehaviorQueryTags),
+      mutation_handoff_cards_boosted: uiBehaviorCardsBoosted,
       path_prefixes: pathPrefixes,
     };
     if (sliceSummaryStats.slices_truncated || sliceSummaryStats.members_truncated) {

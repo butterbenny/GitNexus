@@ -33,6 +33,7 @@ export type UiContractInteraction = {
   handler: { kind: 'inline' | 'identifier' | 'member' | 'unknown'; name: string; line: number };
   gates: UiContractGate[];
   effects: UiContractEffect[];
+  mutationHandoffs?: UiMutationHandoff[];
   smells: UiContractSmell[];
 };
 
@@ -43,6 +44,12 @@ export type UiControlledSurface = {
   line: number;
 };
 
+export type UiPendingGateSurface = {
+  element: string;
+  gates: UiContractGate[];
+  line: number;
+};
+
 export type UiContractSmell = {
   kind: string;
   message: string;
@@ -50,10 +57,63 @@ export type UiContractSmell = {
   confidence: number;
 };
 
+export type UiMutationHandoffKind =
+  | 'handle-submit-mutation'
+  | 'handle-submit-sequence'
+  | 'callback-handoff'
+  | 'mutation-fn-sequence';
+
+export type UiMutationHandoff = {
+  kind: UiMutationHandoffKind;
+  source: string;
+  target?: string;
+  via: 'handleSubmit' | 'onSuccess' | 'onError' | 'onSettled' | 'onMutate' | 'mutationFn';
+  sequence?: string[];
+  line: number;
+  confidence: number;
+};
+
+export type UiBehaviorTag =
+  | UiMutationHandoffKind
+  | 'mutation-closes-surface'
+  | 'mutation-refreshes-cache'
+  | 'mutation-cache-write'
+  | 'mutation-cache-write-plus-refresh'
+  | 'mutation-optimistic-cache-write'
+  | 'mutation-optimistic-projection-reconcile'
+  | 'mutation-rollback-restores-cache'
+  | 'mutation-rollback-restores-multi-cache'
+  | 'mutation-rollback-restores-projection-reconcile'
+  | 'mutation-refreshes-multiple-cache-roots'
+  | 'mutation-refreshes-cross-root-cache'
+  | 'mutation-navigates'
+  | 'mutation-shows-toast'
+  | 'mutation-pending-ux'
+  | 'mutation-pending-controlled-surface'
+  | 'mutation-table-row-pending'
+  | 'mutation-table-inline-success'
+  | 'mutation-table-inline-success-undo'
+  | 'mutation-table-inline-success-deferred-refresh'
+  | 'selection-prefill'
+  | 'selection-async-enrichment'
+  | 'selection-resets-dependent-state'
+  | 'selection-enabled-follow-up-query'
+  | 'query-required-suspense'
+  | 'query-optional-gate-non-suspense'
+  | 'query-enabled-gate'
+  | 'query-enabled-non-suspense'
+  | 'query-focus-refresh-always'
+  | 'query-polling-refresh'
+  | 'query-keep-previous-data'
+  | 'query-interactive-refetch';
+
 export type UiContractCard = {
   filePath: string;
   controlled: UiControlledSurface[];
+  pendingGates: UiPendingGateSurface[];
   interactions: UiContractInteraction[];
+  mutationHandoffs: UiMutationHandoff[];
+  behaviorTags: UiBehaviorTag[];
   queries: UiQueryContract[];
   cacheLinks: UiCacheLink[];
   cacheCoverage?: UiCacheCoverage[];
@@ -69,6 +129,7 @@ export type UiCacheOperation = {
   callee: string;
   queryKey: string;
   queryKeyParts?: string[];
+  updateText?: string;
   exact?: boolean;
   line: number;
   confidence: number;
@@ -111,6 +172,7 @@ export type UiQueryContract = {
   refetchTriggers?: UiQueryRefetchTrigger[];
   cacheWriteTriggers?: UiQueryCacheWriteTrigger[];
   enabled?: string;
+  placeholderData?: string;
   staleTime?: string;
   refetchOnMount?: string;
   refetchOnWindowFocus?: string;
@@ -144,6 +206,11 @@ const UI_EVENT_ATTRS = new Set([
   'onCheckedChange',
 ]);
 
+const SELECTION_PREFILL_EVENTS = new Set([
+  'onSelect',
+  'onValueChange',
+]);
+
 const INVALIDATION_METHODS = new Set([
   'invalidateQueries',
   'refetchQueries',
@@ -154,8 +221,25 @@ const INVALIDATION_METHODS = new Set([
 ]);
 
 const MUTATION_METHODS = new Set(['mutate', 'mutateAsync']);
+const STATE_UPDATE_METHODS = new Set(['setValue', 'setValues', 'setFieldValue', 'resetField']);
 
 const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete']);
+
+type MutationCallbackKey = 'onSuccess' | 'onError' | 'onSettled' | 'onMutate';
+
+type MutationCallbackEntry = {
+  key: MutationCallbackKey;
+  node: Parser.SyntaxNode;
+};
+
+type MutationBinding = {
+  trigger: string;
+  callbacks: MutationCallbackEntry[];
+  mutationFnNode: Parser.SyntaxNode | null;
+  line: number;
+};
+
+type MutationBindingMap = Map<string, MutationBinding>;
 
 const GATE_ATTRS = new Set([
   'disabled',
@@ -214,6 +298,27 @@ const extractArrayLiteralParts = (node: Parser.SyntaxNode | null): string[] | un
 const walkNamed = (node: Parser.SyntaxNode, fn: (n: Parser.SyntaxNode) => void) => {
   fn(node);
   for (let i = 0; i < node.namedChildCount; i++) walkNamed(node.namedChild(i), fn);
+};
+
+const walkOwnScopeNamed = (node: Parser.SyntaxNode, fn: (n: Parser.SyntaxNode) => void) => {
+  const visit = (current: Parser.SyntaxNode, isRoot: boolean) => {
+    fn(current);
+    for (let i = 0; i < current.namedChildCount; i += 1) {
+      const child = current.namedChild(i);
+      if (!child) continue;
+      if (!isRoot && (
+        child.type === 'function_declaration'
+        || child.type === 'method_definition'
+        || child.type === 'arrow_function'
+        || child.type === 'function_expression'
+      )) {
+        continue;
+      }
+      visit(child, false);
+    }
+  };
+
+  visit(node, true);
 };
 
 const getNodeLine = (node: Parser.SyntaxNode | null | undefined): number => {
@@ -294,7 +399,7 @@ const classifyCallExpression = (callNode: Parser.SyntaxNode): UiContractEffect |
       return { kind: 'mutation', callee: name, args, line, confidence: 0.75 };
     }
 
-    if (/^set[A-Z]/.test(name)) {
+    if (/^set[A-Z]/.test(name) || STATE_UPDATE_METHODS.has(name)) {
       return { kind: 'state-update', callee: name, args, line, confidence: 0.8 };
     }
 
@@ -326,6 +431,10 @@ const classifyCallExpression = (callNode: Parser.SyntaxNode): UiContractEffect |
 
     if (propertyText === 'assign' && objectText === 'window.location') {
       return { kind: 'navigate', callee: callee.calleeText, args, line, confidence: 0.85 };
+    }
+
+    if (/^set[A-Z]/.test(propertyText) || STATE_UPDATE_METHODS.has(propertyText)) {
+      return { kind: 'state-update', callee: callee.calleeText, args, line, confidence: 0.8 };
     }
 
     if (objectText === 'toast' || propertyText === 'toast') {
@@ -506,10 +615,576 @@ const getObjectPairs = (objectNode: Parser.SyntaxNode): Array<{ key: string; val
   return out;
 };
 
-const getCallExpressionFirstArg = (callNode: Parser.SyntaxNode): Parser.SyntaxNode | null => {
+const getCallExpressionArg = (callNode: Parser.SyntaxNode, index: number): Parser.SyntaxNode | null => {
   const argsNode = (callNode as any).childForFieldName?.('arguments') as Parser.SyntaxNode | null;
   if (!argsNode) return null;
-  return argsNode.namedChildren?.[0] || null;
+  return argsNode.namedChildren?.[index] || null;
+};
+
+const getCallExpressionFirstArg = (callNode: Parser.SyntaxNode): Parser.SyntaxNode | null => {
+  return getCallExpressionArg(callNode, 0);
+};
+
+const resolveFunctionLikeNode = (
+  node: Parser.SyntaxNode | null,
+  fnNodesByName: Map<string, Parser.SyntaxNode>
+): Parser.SyntaxNode | null => {
+  const expr = peelExpression(node);
+  if (!expr) return null;
+
+  if (expr.type === 'arrow_function' || expr.type === 'function_expression') return expr;
+
+  if (expr.type === 'identifier') {
+    const name = String((expr as any).text || '').trim();
+    return name ? fnNodesByName.get(name) || null : null;
+  }
+
+  return null;
+};
+
+const isCallAwaited = (callNode: Parser.SyntaxNode): boolean => {
+  let current: Parser.SyntaxNode | null = callNode.parent;
+  while (current) {
+    if (current.type === 'await_expression') return true;
+    if (
+      current.type === 'parenthesized_expression'
+      || current.type === 'as_expression'
+      || current.type === 'type_assertion'
+      || current.type === 'satisfies_expression'
+    ) {
+      current = current.parent;
+      continue;
+    }
+    break;
+  }
+  return false;
+};
+
+const getMutationTriggerNameFromCall = (
+  callNode: Parser.SyntaxNode,
+  mutationTriggerNames: Set<string>
+): string | null => {
+  if (callNode.type !== 'call_expression') return null;
+  const callee = getCallExpressionCallee(callNode);
+  if (!callee) return null;
+
+  if (callee.kind === 'member' && MUTATION_METHODS.has(callee.propertyText || '')) {
+    return callee.calleeText;
+  }
+
+  if (callee.kind === 'identifier') {
+    const name = callee.name || '';
+    if (MUTATION_METHODS.has(name) || mutationTriggerNames.has(name)) return name;
+  }
+
+  return null;
+};
+
+const collectMutationTriggerCalls = (
+  fnNode: Parser.SyntaxNode,
+  mutationTriggerNames: Set<string>
+): Array<{ callee: string; line: number; awaited: boolean }> => {
+  const bodyNode = getFunctionBodyNode(fnNode) ?? fnNode;
+  const calls: Array<{ callee: string; line: number; awaited: boolean }> = [];
+
+  walkOwnScopeNamed(bodyNode, node => {
+    if (node.type !== 'call_expression') return;
+    const callee = getMutationTriggerNameFromCall(node, mutationTriggerNames);
+    if (!callee) return;
+    calls.push({
+      callee,
+      line: getNodeLine(node),
+      awaited: isCallAwaited(node),
+    });
+  });
+
+  const seen = new Set<string>();
+  return calls.filter(call => {
+    const key = `${call.callee}|${call.line}|${call.awaited ? 1 : 0}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+const collectAwaitedCallSequence = (fnNode: Parser.SyntaxNode): Array<{ callee: string; line: number }> => {
+  const bodyNode = getFunctionBodyNode(fnNode) ?? fnNode;
+  const calls: Array<{ callee: string; line: number }> = [];
+
+  walkOwnScopeNamed(bodyNode, node => {
+    if (node.type !== 'await_expression') return;
+    const awaited = peelExpression(node);
+    if (!awaited || awaited.type !== 'call_expression') return;
+    const callee = getCallExpressionCallee(awaited);
+    const calleeText = callee?.calleeText || '';
+    if (!calleeText) return;
+    calls.push({
+      callee: calleeText,
+      line: getNodeLine(awaited),
+    });
+  });
+
+  const seen = new Set<string>();
+  return calls.filter(call => {
+    const key = `${call.callee}|${call.line}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+const collapseCallSequence = (calls: string[]): string[] => {
+  const sequence: string[] = [];
+  for (const call of calls) {
+    if (!call) continue;
+    if (sequence[sequence.length - 1] === call) continue;
+    sequence.push(call);
+  }
+  return sequence;
+};
+
+const dedupeMutationHandoffs = (handoffs: UiMutationHandoff[]): UiMutationHandoff[] => {
+  const seen = new Set<string>();
+  return handoffs.filter(handoff => {
+    const key = [
+      handoff.kind,
+      handoff.source,
+      handoff.target || '',
+      handoff.via,
+      Array.isArray(handoff.sequence) ? handoff.sequence.join('>') : '',
+      handoff.line,
+    ].join('|');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+const getEffectMethodName = (effect: UiContractEffect): string => {
+  const callee = String(effect?.callee || '').trim();
+  if (!callee) return '';
+  const parts = callee.split('.');
+  return parts[parts.length - 1] || callee;
+};
+
+const isCloseStateEffect = (effect: UiContractEffect): boolean => {
+  if (effect.kind !== 'state-update') return false;
+  if (!/\bfalse\b/i.test(String(effect.args || ''))) return false;
+
+  const method = getEffectMethodName(effect);
+  return /^(set.*open|close.*)$/i.test(method);
+};
+
+const isCacheWriteEffect = (effect: UiContractEffect): boolean => {
+  if (effect.kind !== 'invalidate') return false;
+  const method = getEffectMethodName(effect);
+  return method === 'setQueryData' || method === 'setQueriesData';
+};
+
+const isCacheRefreshEffect = (effect: UiContractEffect): boolean => {
+  if (effect.kind !== 'invalidate') return false;
+  return !isCacheWriteEffect(effect);
+};
+
+const isSelectionPrefillEffect = (effect: UiContractEffect): boolean => {
+  if (effect.kind !== 'state-update') return false;
+  return STATE_UPDATE_METHODS.has(getEffectMethodName(effect));
+};
+
+const isSelectionResetEffect = (effect: UiContractEffect): boolean => {
+  if (effect.kind !== 'state-update') return false;
+
+  const method = getEffectMethodName(effect);
+  if (method === 'resetField') return true;
+  if (!STATE_UPDATE_METHODS.has(method)) return false;
+
+  return /\[\s*\]|\{\s*\}|''|""|\bfalse\b|\bnull\b|defaultValue/i.test(String(effect.args || ''));
+};
+
+const isSelectionAsyncEffect = (effect: UiContractEffect): boolean => {
+  return effect.kind === 'mutation' || effect.kind === 'http';
+};
+
+const isSelectionDrivenQuery = (query: UiQueryContract): boolean => {
+  const queryText = compactText(`${query?.queryKey || ''} ${query?.enabled || ''}`.trim()).toLowerCase();
+  return /\bselected[a-z0-9_]*\b/.test(queryText);
+};
+
+const isNonSuspenseQueryHook = (hook: string): boolean => {
+  return hook === 'useQuery' || hook === 'useInfiniteQuery';
+};
+
+const isSuspenseQueryHook = (hook: string): boolean => {
+  return hook === 'useSuspenseQuery' || hook === 'useSuspenseInfiniteQuery';
+};
+
+const hasEnabledGate = (query: UiQueryContract): boolean => {
+  const enabled = compactText(String(query?.enabled || '').trim());
+  return Boolean(enabled) && enabled !== 'true';
+};
+
+const usesKeepPreviousData = (query: UiQueryContract): boolean => {
+  return /\bkeepPreviousData\b/.test(String(query?.placeholderData || ''));
+};
+
+const usesAlwaysFocusRefresh = (query: UiQueryContract): boolean => {
+  return /\balways\b/.test(String(query?.refetchOnWindowFocus || ''));
+};
+
+const usesPollingRefresh = (query: UiQueryContract): boolean => {
+  return Boolean(compactText(String(query?.refetchInterval || '').trim()));
+};
+
+const normalizeCacheKeyRoot = (value: string): string => {
+  return String(value || '').trim().replace(/^['"`]|['"`]$/g, '');
+};
+
+const buildCacheOperationsByLine = (cacheOperations: UiCacheOperation[]): Map<number, UiCacheOperation[]> => {
+  const opsByLine = new Map<number, UiCacheOperation[]>();
+
+  for (const operation of cacheOperations) {
+    const line = operation?.line;
+    if (typeof line !== 'number' || !Number.isFinite(line)) continue;
+    const existing = opsByLine.get(line) || [];
+    existing.push(operation);
+    opsByLine.set(line, existing);
+  }
+
+  return opsByLine;
+};
+
+const extractCacheKeyRoot = (queryKey: string, queryKeyParts?: string[]): string => {
+  const firstPart = Array.isArray(queryKeyParts)
+    ? queryKeyParts.find(part => String(part || '').trim())
+    : '';
+  if (firstPart) return normalizeCacheKeyRoot(String(firstPart));
+
+  const text = compactText(String(queryKey || '').trim());
+  if (!text) return '';
+
+  const callMatch = text.match(/^([A-Za-z0-9_$.]+)\s*\(/);
+  if (callMatch) return normalizeCacheKeyRoot(callMatch[1]);
+
+  const arrayMatch = text.match(/^\[\s*(['"`]?)([^'"`\],\s]+)\1/);
+  if (arrayMatch) return normalizeCacheKeyRoot(arrayMatch[2]);
+
+  return normalizeCacheKeyRoot(text);
+};
+
+const extractCacheKeyNamespace = (root: string): string => {
+  const normalized = normalizeCacheKeyRoot(root);
+  if (!normalized) return '';
+
+  const dotIndex = normalized.indexOf('.');
+  return dotIndex === -1 ? normalized : normalized.slice(0, dotIndex);
+};
+
+const collectCacheWriteRootsFromEffects = (
+  effects: UiContractEffect[],
+  opsByLine: Map<number, UiCacheOperation[]>,
+): Set<string> => {
+  const roots = new Set<string>();
+
+  for (const effect of effects) {
+    if (!isCacheWriteEffect(effect)) continue;
+    const operations = opsByLine.get(effect.line) || [];
+    for (const operation of operations) {
+      if (operation.kind !== 'write') continue;
+      const root = extractCacheKeyRoot(operation.queryKey, operation.queryKeyParts);
+      if (root) roots.add(root);
+    }
+  }
+
+  return roots;
+};
+
+const isProjectionWriteOperation = (operation: UiCacheOperation): boolean => {
+  if (operation.kind !== 'write') return false;
+
+  const updateText = compactText(String(operation.updateText || '').trim());
+  if (!updateText) return false;
+
+  return /\bfilter\s*\(|\bmap\s*\(|\borderBy\s*\(|\buniqBy\s*\(|\bsort\s*\(|\bsplice\s*\(|\barrayMove\s*\(/.test(updateText);
+};
+
+const collectProjectionWriteRootsFromEffects = (
+  effects: UiContractEffect[],
+  opsByLine: Map<number, UiCacheOperation[]>,
+): Set<string> => {
+  const roots = new Set<string>();
+
+  for (const effect of effects) {
+    if (!isCacheWriteEffect(effect)) continue;
+    const operations = opsByLine.get(effect.line) || [];
+    for (const operation of operations) {
+      if (!isProjectionWriteOperation(operation)) continue;
+      const root = extractCacheKeyRoot(operation.queryKey, operation.queryKeyParts);
+      if (root) roots.add(root);
+    }
+  }
+
+  return roots;
+};
+
+const getNodeText = (node: Parser.SyntaxNode | null, maxLen = 4000): string => {
+  return compactText(String((node as any)?.text || '').trim(), maxLen);
+};
+
+const getMutationCallbackText = (
+  binding: MutationBinding,
+  key: MutationCallbackKey,
+): string => {
+  const entry = binding.callbacks.find(callback => callback.key === key);
+  if (!entry) return '';
+  return getNodeText(getFunctionBodyNode(entry.node) ?? entry.node);
+};
+
+const deriveTableRowOptimisticTags = (
+  mutationBindings: MutationBindingMap,
+): UiBehaviorTag[] => {
+  const tags = new Set<UiBehaviorTag>();
+
+  for (const binding of mutationBindings.values()) {
+    const onMutateText = getMutationCallbackText(binding, 'onMutate');
+    const onSuccessText = getMutationCallbackText(binding, 'onSuccess');
+    const pendingLifecycleText = [
+      getMutationCallbackText(binding, 'onSettled'),
+      getMutationCallbackText(binding, 'onError'),
+      onSuccessText,
+    ].join(' ');
+
+    const hasRowPendingLifecycle =
+      /\baddRowPending\s*\(/.test(onMutateText)
+      && /\bremoveRowPending\s*\(/.test(pendingLifecycleText);
+    const hasInlineSuccessRow =
+      /\baddRowReplacement\s*\(/.test(onSuccessText)
+      && /\b(?:TableRowSuccessState|successMessage\s*=)/.test(onSuccessText);
+    const hasUndoableSuccessRow =
+      hasInlineSuccessRow
+      && /\bundoMutationFn\s*=/.test(onSuccessText);
+    const hasDeferredRefreshSuccessRow =
+      hasInlineSuccessRow
+      && /\binvalidationKeys\s*=/.test(onSuccessText);
+
+    if (hasRowPendingLifecycle) {
+      tags.add('mutation-table-row-pending');
+    }
+    if (hasInlineSuccessRow) {
+      tags.add('mutation-table-inline-success');
+    }
+    if (hasUndoableSuccessRow) {
+      tags.add('mutation-table-inline-success-undo');
+    }
+    if (hasDeferredRefreshSuccessRow) {
+      tags.add('mutation-table-inline-success-deferred-refresh');
+    }
+  }
+
+  return Array.from(tags);
+};
+
+const deriveCacheOwnershipTags = (
+  interactions: UiContractInteraction[],
+  cacheOperations: UiCacheOperation[],
+): UiBehaviorTag[] => {
+  const tags = new Set<UiBehaviorTag>();
+  const opsByLine = buildCacheOperationsByLine(cacheOperations);
+
+  for (const interaction of interactions) {
+    const effects = Array.isArray(interaction.effects) ? interaction.effects : [];
+    if (!effects.some(effect => effect.kind === 'mutation')) continue;
+
+    const cacheLines = Array.from(new Set(
+      effects
+        .filter(effect => effect.kind === 'invalidate')
+        .map(effect => effect.line)
+        .filter((line): line is number => typeof line === 'number' && Number.isFinite(line)),
+    ));
+    if (cacheLines.length === 0) continue;
+
+    const operations: UiCacheOperation[] = [];
+    for (const line of cacheLines) {
+      const matches = opsByLine.get(line) || [];
+      operations.push(...matches);
+    }
+    if (operations.length < 2) continue;
+
+    const roots = new Set(
+      operations
+        .map(operation => extractCacheKeyRoot(operation.queryKey, operation.queryKeyParts))
+        .filter(Boolean),
+    );
+    if (roots.size >= 2) {
+      tags.add('mutation-refreshes-multiple-cache-roots');
+    }
+
+    const namespaces = new Set(
+      Array.from(roots)
+        .map(root => extractCacheKeyNamespace(root))
+        .filter(Boolean),
+    );
+    if (namespaces.size >= 2) {
+      tags.add('mutation-refreshes-cross-root-cache');
+    }
+  }
+
+  return Array.from(tags);
+};
+
+const deriveOptimisticRollbackTags = (
+  mutationBindings: MutationBindingMap,
+  fnNodesByName: Map<string, Parser.SyntaxNode>,
+  mutationTriggerNames: Set<string>,
+  cacheOperations: UiCacheOperation[],
+): UiBehaviorTag[] => {
+  const tags = new Set<UiBehaviorTag>();
+  const opsByLine = buildCacheOperationsByLine(cacheOperations);
+
+  for (const binding of mutationBindings.values()) {
+    const optimisticEntry = binding.callbacks.find(entry => entry.key === 'onMutate');
+    const rollbackEntry = binding.callbacks.find(entry => entry.key === 'onError');
+
+    const optimisticRoots = optimisticEntry
+      ? collectCacheWriteRootsFromEffects(
+          analyzeEffects(optimisticEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+          opsByLine,
+        )
+      : new Set<string>();
+    const rollbackRoots = rollbackEntry
+      ? collectCacheWriteRootsFromEffects(
+          analyzeEffects(rollbackEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+          opsByLine,
+        )
+      : new Set<string>();
+    const optimisticProjectionRoots = optimisticEntry
+      ? collectProjectionWriteRootsFromEffects(
+          analyzeEffects(optimisticEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+          opsByLine,
+        )
+      : new Set<string>();
+    const rollbackProjectionRoots = rollbackEntry
+      ? collectProjectionWriteRootsFromEffects(
+          analyzeEffects(rollbackEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+          opsByLine,
+        )
+      : new Set<string>();
+
+    if (optimisticRoots.size > 0) {
+      tags.add('mutation-optimistic-cache-write');
+    }
+    if (optimisticProjectionRoots.size > 0) {
+      tags.add('mutation-optimistic-projection-reconcile');
+    }
+    if (optimisticRoots.size > 0 && rollbackRoots.size > 0) {
+      tags.add('mutation-rollback-restores-cache');
+    }
+    if (optimisticRoots.size > 1 && rollbackRoots.size > 1) {
+      tags.add('mutation-rollback-restores-multi-cache');
+    }
+    if (optimisticProjectionRoots.size > 0 && rollbackProjectionRoots.size > 0) {
+      tags.add('mutation-rollback-restores-projection-reconcile');
+    }
+  }
+
+  return Array.from(tags);
+};
+
+const deriveBehaviorTags = (
+  controlled: UiControlledSurface[],
+  pendingGates: UiPendingGateSurface[],
+  interactions: UiContractInteraction[],
+  mutationBindings: MutationBindingMap,
+  mutationHandoffs: UiMutationHandoff[],
+  queries: UiQueryContract[],
+  cacheOperations: UiCacheOperation[],
+  fnNodesByName: Map<string, Parser.SyntaxNode>,
+  mutationTriggerNames: Set<string>,
+): UiBehaviorTag[] => {
+  const tags = new Set<UiBehaviorTag>();
+  const hasMutationSignals = mutationHandoffs.length > 0
+    || interactions.some(interaction => interaction.effects.some(effect => effect.kind === 'mutation'));
+
+  for (const handoff of mutationHandoffs) {
+    tags.add(handoff.kind);
+  }
+
+  if (hasMutationSignals && pendingGates.length > 0) {
+    tags.add('mutation-pending-ux');
+  }
+  if (hasMutationSignals && pendingGates.length > 0 && controlled.length > 0) {
+    tags.add('mutation-pending-controlled-surface');
+  }
+
+  for (const interaction of interactions) {
+    const effects = Array.isArray(interaction.effects) ? interaction.effects : [];
+    const hasMutation = effects.some(effect => effect.kind === 'mutation');
+    const isSelectionInteraction = SELECTION_PREFILL_EVENTS.has(interaction.event);
+
+    if (hasMutation && effects.some(isCloseStateEffect)) tags.add('mutation-closes-surface');
+    const hasCacheRefresh = hasMutation && effects.some(isCacheRefreshEffect);
+    const hasCacheWrite = hasMutation && effects.some(isCacheWriteEffect);
+
+    if (hasCacheRefresh) tags.add('mutation-refreshes-cache');
+    if (hasCacheWrite) tags.add('mutation-cache-write');
+    if (hasCacheRefresh && hasCacheWrite) tags.add('mutation-cache-write-plus-refresh');
+    if (hasMutation && effects.some(effect => effect.kind === 'navigate')) tags.add('mutation-navigates');
+    if (hasMutation && effects.some(effect => effect.kind === 'toast')) tags.add('mutation-shows-toast');
+    if (isSelectionInteraction && effects.some(isSelectionPrefillEffect)) {
+      tags.add('selection-prefill');
+    }
+    if (isSelectionInteraction && effects.some(isSelectionAsyncEffect)) {
+      tags.add('selection-async-enrichment');
+    }
+    if (isSelectionInteraction && effects.some(isSelectionResetEffect)) {
+      tags.add('selection-resets-dependent-state');
+    }
+  }
+
+  const hasSuspenseQuery = queries.some(query => isSuspenseQueryHook(query.hook));
+  const hasOptionalNonSuspenseGate = queries.some(query => hasEnabledGate(query) && isNonSuspenseQueryHook(query.hook));
+  if (hasSuspenseQuery) {
+    tags.add('query-required-suspense');
+  }
+  if (hasSuspenseQuery && hasOptionalNonSuspenseGate) {
+    tags.add('query-optional-gate-non-suspense');
+  }
+
+  for (const tag of deriveCacheOwnershipTags(interactions, cacheOperations)) {
+    tags.add(tag);
+  }
+
+  for (const tag of deriveOptimisticRollbackTags(mutationBindings, fnNodesByName, mutationTriggerNames, cacheOperations)) {
+    tags.add(tag);
+  }
+
+  for (const tag of deriveTableRowOptimisticTags(mutationBindings)) {
+    tags.add(tag);
+  }
+
+  for (const query of queries) {
+    if (hasEnabledGate(query)) {
+      tags.add('query-enabled-gate');
+      if (isNonSuspenseQueryHook(query.hook)) tags.add('query-enabled-non-suspense');
+      if (isNonSuspenseQueryHook(query.hook) && isSelectionDrivenQuery(query)) {
+        tags.add('selection-enabled-follow-up-query');
+      }
+    }
+
+    if (usesAlwaysFocusRefresh(query)) {
+      tags.add('query-focus-refresh-always');
+    }
+
+    if (usesPollingRefresh(query)) {
+      tags.add('query-polling-refresh');
+    }
+
+    if (usesKeepPreviousData(query)) {
+      tags.add('query-keep-previous-data');
+      if (isNonSuspenseQueryHook(query.hook)) tags.add('query-interactive-refetch');
+    }
+  }
+
+  return Array.from(tags);
 };
 
 const interpretBoolLiteral = (node: Parser.SyntaxNode | null): boolean | undefined => {
@@ -550,6 +1225,7 @@ const extractCacheOperations = (root: Parser.SyntaxNode): UiCacheOperation[] => 
     if (!firstArg) return;
 
     let queryKeyNode: Parser.SyntaxNode | null = null;
+    let updateText = '';
     let exact: boolean | undefined;
 
     const peeledFirst = peelExpression(firstArg);
@@ -567,6 +1243,11 @@ const extractCacheOperations = (root: Parser.SyntaxNode): UiCacheOperation[] => 
     const queryKey = compactText(String((queryKeyExpr as any)?.text || '').trim());
     if (!queryKey) return;
 
+    if (method === 'setQueryData' || method === 'setQueriesData') {
+      const updateNode = peelExpression(getCallExpressionArg(node, 1));
+      updateText = compactText(String((updateNode as any)?.text || '').trim());
+    }
+
     operations.push({
       kind: method === 'setQueryData' || method === 'setQueriesData'
         ? 'write'
@@ -577,6 +1258,7 @@ const extractCacheOperations = (root: Parser.SyntaxNode): UiCacheOperation[] => 
       callee: callee.calleeText,
       queryKey,
       queryKeyParts: extractArrayLiteralParts(queryKeyExpr),
+      updateText,
       exact,
       line: getNodeLine(node),
       confidence,
@@ -723,33 +1405,50 @@ const annotateQueriesWithCacheWriteTriggers = (queries: UiQueryContract[], cache
   });
 };
 
+const extractMutationCallbackEntries = (
+  callNode: Parser.SyntaxNode,
+  fnNodesByName: Map<string, Parser.SyntaxNode>
+): MutationCallbackEntry[] => {
+  const obj = getFirstObjectArg(callNode);
+  if (!obj) return [];
+
+  const callbackKeys = new Set<MutationCallbackKey>(['onSuccess', 'onError', 'onSettled', 'onMutate']);
+  const entries: MutationCallbackEntry[] = [];
+
+  for (const pair of getObjectPairs(obj)) {
+    if (!callbackKeys.has(pair.key as MutationCallbackKey)) continue;
+    const resolved = resolveFunctionLikeNode(pair.value, fnNodesByName);
+    if (resolved) {
+      entries.push({
+        key: pair.key as MutationCallbackKey,
+        node: resolved,
+      });
+    }
+  }
+
+  return entries;
+};
+
 const extractMutationCallbackNodes = (
   callNode: Parser.SyntaxNode,
   fnNodesByName: Map<string, Parser.SyntaxNode>
 ): Parser.SyntaxNode[] => {
-  const obj = getFirstObjectArg(callNode);
-  if (!obj) return [];
+  return extractMutationCallbackEntries(callNode, fnNodesByName).map(entry => entry.node);
+};
 
-  const callbackKeys = new Set(['onSuccess', 'onError', 'onSettled', 'onMutate']);
-  const nodes: Parser.SyntaxNode[] = [];
+const extractMutationFnNode = (
+  callNode: Parser.SyntaxNode,
+  fnNodesByName: Map<string, Parser.SyntaxNode>
+): Parser.SyntaxNode | null => {
+  const obj = getFirstObjectArg(callNode);
+  if (!obj) return null;
 
   for (const pair of getObjectPairs(obj)) {
-    if (!callbackKeys.has(pair.key)) continue;
-    const value = pair.value;
-
-    if (value.type === 'arrow_function' || value.type === 'function_expression') {
-      nodes.push(value);
-      continue;
-    }
-
-    if (value.type === 'identifier') {
-      const name = String((value as any).text || '').trim();
-      const resolved = name ? fnNodesByName.get(name) : null;
-      if (resolved) nodes.push(resolved);
-    }
+    if (pair.key !== 'mutationFn') continue;
+    return resolveFunctionLikeNode(pair.value, fnNodesByName);
   }
 
-  return nodes;
+  return null;
 };
 
 const extractMutationTriggersFromObjectPattern = (patternNode: Parser.SyntaxNode): string[] => {
@@ -817,6 +1516,137 @@ const buildMutationCallbackMap = (root: Parser.SyntaxNode, fnNodesByName: Map<st
   });
 
   return map;
+};
+
+const buildMutationBindingMap = (root: Parser.SyntaxNode, fnNodesByName: Map<string, Parser.SyntaxNode>): MutationBindingMap => {
+  const map: MutationBindingMap = new Map();
+
+  walkNamed(root, node => {
+    if (node.type !== 'call_expression') return;
+    if (!isUseMutationCall(node)) return;
+
+    const callbacks = extractMutationCallbackEntries(node, fnNodesByName);
+    const mutationFnNode = extractMutationFnNode(node, fnNodesByName);
+    if (callbacks.length === 0 && !mutationFnNode) return;
+
+    const declarator = node.parent;
+    if (!declarator || declarator.type !== 'variable_declarator') return;
+
+    const nameNode = (declarator as any).childForFieldName?.('name') as Parser.SyntaxNode | null;
+    if (!nameNode) return;
+
+    const triggers: string[] = [];
+
+    if (nameNode.type === 'identifier') {
+      const varName = String((nameNode as any).text || '').trim();
+      if (varName) {
+        triggers.push(`${varName}.mutate`);
+        triggers.push(`${varName}.mutateAsync`);
+      }
+    } else if (nameNode.type === 'object_pattern') {
+      triggers.push(...extractMutationTriggersFromObjectPattern(nameNode));
+    }
+
+    for (const trigger of Array.from(new Set(triggers.filter(Boolean)))) {
+      map.set(trigger, {
+        trigger,
+        callbacks,
+        mutationFnNode,
+        line: getNodeLine(node),
+      });
+    }
+  });
+
+  return map;
+};
+
+const buildMutationHandoffsFromBindings = (
+  mutationBindings: MutationBindingMap,
+  fnNodesByName: Map<string, Parser.SyntaxNode>,
+  mutationTriggerNames: Set<string>
+): UiMutationHandoff[] => {
+  const handoffs: UiMutationHandoff[] = [];
+
+  for (const binding of mutationBindings.values()) {
+    for (const callback of binding.callbacks) {
+      const effects = analyzeEffects(callback.node, fnNodesByName, {
+        visited: new Set<string>(),
+        mutationTriggerNames,
+      });
+
+      for (const effect of effects) {
+        if (effect.kind !== 'mutation') continue;
+        if (!effect.callee || effect.callee === binding.trigger) continue;
+        handoffs.push({
+          kind: 'callback-handoff',
+          source: binding.trigger,
+          target: effect.callee,
+          via: callback.key,
+          line: getNodeLine(callback.node),
+          confidence: Math.min(0.95, effect.confidence),
+        });
+      }
+    }
+
+    if (binding.mutationFnNode) {
+      const sequence = collapseCallSequence(
+        collectAwaitedCallSequence(binding.mutationFnNode).map(call => call.callee),
+      );
+      if (sequence.length >= 2) {
+        handoffs.push({
+          kind: 'mutation-fn-sequence',
+          source: binding.trigger,
+          target: sequence[sequence.length - 1],
+          via: 'mutationFn',
+          sequence,
+          line: getNodeLine(binding.mutationFnNode),
+          confidence: 0.82,
+        });
+      }
+    }
+  }
+
+  return dedupeMutationHandoffs(handoffs);
+};
+
+const extractHandleSubmitHandoffs = (
+  handleSubmitCall: Parser.SyntaxNode,
+  fnNodesByName: Map<string, Parser.SyntaxNode>,
+  mutationTriggerNames: Set<string>
+): UiMutationHandoff[] => {
+  const submitNode = resolveFunctionLikeNode(getCallExpressionFirstArg(handleSubmitCall), fnNodesByName);
+  if (!submitNode) return [];
+
+  const line = getNodeLine(handleSubmitCall);
+  const mutationCalls = collectMutationTriggerCalls(submitNode, mutationTriggerNames);
+  const handoffs: UiMutationHandoff[] = mutationCalls.map(call => ({
+    kind: 'handle-submit-mutation',
+    source: 'handleSubmit',
+    target: call.callee,
+    via: 'handleSubmit',
+    line,
+    confidence: call.awaited ? 0.9 : 0.82,
+  }));
+
+  const awaitedSequence = collapseCallSequence(
+    mutationCalls
+      .filter(call => call.awaited)
+      .map(call => call.callee),
+  );
+
+  if (awaitedSequence.length >= 2) {
+    handoffs.push({
+      kind: 'handle-submit-sequence',
+      source: 'handleSubmit',
+      target: awaitedSequence[awaitedSequence.length - 1],
+      via: 'handleSubmit',
+      sequence: awaitedSequence,
+      line,
+      confidence: 0.88,
+    });
+  }
+
+  return dedupeMutationHandoffs(handoffs);
 };
 
 const expandMutationCallbackEffects = (
@@ -950,6 +1780,11 @@ const extractGatesFromAttributeMap = (attrMap: Map<string, Parser.SyntaxNode>): 
   return gates;
 };
 
+const isPendingGate = (gate: UiContractGate): boolean => {
+  return /pending|loading|submitting|fetching|processing/i.test(gate.attribute)
+    || /pending|loading|submitting|fetching|processing/i.test(gate.value);
+};
+
 const extractControlledSurfaces = (root: Parser.SyntaxNode): UiControlledSurface[] => {
   const controlled: UiControlledSurface[] = [];
 
@@ -975,11 +1810,30 @@ const extractControlledSurfaces = (root: Parser.SyntaxNode): UiControlledSurface
   return controlled;
 };
 
+const extractPendingGateSurfaces = (root: Parser.SyntaxNode): UiPendingGateSurface[] => {
+  const surfaces: UiPendingGateSurface[] = [];
+
+  walkNamed(root, node => {
+    if (node.type !== 'jsx_opening_element' && node.type !== 'jsx_self_closing_element') return;
+    const gates = extractGatesFromAttributeMap(getOpeningElementAttributeMap(node)).filter(isPendingGate);
+    if (gates.length === 0) return;
+
+    surfaces.push({
+      element: getJsxElementName(node),
+      gates,
+      line: getNodeLine(node),
+    });
+  });
+
+  return surfaces;
+};
+
 const extractQueryContracts = (root: Parser.SyntaxNode): UiQueryContract[] => {
   const queries: UiQueryContract[] = [];
 
   const interestingOptionKeys = new Set([
     'enabled',
+    'placeholderData',
     'staleTime',
     'refetchOnMount',
     'refetchOnWindowFocus',
@@ -1167,7 +2021,7 @@ const buildInteractionSmells = (interaction: {
 
   const hasMutation = interaction.effects.some(e => e.kind === 'mutation');
   const hasInvalidate = interaction.effects.some(e => e.kind === 'invalidate');
-  const hasPendingGate = interaction.gates.some(g => /pending|loading|submitting|fetching|processing/i.test(g.attribute) || /pending|loading|submitting|fetching|processing/i.test(g.value));
+  const hasPendingGate = interaction.gates.some(isPendingGate);
 
   if (hasMutation && !hasInvalidate) {
     smells.push({
@@ -1219,13 +2073,160 @@ const buildInteractionSmells = (interaction: {
   return smells;
 };
 
+const isUseEffectCall = (callNode: Parser.SyntaxNode): boolean => {
+  if (callNode.type !== 'call_expression') return false;
+  const callee = getCallExpressionCallee(callNode);
+  if (!callee) return false;
+
+  return (callee.kind === 'identifier' && callee.name === 'useEffect')
+    || (callee.kind === 'member' && callee.propertyText === 'useEffect');
+};
+
+const hasSelectionSyncText = (text: string): boolean => {
+  return /\b(?:rawSelected|selected)[A-Za-z0-9_]*\b|\bcurrentContact\b/.test(String(text || ''));
+};
+
+const buildSelectionSyncUseEffectSmells = (
+  root: Parser.SyntaxNode,
+  fnNodesByName: Map<string, Parser.SyntaxNode>,
+  mutationTriggerNames: Set<string>,
+): UiContractSmell[] => {
+  const smells: UiContractSmell[] = [];
+
+  walkNamed(root, node => {
+    if (!isUseEffectCall(node)) return;
+
+    const effectNode = resolveFunctionLikeNode(getCallExpressionArg(node, 0), fnNodesByName);
+    if (!effectNode) return;
+
+    const depsNode = peelExpression(getCallExpressionArg(node, 1));
+    const bodyNode = getFunctionBodyNode(effectNode) ?? effectNode;
+    const depsText = compactText(String((depsNode as any)?.text || ''));
+    const bodyText = compactText(String((bodyNode as any)?.text || ''));
+    if (!hasSelectionSyncText(`${depsText} ${bodyText}`)) return;
+
+    const effects = analyzeEffects(effectNode, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames });
+    const hasSelectionAsync = effects.some(effect => effect.kind === 'mutation' || effect.kind === 'http');
+    const hasSelectionStateSync = effects.some(effect => isSelectionPrefillEffect(effect) || isSelectionResetEffect(effect));
+    if (!hasSelectionAsync && !hasSelectionStateSync) return;
+
+    smells.push({
+      kind: 'selection-sync-useeffect',
+      message: 'Selection-driven sync runs in useEffect; prefer owning async enrichment and dependent resets in selection handlers or query/mutation callbacks.',
+      line: getNodeLine(node),
+      confidence: hasSelectionAsync && hasSelectionStateSync ? 0.82 : 0.72,
+    });
+  });
+
+  return smells;
+};
+
+const buildMutationFreshnessPolicySmells = (
+  interactions: UiContractInteraction[],
+  queries: UiQueryContract[],
+): UiContractSmell[] => {
+  const smells: UiContractSmell[] = [];
+
+  for (const interaction of interactions) {
+    const effects = Array.isArray(interaction.effects) ? interaction.effects : [];
+    const hasMutation = effects.some(effect => effect.kind === 'mutation');
+    if (!hasMutation) continue;
+
+    const hasExplicitRefresh = effects.some(effect => isCacheRefreshEffect(effect) || isCacheWriteEffect(effect));
+    if (hasExplicitRefresh) continue;
+
+    const scope = String(interaction.scope || '').trim();
+    if (!scope) continue;
+
+    const hasFreshnessPolicy = queries.some(query =>
+      String(query?.scope || '').trim() === scope
+      && (usesAlwaysFocusRefresh(query) || usesPollingRefresh(query))
+    );
+    if (!hasFreshnessPolicy) continue;
+
+    smells.push({
+      kind: 'mutation-relies-on-freshness-policy',
+      message: 'Mutation surface has no local invalidate/setQueryData path while nearby queries rely on refetchOnWindowFocus/refetchInterval; prefer ownership-aligned cache refresh after success.',
+      line: interaction.handler.line,
+      confidence: 0.74,
+    });
+  }
+
+  return smells;
+};
+
+const buildOptimisticRollbackSmells = (
+  mutationBindings: MutationBindingMap,
+  fnNodesByName: Map<string, Parser.SyntaxNode>,
+  mutationTriggerNames: Set<string>,
+  cacheOperations: UiCacheOperation[],
+): UiContractSmell[] => {
+  const smells: UiContractSmell[] = [];
+  const opsByLine = buildCacheOperationsByLine(cacheOperations);
+
+  for (const binding of mutationBindings.values()) {
+    const optimisticEntry = binding.callbacks.find(entry => entry.key === 'onMutate');
+    if (!optimisticEntry) continue;
+
+    const optimisticRoots = collectCacheWriteRootsFromEffects(
+      analyzeEffects(optimisticEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+      opsByLine,
+    );
+    if (optimisticRoots.size === 0) continue;
+
+    const rollbackEntry = binding.callbacks.find(entry => entry.key === 'onError');
+    const rollbackRoots = rollbackEntry
+      ? collectCacheWriteRootsFromEffects(
+          analyzeEffects(rollbackEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+          opsByLine,
+        )
+      : new Set<string>();
+    const optimisticProjectionRoots = collectProjectionWriteRootsFromEffects(
+      analyzeEffects(optimisticEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+      opsByLine,
+    );
+    const rollbackProjectionRoots = rollbackEntry
+      ? collectProjectionWriteRootsFromEffects(
+          analyzeEffects(rollbackEntry.node, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }),
+          opsByLine,
+        )
+      : new Set<string>();
+
+    const missingRoots = Array.from(optimisticRoots).filter(root => !rollbackRoots.has(root));
+    if (missingRoots.length === 0) continue;
+
+    smells.push({
+      kind: 'mutation-rollback-misses-optimistic-cache-roots',
+      message: `Optimistic cache writes touch root(s) that onError does not restore: ${missingRoots.join(', ')}. Restore all optimistic projections to avoid stale filtered lists or derived views after failure.`,
+      line: binding.line,
+      confidence: optimisticRoots.size > 1 ? 0.82 : 0.72,
+    });
+
+    const missingProjectionRoots = Array.from(optimisticProjectionRoots)
+      .filter(root => !rollbackProjectionRoots.has(root));
+    if (missingProjectionRoots.length === 0) continue;
+
+    smells.push({
+      kind: 'mutation-rollback-misses-optimistic-projection-reconcile',
+      message: `Optimistic projection writes touch root(s) that onError does not reconcile: ${missingProjectionRoots.join(', ')}. Restore filtered-list or ordering projections to avoid stale membership or order after failure.`,
+      line: binding.line,
+      confidence: 0.86,
+    });
+  }
+
+  return smells;
+};
+
 export const extractUiContractCard = async (filePath: string, content: string): Promise<UiContractCard> => {
   const language = getLanguageFromFilename(filePath);
   if (language !== SupportedLanguages.TypeScript && language !== SupportedLanguages.JavaScript) {
     return {
       filePath,
       controlled: [],
+      pendingGates: [],
       interactions: [],
+      mutationHandoffs: [],
+      behaviorTags: [],
       queries: [],
       cacheLinks: [],
       effectsSummary: {
@@ -1251,7 +2252,10 @@ export const extractUiContractCard = async (filePath: string, content: string): 
     return {
       filePath,
       controlled: [],
+      pendingGates: [],
       interactions: [],
+      mutationHandoffs: [],
+      behaviorTags: [],
       queries: [],
       cacheLinks: [],
       effectsSummary: {
@@ -1268,9 +2272,15 @@ export const extractUiContractCard = async (filePath: string, content: string): 
 
   const root = tree.rootNode;
   const fnNodesByName = collectNamedFunctionNodes(root);
+  const mutationBindings = buildMutationBindingMap(root, fnNodesByName);
   const mutationCallbacks = buildMutationCallbackMap(root, fnNodesByName);
-  const mutationTriggerNames = new Set<string>(mutationCallbacks.keys());
+  const mutationTriggerNames = new Set<string>([
+    ...mutationBindings.keys(),
+    ...mutationCallbacks.keys(),
+  ]);
+  const cardMutationHandoffs = buildMutationHandoffsFromBindings(mutationBindings, fnNodesByName, mutationTriggerNames);
   const controlled = extractControlledSurfaces(root);
+  const pendingGates = extractPendingGateSurfaces(root);
   const rawQueries = extractQueryContracts(root);
   const cacheOperations = extractCacheOperations(root);
   const cacheLinks = buildCacheLinks(cacheOperations, rawQueries);
@@ -1304,6 +2314,7 @@ export const extractUiContractCard = async (filePath: string, content: string): 
     let handlerKind: UiContractInteraction['handler']['kind'] = 'unknown';
     let handlerName = '';
     let effects: UiContractEffect[] = [];
+    let interactionHandoffs: UiMutationHandoff[] = [];
 
     if (!expr) {
       handlerKind = 'unknown';
@@ -1344,16 +2355,9 @@ export const extractUiContractCard = async (filePath: string, content: string): 
         : false;
 
       if (isHandleSubmit) {
-        const argsNode = (expr as any).childForFieldName?.('arguments') as Parser.SyntaxNode | null;
-        const firstArg = argsNode?.namedChildren?.[0] || null;
-
-        if (firstArg?.type === 'identifier') {
-          const name = String((firstArg as any).text || '').trim();
-          const fnNode = name ? fnNodesByName.get(name) : null;
-          effects = fnNode ? analyzeEffects(fnNode, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }) : [];
-        } else if (firstArg && (firstArg.type === 'arrow_function' || firstArg.type === 'function_expression')) {
-          effects = analyzeEffects(firstArg, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames });
-        }
+        const submitNode = resolveFunctionLikeNode(getCallExpressionFirstArg(expr), fnNodesByName);
+        effects = submitNode ? analyzeEffects(submitNode, fnNodesByName, { visited: new Set<string>(), mutationTriggerNames }) : [];
+        interactionHandoffs = extractHandleSubmitHandoffs(expr, fnNodesByName, mutationTriggerNames);
       }
     } else if (expr.type === 'arrow_function' || expr.type === 'function_expression') {
       handlerKind = 'inline';
@@ -1367,6 +2371,19 @@ export const extractUiContractCard = async (filePath: string, content: string): 
 
     const expanded = expandMutationCallbackEffects(effects, mutationCallbacks, fnNodesByName, mutationTriggerNames);
     if (expanded.length > 0) effects = [...effects, ...expanded];
+
+    const sourceMutations = new Set(
+      effects
+        .filter(effect => effect.kind === 'mutation')
+        .map(effect => String(effect.callee || '').trim())
+        .filter(Boolean),
+    );
+    if (sourceMutations.size > 0) {
+      interactionHandoffs.push(
+        ...cardMutationHandoffs.filter(handoff => sourceMutations.has(String(handoff.source || '').trim())),
+      );
+    }
+    interactionHandoffs = dedupeMutationHandoffs(interactionHandoffs);
 
     const smells = buildInteractionSmells({
       event,
@@ -1386,6 +2403,7 @@ export const extractUiContractCard = async (filePath: string, content: string): 
       handler: { kind: handlerKind, name: handlerName, line: handlerLine },
       gates,
       effects,
+      mutationHandoffs: interactionHandoffs,
       smells,
     });
   });
@@ -1441,11 +2459,33 @@ export const extractUiContractCard = async (filePath: string, content: string): 
     for (const eff of interaction.effects) effectsSummary[eff.kind] = (effectsSummary[eff.kind] || 0) + 1;
     smells.push(...interaction.smells);
   }
+  smells.push(...buildSelectionSyncUseEffectSmells(root, fnNodesByName, mutationTriggerNames));
+  smells.push(...buildMutationFreshnessPolicySmells(interactions, queries));
+  smells.push(...buildOptimisticRollbackSmells(mutationBindings, fnNodesByName, mutationTriggerNames, cacheOperations));
+
+  const mutationHandoffs = dedupeMutationHandoffs([
+    ...cardMutationHandoffs,
+    ...interactions.flatMap(interaction => interaction.mutationHandoffs || []),
+  ]);
+  const behaviorTags = deriveBehaviorTags(
+    controlled,
+    pendingGates,
+    interactions,
+    mutationBindings,
+    mutationHandoffs,
+    queries,
+    cacheOperations,
+    fnNodesByName,
+    mutationTriggerNames,
+  );
 
   return {
     filePath,
     controlled,
+    pendingGates,
     interactions,
+    mutationHandoffs,
+    behaviorTags,
     queries,
     cacheLinks,
     cacheCoverage,

@@ -1,6 +1,6 @@
 # Monorepo North Star: Keep / Gate / Remove (GitNexus)
 
-Last updated: 2026-03-02
+Last updated: 2026-03-05
 
 ## Goal
 
@@ -11,6 +11,32 @@ Specialize GitNexus for `/Users/benny/monorepo` “1-shot semantics”:
 - Reduce moving parts that do not improve kernel-head correctness or monorepo pattern lamination.
 
 This doc is **not** a deletion plan by itself. It is a scoped “what’s essential?” map so we can gate (first), then delete (later) with confidence.
+
+## Active Program: Precedent Semantics Ladder
+
+The current monorepo push is to make `precedents` and the 4 kernel heads surface the right non-local examples without prompt steering. Docs remain useful, but the durable goal is to promote repeated monorepo behavior into first-class graph semantics and make low-support one-offs lose by default.
+
+### What the index should surface
+
+- Architecture semantics: route ownership, controller/request/resource chains, permission source-of-truth, query-key families, invalidation closure.
+- Slice semantics: which files travel together, which roles/slots close a feature slice, and which gaps are real.
+- Interaction semantics: close behavior, refetch behavior, mutation handoffs, optimistic writes, navigation after success, selection-to-prefill, suspense versus non-suspense gating.
+- Control-flow semantics: same-owner staged submit, chained follow-up mutation, single-mutation multi-write orchestration, retry/lock/transaction patterns.
+- Anatomy semantics: drawer/dialog/file shape, hook placement, form/container boundaries, parts APIs.
+- Anti-pattern semantics: repeated repo drift that should actively lower ranking instead of being offered as precedent.
+
+### Tranche Plan
+
+1. Tranche 1: jointly rank pattern-catalog, slice, hop, and process precedents; hard-filter changed-file and same-domain examples before ranking; prefer code-derived precedents over generic doc hits.
+2. Tranche 2: make pattern-catalog retrieval content-aware by indexing section notes/content and explicit control-flow titles such as `chained mutation submit flow`, `single mutation orchestrates two writes`, and `same-owner staged follow-up`.
+3. Tranche 3: materialize mutation-handoff semantics (`handleSubmit -> mutate`, `onSuccess -> mutate`, `mutationFn -> await A -> await B`) through `ui_contract` and/or `micro-dataflow`.
+4. Tranche 4: run repeated frontend/backend mining passes, promote only high-support repetitions, and add canonicality scoring plus precedent-quality canaries.
+
+### Promotion Rule
+
+- Promote a new semantic family only when it has repeat support, not because one ticket needed it.
+- Prefer cross-domain repetitions over same-feature repetitions when deciding what becomes “canonical”.
+- Docs never outrank durable graph evidence when the two disagree; docs are bootstrap reinforcement, not the retrieval mechanism.
 
 ## Keep (Core)
 
