@@ -6,6 +6,7 @@ import { processCalls, processCallsFromExtracted } from './call-processor.js';
 import { processLaravelRoutes } from './laravel-route-processor.js';
 import { processLaravelHttpWiring } from './laravel-http-processor.js';
 import { processLaravelRouteNameWiring } from './laravel-route-name-processor.js';
+import { processLaravelQrDelivery } from './laravel-qr-delivery-processor.js';
 import { processLaravelSemanticEdges } from './laravel-semantic-processor.js';
 import { processLaravelAuthorization } from './laravel-auth-processor.js';
 import { processLaravelRouteMiddlewareAuthorization } from './laravel-route-middleware-auth-processor.js';
@@ -291,6 +292,7 @@ export const runPipelineFromRepo = async (
         processLaravelRoutes(graph, files, symbolTable, importMap, phpUseAliases);
         await processLaravelHttpWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
         await processLaravelRouteNameWiring(graph, files, astCache, symbolTable, importMap, phpUseAliases);
+        await processLaravelQrDelivery(graph, files, astCache, symbolTable, importMap, phpUseAliases);
       });
 
       await timeStage('framework.template_methods', async () => {

@@ -215,18 +215,23 @@ export const processLaravelSchedule = async (
       const resolved = resolvePhpClassToFile(classRef, file.path, symbolTable, importMap, phpUseAliases, kind);
       if (!resolved) continue;
 
+      const resolvedClassName = normalizePhpClassRef(stripPhpClassConstant(classRef)).baseName;
       const handlerMethodId = symbolTable.lookupExact(resolved.filePath, 'handle')
         || symbolTable.lookupExact(resolved.filePath, '__invoke');
-      if (!handlerMethodId) continue;
+      const classNodeId = resolvedClassName
+        ? symbolTable.lookupExact(resolved.filePath, resolvedClassName)
+        : undefined;
+      const targetId = handlerMethodId || classNodeId;
+      if (!targetId) continue;
 
-      const relId = generateId('CALLS', `${sourceId}:laravel-schedule-${kind}->${handlerMethodId}`);
+      const relId = generateId('CALLS', `${sourceId}:laravel-schedule-${kind}->${targetId}`);
       graph.addRelationship({
         id: relId,
         type: 'CALLS',
         sourceId,
-        targetId: handlerMethodId,
+        targetId,
         confidence: resolved.confidence,
-        reason: `laravel-schedule-${kind}-${resolved.reason}`,
+        reason: `laravel-schedule-${kind}-${resolved.reason}${handlerMethodId ? '' : '-class-entry'}`,
       });
       relationshipsAdded++;
     }

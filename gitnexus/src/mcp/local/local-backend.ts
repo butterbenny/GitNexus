@@ -431,6 +431,21 @@ type PatternCatalogSection = {
   tokenSet: Set<string>;
 };
 
+type BackendBehaviorIndexEntry = {
+  filePath: string;
+  tags: string[];
+  smells: string[];
+};
+
+type BackendHandoffIndexEntry = {
+  anchorFilePath: string;
+  memberFiles: string[];
+  tags: string[];
+  smells: string[];
+  reasons: string[];
+  title: string;
+};
+
 const patternCatalogCache = new Map<string, { mtimeMs: number; sections: PatternCatalogSection[] }>();
 
 function tokenizePatternCatalogText(value: string): string[] {
@@ -1140,7 +1155,8 @@ export class LocalBackend {
   private semanticModeCache: Map<string, { manifestMtimeMs: number; mode: SemanticRetrievalMode; source: string }> = new Map();
   private semanticVectorIndexCache: Map<string, { checkedAtMs: number; available: boolean }> = new Map();
   private archetypeIndexCache: Map<string, { builtAtMs: number; minHttpConfidence: number; byProcessId: Map<string, { signature: string; example: ArchetypeExample }>; bySignature: Map<string, ArchetypeExample[]> }> = new Map();
-  private backendBehaviorIndexCache: Map<string, { builtAtMs: number; entries: Array<{ filePath: string; tags: string[]; smells: string[] }> }> = new Map();
+  private backendBehaviorIndexCache: Map<string, { builtAtMs: number; entries: BackendBehaviorIndexEntry[] }> = new Map();
+  private backendHandoffIndexCache: Map<string, { builtAtMs: number; entries: BackendHandoffIndexEntry[] }> = new Map();
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -1257,6 +1273,8 @@ export class LocalBackend {
     this.repoMetaMtimeMs.clear();
     this.repoMetaCheckedAtMs.clear();
     this.archetypeIndexCache.clear();
+    this.backendBehaviorIndexCache.clear();
+    this.backendHandoffIndexCache.clear();
 
     for (const entry of entries) {
       const id = this.repoId(entry.name, entry.path, this.repos);
@@ -1559,6 +1577,8 @@ export class LocalBackend {
     this.initializedRepos.clear();
     this.indexStatusCache.delete(repo.id);
     this.archetypeIndexCache.delete(repo.id);
+    this.backendBehaviorIndexCache.delete(repo.id);
+    this.backendHandoffIndexCache.delete(repo.id);
 
     try {
       const raw = await fs.readFile(metaPath, 'utf-8');
@@ -2292,7 +2312,7 @@ export class LocalBackend {
 
   private async loadBackendBehaviorIndex(
     repo: RepoHandle,
-  ): Promise<Array<{ filePath: string; tags: string[]; smells: string[] }>> {
+  ): Promise<BackendBehaviorIndexEntry[]> {
     const now = Date.now();
     const cached = this.backendBehaviorIndexCache.get(repo.id);
     if (cached && (now - cached.builtAtMs) < 30_000) {
@@ -2311,9 +2331,9 @@ export class LocalBackend {
 
     const filePaths = Array.from(new Set(rows
       .map((row: any) => normalizeRepoRelativePath(String(row?.filePath ?? row?.[0] ?? '')))
-      .filter(Boolean)));
+      .filter(filePath => Boolean(filePath) && !isTestFilePath(filePath))));
 
-    const entries: Array<{ filePath: string; tags: string[]; smells: string[] }> = [];
+    const entries: BackendBehaviorIndexEntry[] = [];
     const concurrency = 24;
 
     for (let i = 0; i < filePaths.length; i += concurrency) {
@@ -2351,6 +2371,253 @@ export class LocalBackend {
     }
 
     this.backendBehaviorIndexCache.set(repo.id, { builtAtMs: now, entries });
+    return entries;
+  }
+
+  private async loadBackendHandoffIndex(
+    repo: RepoHandle,
+    backendEntriesInput?: BackendBehaviorIndexEntry[],
+  ): Promise<BackendHandoffIndexEntry[]> {
+    const now = Date.now();
+    const cached = this.backendHandoffIndexCache.get(repo.id);
+    if (cached && (now - cached.builtAtMs) < 30_000) {
+      return cached.entries;
+    }
+
+    await this.ensureInitialized(repo.id);
+
+    const backendEntries = backendEntriesInput || await this.loadBackendBehaviorIndex(repo);
+    const entryByFile = new Map<string, BackendBehaviorIndexEntry>(
+      backendEntries.map(entry => [normalizeRepoRelativePath(entry.filePath), entry]),
+    );
+    const outgoing = new Map<string, Array<{ targetFilePath: string; reason: string; confidence: number }>>();
+    const rows = await executeQuery(repo.id, `
+      MATCH (source)-[r:CodeRelation {type: 'CALLS'}]->(target)
+      WHERE source.filePath ENDS WITH '.php'
+        AND target.filePath ENDS WITH '.php'
+        AND (
+          r.reason STARTS WITH 'laravel-schedule-'
+          OR r.reason STARTS WITH 'laravel-job-dispatch-'
+          OR r.reason STARTS WITH 'laravel-notify-'
+          OR r.reason STARTS WITH 'laravel-mail-send-mailable'
+          OR r.reason STARTS WITH 'laravel-qr-delivery-'
+        )
+      RETURN source.filePath AS sourceFilePath,
+             target.filePath AS targetFilePath,
+             r.reason AS reason,
+             r.confidence AS confidence
+      ORDER BY source.filePath, target.filePath, r.reason
+    `);
+
+    for (const row of rows) {
+      const sourceFilePath = normalizeRepoRelativePath(String(row?.sourceFilePath ?? row?.sourcefilepath ?? row?.[0] ?? ''));
+      const targetFilePath = normalizeRepoRelativePath(String(row?.targetFilePath ?? row?.targetfilepath ?? row?.[1] ?? ''));
+      const reason = String(row?.reason ?? row?.[2] ?? '').trim();
+      const confidence = toFiniteNumber(row?.confidence ?? row?.[3], 0);
+      if (!sourceFilePath || !targetFilePath || !reason) continue;
+      if (isTestFilePath(sourceFilePath) || isTestFilePath(targetFilePath)) continue;
+      if (sourceFilePath === targetFilePath) continue;
+
+      const existing = outgoing.get(sourceFilePath) || [];
+      if (existing.some(edge => edge.targetFilePath === targetFilePath && edge.reason === reason)) continue;
+      existing.push({ targetFilePath, reason, confidence });
+      outgoing.set(sourceFilePath, existing);
+    }
+
+    const isIngressTag = (tag: string): boolean => {
+      return tag === 'scheduler-kernel-owner'
+        || tag === 'scheduler-schedules-job'
+        || tag === 'scheduler-schedules-command'
+        || tag === 'console-command-owner'
+        || tag === 'command-dispatch-callsite'
+        || tag === 'controller-dispatch-callsite'
+        || tag === 'webhook-dispatch-callsite'
+        || tag === 'listener-dispatch-callsite'
+        || tag === 'queued-job-dispatch-callsite'
+        || tag === 'qr-redirect-entrypoint';
+    };
+
+    const isBackendHandoffReason = (reason: string): boolean => {
+      return reason.startsWith('laravel-schedule-')
+        || reason.startsWith('laravel-job-dispatch-')
+        || reason.startsWith('laravel-notify-')
+        || reason.startsWith('laravel-mail-send-mailable')
+        || reason.startsWith('laravel-qr-delivery-');
+    };
+
+    const getEdgePriority = (filePath: string, reason: string): number => {
+      const tagSet = new Set(entryByFile.get(filePath)?.tags || []);
+      return (tagSet.has('delivery-selector-notification') ? 4 : 0)
+        + (tagSet.has('delivery-selector-mail') ? 4 : 0)
+        + (tagSet.has('job-orchestrates-notification-delivery') ? 3 : 0)
+        + (tagSet.has('job-orchestrates-mail-delivery') ? 3 : 0)
+        + (tagSet.has('queued-notification-owner') ? 2 : 0)
+        + (tagSet.has('queued-mail-owner') ? 2 : 0)
+        + (tagSet.has('queue-assignment-inherited') ? 2 : 0)
+        + (tagSet.has('queue-assignment-job') ? 1.5 : 0)
+        + (tagSet.has('queue-assignment-chain') ? 1.25 : 0)
+        + (tagSet.has('queue-assignment-batch') ? 1.25 : 0)
+        + (tagSet.has('qr-mail-piece-handoff') ? 4.5 : 0)
+        + (tagSet.has('qr-trackable-redirect-link') ? 2.5 : 0)
+        + (reason.startsWith('laravel-notify-') ? 1.5 : 0)
+        + (reason.startsWith('laravel-job-dispatch-') ? 1.25 : 0)
+        + (reason.startsWith('laravel-qr-delivery-') ? 1.2 : 0)
+        + (reason.startsWith('laravel-schedule-') ? 1 : 0);
+    };
+
+    const createBackendHandoffTitle = (tags: string[], anchorFilePath: string): string => {
+      const tagSet = new Set(tags);
+      if (tagSet.has('qr-redirect-entrypoint') && tagSet.has('qr-mail-piece-handoff')) {
+        return 'QR redirect -> outbound mail-piece handoff';
+      }
+      if (tagSet.has('scheduler-schedules-command') && tagSet.has('delivery-selector-notification')) {
+        return 'Scheduled command -> queued notification fanout';
+      }
+      if (tagSet.has('scheduler-schedules-command') && (tagSet.has('delivery-selector-mail') || tagSet.has('job-orchestrates-mail-delivery') || tagSet.has('queued-mail-owner'))) {
+        return 'Scheduled command -> queued mail fanout';
+      }
+      if (tagSet.has('scheduler-schedules-job') && tagSet.has('delivery-selector-notification')) {
+        return 'Scheduled job -> queued notification fanout';
+      }
+      if (tagSet.has('scheduler-schedules-job') && (tagSet.has('delivery-selector-mail') || tagSet.has('job-orchestrates-mail-delivery') || tagSet.has('queued-mail-owner'))) {
+        return 'Scheduled job -> queued mail fanout';
+      }
+      if (tagSet.has('command-dispatch-callsite') && tagSet.has('delivery-selector-notification')) {
+        return 'Console command -> queued notification fanout';
+      }
+      if (tagSet.has('command-dispatch-callsite') && (tagSet.has('delivery-selector-mail') || tagSet.has('job-orchestrates-mail-delivery') || tagSet.has('queued-mail-owner'))) {
+        return 'Console command -> queued mail fanout';
+      }
+      if (tagSet.has('command-dispatch-callsite') && tagSet.has('queue-assignment-chain')) {
+        return 'Console command -> queued chain handoff';
+      }
+      if (tagSet.has('webhook-dispatch-callsite') && tagSet.has('delivery-selector-notification')) {
+        return 'Webhook -> queued notification handoff';
+      }
+      if (tagSet.has('controller-dispatch-callsite') && tagSet.has('queue-assignment-job')) {
+        return 'Controller -> queued job handoff';
+      }
+      return path.basename(anchorFilePath);
+    };
+
+    const qualifiesBackendHandoff = (memberFiles: string[], tags: Set<string>): boolean => {
+      if (memberFiles.length < 2) return false;
+      const hasIngress = Array.from(tags).some(isIngressTag);
+      const hasTerminal = tags.has('delivery-selector-mail')
+        || tags.has('delivery-selector-notification')
+        || tags.has('job-orchestrates-mail-delivery')
+        || tags.has('job-orchestrates-notification-delivery')
+        || tags.has('queue-assignment-job')
+        || tags.has('queue-assignment-batch')
+        || tags.has('queue-assignment-chain')
+        || tags.has('queue-assignment-inherited')
+        || tags.has('qr-mail-piece-handoff')
+        || tags.has('qr-trackable-redirect-link');
+      return hasIngress && hasTerminal;
+    };
+
+    const entriesByKey = new Map<string, BackendHandoffIndexEntry>();
+    const orderQrHandoffFiles = (filePaths: string[]): string[] => {
+      const normalized = Array.from(new Set(filePaths.map(filePath => normalizeRepoRelativePath(filePath)).filter(Boolean)));
+      if (normalized.length < 2) return normalized;
+
+      const redirectIndex = normalized.findIndex(filePath => entryByFile.get(filePath)?.tags.includes('qr-redirect-entrypoint'));
+      if (redirectIndex <= 0) return normalized;
+
+      return [normalized[redirectIndex], ...normalized.filter((_, index) => index !== redirectIndex)];
+    };
+    const addEntry = (memberFilesRaw: string[], reasonsRaw: string[]): void => {
+      const memberFiles = Array.from(new Set(memberFilesRaw.map(filePath => normalizeRepoRelativePath(filePath)).filter(Boolean)));
+      const reasons = Array.from(new Set(reasonsRaw.map(reason => String(reason || '').trim()).filter(Boolean)));
+      if (memberFiles.length < 2) return;
+
+      const tags = new Set<string>();
+      const smells = new Set<string>();
+      for (const filePath of memberFiles) {
+        const entry = entryByFile.get(filePath);
+        if (!entry) continue;
+        for (const tag of entry.tags) tags.add(tag);
+        for (const smell of entry.smells) smells.add(smell);
+      }
+      if (!qualifiesBackendHandoff(memberFiles, tags)) return;
+
+      const key = memberFiles.join('>');
+      const candidate: BackendHandoffIndexEntry = {
+        anchorFilePath: memberFiles[0],
+        memberFiles,
+        tags: Array.from(tags).sort(),
+        smells: Array.from(smells).sort(),
+        reasons,
+        title: createBackendHandoffTitle(Array.from(tags), memberFiles[0]),
+      };
+      const existing = entriesByKey.get(key);
+      if (!existing || candidate.reasons.length > existing.reasons.length) {
+        entriesByKey.set(key, candidate);
+      }
+    };
+
+    const maxDepth = 3;
+    for (const entry of backendEntries) {
+      const anchorTagSet = new Set(entry.tags);
+      if (![...anchorTagSet].some(isIngressTag)) continue;
+
+      const stack: Array<{ files: string[]; reasons: string[]; currentFilePath: string; depth: number }> = [];
+      const firstEdges = (outgoing.get(entry.filePath) || [])
+        .filter(edge => isBackendHandoffReason(edge.reason))
+        .sort((left, right) => getEdgePriority(right.targetFilePath, right.reason) - getEdgePriority(left.targetFilePath, left.reason))
+        .slice(0, 6);
+
+      for (const edge of firstEdges) {
+        stack.push({
+          files: [entry.filePath, edge.targetFilePath],
+          reasons: [edge.reason],
+          currentFilePath: edge.targetFilePath,
+          depth: 1,
+        });
+      }
+
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (!current) continue;
+        addEntry(current.files, current.reasons);
+        if (current.depth >= maxDepth) continue;
+
+        const nextEdges = (outgoing.get(current.currentFilePath) || [])
+          .filter(edge => isBackendHandoffReason(edge.reason) && !current.files.includes(edge.targetFilePath))
+          .sort((left, right) => getEdgePriority(right.targetFilePath, right.reason) - getEdgePriority(left.targetFilePath, left.reason))
+          .slice(0, 4);
+
+        for (const edge of nextEdges) {
+          stack.push({
+            files: [...current.files, edge.targetFilePath],
+            reasons: [...current.reasons, edge.reason],
+            currentFilePath: edge.targetFilePath,
+            depth: current.depth + 1,
+          });
+        }
+      }
+    }
+
+    const qrDeliveryEdges = rows.filter(row => String(row?.reason ?? row?.[2] ?? '').startsWith('laravel-qr-delivery-'));
+    for (const row of qrDeliveryEdges) {
+      const sourceFilePath = normalizeRepoRelativePath(String(row?.sourceFilePath ?? row?.sourcefilepath ?? row?.[0] ?? ''));
+      const targetFilePath = normalizeRepoRelativePath(String(row?.targetFilePath ?? row?.targetfilepath ?? row?.[1] ?? ''));
+      const reason = String(row?.reason ?? row?.[2] ?? '').trim();
+      if (!sourceFilePath || !targetFilePath || !reason) continue;
+
+      addEntry(orderQrHandoffFiles([sourceFilePath, targetFilePath]), [reason]);
+    }
+
+    const entries = Array.from(entriesByKey.values())
+      .sort((left, right) => {
+        const leftScore = left.memberFiles.length + left.tags.length * 0.1 + left.reasons.length * 0.15;
+        const rightScore = right.memberFiles.length + right.tags.length * 0.1 + right.reasons.length * 0.15;
+        if (Math.abs(rightScore - leftScore) > 0.001) return rightScore - leftScore;
+        if (left.title !== right.title) return left.title.localeCompare(right.title);
+        return left.anchorFilePath.localeCompare(right.anchorFilePath);
+      });
+
+    this.backendHandoffIndexCache.set(repo.id, { builtAtMs: now, entries });
     return entries;
   }
 
@@ -2606,9 +2873,36 @@ export class LocalBackend {
       const wantsMail = /\bmail\b|\bemail\b|\bmailable\b|\bmail::\b/.test(lower);
       const wantsNotification = /\bnotification\b|\bnotify\b/.test(lower);
       const wantsJob = /\bjob\b|\bdispatch\b|\bhandle\b|\bkernel\b/.test(lower);
-      const wantsEndToEndFlow = /\bend[- ]to[- ]end\b|\bflow\b|\borchestrate\b|\binside job\b|\bowner\b/.test(lower);
+      const wantsEndToEndFlow = /\bend[- ]to[- ]end\b|\bflow\b|\borchestrate\b|\bfanout\b|\binside job\b|\bowner\b/.test(lower);
       const wantsExplicitQueue = /\bonqueue\b|\bjobqueue\b|\bqueue assignment\b|\bwhich queue\b|\bexplicit queue\b/.test(lower);
+      const wantsBatchQueueOwnership = /\bbatch[- ]level\b|\bbatch level\b|\bbatch onqueue\b|\bbus::batch\b|\bbatch queue\b/.test(lower);
+      const wantsChainQueueOwnership = /\bchain[- ]level\b|\bchain level\b|\bchain onqueue\b|\bbus::chain\b|\bchain queue\b/.test(lower);
+      const wantsJobQueueOwnership = /\bjob[- ]level\b|\bjob level\b|\bjob onqueue\b|\bjob queue\b|\bqueue lives on the job\b|\bjob owns queue\b/.test(lower);
+      const wantsInheritedQueueOwnership = /\binherited queue\b|\bdefault queue\b|\bbase mailable\b|\bbase notification\b/.test(lower);
+      const wantsMailSelector = wantsMail && /\bselector\b|\bselects?\b|\bchooses?\b|\bwhich email\b|\bwhich mailable\b|\bcompletion email\b/.test(lower);
+      const wantsNotificationSelector = wantsNotification && /\bselector\b|\bselects?\b|\bchooses?\b|\bwhich notification\b|\bnotify admins?\b|\bnotify user\b/.test(lower);
       const wantsQr = /\bqr\b|\bqr code\b|\bqrcode\b/.test(lower);
+      const wantsScheduler = /\bkernel\b|\bschedule\b|\bscheduled\b|\bscheduler\b|\bcron\b/.test(lower);
+      const wantsCommand = /\bcommand\b|\bartisan\b|\bconsole\b/.test(lower);
+      const wantsController = /\bcontroller\b/.test(lower);
+      const wantsWebhook = /\bwebhook\b/.test(lower);
+      const wantsListener = /\blistener\b|\bsubscriber\b/.test(lower);
+      const wantsDispatchCallsite = /\bdispatch\b|\benqueue\b|\bkick ?off\b|\bspawn\b|\bfanout\b/.test(lower);
+      const wantsBatch = /\bbatch\b|\bbus::batch\b/.test(lower);
+      const wantsChain = /\bchain\b|\bbus::chain\b/.test(lower);
+      const wantsSyncDispatch = /\bdispatchsync\b|\bsync dispatch\b|\bdispatch sync\b|\bsynchronous dispatch\b/.test(lower);
+      const wantsQrRedirect = wantsQr && /\bredirect\b|\bscan\b|\bdestination\b|\btrackable\b|\bslug\b|\bmark as scanned\b/.test(lower);
+      const wantsQrMailPieceHandoff = wantsQr && (
+        /\boutbound\b|\bdirect mail\b|\blob\b|\bhandoff\b|\bletter pdf\b|\bproof\b/.test(lower)
+        || (/\bmail piece\b/.test(lower) && /\bdelivery\b|\boutbound\b|\bhandoff\b|\bdirect mail\b|\blob\b/.test(lower))
+      );
+
+      if (wantsScheduler) {
+        tags.add('scheduler-kernel-owner');
+      }
+      if (wantsCommand) {
+        tags.add('console-command-owner');
+      }
 
       if (wantsJob || /\bjob queue\b|\bjob owner\b/.test(lower)) {
         tags.add('queued-job-owner');
@@ -2622,7 +2916,16 @@ export class LocalBackend {
       if (wantsExplicitQueue && (wantsQueuedDelivery || wantsMail || wantsNotification || wantsJob)) {
         tags.add('queue-assignment-explicit');
       }
-      if (/\binherited queue\b|\bbase mailable\b|\bbase notification\b/.test(lower)) {
+      if (wantsJobQueueOwnership) {
+        tags.add('queue-assignment-job');
+      }
+      if (wantsBatchQueueOwnership) {
+        tags.add('queue-assignment-batch');
+      }
+      if (wantsChainQueueOwnership) {
+        tags.add('queue-assignment-chain');
+      }
+      if (wantsInheritedQueueOwnership) {
         tags.add('queue-assignment-inherited');
       }
       if (/\bmail queue\b|\bqueue mail\b|\bqueued email\b|\bmail::queue\b|\bmail::later\b/.test(lower)) {
@@ -2637,11 +2940,48 @@ export class LocalBackend {
       if (/\buser->notify\b|\b->notify\b|\bnotify\b/.test(lower)) {
         tags.add('delivery-notify');
       }
+      if (wantsMailSelector) {
+        tags.add('delivery-selector-mail');
+      }
+      if (wantsNotificationSelector) {
+        tags.add('delivery-selector-notification');
+      }
       if (wantsJob && wantsMail && wantsEndToEndFlow) {
         tags.add('job-orchestrates-mail-delivery');
       }
       if (wantsJob && wantsNotification && wantsEndToEndFlow) {
         tags.add('job-orchestrates-notification-delivery');
+      }
+      if (wantsScheduler && (wantsJob || wantsQueuedDelivery || wantsMail || wantsNotification || wantsDispatchCallsite)) {
+        tags.add('scheduler-schedules-job');
+      }
+      if (wantsScheduler && (wantsCommand || /\bartisan\b/.test(lower))) {
+        tags.add('scheduler-schedules-command');
+      }
+      if (wantsCommand && (wantsDispatchCallsite || wantsBatch || wantsChain || wantsJob || wantsQueuedDelivery)) {
+        tags.add('command-dispatch-callsite');
+      }
+      if (wantsController && (wantsDispatchCallsite || wantsBatch || wantsChain || wantsJob)) {
+        tags.add('controller-dispatch-callsite');
+      }
+      if (wantsWebhook && (wantsDispatchCallsite || wantsBatch || wantsChain || wantsJob)) {
+        tags.add('webhook-dispatch-callsite');
+        tags.add('controller-dispatch-callsite');
+      }
+      if (wantsListener && (wantsDispatchCallsite || wantsBatch || wantsChain || wantsJob)) {
+        tags.add('listener-dispatch-callsite');
+      }
+      if (wantsJob && (wantsDispatchCallsite || wantsBatch || wantsChain || /\bchild jobs?\b|\bfanout\b/.test(lower)) && wantsEndToEndFlow) {
+        tags.add('queued-job-dispatch-callsite');
+      }
+      if (wantsBatch) {
+        tags.add('dispatch-batch-orchestrator');
+      }
+      if (wantsChain) {
+        tags.add('dispatch-chain-orchestrator');
+      }
+      if (wantsSyncDispatch) {
+        tags.add('dispatch-callsite-sync');
       }
 
       if (wantsQr) {
@@ -2650,10 +2990,16 @@ export class LocalBackend {
         }
         if (/\bmail piece\b|\bsidecar\b|\bletter\b/.test(lower)) {
           tags.add('qr-crud-mail-piece-sidecar');
-          tags.add('qr-html-embed');
         }
         if (/\bpdf\b|\bexport\b|\bdownload\b|\binline\b|\bprint\b|\bfile\b/.test(lower)) {
           tags.add('qr-export-inline-pdf');
+        }
+        if (wantsQrRedirect) {
+          tags.add('qr-redirect-entrypoint');
+          tags.add('qr-trackable-redirect-link');
+        }
+        if (wantsQrMailPieceHandoff) {
+          tags.add('qr-mail-piece-handoff');
         }
         if (/\bparser\b|\bembed\b|\bhtml\b|\breplace\b|\bbody\b/.test(lower)) {
           tags.add('qr-html-embed');
@@ -2672,8 +3018,73 @@ export class LocalBackend {
     const lowerQueryText = String(queryText || '').toLowerCase();
     const uiBehaviorQueryTags = getUiBehaviorQueryTags(queryText);
     const backendBehaviorQueryTags = getBackendBehaviorQueryTags(queryText);
+    const backendSpecificQueryTokenStopwords = new Set([
+      'kernel',
+      'schedule',
+      'scheduled',
+      'scheduler',
+      'cron',
+      'command',
+      'console',
+      'job',
+      'jobs',
+      'dispatch',
+      'queued',
+      'queue',
+      'owner',
+      'ownership',
+      'mail',
+      'email',
+      'mailable',
+      'notification',
+      'notify',
+      'selector',
+      'flow',
+      'handoff',
+      'fanout',
+      'controller',
+      'webhook',
+      'listener',
+      'redirect',
+      'direct',
+      'outbound',
+      'letter',
+      'pdf',
+      'lob',
+      'builder',
+      'piece',
+      'mailpiece',
+      'qr',
+      'code',
+    ]);
     const shouldBoostUiBehaviors = uiBehaviorQueryTags.size > 0;
     const shouldBoostBackendBehaviors = backendBehaviorQueryTags.size > 0;
+    const hasExplicitSchedulerContextQuery = /\bkernel\b|\bschedule\b|\bscheduled\b|\bscheduler\b|\bcron\b/.test(lowerQueryText);
+    const hasExplicitCommandContextQuery = /\bcommand\b|\bartisan\b|\bconsole\b/.test(lowerQueryText);
+    const hasExplicitWebhookContextQuery = /\bwebhook\b/.test(lowerQueryText);
+    const hasExplicitControllerContextQuery = /\bcontroller\b/.test(lowerQueryText);
+    const hasExplicitListenerContextQuery = /\blistener\b|\bsubscriber\b/.test(lowerQueryText);
+    const hasExplicitBatchQueueContextQuery = /\bbatch[- ]level\b|\bbatch level\b|\bbatch onqueue\b|\bbus::batch\b|\bbatch queue\b/.test(lowerQueryText);
+    const hasExplicitChainQueueContextQuery = /\bchain[- ]level\b|\bchain level\b|\bchain onqueue\b|\bbus::chain\b|\bchain queue\b/.test(lowerQueryText);
+    const hasExplicitJobQueueContextQuery = /\bjob[- ]level\b|\bjob level\b|\bjob onqueue\b|\bjob queue\b|\bqueue lives on the job\b|\bjob owns queue\b/.test(lowerQueryText);
+    const hasExplicitInheritedQueueContextQuery = /\binherited queue\b|\bdefault queue\b|\bbase mailable\b|\bbase notification\b/.test(lowerQueryText);
+    const hasExplicitMailSelectorContextQuery = /\bmailable selector\b|\bmail selector\b|\bwhich email\b|\bwhich mailable\b|\bcompletion email\b/.test(lowerQueryText);
+    const hasExplicitNotificationSelectorContextQuery = /\bnotification selector\b|\bwhich notification\b|\bnotify admins?\b|\bnotify user\b/.test(lowerQueryText);
+    const hasExplicitQrRedirectContextQuery = /\bqr\b.*\bredirect\b|\bscan\b|\bdestination\b|\btrackable\b|\bmark as scanned\b/.test(lowerQueryText);
+    const hasExplicitQrHandoffContextQuery =
+      /\bqr\b.*\b(outbound|direct mail|lob|handoff|letter pdf|proof)\b|\b(direct mail|lob)\b.*\bqr\b/.test(lowerQueryText)
+      || (/\bqr\b/.test(lowerQueryText) && /\bmail piece\b/.test(lowerQueryText) && /\bdelivery\b|\boutbound\b|\bhandoff\b|\bdirect mail\b|\blob\b/.test(lowerQueryText));
+    const hasExplicitQrCrossFileHandoffQuery =
+      hasExplicitQrRedirectContextQuery
+      && hasExplicitQrHandoffContextQuery;
+    const hasExplicitBackendHandoffContextQuery =
+      hasExplicitSchedulerContextQuery
+      || hasExplicitWebhookContextQuery
+      || hasExplicitControllerContextQuery
+      || hasExplicitListenerContextQuery
+      || hasExplicitQrRedirectContextQuery
+      || hasExplicitQrHandoffContextQuery
+      || /\bhandoff\b|\bfanout\b|\bingress\b|\bentrypoint\b/.test(lowerQueryText);
     const shouldPenalizeSelectionSyncUseEffect = Array.from(uiBehaviorQueryTags)
       .some(tag => tag.startsWith('selection-'))
       || /\buseeffect\b|\bavoid useeffect\b|\beffect sync\b|\bselection sync\b|\bsync drift\b/.test(lowerQueryText);
@@ -3684,6 +4095,7 @@ export class LocalBackend {
       : anchorHops;
 
     const queryTokens = getQueryTokens(queryText);
+    const backendSpecificQueryTokens = queryTokens.filter(token => !backendSpecificQueryTokenStopwords.has(token));
     for (const hop of inScopeHops) {
       const baseScore = Math.max(1, rankHop(hop, queryTokens) + 1);
       addSlicesForNode(String(hop?.ui?.uid || ''), baseScore);
@@ -4132,6 +4544,104 @@ export class LocalBackend {
         };
       }
 
+      if (card.kind === 'backend-behavior' || card.kind === 'backend-handoff') {
+        const anchorFilePath = normalizeRepoRelativePath(String(card.anchor?.filePath || ''));
+        const keepSameDomainHandoffMembers =
+          card.kind === 'backend-handoff'
+          && Array.isArray((card as any).backend_handoff?.reasons)
+          && (card as any).backend_handoff.reasons.some((reason: any) => String(reason || '').startsWith('laravel-qr-delivery-'));
+        const orderedFiles = Array.from(new Set(
+          [
+            anchorFilePath,
+            ...(Array.isArray(card.member_files) ? card.member_files : []),
+            ...(Array.isArray(card.examples) ? card.examples.map((example: any) => example?.filePath) : []),
+          ]
+            .map(filePath => normalizeRepoRelativePath(String(filePath || '')))
+            .filter(Boolean),
+        ));
+
+        const keptFiles: string[] = [];
+        let changedExcluded = 0;
+        let sameDomainExcluded = 0;
+
+        for (const filePath of orderedFiles) {
+          if (changedPrecedentFiles.has(filePath)) {
+            changedExcluded += 1;
+            continue;
+          }
+          if (isSameDomainPrecedent([filePath])) {
+            if (keepSameDomainHandoffMembers && filePath !== anchorFilePath) {
+              keptFiles.push(filePath);
+              continue;
+            }
+            sameDomainExcluded += 1;
+            continue;
+          }
+          keptFiles.push(filePath);
+        }
+
+        if (keptFiles.length === 0) {
+          if (
+            changedExcluded === 0
+            && sameDomainExcluded > 0
+            && orderedFiles.length > 0
+          ) {
+            const fallbackFiles = orderedFiles.slice(0, card.kind === 'backend-handoff' ? examplesPer + 1 : 1);
+            const fallbackAnchorFilePath = fallbackFiles[0];
+            return {
+              card: {
+                ...card,
+                anchor: {
+                  ...card.anchor,
+                  filePath: fallbackAnchorFilePath,
+                  name: path.basename(fallbackAnchorFilePath),
+                },
+                member_files: card.kind === 'backend-handoff' ? fallbackFiles : card.member_files,
+                examples: fallbackFiles.slice(1).map(filePath => ({
+                  name: path.basename(filePath),
+                  kind: 'File',
+                  filePath,
+                })),
+                filtering: {
+                  changed_files_excluded: 0,
+                  same_domain_excluded: sameDomainExcluded,
+                  same_domain_fallback: true,
+                },
+              },
+              changedExcluded: 0,
+              sameDomainExcluded,
+            };
+          }
+          return null;
+        }
+
+        if (anchorFilePath && !keptFiles.includes(anchorFilePath)) {
+          return null;
+        }
+
+        return {
+          card: {
+            ...card,
+            member_files: card.kind === 'backend-handoff' ? keptFiles : card.member_files,
+            examples: (
+              card.kind === 'backend-handoff'
+                ? keptFiles.filter(filePath => filePath !== anchorFilePath).slice(0, examplesPer)
+                : [anchorFilePath].filter(Boolean)
+            ).map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+            filtering: {
+              changed_files_excluded: changedExcluded,
+              same_domain_excluded: sameDomainExcluded,
+            },
+          },
+          changedExcluded,
+          sameDomainExcluded,
+        };
+      }
+
       const filtered = filterExamples(Array.isArray(card.examples) ? card.examples : []);
       if (filtered.kept.length === 0) {
         if (
@@ -4174,9 +4684,39 @@ export class LocalBackend {
 
     const createBackendBehaviorTitle = (tags: string[], filePath: string): string => {
       const tagSet = new Set(tags);
+      if (tagSet.has('scheduler-schedules-job')) return 'Scheduled queued job';
+      if (tagSet.has('scheduler-schedules-command')) return 'Scheduled console command';
+      if (tagSet.has('webhook-dispatch-callsite')) return 'Webhook dispatch callsite';
+      if (tagSet.has('command-dispatch-callsite') && tagSet.has('dispatch-batch-orchestrator') && tagSet.has('queue-assignment-batch')) {
+        return 'Console command batch queue owner';
+      }
+      if (tagSet.has('command-dispatch-callsite') && tagSet.has('dispatch-chain-orchestrator') && tagSet.has('queue-assignment-chain')) {
+        return 'Console command chain queue owner';
+      }
+      if (tagSet.has('command-dispatch-callsite') && tagSet.has('dispatch-batch-orchestrator')) return 'Console command batch dispatcher';
+      if (tagSet.has('command-dispatch-callsite')) return 'Console command dispatch callsite';
+      if (tagSet.has('queued-job-dispatch-callsite') && tagSet.has('dispatch-batch-orchestrator') && tagSet.has('job-orchestrates-mail-delivery')) {
+        return 'Queued job batch with mail delivery';
+      }
+      if (tagSet.has('queued-job-dispatch-callsite') && tagSet.has('dispatch-chain-orchestrator')) return 'Queued job chain orchestrator';
+      if (tagSet.has('queued-job-owner') && tagSet.has('queue-assignment-job') && tagSet.has('delivery-selector-mail')) {
+        return 'Queued job mail selector';
+      }
+      if (tagSet.has('queued-job-owner') && tagSet.has('queue-assignment-job') && tagSet.has('delivery-selector-notification')) {
+        return 'Queued job notification selector';
+      }
+      if (tagSet.has('queued-job-owner') && tagSet.has('queue-assignment-job')) return 'Queued job queue owner';
+      if (tagSet.has('dispatch-batch-orchestrator')) return 'Queued work batch orchestrator';
+      if (tagSet.has('dispatch-chain-orchestrator')) return 'Queued work chain orchestrator';
+      if (tagSet.has('controller-dispatch-callsite')) return 'Controller dispatch callsite';
+      if (tagSet.has('listener-dispatch-callsite')) return 'Listener dispatch callsite';
       if (tagSet.has('qr-crud-resource')) return 'QR code CRUD resource';
+      if (tagSet.has('qr-redirect-entrypoint')) return 'QR redirect entrypoint';
+      if (tagSet.has('qr-mail-piece-handoff')) return 'QR mail-piece handoff';
       if (tagSet.has('qr-export-inline-pdf')) return 'QR code inline PDF export';
       if (tagSet.has('qr-html-embed')) return 'QR code HTML embed parser';
+      if (tagSet.has('queue-assignment-inherited') && tagSet.has('queued-mail-owner')) return 'Inherited queued mailable';
+      if (tagSet.has('queue-assignment-inherited') && tagSet.has('queued-notification-owner')) return 'Inherited queued notification';
       if (tagSet.has('job-orchestrates-mail-delivery')) return 'Queued mail delivery job';
       if (tagSet.has('job-orchestrates-notification-delivery')) return 'Queued notification delivery job';
       if (tagSet.has('queued-mail-owner')) return 'Queued mailable owner';
@@ -4185,27 +4725,221 @@ export class LocalBackend {
       return path.basename(filePath);
     };
 
+    const backendBehaviorEntries = shouldBoostBackendBehaviors
+      ? await this.loadBackendBehaviorIndex(repo)
+      : [];
+    const backendHandoffEntries = shouldBoostBackendBehaviors
+      ? await this.loadBackendHandoffIndex(repo, backendBehaviorEntries)
+      : [];
+
+    const backendHandoffPrecedents = shouldBoostBackendBehaviors
+      ? backendHandoffEntries
+        .filter(entry => filePathTouchesPrefixes(entry.anchorFilePath, pathPrefixes) || entry.memberFiles.some(filePath => filePathTouchesPrefixes(filePath, pathPrefixes)))
+        .map(entry => {
+          const tagSet = new Set(entry.tags);
+          const matchedTags = Array.from(backendBehaviorQueryTags).filter(tag => tagSet.has(tag));
+          if (matchedTags.length === 0) return null;
+          const textTokenSet = new Set(tokenizePatternCatalogText([
+            entry.title,
+            entry.anchorFilePath,
+            ...entry.memberFiles,
+          ].join(' ')));
+          const textMatchScore = Math.min(
+            queryTokens.reduce((sum, token) => sum + (textTokenSet.has(token) ? 0.24 : 0), 0),
+            1.2,
+          );
+
+          const contextScoreBoost =
+            (hasExplicitSchedulerContextQuery && (tagSet.has('scheduler-kernel-owner') || tagSet.has('scheduler-schedules-job') || tagSet.has('scheduler-schedules-command'))
+              ? 1.35
+              : 0)
+            + (hasExplicitCommandContextQuery && (tagSet.has('console-command-owner') || tagSet.has('command-dispatch-callsite'))
+              ? 1.05
+              : 0)
+            + (hasExplicitWebhookContextQuery && tagSet.has('webhook-dispatch-callsite')
+              ? 1.1
+              : 0)
+            + (hasExplicitControllerContextQuery && tagSet.has('controller-dispatch-callsite') && !tagSet.has('webhook-dispatch-callsite')
+              ? 0.65
+              : 0)
+            + (hasExplicitListenerContextQuery && tagSet.has('listener-dispatch-callsite')
+              ? 0.65
+              : 0)
+            + (hasExplicitBatchQueueContextQuery && tagSet.has('queue-assignment-batch')
+              ? 0.8
+              : 0)
+            + (hasExplicitChainQueueContextQuery && tagSet.has('queue-assignment-chain')
+              ? 0.8
+              : 0)
+            + (hasExplicitJobQueueContextQuery && tagSet.has('queue-assignment-job')
+              ? 0.7
+              : 0)
+            + (hasExplicitInheritedQueueContextQuery && tagSet.has('queue-assignment-inherited')
+              ? 0.9
+              : 0)
+            + (hasExplicitMailSelectorContextQuery && tagSet.has('delivery-selector-mail')
+              ? 0.85
+              : 0)
+            + (hasExplicitNotificationSelectorContextQuery && tagSet.has('delivery-selector-notification')
+              ? 0.85
+              : 0)
+            + (hasExplicitQrRedirectContextQuery && tagSet.has('qr-redirect-entrypoint')
+              ? 0.85
+              : 0)
+            + (hasExplicitQrHandoffContextQuery && tagSet.has('qr-mail-piece-handoff')
+              ? 0.95
+              : 0);
+          const score = matchedTags.length
+            + Math.min(entry.memberFiles.length - 1, 4) * 0.45
+            + Math.min(entry.reasons.length, 4) * 0.2
+            + (
+              matchedTags.includes('scheduler-schedules-job')
+              || matchedTags.includes('scheduler-schedules-command')
+              || matchedTags.includes('dispatch-batch-orchestrator')
+              || matchedTags.includes('dispatch-chain-orchestrator')
+              || matchedTags.includes('webhook-dispatch-callsite')
+              || matchedTags.includes('queued-job-dispatch-callsite')
+              || matchedTags.includes('qr-redirect-entrypoint')
+              || matchedTags.includes('qr-mail-piece-handoff')
+                ? 0.55
+                : 0
+            )
+            + (
+              tagSet.has('delivery-selector-mail')
+              || tagSet.has('delivery-selector-notification')
+              || tagSet.has('job-orchestrates-mail-delivery')
+              || tagSet.has('job-orchestrates-notification-delivery')
+              || tagSet.has('queue-assignment-inherited')
+              || tagSet.has('qr-trackable-redirect-link')
+                ? 0.35
+                : 0
+            )
+            + textMatchScore
+            + contextScoreBoost;
+
+          return {
+            kind: 'backend-handoff',
+            score,
+            anchor: {
+              name: path.basename(entry.anchorFilePath),
+              title: entry.title,
+              kind: 'File',
+              filePath: entry.anchorFilePath,
+            },
+            member_files: entry.memberFiles,
+            examples: entry.memberFiles.slice(1, examplesPer + 1).map(filePath => ({
+              name: path.basename(filePath),
+              kind: 'File',
+              filePath,
+            })),
+            backend_handoff: {
+              tags: entry.tags,
+              smells: entry.smells,
+              reasons: entry.reasons,
+              matched_tags: matchedTags,
+            },
+          };
+        })
+        .filter(Boolean)
+        .sort((left: any, right: any) => toFiniteNumber(right?.score, 0) - toFiniteNumber(left?.score, 0))
+        .slice(0, Math.max(limit * 2, 8))
+      : [];
+
     const backendBehaviorPrecedents = shouldBoostBackendBehaviors
-      ? (await this.loadBackendBehaviorIndex(repo))
+      ? backendBehaviorEntries
         .filter(entry => filePathTouchesPrefixes(entry.filePath, pathPrefixes))
         .map(entry => {
           const matchedTags = Array.from(backendBehaviorQueryTags).filter(tag => entry.tags.includes(tag));
           if (matchedTags.length === 0) return null;
           const tagSet = new Set(entry.tags);
+          const textTokenSet = new Set(tokenizePatternCatalogText([
+            createBackendBehaviorTitle(entry.tags, entry.filePath),
+            entry.filePath,
+          ].join(' ')));
+          const textMatchScore = Math.min(
+            queryTokens.reduce((sum, token) => sum + (textTokenSet.has(token) ? 0.16 : 0), 0),
+            0.64,
+          );
+          const contextScoreBoost =
+            (hasExplicitSchedulerContextQuery && (tagSet.has('scheduler-kernel-owner') || tagSet.has('scheduler-schedules-job') || tagSet.has('scheduler-schedules-command'))
+              ? 1.2
+              : 0)
+            + (hasExplicitCommandContextQuery && (tagSet.has('console-command-owner') || tagSet.has('command-dispatch-callsite'))
+              ? 0.9
+              : 0)
+            + (hasExplicitWebhookContextQuery && tagSet.has('webhook-dispatch-callsite')
+              ? 1
+              : 0)
+            + (hasExplicitControllerContextQuery && tagSet.has('controller-dispatch-callsite') && !tagSet.has('webhook-dispatch-callsite')
+              ? 0.55
+              : 0)
+            + (hasExplicitListenerContextQuery && tagSet.has('listener-dispatch-callsite')
+              ? 0.55
+              : 0)
+            + (hasExplicitBatchQueueContextQuery && tagSet.has('queue-assignment-batch')
+              ? 0.75
+              : 0)
+            + (hasExplicitChainQueueContextQuery && tagSet.has('queue-assignment-chain')
+              ? 0.75
+              : 0)
+            + (hasExplicitJobQueueContextQuery && tagSet.has('queue-assignment-job')
+              ? 0.6
+              : 0)
+            + (hasExplicitInheritedQueueContextQuery && tagSet.has('queue-assignment-inherited')
+              ? 0.8
+              : 0)
+            + (hasExplicitMailSelectorContextQuery && tagSet.has('delivery-selector-mail')
+              ? 0.7
+              : 0)
+            + (hasExplicitNotificationSelectorContextQuery && tagSet.has('delivery-selector-notification')
+              ? 0.7
+              : 0)
+            + (hasExplicitQrRedirectContextQuery && tagSet.has('qr-redirect-entrypoint')
+              ? 0.75
+              : 0)
+            + (hasExplicitQrHandoffContextQuery && tagSet.has('qr-mail-piece-handoff')
+              ? 0.85
+              : 0);
           const score = matchedTags.length
             + (
-              matchedTags.includes('job-orchestrates-mail-delivery')
+              matchedTags.includes('scheduler-schedules-job')
+              || matchedTags.includes('scheduler-schedules-command')
+              || matchedTags.includes('dispatch-batch-orchestrator')
+              || matchedTags.includes('dispatch-chain-orchestrator')
+              || matchedTags.includes('webhook-dispatch-callsite')
+              || matchedTags.includes('queued-job-dispatch-callsite')
+              || matchedTags.includes('job-orchestrates-mail-delivery')
               || matchedTags.includes('job-orchestrates-notification-delivery')
               || matchedTags.includes('qr-export-inline-pdf')
               || matchedTags.includes('qr-html-embed')
+              || matchedTags.includes('qr-redirect-entrypoint')
+              || matchedTags.includes('qr-mail-piece-handoff')
                 ? 0.4
                 : 0
             )
             + (
-              tagSet.has('queue-assignment-explicit') || tagSet.has('qr-crud-mail-piece-sidecar')
+              matchedTags.includes('job-orchestrates-mail-delivery')
+              || matchedTags.includes('job-orchestrates-notification-delivery')
+              || matchedTags.includes('queued-job-dispatch-callsite')
+              || matchedTags.includes('delivery-selector-mail')
+              || matchedTags.includes('delivery-selector-notification')
+                ? 0.15
+                : 0
+            )
+            + (
+              tagSet.has('queue-assignment-explicit')
+              || tagSet.has('queue-assignment-job')
+              || tagSet.has('queue-assignment-batch')
+              || tagSet.has('queue-assignment-chain')
+              || tagSet.has('qr-crud-mail-piece-sidecar')
+              || tagSet.has('qr-trackable-redirect-link')
+              || tagSet.has('command-dispatch-callsite')
+              || tagSet.has('scheduler-kernel-owner')
                 ? 0.2
                 : 0
-            );
+            )
+            + textMatchScore
+            + contextScoreBoost;
 
           return {
             kind: 'backend-behavior',
@@ -4239,6 +4973,7 @@ export class LocalBackend {
       slice: 1.6,
       hop: 1.45,
       process: 1.3,
+      'backend-handoff': 1.58,
       'backend-behavior': 1.45,
       'pattern-catalog': 0.9,
       'anti-pattern': 0.75,
@@ -4249,13 +4984,15 @@ export class LocalBackend {
       slice: 0,
       hop: 1,
       process: 2,
-      'backend-behavior': 3,
-      'pattern-catalog': 4,
-      'anti-pattern': 5,
-      'agent-guideline': 6,
+      'backend-handoff': 3,
+      'backend-behavior': 4,
+      'pattern-catalog': 5,
+      'anti-pattern': 6,
+      'agent-guideline': 7,
     };
 
     const rawPrecedents = [
+      ...backendHandoffPrecedents,
       ...backendBehaviorPrecedents,
       ...patternCatalogPrecedents,
       ...antiPatternPrecedents,
@@ -4268,6 +5005,7 @@ export class LocalBackend {
     let changedFilesExcluded = 0;
     let sameDomainExcluded = 0;
     let uiBehaviorCardsBoosted = 0;
+    let backendHandoffCardsBoosted = 0;
     let backendBehaviorCardsBoosted = 0;
     let backendBehaviorSameDomainFallbacks = 0;
     const precedents = (await Promise.all(rawPrecedents.map(async card => {
@@ -4282,12 +5020,18 @@ export class LocalBackend {
       const rawScore = Math.max(0, toFiniteNumber(filtered.card.score ?? filtered.card.anchor?.score, 0));
       const signal = rawScore > 0 ? 1 - (1 / (1 + rawScore)) : 0;
       const exampleCount = Array.isArray(filtered.card.examples) ? filtered.card.examples.length : 0;
-      const codeDerivedBonus = ['slice', 'hop', 'process', 'backend-behavior'].includes(filtered.card.kind) ? 0.12 : 0;
+      const codeDerivedBonus = ['slice', 'hop', 'process', 'backend-handoff', 'backend-behavior'].includes(filtered.card.kind) ? 0.12 : 0;
 
       let uiBehaviorBonus = 0;
       let uiBehaviorMatches = 0;
+      let backendHandoffBonus = 0;
+      let backendHandoffMatches = 0;
+      let backendSpecificityBonus = 0;
+      let backendSpecificityMatches = 0;
       let backendBehaviorBonus = 0;
       let backendBehaviorMatches = 0;
+      let backendContextBonus = 0;
+      let backendContextPenalty = 0;
       let uiBehaviorPenalty = 0;
       let uiBehaviorSmells = 0;
       let pendingUiBehaviorPenalty = 0;
@@ -4309,30 +5053,226 @@ export class LocalBackend {
       if (shouldBoostBackendBehaviors) {
         const candidateFiles = collectPrecedentFilePaths(filtered.card)
           .filter(isPhpLikeFilePath)
-          .slice(0, 3);
+          .slice(0, filtered.card.kind === 'backend-handoff' ? 5 : 3);
         const candidateTags = new Set<string>();
+        const candidateTextTokens = new Set<string>();
 
         for (const filePath of candidateFiles) {
           const signals = await getBackendBehaviorSignalsForFile(filePath);
           for (const tag of signals.tags) candidateTags.add(tag);
+          for (const token of tokenizePatternCatalogText(filePath)) candidateTextTokens.add(token);
+        }
+        for (const token of tokenizePatternCatalogText(String(filtered.card.anchor?.title || ''))) {
+          candidateTextTokens.add(token);
+        }
+        if (Array.isArray(filtered.card.member_files)) {
+          for (const filePath of filtered.card.member_files) {
+            for (const token of tokenizePatternCatalogText(String(filePath || ''))) candidateTextTokens.add(token);
+          }
         }
 
         const matchedBackendBehaviorTags = Array.from(backendBehaviorQueryTags)
           .filter(tag => candidateTags.has(tag));
         backendBehaviorMatches = matchedBackendBehaviorTags.length;
+        const matchedSpecificBackendTokens = backendSpecificQueryTokens
+          .filter(token => candidateTextTokens.has(token));
+        backendSpecificityMatches = matchedSpecificBackendTokens.length;
 
         if (backendBehaviorMatches > 0) {
           backendBehaviorBonus = Math.min(backendBehaviorMatches, 3) * 0.35;
+          if (backendSpecificityMatches > 0) {
+            backendSpecificityBonus = Math.min(
+              backendSpecificityMatches * 0.55,
+              filtered.card.kind === 'backend-handoff' ? 1.1 : 1.3,
+            );
+            backendBehaviorBonus += backendSpecificityBonus;
+          }
+          if (filtered.card.kind === 'backend-handoff') {
+            backendHandoffMatches = backendBehaviorMatches;
+            backendHandoffBonus = hasExplicitBackendHandoffContextQuery
+              ? 0.12 + Math.min(Math.max(candidateFiles.length - 1, 0), 4) * 0.05
+              : 0.04;
+            backendBehaviorBonus += backendHandoffBonus;
+            backendHandoffCardsBoosted += 1;
+          }
+          if (
+            hasExplicitQrCrossFileHandoffQuery
+            && filtered.card.kind === 'backend-handoff'
+            && matchedBackendBehaviorTags.includes('qr-redirect-entrypoint')
+            && matchedBackendBehaviorTags.includes('qr-mail-piece-handoff')
+          ) {
+            backendBehaviorBonus += 0.75;
+          }
           if (matchedBackendBehaviorTags.includes('qr-export-inline-pdf')) {
             backendBehaviorBonus += 0.5;
+          }
+          if (
+            matchedBackendBehaviorTags.includes('scheduler-schedules-job')
+            || matchedBackendBehaviorTags.includes('scheduler-schedules-command')
+            || matchedBackendBehaviorTags.includes('dispatch-batch-orchestrator')
+            || matchedBackendBehaviorTags.includes('dispatch-chain-orchestrator')
+            || matchedBackendBehaviorTags.includes('webhook-dispatch-callsite')
+            || matchedBackendBehaviorTags.includes('queued-job-dispatch-callsite')
+            || matchedBackendBehaviorTags.includes('queue-assignment-batch')
+            || matchedBackendBehaviorTags.includes('queue-assignment-chain')
+            || matchedBackendBehaviorTags.includes('qr-redirect-entrypoint')
+          ) {
+            backendBehaviorBonus += 0.12;
           }
           if (
             matchedBackendBehaviorTags.includes('job-orchestrates-mail-delivery')
             || matchedBackendBehaviorTags.includes('job-orchestrates-notification-delivery')
             || matchedBackendBehaviorTags.includes('qr-html-embed')
+            || matchedBackendBehaviorTags.includes('delivery-selector-mail')
+            || matchedBackendBehaviorTags.includes('delivery-selector-notification')
+            || matchedBackendBehaviorTags.includes('qr-mail-piece-handoff')
           ) {
             backendBehaviorBonus += 0.12;
           }
+
+          if (
+            hasExplicitSchedulerContextQuery
+            && (
+              candidateTags.has('scheduler-kernel-owner')
+              || candidateTags.has('scheduler-schedules-job')
+              || candidateTags.has('scheduler-schedules-command')
+            )
+          ) {
+            backendContextBonus += 0.45;
+          }
+
+          if (
+            hasExplicitCommandContextQuery
+            && (candidateTags.has('console-command-owner') || candidateTags.has('command-dispatch-callsite'))
+          ) {
+            backendContextBonus += 0.4;
+          }
+
+          if (hasExplicitWebhookContextQuery && candidateTags.has('webhook-dispatch-callsite')) {
+            backendContextBonus += 0.45;
+          }
+
+          if (
+            hasExplicitControllerContextQuery
+            && candidateTags.has('controller-dispatch-callsite')
+            && !candidateTags.has('webhook-dispatch-callsite')
+          ) {
+            backendContextBonus += 0.25;
+          }
+
+          if (hasExplicitListenerContextQuery && candidateTags.has('listener-dispatch-callsite')) {
+            backendContextBonus += 0.25;
+          }
+
+          if (hasExplicitBatchQueueContextQuery && candidateTags.has('queue-assignment-batch')) {
+            backendContextBonus += 0.35;
+          }
+
+          if (hasExplicitChainQueueContextQuery && candidateTags.has('queue-assignment-chain')) {
+            backendContextBonus += 0.35;
+          }
+
+          if (hasExplicitJobQueueContextQuery && candidateTags.has('queue-assignment-job')) {
+            backendContextBonus += 0.3;
+          }
+
+          if (hasExplicitInheritedQueueContextQuery && candidateTags.has('queue-assignment-inherited')) {
+            backendContextBonus += 0.45;
+          }
+
+          if (hasExplicitMailSelectorContextQuery && candidateTags.has('delivery-selector-mail')) {
+            backendContextBonus += 0.35;
+          }
+
+          if (hasExplicitNotificationSelectorContextQuery && candidateTags.has('delivery-selector-notification')) {
+            backendContextBonus += 0.35;
+          }
+
+          if (hasExplicitQrRedirectContextQuery && candidateTags.has('qr-redirect-entrypoint')) {
+            backendContextBonus += 0.4;
+          }
+
+          if (hasExplicitQrHandoffContextQuery && candidateTags.has('qr-mail-piece-handoff')) {
+            backendContextBonus += 0.45;
+          }
+
+          if (
+            hasExplicitSchedulerContextQuery
+            && !candidateTags.has('scheduler-kernel-owner')
+            && !candidateTags.has('scheduler-schedules-job')
+            && !candidateTags.has('scheduler-schedules-command')
+          ) {
+            backendContextPenalty += 0.55;
+          }
+
+          if (
+            hasExplicitCommandContextQuery
+            && !candidateTags.has('console-command-owner')
+            && !candidateTags.has('command-dispatch-callsite')
+          ) {
+            backendContextPenalty += 0.35;
+          }
+
+          if (hasExplicitWebhookContextQuery && !candidateTags.has('webhook-dispatch-callsite')) {
+            backendContextPenalty += 0.4;
+          }
+
+          if (
+            hasExplicitControllerContextQuery
+            && !candidateTags.has('controller-dispatch-callsite')
+            && !candidateTags.has('webhook-dispatch-callsite')
+          ) {
+            backendContextPenalty += 0.2;
+          }
+
+          if (hasExplicitListenerContextQuery && !candidateTags.has('listener-dispatch-callsite')) {
+            backendContextPenalty += 0.2;
+          }
+
+          if (hasExplicitBatchQueueContextQuery && !candidateTags.has('queue-assignment-batch')) {
+            backendContextPenalty += 0.3;
+          }
+
+          if (hasExplicitChainQueueContextQuery && !candidateTags.has('queue-assignment-chain')) {
+            backendContextPenalty += 0.3;
+          }
+
+          if (hasExplicitJobQueueContextQuery && !candidateTags.has('queue-assignment-job')) {
+            backendContextPenalty += 0.22;
+          }
+
+          if (hasExplicitInheritedQueueContextQuery && !candidateTags.has('queue-assignment-inherited')) {
+            backendContextPenalty += 0.35;
+          }
+
+          if (hasExplicitMailSelectorContextQuery && !candidateTags.has('delivery-selector-mail')) {
+            backendContextPenalty += 0.28;
+          }
+
+          if (hasExplicitNotificationSelectorContextQuery && !candidateTags.has('delivery-selector-notification')) {
+            backendContextPenalty += 0.28;
+          }
+
+          if (hasExplicitQrRedirectContextQuery && !candidateTags.has('qr-redirect-entrypoint')) {
+            backendContextPenalty += 0.35;
+          }
+
+          if (hasExplicitQrHandoffContextQuery && !candidateTags.has('qr-mail-piece-handoff')) {
+            backendContextPenalty += 0.4;
+          }
+
+          if (hasExplicitQrCrossFileHandoffQuery && filtered.card.kind !== 'backend-handoff') {
+            backendContextPenalty += 1.05;
+          }
+
+          if (filtered.card.kind === 'backend-handoff' && !hasExplicitBackendHandoffContextQuery) {
+            backendContextPenalty += 0.45;
+          }
+          if (backendSpecificityMatches > 0) {
+            backendContextPenalty = Math.max(0, backendContextPenalty - Math.min(backendSpecificityMatches * 0.22, 0.44));
+          }
+
+          backendBehaviorBonus += Math.min(backendContextBonus, 0.7);
           backendBehaviorCardsBoosted += 1;
         }
       }
@@ -4504,6 +5444,7 @@ export class LocalBackend {
         + codeDerivedBonus
         + backendBehaviorBonus
         + uiBehaviorBonus
+        - backendContextPenalty
         - uiBehaviorPenalty;
 
       return {
@@ -4515,8 +5456,14 @@ export class LocalBackend {
             signal: round3(signal),
             examples: exampleCount,
             code_derived_bonus: round3(codeDerivedBonus),
+            backend_handoff_bonus: round3(backendHandoffBonus),
+            backend_handoff_matches: backendHandoffMatches,
+            backend_specificity_bonus: round3(backendSpecificityBonus),
+            backend_specificity_matches: backendSpecificityMatches,
             backend_behavior_bonus: round3(backendBehaviorBonus),
             backend_behavior_matches: backendBehaviorMatches,
+            backend_context_bonus: round3(backendContextBonus),
+            backend_context_penalty: round3(backendContextPenalty),
             ui_behavior_bonus: round3(uiBehaviorBonus),
             ui_behavior_penalty: round3(uiBehaviorPenalty),
             ui_behavior_matches: uiBehaviorMatches,
@@ -4578,6 +5525,7 @@ export class LocalBackend {
         same_domain_excluded: sameDomainExcluded,
       },
       backend_behavior_query_tags: Array.from(backendBehaviorQueryTags),
+      backend_handoff_cards_boosted: backendHandoffCardsBoosted,
       backend_behavior_cards_boosted: backendBehaviorCardsBoosted,
       backend_behavior_same_domain_fallbacks: backendBehaviorSameDomainFallbacks,
       ui_behavior_query_tags: Array.from(uiBehaviorQueryTags),
